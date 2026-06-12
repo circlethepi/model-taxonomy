@@ -1,0 +1,44 @@
+name: taxonomy
+channels:
+  - defaults
+dependencies:
+  - blas=1.0=openblas
+  - bzip2=1.0.8=h80987f9_6
+  - ca-certificates=2026.5.14=hca03da5_0
+  - libcxx=22.1.2=hf894667_0
+  - libexpat=2.8.1=h50f4ffc_0
+  - libffi=3.4.8=hcfc0b96_2
+  - libgfortran=15.2.0=h09d7db9_1
+  - libgfortran5=15.2.0=hb654fa1_1
+  - libopenblas=0.3.31=h7813bb4_2
+  - libzlib=1.3.2=hb4cf58c_0
+  - llvm-openmp=22.1.2=h4714345_1
+  - ncurses=6.5=hee39554_0
+  - numpy=2.4.6=py311heca761d_0
+  - numpy-base=2.4.6=py311h23175f9_0
+  - openssl=3.5.7=ha0b305a_0
+  - packaging=26.0=py311hca03da5_0
+  - pip=26.1.1=pyhc872135_1
+  - python=3.11.15=h478e877_1
+  - readline=8.3=h0b18652_0
+  - sqlite=3.53.2=h1cce5ff_0
+  - tk=8.6.15=hcd8a7d5_0
+  - tzdata=2026b=he532380_0
+  - wheel=0.46.3=py311hca03da5_0
+  - xz=5.8.2=h8bbcb1d_0
+  - zlib=1.3.2=hb4cf58c_0
+  - pip:
+      - filelock==3.29.3
+      - fsspec==2026.4.0
+      - jinja2==3.1.6
+      - markupsafe==3.0.3
+      - mpmath==1.3.0
+      - networkx==3.6.1
+      - pillow==12.2.0
+      - setuptools==81.0.0
+      - sympy==1.14.0
+      - torch==2.12.0
+      - torchaudio==2.11.0
+      - torchvision==0.27.0
+      - typing-extensions==4.15.0
+prefix: /Users/mnzk/miniconda3/envs/taxonomy

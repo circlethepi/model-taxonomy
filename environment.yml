@@ -41,4 +41,12 @@ dependencies:
       - torchaudio==2.11.0
       - torchvision==0.27.0
       - typing-extensions==4.15.0
+      - transformers>=4.45.0
+      - accelerate>=0.34.0
+      - datasets>=2.20.0
+      - sentence-transformers>=3.0.0
+      - scikit-learn>=1.5.0
+      - submitit>=1.5.1
+      - joblib>=1.4.0
+      - huggingface-hub>=0.25.0
 prefix: /Users/mnzk/miniconda3/envs/taxonomy

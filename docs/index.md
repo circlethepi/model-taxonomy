@@ -44,10 +44,10 @@ Collection of models
 | Document | Contents |
 |---|---|
 | [Getting Started](getting_started.md) | Installation and a complete end-to-end example |
-| [Core Concepts](concepts.md) | Data model, pipeline, and design rationale |
-| [Behavioral Taxonomy](guides/behavioral_taxonomy.md) | Probe design, embedder strategies, batching |
-| [Functional Taxonomy](guides/functional_taxonomy.md) | Activation Gram matrices, layer selection, pooling |
-| [Structural Taxonomy](guides/structural_taxonomy.md) | LoRA vs full-weight mode, n_components, layer detection |
+| [Core Concepts](concepts.md) | Data model, pipeline, cache hierarchy, and design rationale |
+| [Behavioral Taxonomy](guides/behavioral_taxonomy.md) | Generated-output comparison, embedder strategies, probe design |
+| [Functional Taxonomy](guides/functional_taxonomy.md) | Activation modes (input / generation / both), Gram matrices, layer selection |
+| [Structural Taxonomy](guides/structural_taxonomy.md) | LoRA adapter cache, config.json schema, n_components |
 | [Compute Backends](guides/compute_backends.md) | Local execution and SLURM cluster setup |
 | [Geometry Methods](guides/geometry_methods.md) | MDS, PCA, UMAP — when to use each |
 | [Extending the Library](guides/extending.md) | Implementing a new taxonomy |

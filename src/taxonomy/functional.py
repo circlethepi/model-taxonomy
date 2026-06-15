@@ -22,6 +22,21 @@ class FunctionalTaxonomy(Taxonomy):
 
     The representation for a model is the stacked upper triangles of its per-layer
     Gram matrices: shape (N_layers, N_probes*(N_probes+1)//2).
+
+    Activation modes
+    ----------------
+    ``"input"`` (default)
+        Activations from the forward pass on the input prompt only.
+    ``"generation"``
+        Activations collected during auto-regressive generation.  At each
+        decoding step the last-token hidden state is extracted per layer; these
+        are mean-pooled across all generated steps to yield one vector per
+        (probe, layer).  Requires ``max_new_tokens > 0``.
+    ``"both"``
+        Runs both input and generation passes and stacks their Gram rows,
+        producing a ``(2*N_layers, features)`` matrix.  The first N_layers rows
+        correspond to input activations; the next N_layers to generation
+        activations.
     """
 
     def __init__(
@@ -35,6 +50,8 @@ class FunctionalTaxonomy(Taxonomy):
         hf_token: str | None = None,
         pooling: Literal["mean", "last_token", "cls"] = "mean",
         normalize_activations: bool = True,
+        activation_mode: Literal["input", "generation", "both"] = "input",
+        max_new_tokens: int = 32,
     ) -> None:
         self.probes = list(probes)
         self.layer_indices = list(layer_indices)
@@ -45,6 +62,8 @@ class FunctionalTaxonomy(Taxonomy):
         self.hf_token = hf_token or os.environ.get("HF_TOKEN")
         self.pooling = pooling
         self.normalize_activations = normalize_activations
+        self.activation_mode = activation_mode
+        self.max_new_tokens = max_new_tokens
 
     @property
     def taxonomy_name(self) -> str:
@@ -58,6 +77,8 @@ class FunctionalTaxonomy(Taxonomy):
             "pooling": self.pooling,
             "normalize_activations": self.normalize_activations,
             "torch_dtype": str(self.torch_dtype),
+            "activation_mode": self.activation_mode,
+            "max_new_tokens": self.max_new_tokens,
         }
 
     def extract(self, model_id: ModelID) -> ModelRepresentation:
@@ -91,8 +112,9 @@ class FunctionalTaxonomy(Taxonomy):
         )
         model.eval()
 
-        # per_layer_vecs[k] accumulates one (d,) vector per probe for layer_indices[k]
-        per_layer_vecs: list[list[np.ndarray]] = [[] for _ in self.layer_indices]
+        # Number of layer-vector slots per probe depends on activation_mode
+        n_layer_vecs = (2 if self.activation_mode == "both" else 1) * len(self.layer_indices)
+        per_layer_vecs: list[list[np.ndarray]] = [[] for _ in range(n_layer_vecs)]
 
         try:
             for i in range(0, len(self.probes), self.batch_size):
@@ -118,7 +140,7 @@ class FunctionalTaxonomy(Taxonomy):
             G = H @ H.T  # (N_probes, N_probes)
             gram_rows.append(G[triu_idx].astype(np.float32))
 
-        matrix = np.stack(gram_rows, axis=0)  # (N_layers, N_probes*(N_probes+1)//2)
+        matrix = np.stack(gram_rows, axis=0)  # (n_layer_vecs, features)
 
         return ModelRepresentation.create(
             model_id=model_id,
@@ -127,8 +149,9 @@ class FunctionalTaxonomy(Taxonomy):
             config=self.config_dict(),
             metadata={
                 "n_probes": len(self.probes),
-                "n_layers": len(self.layer_indices),
+                "n_layers": n_layer_vecs,
                 "layer_indices": self.layer_indices,
+                "activation_mode": self.activation_mode,
             },
         )
 
@@ -138,7 +161,7 @@ class FunctionalTaxonomy(Taxonomy):
         tokenizer: Any,
         probes: list[str],
     ) -> list[list[np.ndarray]]:
-        """Return one list per probe, each containing N_layers activation vectors."""
+        """Return one list per probe, each containing n_layer_vecs activation vectors."""
         inputs = tokenizer(
             probes,
             return_tensors="pt",
@@ -149,16 +172,78 @@ class FunctionalTaxonomy(Taxonomy):
         inputs = {k: v.to(model.device) for k, v in inputs.items()}
 
         with torch.no_grad():
-            out = model(**inputs, output_hidden_states=True)
+            if self.activation_mode == "input":
+                return self._extract_input_activations(model, inputs, len(probes))
+            elif self.activation_mode == "generation":
+                return self._extract_generation_activations(
+                    model, tokenizer, inputs, len(probes)
+                )
+            elif self.activation_mode == "both":
+                input_vecs = self._extract_input_activations(model, inputs, len(probes))
+                gen_vecs = self._extract_generation_activations(
+                    model, tokenizer, inputs, len(probes)
+                )
+                # Concatenate per-probe: [input_layers..., gen_layers...]
+                return [iv + gv for iv, gv in zip(input_vecs, gen_vecs)]
+            else:
+                raise ValueError(f"Unknown activation_mode: {self.activation_mode!r}")
 
+    def _extract_input_activations(
+        self,
+        model: Any,
+        inputs: dict,
+        n_probes: int,
+    ) -> list[list[np.ndarray]]:
+        """Forward pass on the input prompt; return one vector per (probe, layer)."""
+        out = model(**inputs, output_hidden_states=True)
         batch_results: list[list[np.ndarray]] = []
-        for probe_idx in range(len(probes)):
+        for probe_idx in range(n_probes):
             probe_layer_vecs: list[np.ndarray] = []
             for layer_idx in self.layer_indices:
                 h = out.hidden_states[layer_idx][probe_idx]  # (seq_len, d)
-                vec = self._pool(h).float().cpu().numpy()     # (d,)
+                vec = self._pool(h).float().cpu().numpy()
                 probe_layer_vecs.append(vec)
             batch_results.append(probe_layer_vecs)
+        return batch_results
+
+    def _extract_generation_activations(
+        self,
+        model: Any,
+        tokenizer: Any,
+        inputs: dict,
+        n_probes: int,
+    ) -> list[list[np.ndarray]]:
+        """Generation-phase activations, mean-pooled across decoding steps.
+
+        At each step the last-token hidden state is extracted for each selected
+        layer (shape: batch × d) and accumulated.  After all steps the per-step
+        tensors are stacked and averaged, yielding one (d,) vector per
+        (probe, layer).
+        """
+        gen_out = model.generate(
+            **inputs,
+            max_new_tokens=self.max_new_tokens,
+            do_sample=False,
+            pad_token_id=tokenizer.pad_token_id,
+            return_dict_in_generate=True,
+            output_hidden_states=True,
+        )
+        # gen_out.hidden_states: tuple[step] of tuple[layer] of (batch, seq_at_step, d)
+        # For step 0: seq_at_step == input_len + 1.  For steps 1+: seq_at_step == 1.
+        # Taking [:, -1, :] always selects the most-recently generated token.
+
+        per_layer_per_step: list[list[np.ndarray]] = [[] for _ in self.layer_indices]
+        for step_hs in gen_out.hidden_states:
+            for k, layer_idx in enumerate(self.layer_indices):
+                h = step_hs[layer_idx][:, -1, :]   # (batch, d)
+                per_layer_per_step[k].append(h.float().cpu().numpy())
+
+        batch_results: list[list[np.ndarray]] = [[] for _ in range(n_probes)]
+        for k in range(len(self.layer_indices)):
+            stacked = np.stack(per_layer_per_step[k], axis=0)  # (n_steps, batch, d)
+            mean_over_steps = stacked.mean(axis=0)              # (batch, d)
+            for probe_idx in range(n_probes):
+                batch_results[probe_idx].append(mean_over_steps[probe_idx])
 
         return batch_results
 

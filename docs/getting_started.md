@@ -26,13 +26,12 @@ pip install submitit
 
 ## Minimal example
 
-The following runs a full behavioral analysis on three small public models using hidden-state embeddings, CKA distances, and MDS coordinates. No GPU is required for tiny models.
+The following runs a full functional analysis on three small public models using activation Gram matrices, CKA distances, and MDS coordinates. No GPU is required for tiny models.
 
 ```python
 from src import (
     ModelCollection,
-    BehavioralTaxonomy,
-    HiddenStateEmbedder,
+    FunctionalTaxonomy,
     CKADistanceMetric,
     MDSGeometry,
     LocalBackend,
@@ -57,13 +56,13 @@ probes = [
 ]
 
 # 3. Configure the three pipeline steps
-taxonomy = BehavioralTaxonomy(
+taxonomy = FunctionalTaxonomy(
     probes=probes,
-    embedder=HiddenStateEmbedder(layer_index=-1, pooling="mean"),
-    cache=DiskCache("./cache"),
-    device="cpu",           # use "cuda" for GPU
+    layer_indices=[-1],           # last transformer layer
+    cache=DiskCache("./cache"),   # safetensors format by default
+    device="cpu",                 # use "cuda" for GPU
 )
-metric = CKADistanceMetric(kernel="linear")
+metric = CKADistanceMetric(kernel="linear", unbiased=False)
 geometry = MDSGeometry(n_components=2)
 
 # 4. Run the pipeline
@@ -90,8 +89,32 @@ print(result.geometry.coordinates)
 #  [ 0.18 -0.11]
 #  [ 0.03  0.07]]
 
-# 6. Save and reload
+# 6. Save and reload (all files written as safetensors)
 result.save("./results/run1")
+```
+
+## Choosing a taxonomy
+
+| Taxonomy | What it captures | When to use |
+|---|---|---|
+| `FunctionalTaxonomy` | Covariance structure of internal activations | Comparing how models *process* inputs internally |
+| `BehavioralTaxonomy` | Semantic content of generated text | Comparing what models *produce* |
+| `StructuralTaxonomy` | LoRA adapter weight geometry | Comparing fine-tuned variants of a shared base model |
+
+## Behavioral example (generated output)
+
+`BehavioralTaxonomy` requires `max_new_tokens > 0` — it compares models purely on their generated text.
+
+```python
+from src import BehavioralTaxonomy, SentenceTransformerEmbedder, DiskCache
+
+taxonomy = BehavioralTaxonomy(
+    probes=probes,
+    embedder=SentenceTransformerEmbedder(use_generated_text=True),
+    cache=DiskCache("./cache"),
+    device="cuda",
+    max_new_tokens=64,
+)
 ```
 
 ## Using a HuggingFace Hub search
@@ -113,17 +136,19 @@ For models that require authentication (Llama, Gemma, etc.), pass your HuggingFa
 ```python
 import os
 
-taxonomy = BehavioralTaxonomy(
+taxonomy = FunctionalTaxonomy(
     probes=probes,
-    embedder=HiddenStateEmbedder(),
+    layer_indices=[-4, -3, -2, -1],
     hf_token=os.environ["HF_TOKEN"],   # or pass the string directly
 )
 ```
 
-Alternatively, set the `HF_TOKEN` environment variable and omit the argument — `BehavioralTaxonomy` reads it automatically.
+Alternatively, set the `HF_TOKEN` environment variable and omit the argument — all taxonomy classes read it automatically.
 
 ## Next steps
 
 - [Core Concepts](concepts.md) — understand the data model before running larger experiments
-- [Behavioral Taxonomy](guides/behavioral_taxonomy.md) — probe design and embedder strategies
+- [Behavioral Taxonomy](guides/behavioral_taxonomy.md) — generated-output comparison and embedder strategies
+- [Functional Taxonomy](guides/functional_taxonomy.md) — activation modes: input, generation, or both
+- [Structural Taxonomy](guides/structural_taxonomy.md) — LoRA adapter caching and config.json
 - [Compute Backends](guides/compute_backends.md) — scaling to a SLURM cluster

@@ -42,6 +42,20 @@ The geometry step is optional — you can analyze the distance matrix directly w
 
 ---
 
+## The three taxonomy levels
+
+Each taxonomy captures a distinct level of abstraction:
+
+| Taxonomy | What it extracts | Input required |
+|---|---|---|
+| **Structural** | LoRA adapter weight geometry | None (parameters only) |
+| **Functional** | Covariance structure of internal activations | Probe strings |
+| **Behavioral** | Semantic content of generated text | Probe strings + generation |
+
+**Structural** captures *what was changed* during fine-tuning (the LoRA delta matrices). **Functional** captures *how* a model processes inputs layer by layer. **Behavioral** captures *what* a model produces.
+
+---
+
 ## Data containers
 
 ### `ModelRepresentation`
@@ -58,7 +72,7 @@ class ModelRepresentation:
     cache_key: str           # SHA-256 of (model_id, config_hash)
 ```
 
-The `cache_key` is stable: the same model + same configuration always produces the same key. Changing any extraction parameter (probe list, layer, pooling strategy) produces a different key and invalidates cached results automatically.
+The `cache_key` is stable: the same model + same configuration always produces the same key. Changing any extraction parameter (probe list, layer, pooling strategy, activation mode) produces a different key and invalidates cached results automatically.
 
 ### `DistanceMatrix`
 
@@ -106,7 +120,7 @@ Groups multiple `TaxonomyAnalysis` objects for the same model collection, one pe
 ```python
 profile = ModelTaxonomyProfile(model_ids=model_ids)
 profile.add(behavioral_result)
-profile.add(structural_result)    # when implemented
+profile.add(structural_result)
 
 profile.taxonomy_names()          # ["behavioral", "structural"]
 profile.get("behavioral")         # TaxonomyAnalysis
@@ -117,16 +131,60 @@ profile.save("./results/full_profile")
 
 ## Caching
 
-`DiskCache` avoids re-running inference for model-taxonomy pairs that have already been computed. It is keyed by a hash of the model ID plus all extraction parameters, so:
+Three cache classes cover different storage needs. All tensor data is stored in **safetensors** format — memory-mappable, pickle-free, and fast to load.
 
-- Re-running with the same config hits the cache.
-- Changing any parameter (probe list, layer index, pooling, etc.) misses the cache and triggers fresh inference.
-- Multiple SLURM jobs writing the same key are safe: `filelock` ensures only one job writes, and atomic `os.replace()` prevents partial reads.
+### `DiskCache` — flat hash-keyed cache
+
+The general-purpose cache for `ModelRepresentation` objects. Keyed by a SHA-256 hash of the model ID plus all extraction parameters.
 
 ```python
-cache = DiskCache("./cache")         # NPZ format by default
-cache = DiskCache("./cache", format="pt")  # use .pt for bfloat16 precision
+cache = DiskCache("./cache")                      # safetensors format (default)
+cache = DiskCache("./cache", format="npz")        # NumPy zip (backward compat)
+cache = DiskCache("./cache", format="pt")         # PyTorch (preserves bfloat16)
 ```
+
+Re-running with the same config hits the cache. Changing any parameter (probe list, layer index, pooling, `activation_mode`, etc.) misses the cache and triggers fresh extraction.
+
+Files are stored at `cache_dir/{key[:2]}/{key}.safetensors`. Writes are atomic (`os.replace`) and protected by a per-key `filelock`, making concurrent SLURM writes safe.
+
+### `LoRACache` — hierarchical LoRA adapter cache
+
+Organises structural representations under `base_model → adapter`, alongside a human-readable `config.json` with fine-tuning details.
+
+```python
+from src.cache import LoRACache
+
+lora_cache = LoRACache("./cache")
+
+# Directory structure:
+# ./cache/loras/meta-llama--Llama-3.1-8B/some-org--my-adapter/
+#     config.json                 ← training details + dataset_recipe stub
+#     representation.safetensors  ← extracted representation matrix
+```
+
+Pass it to `StructuralTaxonomy` instead of (or in addition to) `DiskCache`:
+
+```python
+taxonomy = StructuralTaxonomy(lora_cache=LoRACache("./cache"), ...)
+```
+
+### `CollectionCache` — distance matrices and geometry results
+
+Stores the outputs of a full pipeline run — distance matrix plus any geometry embeddings — so they can be reloaded without re-running the model extraction step.
+
+```python
+from src.cache import CollectionCache
+
+cc = CollectionCache("./cache")
+chash = cc.save_distance_matrix(distance_matrix, model_entries)
+cc.save_geometry(chash, geometry_result)
+
+dm = cc.load_distance_matrix(chash)
+pca = cc.load_geometry(chash, "pca")
+info = cc.load_info(chash)   # collection_info.json as dict
+```
+
+`collection_info.json` records the models and LoRA adapters in the collection, the metric and taxonomy used, and the list of geometry methods computed — enough to reconstruct the collection from scratch if needed.
 
 ---
 
@@ -136,6 +194,8 @@ cache = DiskCache("./cache", format="pt")  # use .pt for bfloat16 precision
 
 **The `Taxonomy` is self-contained.** All configuration is baked into the object at construction time so it is pickle-safe for SLURM serialization. The `ComputeBackend` calls `taxonomy.extract(model_id)` as a pure function.
 
-**GPU memory is bounded.** `BehavioralTaxonomy.extract()` loads the model, processes all probes, then explicitly deletes the model and clears the CUDA cache before returning. Only one model occupies GPU memory at a time when using `LocalBackend(n_jobs=1)`.
+**GPU memory is bounded.** Each taxonomy loads the model, processes all probes, then explicitly deletes the model and clears the CUDA cache before returning. Only one model occupies GPU memory at a time when using `LocalBackend(n_jobs=1)`.
+
+**Behavioral vs functional is a strict boundary.** `BehavioralTaxonomy` operates only on *generated text* — it never reads hidden states or logits. For activation-based comparison, use `FunctionalTaxonomy`. This boundary ensures the cache keys and representations are semantically meaningful.
 
 **HuggingFace is the only model interface.** All models are referenced by HuggingFace Hub path and loaded via `transformers.AutoModelForCausalLM`. Authentication for gated models uses the `HF_TOKEN` environment variable or an explicit token passed to the taxonomy.

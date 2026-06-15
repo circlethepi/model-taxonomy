@@ -1,6 +1,6 @@
 # Structural Taxonomy
 
-The structural taxonomy compares models by the geometry of their **weight matrices**. No input data is required — the representation is derived directly from the model's parameters.
+The structural taxonomy compares models by the geometry of their **weight matrices**. No input data or inference is required — the representation is derived directly from the model's parameters.
 
 The default mode (`lora_only=True`) uses only LoRA adapter matrices, making this taxonomy practical for comparing fine-tuned variants of the same base model without storing full weight matrices.
 
@@ -18,16 +18,21 @@ The default mode (`lora_only=True`) uses only LoRA adapter matrices, making this
 
 ```python
 from src import StructuralTaxonomy
+from src.cache import LoRACache
 
 taxonomy = StructuralTaxonomy(
-    layer_names=None,         # None = auto-detect (LoRA modules or all 2-D weights)
-    n_components=256,         # per-layer vector length after truncate/pad
-    lora_only=True,           # use LoRA adapter matrices only (default)
-    use_lora_product=False,   # if True, compare B@A product instead of concat(A, B)
-    cache=DiskCache("./cache"),
-    hf_token=None,            # falls back to HF_TOKEN env var
+    layer_names=None,              # None = auto-detect (LoRA modules or all 2-D weights)
+    n_components=256,              # per-layer vector length after truncate/pad
+    lora_only=True,                # use LoRA adapter matrices only (default)
+    use_lora_product=False,        # if True, compare B@A product instead of concat(A, B)
+    lora_cache=LoRACache("./cache"),  # hierarchical cache (recommended for LoRA)
+    base_model_id=None,            # auto-detected from PEFT adapter_config.json
+    cache=None,                    # flat DiskCache fallback (optional)
+    hf_token=None,                 # falls back to HF_TOKEN env var
 )
 ```
+
+Cache priority: `lora_cache` is checked first; `cache` (flat `DiskCache`) is used as a fallback if set.
 
 ---
 
@@ -91,6 +96,83 @@ This happens for base models (not fine-tuned with LoRA) and for models where LoR
 
 ---
 
+## LoRA cache (`LoRACache`)
+
+`LoRACache` organises structural representations under a `base_model → adapter` hierarchy on disk, alongside a human-readable `config.json` per adapter.
+
+> **HuggingFace compatibility note:** `LoRACache` is a *custom* cache for extracted representations. It sits alongside HuggingFace's own download cache (`~/.cache/huggingface/hub/`) and does not conflict with it. Raw LoRA weight tensors are not stored here — they stay in HuggingFace's cache. What `LoRACache` stores is the extracted representation matrix that would otherwise have to be recomputed each run.
+
+### Directory structure
+
+```
+cache_root/loras/
+  meta-llama--Llama-3.1-8B/            ← base model (/ replaced with --)
+    some-org--my-adapter/               ← adapter (/ replaced with --)
+      config.json
+      representation.safetensors
+```
+
+### `config.json` schema
+
+```json
+{
+  "schema_version": "1",
+  "base_model_id": "meta-llama/Llama-3.1-8B",
+  "adapter_id": "some-org/my-adapter",
+  "adapter_type": "lora",
+  "training_config": {
+    "lora_rank": 16,
+    "lora_alpha": 32,
+    "target_modules": ["q_proj", "v_proj"],
+    "lora_dropout": 0.05
+  },
+  "dataset_recipe": {
+    "_note": "stub — populate with actual dataset details",
+    "dataset_ids": [],
+    "split": null,
+    "num_samples": null
+  },
+  "extraction_config": {
+    "n_components": 256,
+    "use_lora_product": false,
+    "layer_names": null
+  },
+  "extracted_at": "2026-06-15T00:00:00Z"
+}
+```
+
+`training_config` is populated automatically from the adapter's PEFT `adapter_config.json` (downloaded from the Hub). `dataset_recipe` is a documented stub for the dataset taxonomy feature (to be implemented separately).
+
+### Base model auto-detection
+
+When `base_model_id=None` (the default), `StructuralTaxonomy` reads the adapter's `adapter_config.json` from the Hub to find `base_model_name_or_path`. You can also specify it explicitly:
+
+```python
+taxonomy = StructuralTaxonomy(
+    lora_cache=LoRACache("./cache"),
+    base_model_id="meta-llama/Llama-3.1-8B",   # skip the Hub lookup
+)
+```
+
+### Cache API
+
+```python
+from src.cache import LoRACache
+
+lc = LoRACache("./cache")
+
+# Check and load
+lc.exists("meta-llama/Llama-3.1-8B", "some-org/my-adapter")   # → bool
+lc.load("meta-llama/Llama-3.1-8B", "some-org/my-adapter")     # → ModelRepresentation
+lc.load_config("meta-llama/Llama-3.1-8B", "some-org/my-adapter")  # → dict (config.json)
+
+# Browse
+lc.list_base_models()                              # → ["meta-llama/Llama-3.1-8B", ...]
+lc.list_adapters("meta-llama/Llama-3.1-8B")       # → ["some-org/my-adapter", ...]
+```
+
+---
+
 ## Full-weight mode (`lora_only=False`)
 
 When `lora_only=False`, full weight matrices are used.
@@ -109,8 +191,6 @@ taxonomy = StructuralTaxonomy(
     n_components=256,
 )
 ```
-
-The named parameters must exist in the model. This mode is useful when you want to compare a specific subset of layers (e.g., only attention projections, or only the first few layers).
 
 To find available parameter names for a model:
 
@@ -139,31 +219,15 @@ taxonomy = StructuralTaxonomy(lora_only=False, n_components=256)
 
 Each per-layer vector is truncated or zero-padded to exactly `n_components` values before stacking. This ensures the representation matrix has a fixed second dimension regardless of the actual layer sizes.
 
-Choosing `n_components`:
-
 | Scenario | Recommendation |
 |---|---|
 | Comparing LoRA adapters (rank 4–16) | 64–256 (the adapter vectors are naturally small) |
-| Comparing attention weight matrices (4096×4096) | 512–2048 (more values capture more structure) |
+| Comparing attention weight matrices (4096×4096) | 512–2048 |
 | Quick comparison / diagnostic | 256 (default) |
-
-Increasing `n_components` captures more of the weight structure but makes representations larger and distances slower to compute. The CKA metric is invariant to the specific value chosen as long as `n_components` is consistent across all models in a collection.
-
----
-
-## Representation shape
-
-```
-(N_layers, n_components)
-```
-
-where `N_layers` is the number of LoRA modules (in LoRA mode) or specified/detected weight layers (in full-weight mode), and `n_components` is fixed.
 
 ---
 
 ## Distance metrics
-
-Both `FrobeniusDistanceMetric` and `CKADistanceMetric` work with structural representations.
 
 ```python
 from src import FrobeniusDistanceMetric, CKADistanceMetric
@@ -175,7 +239,7 @@ metric = FrobeniusDistanceMetric(normalize=True)
 metric = CKADistanceMetric(kernel="linear", unbiased=True)
 ```
 
-**Tip:** `CKADistanceMetric(unbiased=True)` requires `N_layers >= 4` for numerically stable estimates. With fewer layers, use `unbiased=False`.
+`CKADistanceMetric(unbiased=True)` requires `N_layers >= 4`. With fewer layers, use `unbiased=False`.
 
 ---
 
@@ -185,22 +249,23 @@ metric = CKADistanceMetric(kernel="linear", unbiased=True)
 import torch
 from src import (
     StructuralTaxonomy, CKADistanceMetric,
-    MDSGeometry, LocalBackend, DiskCache,
+    MDSGeometry, LocalBackend,
     ModelCollection, TaxonomyAnalyzer,
 )
+from src.cache import LoRACache
 
 # Compare LoRA fine-tuned variants of the same base model
 models = ModelCollection.from_ids([
-    "base-org/Llama-3.2-1B-lora-task-A",
-    "base-org/Llama-3.2-1B-lora-task-B",
-    "base-org/Llama-3.2-1B-lora-task-C",
+    "some-org/Llama-3.1-8B-lora-task-A",
+    "some-org/Llama-3.1-8B-lora-task-B",
+    "some-org/Llama-3.1-8B-lora-task-C",
 ])
 
-# LoRA mode (default): use only adapter matrices
 taxonomy = StructuralTaxonomy(
     lora_only=True,
     n_components=256,
-    cache=DiskCache("./cache"),
+    lora_cache=LoRACache("./cache"),
+    # base_model_id auto-detected from each adapter's adapter_config.json
     hf_token="hf_...",
 )
 
@@ -211,19 +276,27 @@ result = TaxonomyAnalyzer(
     backend=LocalBackend(n_jobs=1),
 ).fit(list(models))
 
-print(result.distance_matrix.sorted_neighbors("base-org/Llama-3.2-1B-lora-task-A"))
+print(result.distance_matrix.sorted_neighbors("some-org/Llama-3.1-8B-lora-task-A"))
 result.save("./results/structural_lora_cka")
+
+# Inspect the cached config for any adapter
+lc = LoRACache("./cache")
+cfg = lc.load_config("meta-llama/Llama-3.1-8B", "some-org/Llama-3.1-8B-lora-task-A")
+print(cfg["training_config"])
+print(cfg["dataset_recipe"])   # stub, to be filled in
 ```
 
 ### Full-weight example
 
 ```python
 # Compare base models by specific attention layers
+from src.cache import DiskCache
+
 taxonomy = StructuralTaxonomy(
     lora_only=False,
     layer_names=[
         f"model.layers.{i}.self_attn.q_proj.weight"
-        for i in range(4)   # first 4 layers
+        for i in range(4)
     ],
     n_components=512,
     cache=DiskCache("./cache"),

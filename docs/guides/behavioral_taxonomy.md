@@ -1,6 +1,8 @@
 # Behavioral Taxonomy
 
-The behavioral taxonomy compares models by what they *produce* — specifically, by the geometric structure of their outputs over a shared set of probe inputs. It is the most generally applicable taxonomy because it requires no access to model internals beyond what the model exposes through its forward pass.
+The behavioral taxonomy compares models by what they *produce* — specifically, by the semantic geometry of their generated outputs over a shared set of probe inputs. It is the most externally observable taxonomy because it relies only on what a model generates, with no access to internal weights or activations.
+
+> **Scope boundary:** `BehavioralTaxonomy` operates exclusively on generated text. It does not collect hidden states or logits. If you want to compare models by their internal activation structure, use `FunctionalTaxonomy` instead.
 
 ## How it works
 
@@ -8,14 +10,14 @@ For each model in the collection:
 
 1. Load the model and tokenizer from HuggingFace.
 2. For each probe string (processed in batches):
-   - Run a forward pass with `output_hidden_states=True`.
-   - Optionally generate text (`max_new_tokens > 0`).
-   - Pass the output to an `Embedder` to get a vector `e ∈ R^d`.
+   - Run `model.generate()` with `max_new_tokens` steps.
+   - Decode the generated continuation.
+   - Pass the generated text to an `Embedder` to get a vector `e ∈ R^d`.
 3. Stack the `N` probe vectors into a matrix `M ∈ R^{N × d}`.
 4. Delete the model from GPU memory; clear the CUDA cache.
-5. Return `ModelRepresentation(matrix=M, ...)`.
+5. Return `ModelRepresentation(matrix=M, metadata={"generated_texts": [...]}, ...)`.
 
-This matrix is the model's *behavioral surrogate* — a compact description of how it responds to the probe distribution.
+Generated texts are stored in `ModelRepresentation.metadata["generated_texts"]` so you can audit what the model produced without re-running extraction.
 
 ## Configuration
 
@@ -23,52 +25,26 @@ This matrix is the model's *behavioral surrogate* — a compact description of h
 BehavioralTaxonomy(
     probes=probes,
     embedder=embedder,
-    cache=DiskCache("./cache"),   # optional, but recommended
+    cache=DiskCache("./cache"),   # safetensors format by default
     device="cuda",                # or "cpu"
-    batch_size=8,                 # probes per forward pass
-    max_new_tokens=0,             # 0 = no generation (faster)
+    batch_size=8,                 # probes per generate call
+    max_new_tokens=64,            # required: must be > 0
     torch_dtype=torch.float16,    # use bfloat16 for Llama/Gemma
     hf_token=None,                # falls back to HF_TOKEN env var
 )
 ```
 
-Set `batch_size` based on the model size and GPU memory. A 7B model at float16 needs ~14 GB; with a batch of 8 probes of average length 20 tokens, the activations add another ~2 GB.
+`max_new_tokens` must be greater than zero — behavioral comparison is defined by what models generate. If you pass `max_new_tokens=0`, a `ValueError` is raised at construction time with a pointer to `FunctionalTaxonomy`.
 
-## Embedder strategies
+Set `batch_size` based on the model size and GPU memory. A 7B model at float16 needs ~14 GB; with a batch of 8 probes the generated token buffers add ~1–2 GB.
 
-The `Embedder` controls how the model output for one probe is converted into a single vector. Two strategies are available, and they can be mixed across experiments since the resulting representations are stored separately in the cache.
+## Embedder strategy
 
-### Strategy 1: Hidden state embedder
+The `Embedder` controls how the generated text for one probe is converted into a single vector.
 
-Uses the model's own internal representations. No second model is needed.
+### Sentence transformer embedder
 
-```python
-from src import HiddenStateEmbedder
-
-# Default: last layer, mean pooling over sequence positions
-embedder = HiddenStateEmbedder(
-    strategy="hidden_states",
-    layer_index=-1,          # -1 = last layer, -2 = second-to-last, etc.
-    pooling="mean",          # "mean", "last_token", or "cls"
-)
-
-# Use logit vectors instead of hidden states
-embedder = HiddenStateEmbedder(
-    strategy="logits",
-    pooling="mean",          # mean over sequence positions → (vocab_size,) vector
-)
-```
-
-**When to use:** When you want to capture internal representational geometry — closer to the *functional* than the *behavioral* level, but faster to compute since no second model is needed.
-
-**Pooling guidance:**
-- `"mean"` — averages over all token positions; robust and generally recommended.
-- `"last_token"` — the final token's representation; useful for causal LMs where the last token aggregates the full context.
-- `"cls"` — the `[CLS]` token; only meaningful for BERT-style masked LMs.
-
-### Strategy 2: Sentence transformer embedder
-
-Generates text with the model, then encodes the generated text with a separate sentence-transformers model running on CPU.
+Encodes the generated text with a separate sentence-transformers model running on CPU.
 
 ```python
 from src import SentenceTransformerEmbedder
@@ -76,16 +52,22 @@ from src import SentenceTransformerEmbedder
 embedder = SentenceTransformerEmbedder(
     model_name="sentence-transformers/all-MiniLM-L6-v2",
     device="cpu",
-    use_generated_text=True,    # False = embed the raw probe instead
+    use_generated_text=True,      # embeds the generated continuation
     normalize_embeddings=True,
 )
 ```
 
-This strategy requires `max_new_tokens > 0` in `BehavioralTaxonomy`.
+**When to use:** When you care about the *semantic content* of outputs — two models that express the same idea in different words will be similar, while models that produce factually different answers will be far apart.
 
-**When to use:** When you care about the *semantic content* of outputs rather than the model's internal representations. Two models that say the same thing in different words will be close; two models that express the same idea with different phrasing will be closer than with hidden-state embeddings.
+**Sentence-transformer model:** Loaded once at construction time on CPU and kept alive across all models. It does not occupy GPU memory. The default `all-MiniLM-L6-v2` is a 22M-parameter model producing 384-dimensional embeddings — fast and accurate for most purposes.
 
-**Sentence-transformer model:** The model is loaded once at construction time on CPU and kept alive. It does not occupy GPU memory. The default `all-MiniLM-L6-v2` is a 22M-parameter model that produces 384-dimensional embeddings; it is fast and accurate for most purposes.
+**Setting `use_generated_text=False`** embeds the raw probe string instead of the generated text. This makes behavioral distances probe-distribution-only and effectively constant across models; it is rarely useful but available as a baseline.
+
+---
+
+> **Note on `HiddenStateEmbedder`:** Passing a `HiddenStateEmbedder` to `BehavioralTaxonomy` will raise a `ValueError` when `embed()` is called, because `BehavioralTaxonomy` does not collect hidden states. Use `FunctionalTaxonomy` if you want to compare activation-based representations — it provides the same layerwise control with a cleaner interface.
+
+---
 
 ## Designing probe sets
 
@@ -93,7 +75,7 @@ The quality of the behavioral comparison depends heavily on the probe set. Probe
 
 - **Cover the relevant input distribution.** If you are comparing instruction-tuned models, include instruction-style prompts. If comparing domain specialists, use domain-specific probes.
 - **Be diverse enough to prevent rank collapse.** If all probes are very similar, the representation matrices will be nearly identical for all models and distances will be near zero.
-- **Be long enough to elicit meaningful responses.** Single-token probes often produce degenerate distributions.
+- **Be long enough to elicit meaningful responses.** Single-token probes often produce degenerate generations.
 - **Be the same for all models.** The representations are only comparable when computed on the same probe set. The `TaxonomyAnalyzer` will raise an error if the shape of two representations does not match.
 
 A reasonable starting point is 50–200 probes drawn from a benchmark dataset (e.g., MMLU, HellaSwag) or a curated set covering the capabilities you care about.
@@ -108,14 +90,16 @@ probes = [row["question"] for row in ds]
 
 ## Caching
 
-Representations are cached to disk by default when a `DiskCache` is passed. The cache key encodes the model ID, probe list, layer index, pooling strategy, and all other extraction parameters. Changing any one of these produces a different key and triggers fresh inference.
+Representations are cached to disk when a `DiskCache` is passed. The cache key encodes the model ID, probe list, embedder config, `max_new_tokens`, and all other extraction parameters. Changing any one of these produces a different key and triggers fresh inference.
+
+Generated texts are stored in `ModelRepresentation.metadata["generated_texts"]` inside the cache entry, so you can inspect what was generated without re-running the model.
 
 ```python
-cache = DiskCache("./cache")           # NPZ format — portable, compatible with numpy
-cache = DiskCache("./cache", format="pt")  # PyTorch format — preserves bfloat16 precision
+cache = DiskCache("./cache")              # safetensors (default, fast)
+cache = DiskCache("./cache", format="npz")  # NumPy zip (backward compat)
 ```
 
-The cache is safe for concurrent use across SLURM jobs sharing a network filesystem — see [Compute Backends](compute_backends.md).
+The cache is safe for concurrent use across SLURM jobs sharing a network filesystem.
 
 ## Memory management
 
@@ -124,14 +108,15 @@ The cache is safe for concurrent use across SLURM jobs sharing a network filesys
 - The model is deleted from Python's object graph.
 - `torch.cuda.empty_cache()` is called to release GPU memory back to the allocator.
 
-When using `LocalBackend(n_jobs=1)`, models are processed sequentially and GPU memory usage stays bounded. Do not use `n_jobs > 1` with GPU models — multiple models cannot share a single GPU without careful memory management.
+When using `LocalBackend(n_jobs=1)`, models are processed sequentially and GPU memory usage stays bounded. Do not use `n_jobs > 1` with GPU models.
 
 ## Full example
 
 ```python
 import torch
+from datasets import load_dataset
 from src import (
-    BehavioralTaxonomy, HiddenStateEmbedder, SentenceTransformerEmbedder,
+    BehavioralTaxonomy, SentenceTransformerEmbedder,
     DiskCache, ModelCollection, TaxonomyAnalyzer,
     CKADistanceMetric, MDSGeometry, LocalBackend,
 )
@@ -142,35 +127,34 @@ models = ModelCollection.from_ids([
     "Qwen/Qwen2.5-1.5B",
 ])
 
-probes = [...]  # 100 probe strings
+ds = load_dataset("cais/mmlu", "all", split="test[:100]")
+probes = [row["question"] for row in ds]
 
-# Option A: own hidden states (no generation needed)
 taxonomy = BehavioralTaxonomy(
-    probes=probes,
-    embedder=HiddenStateEmbedder(layer_index=-1, pooling="mean"),
-    cache=DiskCache("./cache"),
-    device="cuda",
-    batch_size=4,
-    torch_dtype=torch.bfloat16,     # Llama uses bfloat16
-    hf_token="hf_...",
-)
-
-# Option B: sentence-transformer on generated text
-taxonomy_b = BehavioralTaxonomy(
     probes=probes,
     embedder=SentenceTransformerEmbedder(use_generated_text=True),
     cache=DiskCache("./cache"),
     device="cuda",
     batch_size=4,
-    max_new_tokens=64,              # required for text generation
+    max_new_tokens=64,
     torch_dtype=torch.bfloat16,
     hf_token="hf_...",
 )
 
 result = TaxonomyAnalyzer(
     taxonomy=taxonomy,
-    metric=CKADistanceMetric(kernel="linear"),
+    metric=CKADistanceMetric(kernel="linear", unbiased=False),
     geometry_method=MDSGeometry(n_components=2),
     backend=LocalBackend(n_jobs=1),
 ).fit(list(models))
+
+# Inspect nearest neighbors by behavioral output similarity
+print(result.distance_matrix.sorted_neighbors("meta-llama/Llama-3.2-1B"))
+
+# Audit what was actually generated
+rep = result.representations[0]
+for probe, text in zip(probes[:3], rep.metadata["generated_texts"][:3]):
+    print(f"  Q: {probe[:60]}")
+    print(f"  A: {text[:80]}")
+    print()
 ```

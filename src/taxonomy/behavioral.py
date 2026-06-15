@@ -15,19 +15,33 @@ from src.cache.disk import DiskCache
 
 @dataclass
 class _InferenceOutput:
-    """Unified container for a single forward pass over one probe."""
+    """Unified container for the output of one generation call over one probe."""
 
     hidden_states: tuple | None
-    logits: torch.Tensor
+    logits: "torch.Tensor | None"
     generated_text: str | None
 
 
 class BehavioralTaxonomy(Taxonomy):
     """Extracts behavioral representations of HuggingFace language models.
 
-    For each model, runs inference over a set of probe strings and uses the
-    provided embedder to convert each output into a fixed-size vector.
-    The stacked vectors form the (N_probes, d) matrix representation.
+    For each model, generates continuations for a set of probe strings and uses
+    the provided embedder to convert each generated output into a fixed-size
+    vector.  The stacked vectors form the (N_probes, d) matrix representation.
+
+    This taxonomy operates **exclusively on generated text output** — it does not
+    collect hidden states or logits during the generation pass.  Use
+    :class:`FunctionalTaxonomy` if you need activation-based comparison.
+
+    Generated texts are stored in ``ModelRepresentation.metadata["generated_texts"]``
+    so you can audit outputs without re-running the model.
+
+    Parameters
+    ----------
+    max_new_tokens:
+        Number of tokens to generate per probe.  Must be > 0 — this is what
+        distinguishes behavioral (output-based) comparison from functional
+        (activation-based) comparison.
     """
 
     def __init__(
@@ -37,10 +51,16 @@ class BehavioralTaxonomy(Taxonomy):
         cache: DiskCache | None = None,
         device: str = "cuda",
         batch_size: int = 8,
-        max_new_tokens: int = 0,
+        max_new_tokens: int = 64,
         torch_dtype: torch.dtype = torch.float16,
         hf_token: str | None = None,
     ) -> None:
+        if max_new_tokens <= 0:
+            raise ValueError(
+                "BehavioralTaxonomy requires max_new_tokens > 0. "
+                "Behavioral comparison is based on generated text output. "
+                "For activation-based comparison use FunctionalTaxonomy instead."
+            )
         self.probes = list(probes)
         self.embedder = embedder
         self.cache = cache
@@ -95,11 +115,13 @@ class BehavioralTaxonomy(Taxonomy):
         model.eval()
 
         vectors: list[np.ndarray] = []
+        all_generated_texts: list[str] = []
         try:
             for i in range(0, len(self.probes), self.batch_size):
                 batch_probes = self.probes[i : i + self.batch_size]
-                batch_vectors = self._process_batch(model, tokenizer, batch_probes)
+                batch_vectors, batch_texts = self._process_batch(model, tokenizer, batch_probes)
                 vectors.extend(batch_vectors)
+                all_generated_texts.extend(batch_texts)
         finally:
             del model
             gc.collect()
@@ -112,7 +134,10 @@ class BehavioralTaxonomy(Taxonomy):
             taxonomy=self.taxonomy_name,
             matrix=matrix,
             config=self.config_dict(),
-            metadata={"n_probes": len(self.probes)},
+            metadata={
+                "n_probes": len(self.probes),
+                "generated_texts": all_generated_texts,
+            },
         )
 
     def _process_batch(
@@ -120,9 +145,7 @@ class BehavioralTaxonomy(Taxonomy):
         model: Any,
         tokenizer: Any,
         probes: list[str],
-    ) -> list[np.ndarray]:
-        from transformers import GenerationConfig
-
+    ) -> tuple[list[np.ndarray], list[str]]:
         inputs = tokenizer(
             probes,
             return_tensors="pt",
@@ -131,43 +154,29 @@ class BehavioralTaxonomy(Taxonomy):
             max_length=512,
         )
         inputs = {k: v.to(model.device) for k, v in inputs.items()}
+        input_len = inputs["input_ids"].shape[1]
 
         with torch.no_grad():
-            if self.max_new_tokens > 0:
-                output_ids = model.generate(
-                    **inputs,
-                    max_new_tokens=self.max_new_tokens,
-                    do_sample=False,
-                    pad_token_id=tokenizer.pad_token_id,
-                )
-                generated_texts = tokenizer.batch_decode(
-                    output_ids[:, inputs["input_ids"].shape[1] :],
-                    skip_special_tokens=True,
-                )
-                forward_out = model(
-                    **inputs,
-                    output_hidden_states=True,
-                )
-            else:
-                generated_texts = [None] * len(probes)
-                forward_out = model(
-                    **inputs,
-                    output_hidden_states=True,
-                )
+            output_ids = model.generate(
+                **inputs,
+                max_new_tokens=self.max_new_tokens,
+                do_sample=False,
+                pad_token_id=tokenizer.pad_token_id,
+            )
+
+        generated_texts = tokenizer.batch_decode(
+            output_ids[:, input_len:],
+            skip_special_tokens=True,
+        )
 
         vectors = []
-        for idx, (probe, gen_text) in enumerate(zip(probes, generated_texts)):
-            # Build per-probe output by slicing batch dimension
-            per_probe = _InferenceOutput(
-                hidden_states=(
-                    tuple(h[idx : idx + 1] for h in forward_out.hidden_states)
-                    if forward_out.hidden_states
-                    else None
-                ),
-                logits=forward_out.logits[idx : idx + 1],
+        for probe, gen_text in zip(probes, generated_texts):
+            output_obj = _InferenceOutput(
+                hidden_states=None,    # behavioral is output-only; no hidden states collected
+                logits=None,
                 generated_text=gen_text,
             )
-            vec = self.embedder.embed(per_probe, probe)
+            vec = self.embedder.embed(output_obj, probe)
             vectors.append(vec)
 
-        return vectors
+        return vectors, generated_texts

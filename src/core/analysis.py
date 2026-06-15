@@ -24,6 +24,8 @@ class TaxonomyAnalysis:
     geometry: GeometryResult | None = None
 
     def save(self, path: Path) -> None:
+        from safetensors.numpy import save_file
+
         path = Path(path)
         path.mkdir(parents=True, exist_ok=True)
         self.distance_matrix.save(path / "distance_matrix")
@@ -32,23 +34,29 @@ class TaxonomyAnalysis:
         for rep in self.representations:
             rep_dir = path / "representations" / rep.cache_key
             rep_dir.mkdir(parents=True, exist_ok=True)
-            np.save(rep_dir / "matrix.npy", rep.matrix)
-            (rep_dir / "meta.json").write_text(
-                json.dumps(
-                    {
-                        "model_id": rep.model_id,
-                        "taxonomy": rep.taxonomy,
-                        "cache_key": rep.cache_key,
-                        "metadata": rep.metadata,
-                    },
-                    indent=2,
-                )
+            meta_payload = {
+                "model_id": rep.model_id,
+                "taxonomy": rep.taxonomy,
+                "cache_key": rep.cache_key,
+                "metadata": rep.metadata,
+            }
+            meta_bytes = np.frombuffer(
+                json.dumps(meta_payload).encode("utf-8"), dtype=np.uint8
+            )
+            save_file(
+                {
+                    "matrix": np.ascontiguousarray(rep.matrix),
+                    "_meta_json": meta_bytes,
+                },
+                str(rep_dir / "representation.safetensors"),
             )
         meta = {"taxonomy_name": self.taxonomy_name, "model_ids": self.model_ids}
         (path / "meta.json").write_text(json.dumps(meta, indent=2))
 
     @classmethod
     def load(cls, path: Path) -> "TaxonomyAnalysis":
+        from safetensors.numpy import load_file
+
         path = Path(path)
         meta = json.loads((path / "meta.json").read_text())
         distance_matrix = DistanceMatrix.load(path / "distance_matrix")
@@ -59,8 +67,9 @@ class TaxonomyAnalysis:
         rep_root = path / "representations"
         if rep_root.exists():
             for rep_dir in sorted(rep_root.iterdir()):
-                m = json.loads((rep_dir / "meta.json").read_text())
-                matrix = np.load(rep_dir / "matrix.npy")
+                tensors = load_file(str(rep_dir / "representation.safetensors"))
+                matrix = tensors["matrix"]
+                m = json.loads(tensors["_meta_json"].tobytes().decode("utf-8"))
                 representations.append(
                     ModelRepresentation(
                         model_id=m["model_id"],

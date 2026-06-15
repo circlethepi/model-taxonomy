@@ -18,6 +18,7 @@ setup(
         "huggingface-hub>=0.25.0",
         "filelock>=3.13.0",
         "networkx>=3.0.0",
+        "safetensors>=0.4.0",
     ],
     extras_require={
         "umap": ["umap-learn>=0.5.0"],

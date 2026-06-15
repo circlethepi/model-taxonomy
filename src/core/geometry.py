@@ -58,9 +58,10 @@ class GeometryResult:
         return g
 
     def save(self, path: Path) -> None:
+        from safetensors.numpy import save_file
+
         path = Path(path)
         path.mkdir(parents=True, exist_ok=True)
-        np.save(path / "coordinates.npy", self.coordinates)
         meta = {
             "model_ids": self.model_ids,
             "method": self.method,
@@ -69,11 +70,21 @@ class GeometryResult:
             "stress": self.stress,
             "metadata": self.metadata,
         }
-        (path / "meta.json").write_text(json.dumps(meta, indent=2))
+        meta_bytes = np.frombuffer(json.dumps(meta).encode("utf-8"), dtype=np.uint8)
+        save_file(
+            {
+                "coordinates": np.ascontiguousarray(self.coordinates.astype(np.float32)),
+                "_meta_json": meta_bytes,
+            },
+            str(path / "geometry.safetensors"),
+        )
 
     @classmethod
     def load(cls, path: Path) -> "GeometryResult":
+        from safetensors.numpy import load_file
+
         path = Path(path)
-        coordinates = np.load(path / "coordinates.npy")
-        meta = json.loads((path / "meta.json").read_text())
+        tensors = load_file(str(path / "geometry.safetensors"))
+        coordinates = tensors["coordinates"]
+        meta = json.loads(tensors["_meta_json"].tobytes().decode("utf-8"))
         return cls(coordinates=coordinates, **meta)

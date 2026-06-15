@@ -4,6 +4,7 @@ All public classes are importable directly from `src`:
 
 ```python
 from src import BehavioralTaxonomy, CKADistanceMetric, MDSGeometry, ...
+from src.cache import DiskCache, LoRACache, CollectionCache
 ```
 
 ---
@@ -49,6 +50,14 @@ class ModelRepresentation:
 
 Use `ModelRepresentation.create()` rather than the raw constructor — it computes `cache_key` automatically from `config`.
 
+**`metadata` keys by taxonomy:**
+
+| Taxonomy | Keys |
+|---|---|
+| `structural` | `n_layers`, `layer_labels`, `lora_only` |
+| `functional` | `n_probes`, `n_layers`, `layer_indices`, `activation_mode` |
+| `behavioral` | `n_probes`, `generated_texts` |
+
 ---
 
 ### `DistanceMatrix`
@@ -63,7 +72,7 @@ class DistanceMatrix:
 
     def __getitem__(self, pair: tuple[ModelID, ModelID]) -> float
     def sorted_neighbors(self, model_id: ModelID) -> list[tuple[ModelID, float]]
-    def save(self, path: Path) -> None
+    def save(self, path: Path) -> None      # writes distance_matrix.safetensors
     @classmethod
     def load(cls, path: Path) -> DistanceMatrix
 ```
@@ -87,7 +96,7 @@ class GeometryResult:
 
     def nearest_neighbors(self, model_id: ModelID, k: int = 3) -> list[ModelID]
     def to_networkx(self, distance_matrix: DistanceMatrix | None = None) -> nx.Graph
-    def save(self, path: Path) -> None
+    def save(self, path: Path) -> None      # writes geometry.safetensors
     @classmethod
     def load(cls, path: Path) -> GeometryResult
 ```
@@ -107,7 +116,7 @@ class TaxonomyAnalysis:
     distance_matrix: DistanceMatrix
     geometry:        GeometryResult | None
 
-    def save(self, path: Path) -> None
+    def save(self, path: Path) -> None      # writes safetensors for all tensors
     @classmethod
     def load(cls, path: Path) -> TaxonomyAnalysis
 ```
@@ -205,12 +214,18 @@ class BehavioralTaxonomy(Taxonomy):
         cache: DiskCache | None = None,
         device: str = "cuda",
         batch_size: int = 8,
-        max_new_tokens: int = 0,         # 0 = no generation
+        max_new_tokens: int = 64,        # must be > 0; raises ValueError otherwise
         torch_dtype: torch.dtype = torch.float16,
         hf_token: str | None = None,     # falls back to HF_TOKEN env var
     )
     taxonomy_name = "behavioral"
 ```
+
+Compares models by the semantic content of their generated text. `max_new_tokens` must be `> 0` — behavioral comparison is defined by what models produce. Use `FunctionalTaxonomy` for activation-based comparison.
+
+Generated texts are stored in `ModelRepresentation.metadata["generated_texts"]` for auditing.
+
+**`HiddenStateEmbedder` is not compatible with `BehavioralTaxonomy`.** `BehavioralTaxonomy` does not collect hidden states; passing `HiddenStateEmbedder` will raise a `ValueError` when `embed()` is called. Use `SentenceTransformerEmbedder` instead.
 
 ---
 
@@ -221,7 +236,7 @@ class FunctionalTaxonomy(Taxonomy):
     def __init__(
         self,
         probes: Sequence[str],
-        layer_indices: list[int],                      # e.g. [-4, -3, -2, -1]
+        layer_indices: list[int],
         cache: DiskCache | None = None,
         device: str = "cuda",
         batch_size: int = 8,
@@ -229,6 +244,8 @@ class FunctionalTaxonomy(Taxonomy):
         hf_token: str | None = None,
         pooling: Literal["mean", "last_token", "cls"] = "mean",
         normalize_activations: bool = True,
+        activation_mode: Literal["input", "generation", "both"] = "input",
+        max_new_tokens: int = 32,
     )
     taxonomy_name = "functional"
 ```
@@ -238,10 +255,17 @@ class FunctionalTaxonomy(Taxonomy):
 | `layer_indices` | Indices into `hidden_states`; `-1` = last transformer block, `0` = embedding layer |
 | `pooling` | How to pool the `(seq_len, d)` hidden state to a single vector per probe |
 | `normalize_activations` | L2-normalize activation vectors before computing Gram matrix; makes `G[i,i]=1` |
+| `activation_mode` | `"input"`: forward-pass activations on the prompt. `"generation"`: activations during decoding, mean-pooled over steps. `"both"`: both phases stacked. |
+| `max_new_tokens` | Tokens to generate per probe; used when `activation_mode` is `"generation"` or `"both"`. Ignored for `"input"`. |
 
-**Representation shape:** `(N_layers, N_probes*(N_probes+1)//2)` — one row per layer, columns are the upper triangle of the Gram matrix `H @ H.T`.
+**Representation shape:**
 
-**Note on CKA:** `CKADistanceMetric(unbiased=True)` requires `N_layers ≥ 4`. Use `unbiased=False` for smaller layer sets.
+| `activation_mode` | Shape |
+|---|---|
+| `"input"` or `"generation"` | `(N_layers, N_probes*(N_probes+1)//2)` |
+| `"both"` | `(2*N_layers, N_probes*(N_probes+1)//2)` |
+
+**Note on CKA:** `CKADistanceMetric(unbiased=True)` requires the matrix row count to be ≥ 4. For `"both"` mode this is `2 * N_layers`; for other modes it is `N_layers`. Use `unbiased=False` for smaller configurations.
 
 ---
 
@@ -251,11 +275,13 @@ class FunctionalTaxonomy(Taxonomy):
 class StructuralTaxonomy(Taxonomy):
     def __init__(
         self,
-        layer_names: list[str] | None = None,   # None = auto-detect
-        n_components: int = 256,                 # per-layer vector length after truncate/pad
-        lora_only: bool = True,                  # use LoRA adapter matrices only
-        use_lora_product: bool = False,          # True = store B@A; False = concat(A, B)
-        cache: DiskCache | None = None,
+        layer_names: list[str] | None = None,    # None = auto-detect
+        n_components: int = 256,                  # per-layer vector length after truncate/pad
+        lora_only: bool = True,                   # use LoRA adapter matrices only
+        use_lora_product: bool = False,           # True = store B@A; False = concat(A, B)
+        cache: DiskCache | None = None,           # flat hash-keyed fallback
+        lora_cache: LoRACache | None = None,      # hierarchical base_model→adapter cache
+        base_model_id: str | None = None,         # auto-detected from PEFT if None
         hf_token: str | None = None,
     )
     taxonomy_name = "structural"
@@ -263,14 +289,16 @@ class StructuralTaxonomy(Taxonomy):
 
 | Parameter | Description |
 |---|---|
-| `layer_names` | Explicit parameter names to compare; `None` = auto-detect LoRA pairs or all 2-D weights |
+| `layer_names` | Explicit parameter names; `None` = auto-detect LoRA pairs or all 2-D weights |
 | `n_components` | Each per-layer weight vector is truncated or zero-padded to this length |
-| `lora_only` | `True` (default): use only `.lora_A.` / `.lora_B.` adapter parameters; raises `ValueError` if none found |
-| `use_lora_product` | `True`: compare `(B @ A).flatten()` (weight delta); `False`: compare `concat(A.flatten(), B.flatten())` |
+| `lora_only` | `True` (default): use only `.lora_A.` / `.lora_B.` parameters; raises `ValueError` if none found |
+| `use_lora_product` | `True`: compare `(B @ A).flatten()`; `False`: compare `concat(A.flatten(), B.flatten())` |
+| `lora_cache` | `LoRACache` for hierarchical storage under `base_model → adapter` |
+| `base_model_id` | Base model HF ID; if `None`, read from PEFT `adapter_config.json` on the Hub |
 
-**Representation shape:** `(N_layers, n_components)` — one row per weight layer or LoRA module. No input probes required.
+**Cache priority:** `lora_cache` is checked first; `cache` (flat `DiskCache`) is the fallback.
 
-**LoRA detection:** Matches parameters whose names contain `.lora_A.` and `.lora_B.`, covering standard PEFT naming. Models with merged LoRA weights will not have these parameters; use `lora_only=False` for them.
+**Representation shape:** `(N_layers, n_components)` — one row per weight layer or LoRA module.
 
 ---
 
@@ -301,6 +329,8 @@ class HiddenStateEmbedder(Embedder):
     )
 ```
 
+Extracts vectors from the model's own hidden states or logits. **Only compatible with `FunctionalTaxonomy`** (which passes hidden states to the embedder via the `_InferenceOutput` object). Passing this embedder to `BehavioralTaxonomy` will raise a `ValueError` because `BehavioralTaxonomy` does not collect hidden states.
+
 | Parameter | Description |
 |---|---|
 | `strategy` | `"hidden_states"` — use transformer hidden states; `"logits"` — use logit vectors |
@@ -320,7 +350,7 @@ class SentenceTransformerEmbedder(Embedder):
     )
 ```
 
-Requires `max_new_tokens > 0` in `BehavioralTaxonomy` when `use_generated_text=True`.
+Encodes text with a sentence-transformers model on CPU. The intended embedder for `BehavioralTaxonomy`. When `use_generated_text=True`, embeds the generated continuation; when `False`, embeds the raw probe string.
 
 ---
 
@@ -345,7 +375,7 @@ class FrobeniusDistanceMetric(DistanceMetric):
     metric_name = "frobenius"
 ```
 
-`normalize=True`: L2-normalizes each row before computing `‖A − B‖_F / √N`. This makes the distance invariant to embedding scale.
+`normalize=True`: L2-normalizes each row before computing `‖A − B‖_F / √N`. Makes the distance invariant to embedding scale.
 
 ### `CKADistanceMetric`
 
@@ -360,7 +390,7 @@ class CKADistanceMetric(DistanceMetric):
     metric_name = "cka_linear" | "cka_rbf"
 ```
 
-Distance = `1 − CKA(A, B)`. CKA is invariant to orthogonal transformations and isotropic scaling. The unbiased HSIC estimator is more reliable for small probe sets. For the RBF kernel, `sigma=None` uses the median pairwise distance heuristic.
+Distance = `1 − CKA(A, B)`. Invariant to orthogonal transformations and isotropic scaling. `unbiased=True` requires the matrix row count to be ≥ 4 (rows = `N_layers` for functional, or `2*N_layers` in `"both"` mode).
 
 ---
 
@@ -384,7 +414,7 @@ class MDSGeometry(GeometryMethod):
     def __init__(
         self,
         n_components: int = 2,
-        metric: bool = True,      # True = metric MDS, False = non-metric
+        metric: bool = True,
         max_iter: int = 300,
         n_init: int = 4,
         random_state: int = 0,
@@ -446,7 +476,7 @@ class LocalBackend(ComputeBackend):
     def __init__(self, n_jobs: int = 1)
 ```
 
-`n_jobs=1` runs sequentially (required for GPU models). `n_jobs=-1` uses all CPU cores (safe for distance computation, safe for CPU-only models).
+`n_jobs=1` runs sequentially (required for GPU models). `n_jobs=-1` uses all CPU cores (safe for distance computation; safe for CPU-only models).
 
 ### `SlurmBackend`
 
@@ -460,7 +490,7 @@ class SlurmBackend(ComputeBackend):
     )
 ```
 
-`slurm_params` is passed directly to `submitit.AutoExecutor.update_parameters()`. One SLURM job is submitted per model. `n_distance_jobs` controls parallelism for the local distance computation step.
+`slurm_params` is passed directly to `submitit.AutoExecutor.update_parameters()`. One SLURM job per model. `n_distance_jobs` controls parallelism for the local distance computation step.
 
 ---
 
@@ -473,7 +503,7 @@ class DiskCache:
     def __init__(
         self,
         cache_dir: Path | str,
-        format: Literal["npz", "pt"] = "npz",
+        format: Literal["npz", "pt", "safetensors"] = "safetensors",
     )
 
     def exists(self, key: str) -> bool
@@ -483,9 +513,74 @@ class DiskCache:
     def key_for(model_id: ModelID, config: dict) -> str
 ```
 
-`format="npz"` (default) is portable and compatible with any numpy installation. `format="pt"` preserves `bfloat16` precision when models use it.
+| Format | Description |
+|---|---|
+| `"safetensors"` (default) | Memory-mappable, pickle-free, fast load. Recommended. |
+| `"npz"` | NumPy zip archive. Portable backward-compatible option. |
+| `"pt"` | PyTorch format. Preserves `bfloat16` precision. |
 
 Files are stored at `cache_dir/{key[:2]}/{key}.{ext}`. Writes are atomic (`os.replace`) and protected by a per-key `filelock`, making concurrent SLURM writes safe.
+
+---
+
+### `LoRACache`
+
+```python
+class LoRACache:
+    def __init__(self, cache_root: Path | str)
+
+    def exists(self, base_model_id: str, adapter_id: str) -> bool
+    def save(
+        self,
+        base_model_id: str,
+        adapter_id: str,
+        rep: ModelRepresentation,
+        training_config: dict,
+        extraction_config: dict,
+    ) -> None
+    def load(self, base_model_id: str, adapter_id: str) -> ModelRepresentation
+    def load_config(self, base_model_id: str, adapter_id: str) -> dict
+    def list_adapters(self, base_model_id: str) -> list[str]
+    def list_base_models(self) -> list[str]
+
+    @staticmethod
+    def detect_base_model(adapter_id: str, hf_token: str | None = None) -> str
+    @staticmethod
+    def _read_peft_adapter_config(adapter_id: str, hf_token: str | None = None) -> dict
+```
+
+Hierarchical cache for structural (LoRA) representations. Stores a `config.json` (with `training_config` and a `dataset_recipe` stub) and `representation.safetensors` per adapter under `base_model → adapter` directories.
+
+`detect_base_model` reads the PEFT `adapter_config.json` from the Hub to resolve the base model ID automatically.
+
+---
+
+### `CollectionCache`
+
+```python
+class CollectionCache:
+    def __init__(self, cache_root: Path | str)
+
+    @staticmethod
+    def collection_hash(model_ids: list[str], taxonomy: str, metric: str) -> str
+
+    def exists(self, collection_hash: str) -> bool
+    def save_distance_matrix(
+        self,
+        distance_matrix: DistanceMatrix,
+        model_entries: list[dict] | None = None,
+    ) -> str    # returns collection_hash
+
+    def save_geometry(self, collection_hash: str, geometry: GeometryResult) -> None
+    def load_distance_matrix(self, collection_hash: str) -> DistanceMatrix
+    def load_geometry(self, collection_hash: str, method: str) -> GeometryResult
+    def load_info(self, collection_hash: str) -> dict
+    def list_collections(self) -> list[str]
+```
+
+Stores distance matrices and geometry results for a model collection. `collection_info.json` records all models (and their LoRA adapter details if applicable), the metric and taxonomy used, and the list of geometry methods computed. `save_geometry` can be called multiple times to add PCA, MDS, and UMAP results to the same collection.
+
+`model_entries` is an ordered list of dicts describing each model in `distance_matrix.model_ids`. Each entry should have at minimum `{"model_id": ..., "entry_type": "base_model" | "lora_adapter"}`. LoRA adapter entries can additionally record `base_model_id` and `adapter_cache_slug` to allow cache lookup.
 
 ---
 

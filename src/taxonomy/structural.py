@@ -9,6 +9,7 @@ import numpy as np
 from src.core.protocols import Taxonomy, ModelID
 from src.core.representation import ModelRepresentation
 from src.cache.disk import DiskCache
+from src.cache.lora_cache import LoRACache
 
 
 def _find_lora_pairs(
@@ -59,6 +60,11 @@ class StructuralTaxonomy(Taxonomy):
 
     The representation matrix has shape (N_layers, n_components), where each row
     corresponds to one weight layer/adapter.
+
+    Cache priority:
+        1. ``lora_cache`` (LoRACache) — checked first when set; organises
+           representations under ``base_model_id → adapter_id``.
+        2. ``cache`` (DiskCache) — flat hash-keyed fallback.
     """
 
     def __init__(
@@ -68,6 +74,8 @@ class StructuralTaxonomy(Taxonomy):
         lora_only: bool = True,
         use_lora_product: bool = False,
         cache: DiskCache | None = None,
+        lora_cache: LoRACache | None = None,
+        base_model_id: str | None = None,
         hf_token: str | None = None,
     ) -> None:
         self.layer_names = layer_names
@@ -75,6 +83,8 @@ class StructuralTaxonomy(Taxonomy):
         self.lora_only = lora_only
         self.use_lora_product = use_lora_product
         self.cache = cache
+        self.lora_cache = lora_cache
+        self.base_model_id = base_model_id
         self.hf_token = hf_token or os.environ.get("HF_TOKEN")
 
     @property
@@ -91,17 +101,55 @@ class StructuralTaxonomy(Taxonomy):
         }
 
     def extract(self, model_id: ModelID) -> ModelRepresentation:
-        cache_key = DiskCache.key_for(model_id, self.config_dict()) if self.cache else ""
+        # Try LoRACache first (hierarchical, base_model-aware)
+        if self.lora_cache is not None:
+            base_id = self._resolve_base_model(model_id)
+            if self.lora_cache.exists(base_id, model_id):
+                return self.lora_cache.load(base_id, model_id)
 
+        # Fall back to flat DiskCache
+        cache_key = DiskCache.key_for(model_id, self.config_dict()) if self.cache else ""
         if self.cache is not None and self.cache.exists(cache_key):
             return self.cache.load(cache_key)
 
         rep = self._extract_fresh(model_id, cache_key)
 
-        if self.cache is not None:
+        # Persist to whichever cache is configured
+        if self.lora_cache is not None:
+            base_id = self._resolve_base_model(model_id)
+            training_config = self._read_training_config(model_id)
+            self.lora_cache.save(
+                base_model_id=base_id,
+                adapter_id=model_id,
+                rep=rep,
+                training_config=training_config,
+                extraction_config={
+                    "n_components": self.n_components,
+                    "use_lora_product": self.use_lora_product,
+                    "layer_names": self.layer_names,
+                },
+            )
+        elif self.cache is not None:
             self.cache.save(cache_key, rep)
 
         return rep
+
+    def _resolve_base_model(self, adapter_id: ModelID) -> str:
+        if self.base_model_id is not None:
+            return self.base_model_id
+        return LoRACache.detect_base_model(adapter_id, self.hf_token)
+
+    def _read_training_config(self, adapter_id: ModelID) -> dict:
+        try:
+            peft_cfg = LoRACache._read_peft_adapter_config(adapter_id, self.hf_token)
+            return {
+                "lora_rank": peft_cfg.get("r"),
+                "lora_alpha": peft_cfg.get("lora_alpha"),
+                "target_modules": peft_cfg.get("target_modules"),
+                "lora_dropout": peft_cfg.get("lora_dropout"),
+            }
+        except Exception:
+            return {}
 
     def _extract_fresh(self, model_id: ModelID, cache_key: str) -> ModelRepresentation:
         from transformers import AutoModelForCausalLM

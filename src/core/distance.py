@@ -43,15 +43,26 @@ class DistanceMatrix:
         return sorted(pairs, key=lambda x: x[1])
 
     def save(self, path: Path) -> None:
+        from safetensors.numpy import save_file
+
         path = Path(path)
         path.mkdir(parents=True, exist_ok=True)
-        np.save(path / "matrix.npy", self.matrix)
         meta = {"model_ids": self.model_ids, "metric": self.metric, "taxonomy": self.taxonomy}
-        (path / "meta.json").write_text(json.dumps(meta, indent=2))
+        meta_bytes = np.frombuffer(json.dumps(meta).encode("utf-8"), dtype=np.uint8)
+        save_file(
+            {
+                "matrix": np.ascontiguousarray(self.matrix.astype(np.float32)),
+                "_meta_json": meta_bytes,
+            },
+            str(path / "distance_matrix.safetensors"),
+        )
 
     @classmethod
     def load(cls, path: Path) -> "DistanceMatrix":
+        from safetensors.numpy import load_file
+
         path = Path(path)
-        matrix = np.load(path / "matrix.npy")
-        meta = json.loads((path / "meta.json").read_text())
+        tensors = load_file(str(path / "distance_matrix.safetensors"))
+        matrix = tensors["matrix"].astype(np.float64)
+        meta = json.loads(tensors["_meta_json"].tobytes().decode("utf-8"))
         return cls(matrix=matrix, **meta)

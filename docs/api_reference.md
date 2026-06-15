@@ -214,6 +214,66 @@ class BehavioralTaxonomy(Taxonomy):
 
 ---
 
+### `FunctionalTaxonomy`
+
+```python
+class FunctionalTaxonomy(Taxonomy):
+    def __init__(
+        self,
+        probes: Sequence[str],
+        layer_indices: list[int],                      # e.g. [-4, -3, -2, -1]
+        cache: DiskCache | None = None,
+        device: str = "cuda",
+        batch_size: int = 8,
+        torch_dtype: torch.dtype = torch.float16,
+        hf_token: str | None = None,
+        pooling: Literal["mean", "last_token", "cls"] = "mean",
+        normalize_activations: bool = True,
+    )
+    taxonomy_name = "functional"
+```
+
+| Parameter | Description |
+|---|---|
+| `layer_indices` | Indices into `hidden_states`; `-1` = last transformer block, `0` = embedding layer |
+| `pooling` | How to pool the `(seq_len, d)` hidden state to a single vector per probe |
+| `normalize_activations` | L2-normalize activation vectors before computing Gram matrix; makes `G[i,i]=1` |
+
+**Representation shape:** `(N_layers, N_probes*(N_probes+1)//2)` — one row per layer, columns are the upper triangle of the Gram matrix `H @ H.T`.
+
+**Note on CKA:** `CKADistanceMetric(unbiased=True)` requires `N_layers ≥ 4`. Use `unbiased=False` for smaller layer sets.
+
+---
+
+### `StructuralTaxonomy`
+
+```python
+class StructuralTaxonomy(Taxonomy):
+    def __init__(
+        self,
+        layer_names: list[str] | None = None,   # None = auto-detect
+        n_components: int = 256,                 # per-layer vector length after truncate/pad
+        lora_only: bool = True,                  # use LoRA adapter matrices only
+        use_lora_product: bool = False,          # True = store B@A; False = concat(A, B)
+        cache: DiskCache | None = None,
+        hf_token: str | None = None,
+    )
+    taxonomy_name = "structural"
+```
+
+| Parameter | Description |
+|---|---|
+| `layer_names` | Explicit parameter names to compare; `None` = auto-detect LoRA pairs or all 2-D weights |
+| `n_components` | Each per-layer weight vector is truncated or zero-padded to this length |
+| `lora_only` | `True` (default): use only `.lora_A.` / `.lora_B.` adapter parameters; raises `ValueError` if none found |
+| `use_lora_product` | `True`: compare `(B @ A).flatten()` (weight delta); `False`: compare `concat(A.flatten(), B.flatten())` |
+
+**Representation shape:** `(N_layers, n_components)` — one row per weight layer or LoRA module. No input probes required.
+
+**LoRA detection:** Matches parameters whose names contain `.lora_A.` and `.lora_B.`, covering standard PEFT naming. Models with merged LoRA weights will not have these parameters; use `lora_only=False` for them.
+
+---
+
 ## Embedders
 
 Both embedders share this interface:

@@ -35,8 +35,8 @@ Collection of models
 | Taxonomy | What is compared | Status |
 |---|---|---|
 | **Behavioral** | Mean-embedded outputs over probe inputs | Implemented |
-| **Functional** | Internal activations w.r.t. inputs | Planned |
-| **Structural** | Model weight matrices | Planned |
+| **Functional** | Gram matrices of internal activations per layer | Implemented |
+| **Structural** | Weight matrices / LoRA adapter matrices | Implemented |
 | **Training Data** | Fine-tuning dataset distribution | Planned |
 
 ## Documentation
@@ -46,6 +46,8 @@ Collection of models
 | [Getting Started](getting_started.md) | Installation and a complete end-to-end example |
 | [Core Concepts](concepts.md) | Data model, pipeline, and design rationale |
 | [Behavioral Taxonomy](guides/behavioral_taxonomy.md) | Probe design, embedder strategies, batching |
+| [Functional Taxonomy](guides/functional_taxonomy.md) | Activation Gram matrices, layer selection, pooling |
+| [Structural Taxonomy](guides/structural_taxonomy.md) | LoRA vs full-weight mode, n_components, layer detection |
 | [Compute Backends](guides/compute_backends.md) | Local execution and SLURM cluster setup |
 | [Geometry Methods](guides/geometry_methods.md) | MDS, PCA, UMAP — when to use each |
 | [Extending the Library](guides/extending.md) | Implementing a new taxonomy |

@@ -18,6 +18,27 @@ def load_config(path: str | Path) -> dict:
         return yaml.safe_load(f)
 
 
+def load_recipe(path: Path | str):
+    """Load DatasetRecipe or ClassAwareDatasetRecipe by inspecting recipe_type."""
+    import json as _json
+    data = _json.loads(Path(path).read_text())
+    if data.get("recipe_type") == "class_aware":
+        from src.datasets.class_recipe import ClassAwareDatasetRecipe
+        return ClassAwareDatasetRecipe.load(path)
+    from src.datasets.recipe import DatasetRecipe
+    return DatasetRecipe.load(path)
+
+
+def make_mixed_dataset(recipe, total_samples: int, seed: int = 42, hf_token: str | None = None):
+    """Instantiate MixedDataset or ClassMixedDataset depending on recipe type."""
+    from src.datasets.class_recipe import ClassAwareDatasetRecipe
+    if isinstance(recipe, ClassAwareDatasetRecipe):
+        from src.datasets.mixed_dataset import ClassMixedDataset
+        return ClassMixedDataset(recipe, total_samples=total_samples, seed=seed, hf_token=hf_token)
+    from src.datasets.mixed_dataset import MixedDataset
+    return MixedDataset(recipe, total_samples=total_samples, seed=seed, hf_token=hf_token)
+
+
 def hf_token(cfg: dict) -> str | None:
     return cfg.get("hf_token") or os.environ.get("HF_TOKEN") or None
 
@@ -99,9 +120,6 @@ def make_repr_cache(output_dir: Path):
 
 def make_queries(cfg: dict) -> list[str]:
     """Load query strings from the configured queries_dataset."""
-    from src.datasets.recipe import DatasetRecipe
-    from src.datasets.mixed_dataset import MixedDataset
-
     output_dir = Path(cfg["output_dir"])
     ext_cfg = cfg.get("extraction", {})
     dataset_name = ext_cfg.get("queries_dataset")
@@ -116,13 +134,12 @@ def make_queries(cfg: dict) -> list[str]:
             f"Recipe not found at {recipe_path}. Run build_datasets.py first."
         )
 
-    recipe = DatasetRecipe.load(recipe_path)
-    mixed = MixedDataset(
-        recipe,
-        total_samples=n_queries,
-        seed=cfg.get("datasets", [{}])[0].get("seed", 42),
-        hf_token=hf_token(cfg),
+    seed = next(
+        (d.get("seed", 42) for d in cfg.get("datasets", []) if d["name"] == dataset_name),
+        42,
     )
+    recipe = load_recipe(recipe_path)
+    mixed = make_mixed_dataset(recipe, total_samples=n_queries, seed=seed, hf_token=hf_token(cfg))
     return mixed.to_queries(n=n_queries)
 
 
@@ -160,6 +177,8 @@ def make_behavioral_taxonomy(cfg: dict, queries: list[str], cache=None):
         device="cpu",
         use_generated_text=True,
         normalize_embeddings=ecfg.get("normalize_embeddings", True),
+        trust_remote_code=ecfg.get("trust_remote_code", False),
+        prompt_name=ecfg.get("prompt_name"),
     )
     return BehavioralTaxonomy(
         queries=queries,

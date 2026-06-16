@@ -22,11 +22,15 @@ class SentenceTransformerEmbedder(Embedder):
         device: str = "cpu",
         use_generated_text: bool = True,
         normalize_embeddings: bool = True,
+        trust_remote_code: bool = False,
+        prompt_name: str | None = None,
     ) -> None:
         self.model_name = model_name
         self.device = device
         self.use_generated_text = use_generated_text
         self.normalize_embeddings = normalize_embeddings
+        self.trust_remote_code = trust_remote_code
+        self.prompt_name = prompt_name
         self._st_model = None
         self._embedding_dim: int | None = None
 
@@ -34,7 +38,9 @@ class SentenceTransformerEmbedder(Embedder):
         if self._st_model is None:
             from sentence_transformers import SentenceTransformer
 
-            self._st_model = SentenceTransformer(self.model_name, device=self.device)
+            self._st_model = SentenceTransformer(
+                self.model_name, device=self.device, trust_remote_code=self.trust_remote_code
+            )
             self._embedding_dim = self._st_model.get_sentence_embedding_dimension()
 
     @property
@@ -53,12 +59,14 @@ class SentenceTransformerEmbedder(Embedder):
         else:
             text = query
 
-        vec = self._st_model.encode(
-            text,
+        encode_kwargs: dict = dict(
             convert_to_numpy=True,
             normalize_embeddings=self.normalize_embeddings,
             show_progress_bar=False,
         )
+        if self.prompt_name is not None:
+            encode_kwargs["prompt_name"] = self.prompt_name
+        vec = self._st_model.encode(text, **encode_kwargs)
         return vec.astype(np.float32)
 
     def config_dict(self) -> dict[str, Any]:
@@ -67,4 +75,6 @@ class SentenceTransformerEmbedder(Embedder):
             "model_name": self.model_name,
             "use_generated_text": self.use_generated_text,
             "normalize_embeddings": self.normalize_embeddings,
+            "trust_remote_code": self.trust_remote_code,
+            "prompt_name": self.prompt_name,
         }

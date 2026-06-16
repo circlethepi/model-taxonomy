@@ -18,9 +18,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from scripts._utils import load_config, hf_token, adapter_dir
-from src.datasets.recipe import DatasetRecipe
-from src.datasets.mixed_dataset import MixedDataset
+from scripts._utils import load_config, hf_token, adapter_dir, load_recipe, make_mixed_dataset
 
 
 def _finetune_one(
@@ -71,13 +69,13 @@ def _finetune_one(
     model = get_peft_model(model, lora_config)
     model.print_trainable_parameters()
 
-    recipe = DatasetRecipe.load(recipe_path)
+    recipe = load_recipe(recipe_path)
     n_samples = ft_cfg.get("n_samples", 1000)
     seed = ft_cfg.get("seed", 42)
     text_field = recipe.datasets[0].text_field
 
     print(f"    Building dataset: {n_samples} samples from '{dataset_name}' (field: {text_field!r})")
-    mixed = MixedDataset(recipe, total_samples=n_samples, seed=seed, hf_token=token)
+    mixed = make_mixed_dataset(recipe, total_samples=n_samples, seed=seed, hf_token=token)
     hf_dataset = Dataset.from_list(list(mixed.for_finetuning()))
 
     sft_cfg = SFTConfig(

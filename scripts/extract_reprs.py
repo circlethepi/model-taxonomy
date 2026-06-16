@@ -1,0 +1,93 @@
+"""Step 3: extract activations and/or outputs for a set of models.
+
+Pre-populates the DiskCache so run_taxonomy.py can load representations
+without re-running inference.
+
+Usage:
+    python scripts/extract_reprs.py experiments/example.yaml
+    python scripts/extract_reprs.py experiments/example.yaml --taxonomy functional
+    python scripts/extract_reprs.py experiments/example.yaml --taxonomy behavioral functional
+"""
+
+from __future__ import annotations
+
+import argparse
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+from scripts._utils import (
+    load_config,
+    resolve_model_ids,
+    make_repr_cache,
+    make_queries,
+    make_functional_taxonomy,
+    make_behavioral_taxonomy,
+)
+
+
+def extract_representations(cfg: dict, only_taxonomies: list[str] | None = None) -> None:
+    """Extract and cache representations for all configured models and taxonomies."""
+    output_dir = Path(cfg["output_dir"])
+    ext_cfg = cfg.get("extraction", {})
+    tax_cfgs = ext_cfg.get("taxonomies", {})
+
+    model_ids = resolve_model_ids(cfg, section_key="extraction")
+    if not model_ids:
+        print("  No models to extract. Check extraction.models in your config.")
+        return
+
+    print(f"  Models ({len(model_ids)}):")
+    for mid in model_ids:
+        print(f"    {mid}")
+
+    cache = make_repr_cache(output_dir)
+
+    print("  Loading queries...")
+    queries = make_queries(cfg)
+    print(f"  Got {len(queries)} queries.")
+
+    enabled = set(only_taxonomies) if only_taxonomies else None
+
+    # ── Functional taxonomy ────────────────────────────────────────────────────
+    fcfg = tax_cfgs.get("functional", {})
+    if fcfg.get("enabled", True) and (enabled is None or "functional" in enabled):
+        print(f"\n  [functional]  layers={fcfg.get('layer_indices', [-1, -4, -8])}"
+              f"  mode={fcfg.get('activation_mode', 'input')}")
+        taxonomy = make_functional_taxonomy(cfg, queries, cache=cache)
+        for i, model_id in enumerate(model_ids, 1):
+            print(f"    [{i}/{len(model_ids)}] {model_id}", end=" ... ", flush=True)
+            rep = taxonomy.extract(model_id)
+            print(f"shape={rep.matrix.shape}  key={rep.cache_key}")
+
+    # ── Behavioral taxonomy ────────────────────────────────────────────────────
+    bcfg = tax_cfgs.get("behavioral", {})
+    if bcfg.get("enabled", True) and (enabled is None or "behavioral" in enabled):
+        print(f"\n  [behavioral]  max_new_tokens={bcfg.get('max_new_tokens', 64)}")
+        taxonomy = make_behavioral_taxonomy(cfg, queries, cache=cache)
+        for i, model_id in enumerate(model_ids, 1):
+            print(f"    [{i}/{len(model_ids)}] {model_id}", end=" ... ", flush=True)
+            rep = taxonomy.extract(model_id)
+            print(f"shape={rep.matrix.shape}  key={rep.cache_key}")
+
+
+def main(cfg: dict, only_taxonomies: list[str] | None = None) -> None:
+    print("=== Step 3: Extract representations ===")
+    extract_representations(cfg, only_taxonomies=only_taxonomies)
+    print("\nDone. Representations cached.")
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(
+        description="Extract model representations from an experiment YAML."
+    )
+    parser.add_argument("config", help="Path to experiment YAML file.")
+    parser.add_argument(
+        "--taxonomy",
+        nargs="+",
+        metavar="NAME",
+        help="Only extract these taxonomies (e.g. --taxonomy functional behavioral).",
+    )
+    args = parser.parse_args()
+    main(load_config(args.config), only_taxonomies=args.taxonomy)

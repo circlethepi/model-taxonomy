@@ -1,0 +1,86 @@
+name: example
+output_dir: results/example
+# hf_token: null  # set here or via HF_TOKEN environment variable
+
+# ── Datasets ──────────────────────────────────────────────────────────────────
+datasets:
+  - name: alpaca_mix
+    n_samples: 200
+    seed: 42
+    entries:
+      - dataset_id: tatsu-lab/alpaca
+        weight: 1.0
+        text_field: instruction
+        split: train
+  # Example of a weighted mixture:
+  # - name: qa_mix
+  #   n_samples: 500
+  #   seed: 0
+  #   entries:
+  #     - dataset_id: rajpurkar/squad
+  #       weight: 2.0
+  #       text_field: question
+  #       split: train
+  #     - dataset_id: trivia_qa
+  #       subset: unfiltered
+  #       weight: 1.0
+  #       text_field: question
+  #       split: train
+
+# ── Base models ───────────────────────────────────────────────────────────────
+base_models:
+  - meta-llama/Llama-3.1-8B
+
+# ── LoRA fine-tuning ──────────────────────────────────────────────────────────
+fine_tuning:
+  enabled: true
+  datasets: [alpaca_mix]          # dataset names defined above
+  n_samples: 200                  # samples drawn per (base_model, dataset) pair
+  seed: 42
+  lora_rank: 8
+  lora_alpha: 16
+  target_modules: [q_proj, v_proj]
+  lora_dropout: 0.05
+  n_epochs: 1
+  learning_rate: 2.0e-4
+  per_device_train_batch_size: 4
+  gradient_accumulation_steps: 4
+  max_seq_length: 256
+  torch_dtype: float16
+
+# ── Representation extraction ─────────────────────────────────────────────────
+extraction:
+  # "base_models"  → use base_models list above
+  # "fine_tuned"   → discover all adapters under {output_dir}/adapters/
+  # or list explicit HF IDs / local paths
+  models: [base_models, fine_tuned]
+  queries_dataset: alpaca_mix     # which dataset to sample queries from
+  n_queries: 32
+  device: cuda
+  batch_size: 4
+  torch_dtype: float16
+  taxonomies:
+    functional:
+      enabled: true
+      layer_indices: [-1, -4, -8]
+      activation_mode: input      # input | generation | both
+      pooling: mean
+      normalize_activations: true
+      max_new_tokens: 32          # only relevant when activation_mode != input
+    behavioral:
+      enabled: true
+      max_new_tokens: 64
+      embedder:
+        type: sentence_transformer
+        model_name: sentence-transformers/all-MiniLM-L6-v2
+        normalize_embeddings: true
+
+# ── Taxonomy analysis ─────────────────────────────────────────────────────────
+taxonomy:
+  models: [base_models, fine_tuned]
+  taxonomies: [functional, behavioral, structural]
+  metrics:
+    functional: cka               # cka | frobenius
+    behavioral: frobenius
+    structural: frobenius
+  geometry: [mds]          # any subset of [pca, mds, umap]

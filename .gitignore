@@ -4,4 +4,4 @@
 notebooks/*
 .venv
 .vscode
-taxonomy-env
+results

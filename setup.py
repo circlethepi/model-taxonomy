@@ -4,7 +4,7 @@ setup(
     name="model-taxonomy",
     version="0.1.0",
     packages=find_packages(),
-    python_requires=">=3.11",
+    python_requires=">=3.9",
     install_requires=[
         "torch>=2.0.0",
         "numpy>=1.24.0",
@@ -19,6 +19,9 @@ setup(
         "filelock>=3.13.0",
         "networkx>=3.0.0",
         "safetensors>=0.4.0",
+        "peft>=0.12.0",
+        "trl>=0.11.0",
+        "PyYAML>=6.0",
     ],
     extras_require={
         "umap": ["umap-learn>=0.5.0"],

@@ -84,7 +84,7 @@ def _finetune_one(
         learning_rate=ft_cfg.get("learning_rate", 2e-4),
         per_device_train_batch_size=ft_cfg.get("per_device_train_batch_size", 4),
         gradient_accumulation_steps=ft_cfg.get("gradient_accumulation_steps", 4),
-        max_seq_length=ft_cfg.get("max_seq_length", 512),
+        max_length=ft_cfg.get("max_seq_length", 512),
         dataset_text_field=text_field,
         save_strategy="no",
         logging_steps=10,

@@ -30,7 +30,27 @@ import argparse
 import shutil
 import sys
 import time
+from datetime import datetime
 from pathlib import Path
+
+
+class _Tee:
+    """Write to both a stream and a log file simultaneously."""
+
+    def __init__(self, stream, log_file):
+        self._stream = stream
+        self._log = log_file
+
+    def write(self, data):
+        self._stream.write(data)
+        self._log.write(data)
+
+    def flush(self):
+        self._stream.flush()
+        self._log.flush()
+
+    def __getattr__(self, name):
+        return getattr(self._stream, name)
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
@@ -128,12 +148,27 @@ def main() -> None:
     args = parser.parse_args()
 
     cfg = load_config(args.config)
-    run_experiment(
-        cfg,
-        steps=args.steps,
-        force_finetune=args.force,
-        only_taxonomies=args.taxonomy,
-    )
+
+    exp_name = cfg.get("name", Path(args.config).stem)
+    log_dir = Path(cfg["output_dir"]) / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_path = log_dir / f"{exp_name}_{timestamp}.log"
+
+    with open(log_path, "w") as log_f:
+        sys.stdout = _Tee(sys.__stdout__, log_f)
+        sys.stderr = _Tee(sys.__stderr__, log_f)
+        try:
+            print(f"Logging output to {log_path}")
+            run_experiment(
+                cfg,
+                steps=args.steps,
+                force_finetune=args.force,
+                only_taxonomies=args.taxonomy,
+            )
+        finally:
+            sys.stdout = sys.__stdout__
+            sys.stderr = sys.__stderr__
 
 
 if __name__ == "__main__":

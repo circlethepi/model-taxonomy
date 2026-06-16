@@ -68,6 +68,16 @@ class ClassDatasetEntry:
 
     @classmethod
     def from_dict(cls, d: dict) -> ClassDatasetEntry:
+        class_filter = d.get("class_filter")
+        class_weights = d.get("class_weights")
+        # JSON keys are always strings; coerce to match class_filter element types
+        # so that the membership check in __post_init__ works correctly.
+        if class_weights is not None and class_filter:
+            try:
+                elem_type = type(class_filter[0])
+                class_weights = {elem_type(k): v for k, v in class_weights.items()}
+            except (ValueError, TypeError):
+                pass
         return cls(
             dataset_id=d["dataset_id"],
             split=d.get("split", "train"),
@@ -75,8 +85,8 @@ class ClassDatasetEntry:
             text_field=d.get("text_field", "text"),
             class_field=d.get("class_field", "label"),
             subset=d.get("subset"),
-            class_filter=d.get("class_filter"),
-            class_weights=d.get("class_weights"),
+            class_filter=class_filter,
+            class_weights=class_weights,
         )
 
 

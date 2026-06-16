@@ -51,8 +51,14 @@ class LoRACache:
         rep: ModelRepresentation,
         training_config: dict,
         extraction_config: dict,
+        dataset_recipe: dict | None = None,
     ) -> None:
-        """Write config.json and representation.safetensors atomically."""
+        """Write config.json and representation.safetensors atomically.
+
+        Pass ``dataset_recipe=recipe.to_dict()`` to store the full mixing
+        recipe alongside the LoRA tensors.  When omitted a placeholder stub
+        is written instead.
+        """
         from filelock import FileLock
         from safetensors.numpy import save_file
 
@@ -64,18 +70,20 @@ class LoRACache:
             if self.exists(base_model_id, adapter_id):
                 return
 
+            stored_recipe = dataset_recipe if dataset_recipe is not None else {
+                "_note": "stub — populate with actual dataset details",
+                "dataset_ids": [],
+                "split": None,
+                "num_samples": None,
+            }
+
             config = {
                 "schema_version": "1",
                 "base_model_id": base_model_id,
                 "adapter_id": adapter_id,
                 "adapter_type": "lora",
                 "training_config": training_config,
-                "dataset_recipe": {
-                    "_note": "stub — populate with actual dataset details",
-                    "dataset_ids": [],
-                    "split": None,
-                    "num_samples": None,
-                },
+                "dataset_recipe": stored_recipe,
                 "extraction_config": extraction_config,
                 "extracted_at": datetime.now(timezone.utc).isoformat(),
             }

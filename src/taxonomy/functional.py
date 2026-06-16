@@ -15,13 +15,13 @@ from src.cache.disk import DiskCache
 class FunctionalTaxonomy(Taxonomy):
     """Compares models via the covariance structure of their internal activations.
 
-    For each probe input and each specified layer, the model's hidden states are
-    pooled to a single vector. The (N_probes, hidden_dim) activation matrix is then
+    For each query input and each specified layer, the model's hidden states are
+    pooled to a single vector. The (N_queries, hidden_dim) activation matrix is then
     used to compute a Gram matrix G = H @ H.T, where G[i,j] is the dot product of
-    the activation of probe i with the activation of probe j at that layer.
+    the activation of query i with the activation of query j at that layer.
 
     The representation for a model is the stacked upper triangles of its per-layer
-    Gram matrices: shape (N_layers, N_probes*(N_probes+1)//2).
+    Gram matrices: shape (N_layers, N_queries*(N_queries+1)//2).
 
     Activation modes
     ----------------
@@ -31,7 +31,7 @@ class FunctionalTaxonomy(Taxonomy):
         Activations collected during auto-regressive generation.  At each
         decoding step the last-token hidden state is extracted per layer; these
         are mean-pooled across all generated steps to yield one vector per
-        (probe, layer).  Requires ``max_new_tokens > 0``.
+        (query, layer).  Requires ``max_new_tokens > 0``.
     ``"both"``
         Runs both input and generation passes and stacks their Gram rows,
         producing a ``(2*N_layers, features)`` matrix.  The first N_layers rows
@@ -41,7 +41,7 @@ class FunctionalTaxonomy(Taxonomy):
 
     def __init__(
         self,
-        probes: Sequence[str],
+        queries: Sequence[str],
         layer_indices: list[int],
         cache: DiskCache | None = None,
         device: str = "cuda",
@@ -53,7 +53,7 @@ class FunctionalTaxonomy(Taxonomy):
         activation_mode: Literal["input", "generation", "both"] = "input",
         max_new_tokens: int = 32,
     ) -> None:
-        self.probes = list(probes)
+        self.queries = list(queries)
         self.layer_indices = list(layer_indices)
         self.cache = cache
         self.device = device
@@ -72,7 +72,7 @@ class FunctionalTaxonomy(Taxonomy):
     def config_dict(self) -> dict[str, Any]:
         return {
             "taxonomy": "functional",
-            "probes": self.probes,
+            "queries": self.queries,
             "layer_indices": self.layer_indices,
             "pooling": self.pooling,
             "normalize_activations": self.normalize_activations,
@@ -112,16 +112,16 @@ class FunctionalTaxonomy(Taxonomy):
         )
         model.eval()
 
-        # Number of layer-vector slots per probe depends on activation_mode
+        # Number of layer-vector slots per query depends on activation_mode
         n_layer_vecs = (2 if self.activation_mode == "both" else 1) * len(self.layer_indices)
         per_layer_vecs: list[list[np.ndarray]] = [[] for _ in range(n_layer_vecs)]
 
         try:
-            for i in range(0, len(self.probes), self.batch_size):
-                batch_probes = self.probes[i : i + self.batch_size]
-                batch_vecs = self._process_batch(model, tokenizer, batch_probes)
-                for probe_vecs in batch_vecs:
-                    for k, vec in enumerate(probe_vecs):
+            for i in range(0, len(self.queries), self.batch_size):
+                batch_queries = self.queries[i : i + self.batch_size]
+                batch_vecs = self._process_batch(model, tokenizer, batch_queries)
+                for query_vecs in batch_vecs:
+                    for k, vec in enumerate(query_vecs):
                         per_layer_vecs[k].append(vec)
         finally:
             del model
@@ -129,15 +129,15 @@ class FunctionalTaxonomy(Taxonomy):
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
 
-        triu_idx = np.triu_indices(len(self.probes))
+        triu_idx = np.triu_indices(len(self.queries))
         gram_rows: list[np.ndarray] = []
         for vecs in per_layer_vecs:
-            H = np.stack(vecs, axis=0).astype(np.float64)  # (N_probes, d)
+            H = np.stack(vecs, axis=0).astype(np.float64)  # (N_queries, d)
             if self.normalize_activations:
                 norms = np.linalg.norm(H, axis=1, keepdims=True)
                 norms = np.where(norms < 1e-12, 1.0, norms)
                 H = H / norms
-            G = H @ H.T  # (N_probes, N_probes)
+            G = H @ H.T  # (N_queries, N_queries)
             gram_rows.append(G[triu_idx].astype(np.float32))
 
         matrix = np.stack(gram_rows, axis=0)  # (n_layer_vecs, features)
@@ -148,7 +148,7 @@ class FunctionalTaxonomy(Taxonomy):
             matrix=matrix,
             config=self.config_dict(),
             metadata={
-                "n_probes": len(self.probes),
+                "n_queries": len(self.queries),
                 "n_layers": n_layer_vecs,
                 "layer_indices": self.layer_indices,
                 "activation_mode": self.activation_mode,
@@ -159,11 +159,11 @@ class FunctionalTaxonomy(Taxonomy):
         self,
         model: Any,
         tokenizer: Any,
-        probes: list[str],
+        queries: list[str],
     ) -> list[list[np.ndarray]]:
-        """Return one list per probe, each containing n_layer_vecs activation vectors."""
+        """Return one list per query, each containing n_layer_vecs activation vectors."""
         inputs = tokenizer(
-            probes,
+            queries,
             return_tensors="pt",
             padding=True,
             truncation=True,
@@ -173,17 +173,17 @@ class FunctionalTaxonomy(Taxonomy):
 
         with torch.no_grad():
             if self.activation_mode == "input":
-                return self._extract_input_activations(model, inputs, len(probes))
+                return self._extract_input_activations(model, inputs, len(queries))
             elif self.activation_mode == "generation":
                 return self._extract_generation_activations(
-                    model, tokenizer, inputs, len(probes)
+                    model, tokenizer, inputs, len(queries)
                 )
             elif self.activation_mode == "both":
-                input_vecs = self._extract_input_activations(model, inputs, len(probes))
+                input_vecs = self._extract_input_activations(model, inputs, len(queries))
                 gen_vecs = self._extract_generation_activations(
-                    model, tokenizer, inputs, len(probes)
+                    model, tokenizer, inputs, len(queries)
                 )
-                # Concatenate per-probe: [input_layers..., gen_layers...]
+                # Concatenate per-query: [input_layers..., gen_layers...]
                 return [iv + gv for iv, gv in zip(input_vecs, gen_vecs)]
             else:
                 raise ValueError(f"Unknown activation_mode: {self.activation_mode!r}")
@@ -192,18 +192,18 @@ class FunctionalTaxonomy(Taxonomy):
         self,
         model: Any,
         inputs: dict,
-        n_probes: int,
+        n_queries: int,
     ) -> list[list[np.ndarray]]:
-        """Forward pass on the input prompt; return one vector per (probe, layer)."""
+        """Forward pass on the input prompt; return one vector per (query, layer)."""
         out = model(**inputs, output_hidden_states=True)
         batch_results: list[list[np.ndarray]] = []
-        for probe_idx in range(n_probes):
-            probe_layer_vecs: list[np.ndarray] = []
+        for query_idx in range(n_queries):
+            query_layer_vecs: list[np.ndarray] = []
             for layer_idx in self.layer_indices:
-                h = out.hidden_states[layer_idx][probe_idx]  # (seq_len, d)
+                h = out.hidden_states[layer_idx][query_idx]  # (seq_len, d)
                 vec = self._pool(h).float().cpu().numpy()
-                probe_layer_vecs.append(vec)
-            batch_results.append(probe_layer_vecs)
+                query_layer_vecs.append(vec)
+            batch_results.append(query_layer_vecs)
         return batch_results
 
     def _extract_generation_activations(
@@ -211,14 +211,14 @@ class FunctionalTaxonomy(Taxonomy):
         model: Any,
         tokenizer: Any,
         inputs: dict,
-        n_probes: int,
+        n_queries: int,
     ) -> list[list[np.ndarray]]:
         """Generation-phase activations, mean-pooled across decoding steps.
 
         At each step the last-token hidden state is extracted for each selected
         layer (shape: batch × d) and accumulated.  After all steps the per-step
         tensors are stacked and averaged, yielding one (d,) vector per
-        (probe, layer).
+        (query, layer).
         """
         gen_out = model.generate(
             **inputs,
@@ -238,12 +238,12 @@ class FunctionalTaxonomy(Taxonomy):
                 h = step_hs[layer_idx][:, -1, :]   # (batch, d)
                 per_layer_per_step[k].append(h.float().cpu().numpy())
 
-        batch_results: list[list[np.ndarray]] = [[] for _ in range(n_probes)]
+        batch_results: list[list[np.ndarray]] = [[] for _ in range(n_queries)]
         for k in range(len(self.layer_indices)):
             stacked = np.stack(per_layer_per_step[k], axis=0)  # (n_steps, batch, d)
             mean_over_steps = stacked.mean(axis=0)              # (batch, d)
-            for probe_idx in range(n_probes):
-                batch_results[probe_idx].append(mean_over_steps[probe_idx])
+            for query_idx in range(n_queries):
+                batch_results[query_idx].append(mean_over_steps[query_idx])
 
         return batch_results
 

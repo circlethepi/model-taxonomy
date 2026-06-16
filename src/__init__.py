@@ -25,6 +25,18 @@ from src.compute.local import LocalBackend
 from src.compute.slurm import SlurmBackend
 
 from src.cache.disk import DiskCache
+from src.cache.dataset_embedding_cache import DatasetEmbeddingCache
+
+from src.taxonomy.dataset_embedding import DatasetEmbeddingTaxonomy
+
+from src.datasets import (
+    DatasetEntry,
+    DatasetRecipe,
+    ClassDatasetEntry,
+    ClassAwareDatasetRecipe,
+    MixedDataset,
+    ClassMixedDataset,
+)
 
 __all__ = [
     # core types
@@ -42,6 +54,7 @@ __all__ = [
     "FunctionalTaxonomy",
     "StructuralTaxonomy",
     "TrainingDataTaxonomy",
+    "DatasetEmbeddingTaxonomy",
     # embedders
     "HiddenStateEmbedder",
     "SentenceTransformerEmbedder",
@@ -57,4 +70,12 @@ __all__ = [
     "SlurmBackend",
     # cache
     "DiskCache",
+    "DatasetEmbeddingCache",
+    # datasets
+    "DatasetEntry",
+    "DatasetRecipe",
+    "ClassDatasetEntry",
+    "ClassAwareDatasetRecipe",
+    "MixedDataset",
+    "ClassMixedDataset",
 ]

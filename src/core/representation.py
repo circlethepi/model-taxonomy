@@ -24,7 +24,7 @@ def _cache_key(model_id: ModelID, config_hash: str) -> str:
 class ModelRepresentation:
     """Matrix representation of a model at a given taxonomy level.
 
-    matrix shape: (N_probes, d) where d is the embedding dimension.
+    matrix shape: (N_queries, d) where d is the embedding dimension.
     """
 
     model_id: ModelID
@@ -57,7 +57,7 @@ class ModelRepresentation:
         )
 
     @property
-    def n_probes(self) -> int:
+    def n_queries(self) -> int:
         return self.matrix.shape[0]
 
     @property

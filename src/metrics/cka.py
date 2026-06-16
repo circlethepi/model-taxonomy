@@ -34,10 +34,10 @@ class CKADistanceMetric(DistanceMetric):
         return f"cka_{self.kernel}"
 
     def compute(self, a: ModelRepresentation, b: ModelRepresentation) -> float:
-        if a.n_probes != b.n_probes:
+        if a.n_queries != b.n_queries:
             raise ValueError(
-                f"Probe count mismatch: {a.n_probes} vs {b.n_probes}. "
-                "Both representations must use the same probe set."
+                f"Query count mismatch: {a.n_queries} vs {b.n_queries}. "
+                "Both representations must use the same query set."
             )
         X = a.matrix.astype(np.float64)
         Y = b.matrix.astype(np.float64)

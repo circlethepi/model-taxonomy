@@ -8,12 +8,12 @@ from src.core.protocols import Embedder
 
 
 class SentenceTransformerEmbedder(Embedder):
-    """Embeds a probe using a separate sentence-transformers model.
+    """Embeds a query using a separate sentence-transformers model.
 
     The sentence-transformer is loaded once at construction time on a separate
-    device (usually CPU) and is kept alive across all probes and models.
+    device (usually CPU) and is kept alive across all queries and models.
     The LM under analysis generates text; this embedder then encodes that text.
-    If use_generated_text=False, the raw probe string is encoded instead.
+    If use_generated_text=False, the raw query string is encoded instead.
     """
 
     def __init__(
@@ -41,7 +41,7 @@ class SentenceTransformerEmbedder(Embedder):
     def embedding_dim(self) -> int | None:
         return self._embedding_dim
 
-    def embed(self, model_output: Any, probe: str) -> np.ndarray:
+    def embed(self, model_output: Any, query: str) -> np.ndarray:
         self._load()
         if self.use_generated_text:
             text = getattr(model_output, "generated_text", None)
@@ -51,7 +51,7 @@ class SentenceTransformerEmbedder(Embedder):
                     "Set max_new_tokens > 0 in BehavioralTaxonomy or use use_generated_text=False."
                 )
         else:
-            text = probe
+            text = query
 
         vec = self._st_model.encode(
             text,

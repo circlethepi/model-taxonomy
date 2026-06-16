@@ -143,11 +143,11 @@ class TaxonomyAnalyzer:
 
         representations = self.backend.map_extract(self.taxonomy, model_ids)
 
-        shapes = {(r.n_probes, r.embedding_dim) for r in representations}
+        shapes = {(r.n_queries, r.embedding_dim) for r in representations}
         if len(shapes) > 1:
             raise ValueError(
                 f"Representations have inconsistent shapes: {shapes}. "
-                "All models must use the same probes and embedder."
+                "All models must use the same queries and embedder."
             )
 
         raw_matrix = self.backend.map_distances(self.metric, representations)

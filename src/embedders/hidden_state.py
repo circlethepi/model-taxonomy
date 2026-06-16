@@ -8,7 +8,7 @@ from src.core.protocols import Embedder
 
 
 class HiddenStateEmbedder(Embedder):
-    """Embeds a probe by extracting the model's own hidden states or logits.
+    """Embeds a query by extracting the model's own hidden states or logits.
 
     No second model is needed; operates entirely within the model under analysis.
     """
@@ -28,7 +28,7 @@ class HiddenStateEmbedder(Embedder):
     def embedding_dim(self) -> int | None:
         return self._embedding_dim
 
-    def embed(self, model_output: Any, probe: str) -> np.ndarray:
+    def embed(self, model_output: Any, query: str) -> np.ndarray:
         """Extract and pool a vector from model_output.
 
         model_output must have .hidden_states (tuple of tensors) or .logits.

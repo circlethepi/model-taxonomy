@@ -11,7 +11,7 @@ class FrobeniusDistanceMetric(DistanceMetric):
 
     With normalize=True (default), each row is L2-normalized before subtraction,
     making the metric invariant to embedding scale.
-    The result is divided by sqrt(N) so it does not grow with the probe set size.
+    The result is divided by sqrt(N) so it does not grow with the query set size.
     """
 
     def __init__(self, normalize: bool = True) -> None:
@@ -22,10 +22,10 @@ class FrobeniusDistanceMetric(DistanceMetric):
         return "frobenius"
 
     def compute(self, a: ModelRepresentation, b: ModelRepresentation) -> float:
-        if a.n_probes != b.n_probes:
+        if a.n_queries != b.n_queries:
             raise ValueError(
-                f"Probe count mismatch: {a.n_probes} vs {b.n_probes}. "
-                "Both representations must use the same probe set."
+                f"Query count mismatch: {a.n_queries} vs {b.n_queries}. "
+                "Both representations must use the same query set."
             )
         ma = a.matrix.astype(np.float64)
         mb = b.matrix.astype(np.float64)
@@ -35,7 +35,7 @@ class FrobeniusDistanceMetric(DistanceMetric):
             mb = _row_normalize(mb)
 
         diff = ma - mb
-        return float(np.linalg.norm(diff, "fro") / np.sqrt(a.n_probes))
+        return float(np.linalg.norm(diff, "fro") / np.sqrt(a.n_queries))
 
 
 def _row_normalize(m: np.ndarray) -> np.ndarray:

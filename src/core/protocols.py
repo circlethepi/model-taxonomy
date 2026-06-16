@@ -35,7 +35,7 @@ class Embedder(ABC):
     """Converts raw model output into a fixed-size vector."""
 
     @abstractmethod
-    def embed(self, model_output: Any, probe: str) -> np.ndarray:
+    def embed(self, model_output: Any, query: str) -> np.ndarray:
         """Return a 1-D float32 array of shape (d,)."""
         ...
 

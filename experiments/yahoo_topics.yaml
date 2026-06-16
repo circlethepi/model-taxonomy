@@ -2,6 +2,17 @@ name: yahoo_topics
 output_dir: results/yahoo_topics
 # hf_token: null  # set here or via HF_TOKEN environment variable
 
+# ── Slurm submission (used by scripts/submit_slurm.py) ───────────────────────
+slurm:
+  partition: gpu
+  gpus_per_node: 1
+  mem_gb: 80
+  time: "24:00:00"
+  cpus_per_task: 8
+  conda_env: null        # e.g. "model-taxonomy" — set to activate a conda env
+  modules: []            # e.g. ["cuda/12.1", "python/3.10"]
+  account: null          # e.g. "myproject" — set if your cluster requires --account
+
 # ── Datasets ──────────────────────────────────────────────────────────────────
 # Yahoo Answers topics: topic 0 = Society & Culture, topic 1 = Science & Mathematics
 # Five fine-tuning mixtures spanning the full range of proportions.

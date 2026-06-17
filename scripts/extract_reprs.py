@@ -24,6 +24,8 @@ from scripts._utils import (
     make_queries,
     make_functional_taxonomy,
     make_behavioral_taxonomy,
+    make_dataset_embedding_cache,
+    make_dataset_embedding_taxonomy,
 )
 
 
@@ -32,23 +34,25 @@ def extract_representations(cfg: dict, only_taxonomies: list[str] | None = None)
     output_dir = Path(cfg["output_dir"])
     ext_cfg = cfg.get("extraction", {})
     tax_cfgs = ext_cfg.get("taxonomies", {})
+    enabled = set(only_taxonomies) if only_taxonomies else None
 
     model_ids = resolve_model_ids(cfg, section_key="extraction")
-    if not model_ids:
+    if not model_ids and (enabled is None or enabled - {"dataset_embedding"}):
         print("  No models to extract. Check extraction.models in your config.")
         return
 
-    print(f"  Models ({len(model_ids)}):")
-    for mid in model_ids:
-        print(f"    {mid}")
+    if model_ids:
+        print(f"  Models ({len(model_ids)}):")
+        for mid in model_ids:
+            print(f"    {mid}")
 
     cache = make_repr_cache(output_dir)
 
-    print("  Loading queries...")
-    queries = make_queries(cfg)
-    print(f"  Got {len(queries)} queries.")
-
-    enabled = set(only_taxonomies) if only_taxonomies else None
+    queries: list[str] = []
+    if model_ids:
+        print("  Loading queries...")
+        queries = make_queries(cfg)
+        print(f"  Got {len(queries)} queries.")
 
     # ── Functional taxonomy ────────────────────────────────────────────────────
     fcfg = tax_cfgs.get("functional", {})
@@ -69,6 +73,18 @@ def extract_representations(cfg: dict, only_taxonomies: list[str] | None = None)
         for i, model_id in enumerate(model_ids, 1):
             print(f"    [{i}/{len(model_ids)}] {model_id}", end=" ... ", flush=True)
             rep = taxonomy.extract(model_id)
+            print(f"shape={rep.matrix.shape}  key={rep.cache_key}")
+
+    # ── Dataset Embedding taxonomy ─────────────────────────────────────────────
+    decfg = tax_cfgs.get("dataset_embedding", {})
+    if decfg.get("enabled", False) and (enabled is None or "dataset_embedding" in enabled):
+        print(f"\n  [dataset_embedding]  representation={decfg.get('representation', 'matrix')}")
+        de_cache = make_dataset_embedding_cache(output_dir)
+        taxonomy = make_dataset_embedding_taxonomy(cfg, cache=de_cache)
+        recipe_ids = taxonomy.recipe_ids()
+        for i, recipe_id in enumerate(recipe_ids, 1):
+            print(f"    [{i}/{len(recipe_ids)}] {recipe_id}", end=" ... ", flush=True)
+            rep = taxonomy.extract(recipe_id)
             print(f"shape={rep.matrix.shape}  key={rep.cache_key}")
 
 

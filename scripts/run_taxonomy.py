@@ -3,7 +3,7 @@
 Reads cached representations produced by extract_reprs.py, then runs
 TaxonomyAnalyzer to produce pairwise distance matrices and (optionally)
 low-dimensional coordinate embeddings.  Results are saved to:
-    {output_dir}/taxonomy/{taxonomy_name}/
+    {output_dir}/taxonomy/
 
 Usage:
     python scripts/run_taxonomy.py experiments/example.yaml
@@ -27,12 +27,18 @@ from scripts._utils import (
     make_functional_taxonomy,
     make_behavioral_taxonomy,
     make_structural_taxonomy,
+    make_dataset_embedding_cache,
+    make_dataset_embedding_taxonomy,
     make_metric,
     make_geometry,
     read_adapter_meta,
 )
 from src.compute.local import LocalBackend
 from src.core.analysis import TaxonomyAnalyzer, ModelTaxonomyProfile
+
+
+def _to_list(v) -> list[str]:
+    return v if isinstance(v, list) else [v]
 
 
 def _make_lora_cache(cfg: dict):
@@ -56,13 +62,14 @@ def run_taxonomy(cfg: dict, only_taxonomies: list[str] | None = None) -> ModelTa
         configured_taxonomies = [t for t in configured_taxonomies if t in only_taxonomies]
 
     model_ids = resolve_model_ids(cfg, section_key="taxonomy")
-    if not model_ids:
+    if not model_ids and (set(configured_taxonomies) - {"dataset_embedding"}):
         print("  No models configured. Check taxonomy.models in your config.")
         return ModelTaxonomyProfile(model_ids=[])
 
-    print(f"  Models ({len(model_ids)}):")
-    for mid in model_ids:
-        print(f"    {mid}")
+    if model_ids:
+        print(f"  Models ({len(model_ids)}):")
+        for mid in model_ids:
+            print(f"    {mid}")
 
     backend = LocalBackend(n_jobs=1)
     repr_cache = make_repr_cache(output_dir)
@@ -73,57 +80,79 @@ def run_taxonomy(cfg: dict, only_taxonomies: list[str] | None = None) -> ModelTa
         print("\n  [functional]")
         queries = make_queries(cfg)
         taxonomy = make_functional_taxonomy(cfg, queries, cache=repr_cache)
-        metric = make_metric(metrics_cfg.get("functional", "cka"))
+        metric_names = _to_list(metrics_cfg.get("functional", "cka"))
 
-        analyzer = TaxonomyAnalyzer(taxonomy, metric, backend)
-        analysis = analyzer.fit(model_ids)
+        for metric_name in metric_names:
+            metric = make_metric(metric_name)
+            analyzer = TaxonomyAnalyzer(taxonomy, metric, backend)
+            analysis = analyzer.fit(model_ids)
 
-        for geo_name in geometry_names:
-            geo = make_geometry(geo_name)
-            geom = geo.fit(analysis.distance_matrix)
-            analysis.geometry = geom
-            print(f"    geometry [{geo_name}] computed  coords={geom.coordinates.shape}")
+            for geo_name in geometry_names:
+                geo = make_geometry(geo_name)
+                analysis.geometry = geo.fit(analysis.distance_matrix)
+                print(f"    [{metric_name}] geometry [{geo_name}] computed  coords={analysis.geometry.coordinates.shape}")
 
-        save_path = output_dir / "taxonomy" / "functional"
-        analysis.save(save_path)
-        profile.add(analysis)
-        print(f"    Saved to {save_path}")
+            if len(metric_names) > 1:
+                analysis.taxonomy_name = f"functional_{metric_name}"
+
+            profile.add(analysis)
 
     # ── Behavioral ─────────────────────────────────────────────────────────────
     if "behavioral" in configured_taxonomies:
         print("\n  [behavioral]")
         queries = make_queries(cfg)
         taxonomy = make_behavioral_taxonomy(cfg, queries, cache=repr_cache)
-        metric = make_metric(metrics_cfg.get("behavioral", "frobenius"))
+        metric_names = _to_list(metrics_cfg.get("behavioral", "frobenius"))
 
-        analyzer = TaxonomyAnalyzer(taxonomy, metric, backend)
-        analysis = analyzer.fit(model_ids)
+        for metric_name in metric_names:
+            metric = make_metric(metric_name)
+            analyzer = TaxonomyAnalyzer(taxonomy, metric, backend)
+            analysis = analyzer.fit(model_ids)
 
-        for geo_name in geometry_names:
-            geo = make_geometry(geo_name)
-            geom = geo.fit(analysis.distance_matrix)
-            analysis.geometry = geom
-            print(f"    geometry [{geo_name}] computed  coords={geom.coordinates.shape}")
+            for geo_name in geometry_names:
+                geo = make_geometry(geo_name)
+                analysis.geometry = geo.fit(analysis.distance_matrix)
+                print(f"    [{metric_name}] geometry [{geo_name}] computed  coords={analysis.geometry.coordinates.shape}")
 
-        save_path = output_dir / "taxonomy" / "behavioral"
-        analysis.save(save_path)
-        profile.add(analysis)
-        print(f"    Saved to {save_path}")
+            if len(metric_names) > 1:
+                analysis.taxonomy_name = f"behavioral_{metric_name}"
+
+            profile.add(analysis)
+
+    # ── Dataset Embedding ──────────────────────────────────────────────────────
+    if "dataset_embedding" in configured_taxonomies:
+        print("\n  [dataset_embedding]")
+        de_cache = make_dataset_embedding_cache(output_dir)
+        taxonomy = make_dataset_embedding_taxonomy(cfg, cache=de_cache)
+        recipe_ids = taxonomy.recipe_ids()
+        metric_names = _to_list(metrics_cfg.get("dataset_embedding", "frobenius"))
+
+        for metric_name in metric_names:
+            metric = make_metric(metric_name)
+            analyzer = TaxonomyAnalyzer(taxonomy, metric, backend)
+            analysis = analyzer.fit(recipe_ids)
+
+            for geo_name in geometry_names:
+                geo = make_geometry(geo_name)
+                analysis.geometry = geo.fit(analysis.distance_matrix)
+                print(f"    [{metric_name}] geometry [{geo_name}] computed  coords={analysis.geometry.coordinates.shape}")
+
+            if len(metric_names) > 1:
+                analysis.taxonomy_name = f"dataset_embedding_{metric_name}"
+
+            profile.add(analysis)
 
     # ── Structural ─────────────────────────────────────────────────────────────
     if "structural" in configured_taxonomies:
         print("\n  [structural]")
         lora_cache = _make_lora_cache(cfg)
 
-        # For local adapters we enrich StructuralTaxonomy with base_model_id per model.
-        # We run each model through its own taxonomy instance so base_model_id is correct.
         from src.taxonomy.structural import StructuralTaxonomy
         from src.core.representation import ModelRepresentation
         from src.core.distance import DistanceMatrix
         from src.core.analysis import TaxonomyAnalysis
         import numpy as np
 
-        metric = make_metric(metrics_cfg.get("structural", "frobenius"))
         representations: list[ModelRepresentation] = []
 
         for model_id in model_ids:
@@ -147,46 +176,48 @@ def run_taxonomy(cfg: dict, only_taxonomies: list[str] | None = None) -> ModelTa
         if len(representations) < 2:
             print("    Not enough models with LoRA adapters for structural taxonomy — skipping.")
         else:
-            n = len(representations)
-            dist_matrix = np.zeros((n, n), dtype=np.float64)
-            for i in range(n):
-                for j in range(i + 1, n):
-                    d = metric.compute(representations[i], representations[j])
-                    dist_matrix[i, j] = dist_matrix[j, i] = d
-
             valid_ids = [r.model_id for r in representations]
-            dm = DistanceMatrix(
-                matrix=dist_matrix,
-                model_ids=valid_ids,
-                metric=metric.metric_name,
-                taxonomy="structural",
-            )
-            analysis = TaxonomyAnalysis(
-                taxonomy_name="structural",
-                model_ids=valid_ids,
-                representations=representations,
-                distance_matrix=dm,
-            )
+            metric_names = _to_list(metrics_cfg.get("structural", "frobenius"))
 
-            for geo_name in geometry_names:
-                if len(representations) < 3 and geo_name == "umap":
-                    print(f"    geometry [{geo_name}] skipped (need ≥3 models)")
-                    continue
-                geo = make_geometry(geo_name)
-                geom = geo.fit(dm)
-                analysis.geometry = geom
-                print(f"    geometry [{geo_name}] computed  coords={geom.coordinates.shape}")
+            for metric_name in metric_names:
+                metric = make_metric(metric_name)
+                n = len(representations)
+                dist_arr = np.zeros((n, n), dtype=np.float64)
+                for i in range(n):
+                    for j in range(i + 1, n):
+                        d = metric.compute(representations[i], representations[j])
+                        dist_arr[i, j] = dist_arr[j, i] = d
 
-            save_path = output_dir / "taxonomy" / "structural"
-            analysis.save(save_path)
-            profile.add(analysis)
-            print(f"    Saved to {save_path}")
+                tax_name = "structural" if len(metric_names) == 1 else f"structural_{metric_name}"
+                dm = DistanceMatrix(
+                    matrix=dist_arr,
+                    model_ids=valid_ids,
+                    metric=metric.metric_name,
+                    taxonomy="structural",
+                )
+                # representations=[] avoids re-saving weights already in lora_cache
+                analysis = TaxonomyAnalysis(
+                    taxonomy_name=tax_name,
+                    model_ids=valid_ids,
+                    representations=[],
+                    distance_matrix=dm,
+                )
 
-    # ── Profile ────────────────────────────────────────────────────────────────
+                for geo_name in geometry_names:
+                    if len(representations) < 3 and geo_name == "umap":
+                        print(f"    geometry [{geo_name}] skipped (need ≥3 models)")
+                        continue
+                    geo = make_geometry(geo_name)
+                    analysis.geometry = geo.fit(dm)
+                    print(f"    [{metric_name}] geometry [{geo_name}] computed  coords={analysis.geometry.coordinates.shape}")
+
+                profile.add(analysis)
+
+    # ── Save all results under taxonomy/ ──────────────────────────────────────
     if profile.taxonomy_names():
-        profile_path = output_dir / "taxonomy" / "profile"
-        profile.save(profile_path)
-        print(f"\n  Profile saved to {profile_path}")
+        tax_path = output_dir / "taxonomy"
+        profile.save(tax_path)
+        print(f"\n  Taxonomy results saved to {tax_path}")
 
     return profile
 

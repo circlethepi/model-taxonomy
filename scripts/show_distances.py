@@ -57,7 +57,7 @@ def main() -> None:
 
     available = sorted(
         d.name for d in tax_root.iterdir()
-        if d.is_dir() and d.name != "profile" and (d / "distance_matrix" / "distance_matrix.safetensors").exists()
+        if d.is_dir() and (d / "distance_matrix" / "distance_matrix.safetensors").exists()
     )
 
     if not available:

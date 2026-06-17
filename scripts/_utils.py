@@ -161,6 +161,7 @@ def make_functional_taxonomy(cfg: dict, queries: list[str], cache=None):
         normalize_activations=fcfg.get("normalize_activations", True),
         activation_mode=fcfg.get("activation_mode", "input"),
         max_new_tokens=fcfg.get("max_new_tokens", 32),
+        representation=fcfg.get("representation", "gram"),
     )
 
 
@@ -226,3 +227,41 @@ def make_geometry(name: str):
         return UMAPGeometry(n_components=2)
     else:
         raise ValueError(f"Unknown geometry method: {name!r}. Choose from pca, mds, umap.")
+
+
+def make_dataset_embedding_cache(output_dir: Path):
+    from src.cache.dataset_embedding_cache import DatasetEmbeddingCache
+    return DatasetEmbeddingCache(output_dir / "cache")
+
+
+def make_dataset_embedding_taxonomy(cfg: dict, cache=None):
+    from src.taxonomy.dataset_embedding import DatasetEmbeddingTaxonomy
+    from src.embedders.sentence_transformer import SentenceTransformerEmbedder
+
+    output_dir = Path(cfg["output_dir"])
+    ext_cfg = cfg.get("extraction", {})
+    decfg = ext_cfg.get("taxonomies", {}).get("dataset_embedding", {})
+    ecfg = decfg.get("embedder", {})
+
+    recipes = []
+    for ds in cfg.get("datasets", []):
+        recipe_path = output_dir / "datasets" / f"{ds['name']}.recipe.json"
+        recipes.append(load_recipe(recipe_path))
+
+    embedder = SentenceTransformerEmbedder(
+        model_name=ecfg.get("model_name", "sentence-transformers/all-MiniLM-L6-v2"),
+        device="cpu",
+        use_generated_text=False,
+        normalize_embeddings=ecfg.get("normalize_embeddings", True),
+        trust_remote_code=ecfg.get("trust_remote_code", False),
+        prompt_name=ecfg.get("prompt_name"),
+    )
+    return DatasetEmbeddingTaxonomy.from_recipes(
+        recipes=recipes,
+        n_samples=decfg.get("n_samples", 200),
+        embedder=embedder,
+        representation=decfg.get("representation", "matrix"),
+        cache=cache,
+        seed=decfg.get("seed", 42),
+        hf_token=hf_token(cfg),
+    )

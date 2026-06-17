@@ -16,12 +16,20 @@ class FunctionalTaxonomy(Taxonomy):
     """Compares models via the covariance structure of their internal activations.
 
     For each query input and each specified layer, the model's hidden states are
-    pooled to a single vector. The (N_queries, hidden_dim) activation matrix is then
-    used to compute a Gram matrix G = H @ H.T, where G[i,j] is the dot product of
-    the activation of query i with the activation of query j at that layer.
+    pooled to a single vector.
 
-    The representation for a model is the stacked upper triangles of its per-layer
-    Gram matrices: shape (N_layers, N_queries*(N_queries+1)//2).
+    Representation modes
+    --------------------
+    ``"gram"`` (default)
+        The (N_queries, hidden_dim) activation matrix H is used to compute a
+        Gram matrix G = H @ H.T.  The representation is the stacked upper
+        triangles of per-layer Gram matrices:
+        shape ``(N_layers, N_queries*(N_queries+1)//2)``.  Rows = layers.
+        Best paired with CKA metric.
+    ``"matrix"``
+        The raw activation vectors are concatenated across layers per query,
+        yielding shape ``(N_queries, N_layers * hidden_dim)``.  Rows = queries.
+        Compatible with both Frobenius and CKA metrics (standard query-CKA).
 
     Activation modes
     ----------------
@@ -33,10 +41,10 @@ class FunctionalTaxonomy(Taxonomy):
         are mean-pooled across all generated steps to yield one vector per
         (query, layer).  Requires ``max_new_tokens > 0``.
     ``"both"``
-        Runs both input and generation passes and stacks their Gram rows,
-        producing a ``(2*N_layers, features)`` matrix.  The first N_layers rows
-        correspond to input activations; the next N_layers to generation
-        activations.
+        Runs both input and generation passes and stacks their layer slots,
+        producing ``2*N_layers`` layer-vector slots per query.  The first
+        N_layers slots correspond to input activations; the next N_layers to
+        generation activations.
     """
 
     def __init__(
@@ -52,6 +60,7 @@ class FunctionalTaxonomy(Taxonomy):
         normalize_activations: bool = True,
         activation_mode: Literal["input", "generation", "both"] = "input",
         max_new_tokens: int = 32,
+        representation: Literal["gram", "matrix"] = "gram",
     ) -> None:
         self.queries = list(queries)
         self.layer_indices = list(layer_indices)
@@ -64,6 +73,7 @@ class FunctionalTaxonomy(Taxonomy):
         self.normalize_activations = normalize_activations
         self.activation_mode = activation_mode
         self.max_new_tokens = max_new_tokens
+        self.representation = representation
 
     @property
     def taxonomy_name(self) -> str:
@@ -79,6 +89,7 @@ class FunctionalTaxonomy(Taxonomy):
             "torch_dtype": str(self.torch_dtype),
             "activation_mode": self.activation_mode,
             "max_new_tokens": self.max_new_tokens,
+            "representation": self.representation,
         }
 
     def extract(self, model_id: ModelID) -> ModelRepresentation:
@@ -129,18 +140,25 @@ class FunctionalTaxonomy(Taxonomy):
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
 
-        triu_idx = np.triu_indices(len(self.queries))
-        gram_rows: list[np.ndarray] = []
-        for vecs in per_layer_vecs:
-            H = np.stack(vecs, axis=0).astype(np.float64)  # (N_queries, d)
+        if self.representation == "gram":
+            triu_idx = np.triu_indices(len(self.queries))
+            rows: list[np.ndarray] = []
+            for vecs in per_layer_vecs:
+                H = np.stack(vecs, axis=0).astype(np.float64)  # (N_queries, d)
+                if self.normalize_activations:
+                    norms = np.linalg.norm(H, axis=1, keepdims=True)
+                    H = H / np.where(norms < 1e-12, 1.0, norms)
+                rows.append((H @ H.T)[triu_idx].astype(np.float32))
+            matrix = np.stack(rows, axis=0)  # (n_layer_vecs, N_queries*(N_queries+1)//2)
+        else:  # "matrix"
+            query_mats: list[np.ndarray] = []
+            for q_idx in range(len(self.queries)):
+                vecs_for_query = [per_layer_vecs[k][q_idx] for k in range(n_layer_vecs)]
+                query_mats.append(np.concatenate(vecs_for_query).astype(np.float32))
+            matrix = np.stack(query_mats, axis=0)  # (N_queries, n_layer_vecs * hidden_dim)
             if self.normalize_activations:
-                norms = np.linalg.norm(H, axis=1, keepdims=True)
-                norms = np.where(norms < 1e-12, 1.0, norms)
-                H = H / norms
-            G = H @ H.T  # (N_queries, N_queries)
-            gram_rows.append(G[triu_idx].astype(np.float32))
-
-        matrix = np.stack(gram_rows, axis=0)  # (n_layer_vecs, features)
+                norms = np.linalg.norm(matrix, axis=1, keepdims=True)
+                matrix = matrix / np.where(norms < 1e-12, 1.0, norms)
 
         return ModelRepresentation.create(
             model_id=model_id,
@@ -152,6 +170,7 @@ class FunctionalTaxonomy(Taxonomy):
                 "n_layers": n_layer_vecs,
                 "layer_indices": self.layer_indices,
                 "activation_mode": self.activation_mode,
+                "representation": self.representation,
             },
         )
 

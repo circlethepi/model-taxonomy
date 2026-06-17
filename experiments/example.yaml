@@ -1,19 +1,25 @@
-name: example
-output_dir: results/example
-# hf_token: null  # set here or via HF_TOKEN environment variable
+# ── Experiment identity ────────────────────────────────────────────────────────
+name: my_experiment            # short identifier; used in log filenames
+output_dir: results/my_experiment  # root for all outputs (adapters, cache, taxonomy)
+# hf_token: null               # Hugging Face token; or set HF_TOKEN env var
 
 # ── Datasets ──────────────────────────────────────────────────────────────────
+# Define one or more named dataset mixes.  Each mix is a weighted blend of HF
+# datasets; names defined here are referenced by fine_tuning and extraction.
 datasets:
-  - name: alpaca_mix
-    n_samples: 200
-    seed: 42
+  - name: my_dataset           # unique name referenced in fine_tuning.datasets
+                               # and extraction.queries_dataset
+    n_samples: 200             # total samples drawn from this mix
+    seed: 42                   # reproducibility seed
     entries:
-      - dataset_id: tatsu-lab/alpaca
-        weight: 1.0
-        text_field: instruction
-        split: train
-  # Example of a weighted mixture:
-  # - name: qa_mix
+      - dataset_id: tatsu-lab/alpaca    # HF dataset repo ID
+        weight: 1.0                     # relative sampling weight (normalised across entries)
+        text_field: instruction         # column name to use as the text/query
+        split: train                    # HF split: train | validation | test
+        # subset: null                  # optional HF config/subset name (e.g. "unfiltered")
+
+  # Multiple entries → weighted mixture:
+  # - name: my_mix
   #   n_samples: 500
   #   seed: 0
   #   entries:
@@ -28,59 +34,104 @@ datasets:
   #       split: train
 
 # ── Base models ───────────────────────────────────────────────────────────────
+# HF repo IDs or local paths.  Used as-is in extraction/taxonomy when token
+# "base_models" appears in models lists, and as starting points for fine-tuning.
 base_models:
-  - meta-llama/Llama-3.1-8B
+  - meta-llama/Llama-3.1-8B   # any HF model ID or local path
 
 # ── LoRA fine-tuning ──────────────────────────────────────────────────────────
+# Produces one adapter per (base_model × dataset) pair, saved under
+# {output_dir}/adapters/.  Skip this section (or set enabled: false) to work
+# with base models only.
 fine_tuning:
-  enabled: true
-  datasets: [alpaca_mix]          # dataset names defined above
-  n_samples: 200                  # samples drawn per (base_model, dataset) pair
+  enabled: true                # false → skip Step 2 entirely
+  datasets: [my_dataset]       # dataset names defined above; one adapter per pair
+  n_samples: 200               # samples drawn per (base_model, dataset) pair
   seed: 42
-  lora_rank: 8
-  lora_alpha: 16
-  target_modules: [q_proj, v_proj]
-  lora_dropout: 0.05
-  n_epochs: 1
-  learning_rate: 2.0e-4
+  lora_rank: 8                 # LoRA rank r; higher → more parameters, richer update
+  lora_alpha: 16               # LoRA alpha; effective scale = alpha / rank
+  target_modules: [q_proj, v_proj]  # transformer sub-modules to apply LoRA to
+  lora_dropout: 0.05           # dropout on LoRA weights; 0.0 to disable
+  n_epochs: 1                  # number of full passes over the training set
+  learning_rate: 2.0e-4        # AdamW learning rate
   per_device_train_batch_size: 4
-  gradient_accumulation_steps: 4
-  max_seq_length: 256
-  torch_dtype: float16
+  gradient_accumulation_steps: 4   # effective batch = per_device × accum
+  max_seq_length: 256          # truncate / pad sequences to this length
+  torch_dtype: float16         # float16 | bfloat16 | float32
 
 # ── Representation extraction ─────────────────────────────────────────────────
+# Step 3: runs inference and caches representations for each model.
+# Results are stored under {output_dir}/cache/ and read by run_taxonomy.
 extraction:
-  # "base_models"  → use base_models list above
-  # "fine_tuned"   → discover all adapters under {output_dir}/adapters/
-  # or list explicit HF IDs / local paths
+  # Which models to extract.  Each entry is one of:
+  #   "base_models" → expands to the base_models list above
+  #   "fine_tuned"  → discovers all adapters under {output_dir}/adapters/
+  #   any HF ID / local path → used directly
   models: [base_models, fine_tuned]
-  queries_dataset: alpaca_mix     # which dataset to sample queries from
-  n_queries: 32
-  device: cuda
-  batch_size: 4
-  torch_dtype: float16
+
+  queries_dataset: my_dataset  # dataset name (defined above) to sample queries from
+  n_queries: 32                # number of queries fed to each model
+  device: cuda                 # cuda | cpu
+  batch_size: 4                # inference batch size
+  torch_dtype: float16         # float16 | bfloat16 | float32
+
   taxonomies:
+    # -- Functional: compare internal activations across layers ----------------
     functional:
       enabled: true
-      layer_indices: [-1, -4, -8]
-      activation_mode: input      # input | generation | both
-      pooling: mean
-      normalize_activations: true
-      max_new_tokens: 32          # only relevant when activation_mode != input
+      layer_indices: [-1, -4, -8]   # layers to extract; negative = from the end
+      activation_mode: input        # input     → activations on the prompt tokens only
+                                    # generation → activations on generated tokens
+                                    # both      → concatenate prompt + generation
+      pooling: mean                 # mean | last_token | cls
+      normalize_activations: true   # L2-normalise each activation vector
+      max_new_tokens: 32            # tokens to generate (ignored when mode=input)
+      representation: gram          # gram   → (N_layers, triu_features), best with cka
+                                    # matrix → (N_queries, N_layers*hidden_dim), best with frobenius
+
+    # -- Behavioral: compare model outputs via a sentence embedder -------------
     behavioral:
       enabled: true
-      max_new_tokens: 64
+      max_new_tokens: 64            # tokens each model generates per query
       embedder:
-        type: sentence_transformer
+        type: sentence_transformer  # currently the only supported embedder type
+        model_name: sentence-transformers/all-MiniLM-L6-v2  # any ST-compatible HF model
+        normalize_embeddings: true  # L2-normalise sentence embeddings
+        # trust_remote_code: false  # set true for models that require it
+        # prompt_name: null         # optional ST prompt name (e.g. "query")
+
+    # -- Dataset embedding: compare datasets by embedding their texts ----------
+    # Uses all datasets defined in the top-level `datasets` section.
+    dataset_embedding:
+      enabled: false                # opt-in; set true to compare datasets against each other
+      n_samples: 200                # texts sampled per dataset
+      seed: 42
+      representation: matrix        # matrix → (N, d) raw embeddings
+                                    # gram   → (1, N*(N+1)/2) upper-triangle Gram matrix
+      embedder:
         model_name: sentence-transformers/all-MiniLM-L6-v2
         normalize_embeddings: true
+        # trust_remote_code: false
+        # prompt_name: null
 
 # ── Taxonomy analysis ─────────────────────────────────────────────────────────
+# Step 4: loads cached representations, computes pairwise distance matrices,
+# and projects them to 2-D coordinates.  Outputs saved to
+# {output_dir}/taxonomy/{taxonomy_name}/.
 taxonomy:
+  # Same token rules as extraction.models above.
   models: [base_models, fine_tuned]
-  taxonomies: [functional, behavioral, structural]
+
+  # Which taxonomies to analyse.  Structural requires LoRA adapters.
+  # dataset_embedding compares datasets rather than models (opt-in via extraction config).
+  taxonomies: [functional, behavioral, structural, dataset_embedding]  # any subset
+
   metrics:
-    functional: cka               # cka | frobenius
-    behavioral: frobenius
-    structural: frobenius
-  geometry: [mds]          # any subset of [pca, mds, umap]
+    functional: cka               # cka | frobenius | [cka, frobenius]
+    behavioral: frobenius         # cka | frobenius | [cka, frobenius]
+    structural: frobenius         # cka | frobenius | [cka, frobenius]
+    dataset_embedding: frobenius  # cka | frobenius | [cka, frobenius]
+
+  # 2-D geometry methods applied to each distance matrix.
+  # umap requires ≥3 models.
+  geometry: [pca, mds, umap]   # any subset of [pca, mds, umap]

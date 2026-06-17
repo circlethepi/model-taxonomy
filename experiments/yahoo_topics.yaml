@@ -147,7 +147,7 @@ extraction:
         model_name: nomic-ai/nomic-embed-text-v1.5
         normalize_embeddings: true
         trust_remote_code: true
-        prompt_name: search_document
+        prompt_name: document
 
 # ── Taxonomy analysis ─────────────────────────────────────────────────────────
 taxonomy:

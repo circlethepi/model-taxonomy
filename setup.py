@@ -22,6 +22,7 @@ setup(
         "peft>=0.12.0",
         "trl>=0.11.0",
         "PyYAML>=6.0",
+        "einops>=0.7.0",
     ],
     extras_require={
         "umap": ["umap-learn>=0.5.0"],

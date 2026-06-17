@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import warnings
 from typing import Any
 
 import numpy as np
@@ -66,7 +67,9 @@ class SentenceTransformerEmbedder(Embedder):
         )
         if self.prompt_name is not None:
             encode_kwargs["prompt_name"] = self.prompt_name
-        vec = self._st_model.encode(text, **encode_kwargs)
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", message=".*get_extended_attention_mask.*")
+            vec = self._st_model.encode(text, **encode_kwargs)
         return vec.astype(np.float32)
 
     def config_dict(self) -> dict[str, Any]:

@@ -41,10 +41,10 @@ class MDSGeometry(GeometryMethod):
             metric_mds=self.metric,
             metric="precomputed",
             max_iter=self.max_iter,
-            n_init=1,
+            n_init=self.n_init,
             random_state=self.random_state,
             normalized_stress="auto",
-            init="classical_mds",
+            init="random",
         )
         coords = mds.fit_transform(distance_matrix.matrix)
 

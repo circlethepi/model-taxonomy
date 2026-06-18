@@ -67,6 +67,8 @@ class TaxonomyAnalysis:
         rep_root = path / "representations"
         if rep_root.exists():
             for rep_dir in sorted(rep_root.iterdir()):
+                if not rep_dir.is_dir():
+                    continue
                 tensors = load_file(str(rep_dir / "representation.safetensors"))
                 matrix = tensors["matrix"]
                 m = json.loads(tensors["_meta_json"].tobytes().decode("utf-8"))

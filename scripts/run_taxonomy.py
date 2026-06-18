@@ -131,6 +131,7 @@ def run_taxonomy(cfg: dict, only_taxonomies: list[str] | None = None) -> ModelTa
             metric = make_metric(metric_name)
             analyzer = TaxonomyAnalyzer(taxonomy, metric, backend)
             analysis = analyzer.fit(recipe_ids)
+            analysis.representations = []  # already cached in DatasetEmbeddingCache
 
             for geo_name in geometry_names:
                 geo = make_geometry(geo_name)

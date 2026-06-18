@@ -152,8 +152,9 @@ extraction:
 # ── Taxonomy analysis ─────────────────────────────────────────────────────────
 taxonomy:
   models: [fine_tuned]
-  taxonomies: [functional, behavioral, structural]
+  taxonomies: [dataset_embedding, functional, behavioral, structural]
   metrics:
+    dataset_embedding: cka
     functional: cka
     behavioral: frobenius
     structural: frobenius

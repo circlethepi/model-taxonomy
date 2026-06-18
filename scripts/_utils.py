@@ -242,11 +242,12 @@ def make_dataset_embedding_taxonomy(cfg: dict, cache=None):
     ext_cfg = cfg.get("extraction", {})
     decfg = ext_cfg.get("taxonomies", {}).get("dataset_embedding", {})
     ecfg = decfg.get("embedder", {})
+    n_samples = decfg.get("n_samples", 200)
 
-    recipes = []
+    datasets = {}
     for ds in cfg.get("datasets", []):
         recipe_path = output_dir / "datasets" / f"{ds['name']}.recipe.json"
-        recipes.append(load_recipe(recipe_path))
+        datasets[ds["name"]] = (load_recipe(recipe_path), n_samples)
 
     embedder = SentenceTransformerEmbedder(
         model_name=ecfg.get("model_name", "sentence-transformers/all-MiniLM-L6-v2"),
@@ -256,10 +257,9 @@ def make_dataset_embedding_taxonomy(cfg: dict, cache=None):
         trust_remote_code=ecfg.get("trust_remote_code", False),
         prompt_name=ecfg.get("prompt_name"),
     )
-    return DatasetEmbeddingTaxonomy.from_recipes(
-        recipes=recipes,
-        n_samples=decfg.get("n_samples", 200),
+    return DatasetEmbeddingTaxonomy(
         embedder=embedder,
+        datasets=datasets,
         representation=decfg.get("representation", "matrix"),
         cache=cache,
         seed=decfg.get("seed", 42),

@@ -278,7 +278,7 @@ class StructuralTaxonomy(Taxonomy):
         layer_names: list[str] | None = None,    # None = auto-detect
         n_components: int = 256,                  # per-layer vector length after truncate/pad
         lora_only: bool = True,                   # use LoRA adapter matrices only
-        use_lora_product: bool = False,           # True = store B@A; False = concat(A, B)
+        use_lora_product: bool = True,            # True = store B@A; False = concat(A, B)
         cache: DiskCache | None = None,           # flat hash-keyed fallback
         lora_cache: LoRACache | None = None,      # hierarchical base_model→adapter cache
         base_model_id: str | None = None,         # auto-detected from PEFT if None

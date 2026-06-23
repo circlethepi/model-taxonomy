@@ -24,7 +24,7 @@ taxonomy = StructuralTaxonomy(
     layer_names=None,              # None = auto-detect (LoRA modules or all 2-D weights)
     n_components=256,              # per-layer vector length after truncate/pad
     lora_only=True,                # use LoRA adapter matrices only (default)
-    use_lora_product=False,        # if True, compare B@A product instead of concat(A, B)
+    use_lora_product=True,         # True = compare B@A product; False = concat(A, B)
     lora_cache=LoRACache("./cache"),  # hierarchical cache (recommended for LoRA)
     base_model_id=None,            # auto-detected from PEFT adapter_config.json
     cache=None,                    # flat DiskCache fallback (optional)
@@ -69,16 +69,16 @@ If `layer_names` is provided alongside `lora_only=True`, only LoRA modules whose
 
 ### Vector construction
 
-By default (`use_lora_product=False`), the per-layer vector is:
-
-```
-v = concat(lora_A.flatten(), lora_B.flatten())
-```
-
-With `use_lora_product=True`, the actual weight delta is computed instead:
+By default (`use_lora_product=True`), the actual weight delta is computed:
 
 ```
 v = (lora_B @ lora_A).flatten()    # shape: (out_features * in_features,)
+```
+
+With `use_lora_product=False`, the raw adapter matrices are concatenated instead:
+
+```
+v = concat(lora_A.flatten(), lora_B.flatten())
 ```
 
 The product `B @ A` represents the direct change to the weight matrix, but it is much larger than the concatenated factors and may require a larger `n_components` to capture meaningful structure.
@@ -134,7 +134,7 @@ cache_root/loras/
   },
   "extraction_config": {
     "n_components": 256,
-    "use_lora_product": false,
+    "use_lora_product": true,
     "layer_names": null
   },
   "extracted_at": "2026-06-15T00:00:00Z"

@@ -211,8 +211,14 @@ def make_metric(name: str):
     elif name == "frobenius":
         from src.metrics.frobenius import FrobeniusDistanceMetric
         return FrobeniusDistanceMetric()
+    elif name == "cosine":
+        from src.metrics.vector import CosineDistanceMetric
+        return CosineDistanceMetric()
+    elif name == "dot_product":
+        from src.metrics.vector import DotProductDistanceMetric
+        return DotProductDistanceMetric()
     else:
-        raise ValueError(f"Unknown metric: {name!r}. Choose 'cka' or 'frobenius'.")
+        raise ValueError(f"Unknown metric: {name!r}. Choose from cka, frobenius, cosine, dot_product.")
 
 
 def make_geometry(name: str):

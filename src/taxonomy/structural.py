@@ -72,7 +72,7 @@ class StructuralTaxonomy(Taxonomy):
         layer_names: list[str] | None = None,
         n_components: int = 256,
         lora_only: bool = True,
-        use_lora_product: bool = False,
+        use_lora_product: bool = True,
         cache: DiskCache | None = None,
         lora_cache: LoRACache | None = None,
         base_model_id: str | None = None,

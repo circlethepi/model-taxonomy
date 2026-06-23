@@ -125,7 +125,10 @@ def run_taxonomy(cfg: dict, only_taxonomies: list[str] | None = None) -> ModelTa
         de_cache = make_dataset_embedding_cache(output_dir)
         taxonomy = make_dataset_embedding_taxonomy(cfg, cache=de_cache)
         recipe_ids = taxonomy.recipe_ids()
-        metric_names = _to_list(metrics_cfg.get("dataset_embedding", "frobenius"))
+
+        de_repr = cfg.get("extraction", {}).get("taxonomies", {}).get("dataset_embedding", {}).get("representation", "matrix")
+        default_de_metric = "cosine" if de_repr == "mean" else "frobenius"
+        metric_names = _to_list(metrics_cfg.get("dataset_embedding", default_de_metric))
 
         for metric_name in metric_names:
             metric = make_metric(metric_name)

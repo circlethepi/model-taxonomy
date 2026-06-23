@@ -51,7 +51,7 @@ class DatasetEmbeddingTaxonomy(Taxonomy):
         self,
         embedder: Embedder,
         datasets: dict[str, tuple[_AnyRecipe, int]],
-        representation: Literal["matrix", "gram"] = "matrix",
+        representation: Literal["matrix", "gram", "mean"] = "matrix",
         cache: DatasetEmbeddingCache | None = None,
         seed: int = 42,
         hf_token: str | None = None,
@@ -83,7 +83,7 @@ class DatasetEmbeddingTaxonomy(Taxonomy):
         recipes: list[_AnyRecipe],
         n_samples: int,
         embedder: Embedder,
-        representation: Literal["matrix", "gram"] = "matrix",
+        representation: Literal["matrix", "gram", "mean"] = "matrix",
         cache: DatasetEmbeddingCache | None = None,
         seed: int = 42,
         hf_token: str | None = None,
@@ -169,6 +169,8 @@ class DatasetEmbeddingTaxonomy(Taxonomy):
             G = (E @ E.T).astype(np.float32)  # (N, N)
             triu_idx = np.triu_indices(len(texts))
             matrix = G[triu_idx][np.newaxis, :]  # (1, N*(N+1)//2)
+        elif self.representation == "mean":
+            matrix = E.mean(axis=0, keepdims=True)  # (1, d)
         else:
             matrix = E  # (N, d)
 

@@ -106,8 +106,9 @@ extraction:
       enabled: false                # opt-in; set true to compare datasets against each other
       n_samples: 200                # texts sampled per dataset
       seed: 42
-      representation: matrix        # matrix → (N, d) raw embeddings
-                                    # gram   → (1, N*(N+1)/2) upper-triangle Gram matrix
+      representation: matrix        # matrix → (N, d) raw embeddings; use cka or frobenius
+                                    # gram   → (1, N*(N+1)/2) Gram upper-triangle; use frobenius
+                                    # mean   → (1, d) centroid embedding; use cosine or dot_product
       embedder:
         model_name: sentence-transformers/all-MiniLM-L6-v2
         normalize_embeddings: true
@@ -130,7 +131,8 @@ taxonomy:
     functional: cka               # cka | frobenius | [cka, frobenius]
     behavioral: frobenius         # cka | frobenius | [cka, frobenius]
     structural: frobenius         # cka | frobenius | [cka, frobenius]
-    dataset_embedding: frobenius  # cka | frobenius | [cka, frobenius]
+    dataset_embedding: frobenius  # cka | frobenius | cosine | dot_product | [list]
+                                  # default auto-selects cosine when representation=mean
 
   # 2-D geometry methods applied to each distance matrix.
   # umap requires ≥3 models.

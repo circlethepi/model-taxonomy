@@ -146,6 +146,10 @@ def run_taxonomy(cfg: dict, only_taxonomies: list[str] | None = None) -> ModelTa
 
             profile.add(analysis)
 
+        other_model_taxonomies = {"functional", "behavioral", "structural"}
+        if not any(t in configured_taxonomies for t in other_model_taxonomies):
+            profile.model_ids = recipe_ids
+
     # ── Structural ─────────────────────────────────────────────────────────────
     if "structural" in configured_taxonomies:
         print("\n  [structural]")

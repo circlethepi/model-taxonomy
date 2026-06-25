@@ -126,7 +126,8 @@ def plot_scatter(
     labels: list[str] | None = None,
     series: list[PlotSeries] | None = None,
     ax: plt.Axes | None = None,
-    annotate: bool = True,
+    annotate: bool = False,
+    marker_size: int = 100,
     title: str | None = None,
     savepath=None,
 ) -> tuple[plt.Figure, plt.Axes]:
@@ -143,7 +144,7 @@ def plot_scatter(
             xy = np.asarray(s.data).ravel()
             color = s.color if s.color is not None else PALETTE[i % len(PALETTE)]
             mkr = s.marker if s.marker is not None else "o"
-            ax.scatter(xy[0], xy[1], color=color, marker=mkr, label=s.label, zorder=3)
+            ax.scatter(xy[0], xy[1], color=color, marker=mkr, label=s.label, s=marker_size, zorder=3)
             if annotate and s.label:
                 ax.annotate(s.label, xy=(xy[0], xy[1]),
                             xytext=(4, 4), textcoords="offset points")
@@ -158,13 +159,13 @@ def plot_scatter(
                 unique = list(dict.fromkeys(color_arr))
                 colors = [PALETTE[unique.index(v) % len(PALETTE)] for v in color_arr]
                 scatter = ax.scatter(coords[:, 0], coords[:, 1], c=colors,
-                                     marker="o", zorder=3)
+                                     marker="o", s=marker_size, zorder=3)
             else:
                 scatter = ax.scatter(coords[:, 0], coords[:, 1], c=color_arr,
-                                     cmap="viridis", marker="o", zorder=3)
+                                     cmap="viridis", marker="o", s=marker_size, zorder=3)
         else:
             ax.scatter(coords[:, 0], coords[:, 1], color=PALETTE[0],
-                       marker="o", zorder=3)
+                       marker="o", s=marker_size, zorder=3)
 
         if annotate:
             for (xi, yi), lbl in zip(coords, point_labels):

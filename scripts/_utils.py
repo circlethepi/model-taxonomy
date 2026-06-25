@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import json
 import os
 from pathlib import Path
@@ -18,6 +19,33 @@ def load_config(path: str | Path) -> dict:
         return yaml.safe_load(f)
 
 
+def expand_dataset_seeds(cfg: dict) -> dict:
+    """Expand dataset blocks that carry a 'seeds' list into one block per seed.
+
+    A dataset block with ``seeds: [0, 1, 2]`` is replaced by three blocks whose
+    names are ``{base_name}_s00``, ``{base_name}_s01``, ``{base_name}_s02`` with
+    ``seed`` set to the corresponding value.  Blocks without a ``seeds`` key are
+    passed through unchanged (backward compatible).
+
+    Returns a new cfg dict (does not mutate the input).
+    """
+    cfg = copy.deepcopy(cfg)
+    expanded: list[dict] = []
+    for ds in cfg.get("datasets", []):
+        seeds = ds.pop("seeds", None)
+        if seeds is None:
+            expanded.append(ds)
+        else:
+            base_name = ds["name"]
+            for seed_val in seeds:
+                entry = copy.deepcopy(ds)
+                entry["name"] = f"{base_name}_s{seed_val:02d}"
+                entry["seed"] = seed_val
+                expanded.append(entry)
+    cfg["datasets"] = expanded
+    return cfg
+
+
 def load_recipe(path: Path | str):
     """Load DatasetRecipe or ClassAwareDatasetRecipe by inspecting recipe_type."""
     import json as _json
@@ -29,18 +57,58 @@ def load_recipe(path: Path | str):
     return DatasetRecipe.load(path)
 
 
-def make_mixed_dataset(recipe, total_samples: int, seed: int = 42, hf_token: str | None = None):
-    """Instantiate MixedDataset or ClassMixedDataset depending on recipe type."""
+def make_mixed_dataset(
+    recipe,
+    total_samples: int,
+    seed: int = 42,
+    hf_token: str | None = None,
+    sample_cache=None,
+):
+    """Instantiate MixedDataset or ClassMixedDataset depending on recipe type.
+
+    If *sample_cache* is provided, checks for a cached list[dict] keyed by
+    ``(recipe_hash, total_samples, seed)`` and returns a ``CachedMixedDataset``
+    on a hit.  On a miss the dataset is loaded from HuggingFace and the rows
+    are written to the cache for future calls.
+    """
     from src.datasets.class_recipe import ClassAwareDatasetRecipe
+
+    if sample_cache is not None:
+        cached_rows = sample_cache.get(recipe.recipe_hash(), total_samples, seed)
+        if cached_rows is not None:
+            from src.datasets.mixed_dataset import CachedMixedDataset
+            return CachedMixedDataset(cached_rows, recipe)
+
     if isinstance(recipe, ClassAwareDatasetRecipe):
         from src.datasets.mixed_dataset import ClassMixedDataset
-        return ClassMixedDataset(recipe, total_samples=total_samples, seed=seed, hf_token=hf_token)
-    from src.datasets.mixed_dataset import MixedDataset
-    return MixedDataset(recipe, total_samples=total_samples, seed=seed, hf_token=hf_token)
+        ds = ClassMixedDataset(recipe, total_samples=total_samples, seed=seed, hf_token=hf_token)
+    else:
+        from src.datasets.mixed_dataset import MixedDataset
+        ds = MixedDataset(recipe, total_samples=total_samples, seed=seed, hf_token=hf_token)
+
+    if sample_cache is not None:
+        sample_cache.put(recipe.recipe_hash(), total_samples, seed, list(ds))
+
+    return ds
 
 
 def hf_token(cfg: dict) -> str | None:
     return cfg.get("hf_token") or os.environ.get("HF_TOKEN") or None
+
+
+# ── Cache dir resolution ───────────────────────────────────────────────────────
+
+def get_cache_dir(cfg: dict) -> Path:
+    """Return the cache root for this experiment.
+
+    If the experiment YAML contains a top-level ``cache_dir`` key the value is
+    used as-is, allowing multiple experiments to share a single cache tree.
+    Otherwise falls back to ``{output_dir}/cache`` (the original per-experiment
+    behaviour, fully backward compatible).
+    """
+    if "cache_dir" in cfg:
+        return Path(cfg["cache_dir"])
+    return Path(cfg["output_dir"]) / "cache"
 
 
 # ── Model ID resolution ────────────────────────────────────────────────────────
@@ -111,12 +179,24 @@ def parse_dtype(name: str) -> torch.dtype:
     return getattr(torch, name)
 
 
-# ── Taxonomy / metric / geometry factories ────────────────────────────────────
+# ── Cache factories ───────────────────────────────────────────────────────────
 
-def make_repr_cache(output_dir: Path):
+def make_repr_cache(cache_dir: Path):
     from src.cache.disk import DiskCache
-    return DiskCache(output_dir / "cache" / "representations")
+    return DiskCache(cache_dir / "representations")
 
+
+def make_dataset_embedding_cache(cache_dir: Path):
+    from src.cache.dataset_embedding_cache import DatasetEmbeddingCache
+    return DatasetEmbeddingCache(cache_dir)
+
+
+def make_sampled_dataset_cache(cache_dir: Path):
+    from src.cache.sampled_dataset_cache import SampledDatasetCache
+    return SampledDatasetCache(cache_dir / "sampled_datasets")
+
+
+# ── Taxonomy / metric / geometry factories ────────────────────────────────────
 
 def make_queries(cfg: dict) -> list[str]:
     """Load query strings from the configured queries_dataset."""
@@ -235,12 +315,7 @@ def make_geometry(name: str):
         raise ValueError(f"Unknown geometry method: {name!r}. Choose from pca, mds, umap.")
 
 
-def make_dataset_embedding_cache(output_dir: Path):
-    from src.cache.dataset_embedding_cache import DatasetEmbeddingCache
-    return DatasetEmbeddingCache(output_dir / "cache")
-
-
-def make_dataset_embedding_taxonomy(cfg: dict, cache=None):
+def make_dataset_embedding_taxonomy(cfg: dict, cache=None, sample_cache=None):
     from src.taxonomy.dataset_embedding import DatasetEmbeddingTaxonomy
     from src.embedders.sentence_transformer import SentenceTransformerEmbedder
 
@@ -249,11 +324,16 @@ def make_dataset_embedding_taxonomy(cfg: dict, cache=None):
     decfg = ext_cfg.get("taxonomies", {}).get("dataset_embedding", {})
     ecfg = decfg.get("embedder", {})
     n_samples = decfg.get("n_samples", 200)
+    global_seed = decfg.get("seed", 42)
 
-    datasets = {}
+    # Build datasets dict with per-dataset seeds (3-tuple).
+    # Per-dataset seed comes from the expanded YAML's 'seed' field; falls back
+    # to the global embedding seed if a dataset block has no seed.
+    datasets: dict[str, Any] = {}
     for ds in cfg.get("datasets", []):
         recipe_path = output_dir / "datasets" / f"{ds['name']}.recipe.json"
-        datasets[ds["name"]] = (load_recipe(recipe_path), n_samples)
+        per_ds_seed = ds.get("seed", global_seed)
+        datasets[ds["name"]] = (load_recipe(recipe_path), n_samples, per_ds_seed)
 
     embedder = SentenceTransformerEmbedder(
         model_name=ecfg.get("model_name", "sentence-transformers/all-MiniLM-L6-v2"),
@@ -268,6 +348,7 @@ def make_dataset_embedding_taxonomy(cfg: dict, cache=None):
         datasets=datasets,
         representation=decfg.get("representation", "matrix"),
         cache=cache,
-        seed=decfg.get("seed", 42),
+        seed=global_seed,
         hf_token=hf_token(cfg),
+        sample_cache=sample_cache,
     )

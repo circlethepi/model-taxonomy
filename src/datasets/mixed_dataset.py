@@ -1,11 +1,14 @@
 from __future__ import annotations
 
-from typing import Iterator
+from typing import TYPE_CHECKING, Iterator
 
 import numpy as np
 
 from src.datasets.recipe import DatasetRecipe
 from src.datasets.class_recipe import ClassAwareDatasetRecipe, ClassDatasetEntry
+
+if TYPE_CHECKING:
+    from src.datasets.recipe import DatasetRecipe as _AnyRecipe
 
 
 def _allocate_counts(weights: list[float], total: int) -> list[int]:
@@ -141,6 +144,45 @@ class MixedDataset:
 
     def __iter__(self) -> Iterator[dict]:
         yield from self._ensure_loaded()
+
+
+class CachedMixedDataset:
+    """Wraps a pre-loaded list[dict] from SampledDatasetCache with the same interface
+    as MixedDataset / ClassMixedDataset, so it can be used as a drop-in replacement.
+    """
+
+    def __init__(self, samples: list[dict], recipe: DatasetRecipe | ClassAwareDatasetRecipe) -> None:
+        self._samples = samples
+        self.recipe = recipe
+        self.total_samples = len(samples)
+        self.seed: int | None = None
+        self.hf_token: str | None = None
+
+    def to_queries(self, n: int | None = None) -> list[str]:
+        samples = self._samples[:n] if n is not None else self._samples
+        field_map = {e.dataset_id: e.text_field for e in self.recipe.datasets}
+        default_field = self.recipe.datasets[0].text_field
+        texts: list[str] = []
+        for row in samples:
+            text = None
+            for tf in field_map.values():
+                if tf in row:
+                    text = str(row[tf])
+                    break
+            texts.append(text if text is not None else str(row.get(default_field, "")))
+        return texts
+
+    def for_finetuning(self) -> Iterator[dict]:
+        yield from self._samples
+
+    def recipe_metadata_dict(self) -> dict:
+        return {"dataset_recipe": self.recipe.to_dict()}
+
+    def __len__(self) -> int:
+        return len(self._samples)
+
+    def __iter__(self) -> Iterator[dict]:
+        yield from self._samples
 
 
 class ClassMixedDataset:

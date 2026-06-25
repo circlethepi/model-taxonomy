@@ -20,6 +20,8 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from scripts._utils import (
     load_config,
+    expand_dataset_seeds,
+    get_cache_dir,
     hf_token,
     resolve_model_ids,
     make_repr_cache,
@@ -28,6 +30,7 @@ from scripts._utils import (
     make_behavioral_taxonomy,
     make_structural_taxonomy,
     make_dataset_embedding_cache,
+    make_sampled_dataset_cache,
     make_dataset_embedding_taxonomy,
     make_metric,
     make_geometry,
@@ -43,8 +46,7 @@ def _to_list(v) -> list[str]:
 
 def _make_lora_cache(cfg: dict):
     from src.cache.lora_cache import LoRACache
-    output_dir = Path(cfg["output_dir"])
-    return LoRACache(output_dir / "cache" / "lora")
+    return LoRACache(get_cache_dir(cfg) / "lora")
 
 
 def run_taxonomy(cfg: dict, only_taxonomies: list[str] | None = None) -> ModelTaxonomyProfile:
@@ -72,7 +74,8 @@ def run_taxonomy(cfg: dict, only_taxonomies: list[str] | None = None) -> ModelTa
             print(f"    {mid}")
 
     backend = LocalBackend(n_jobs=1)
-    repr_cache = make_repr_cache(output_dir)
+    cache_dir = get_cache_dir(cfg)
+    repr_cache = make_repr_cache(cache_dir)
     profile = ModelTaxonomyProfile(model_ids=model_ids)
 
     # ── Functional ─────────────────────────────────────────────────────────────
@@ -122,8 +125,9 @@ def run_taxonomy(cfg: dict, only_taxonomies: list[str] | None = None) -> ModelTa
     # ── Dataset Embedding ──────────────────────────────────────────────────────
     if "dataset_embedding" in configured_taxonomies:
         print("\n  [dataset_embedding]")
-        de_cache = make_dataset_embedding_cache(output_dir)
-        taxonomy = make_dataset_embedding_taxonomy(cfg, cache=de_cache)
+        de_cache = make_dataset_embedding_cache(cache_dir)
+        sample_cache = make_sampled_dataset_cache(cache_dir)
+        taxonomy = make_dataset_embedding_taxonomy(cfg, cache=de_cache, sample_cache=sample_cache)
         recipe_ids = taxonomy.recipe_ids()
 
         de_repr = cfg.get("extraction", {}).get("taxonomies", {}).get("dataset_embedding", {}).get("representation", "matrix")
@@ -248,4 +252,5 @@ if __name__ == "__main__":
         help="Only run these taxonomies (e.g. --taxonomy functional behavioral).",
     )
     args = parser.parse_args()
-    main(load_config(args.config), only_taxonomies=args.taxonomy)
+    cfg = expand_dataset_seeds(load_config(args.config))
+    main(cfg, only_taxonomies=args.taxonomy)

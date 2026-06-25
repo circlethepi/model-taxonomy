@@ -18,7 +18,16 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from scripts._utils import load_config, hf_token, adapter_dir, load_recipe, make_mixed_dataset
+from scripts._utils import (
+    load_config,
+    expand_dataset_seeds,
+    get_cache_dir,
+    hf_token,
+    adapter_dir,
+    load_recipe,
+    make_mixed_dataset,
+    make_sampled_dataset_cache,
+)
 
 
 def _finetune_one(
@@ -29,6 +38,7 @@ def _finetune_one(
     ft_cfg: dict,
     token: str | None,
     force: bool = False,
+    sample_cache=None,
 ) -> None:
     import torch
     from datasets import Dataset
@@ -75,7 +85,8 @@ def _finetune_one(
     text_field = recipe.datasets[0].text_field
 
     print(f"    Building dataset: {n_samples} samples from '{dataset_name}' (field: {text_field!r})")
-    mixed = make_mixed_dataset(recipe, total_samples=n_samples, seed=seed, hf_token=token)
+    mixed = make_mixed_dataset(recipe, total_samples=n_samples, seed=seed, hf_token=token,
+                               sample_cache=sample_cache)
     hf_dataset = Dataset.from_list(list(mixed.for_finetuning()))
 
     sft_cfg = SFTConfig(
@@ -136,6 +147,7 @@ def finetune_all(cfg: dict, force: bool = False) -> list[Path]:
     output_dir = Path(cfg["output_dir"])
     token = hf_token(cfg)
     datasets_dir = output_dir / "datasets"
+    sample_cache = make_sampled_dataset_cache(get_cache_dir(cfg))
 
     produced: list[Path] = []
     pairs = [
@@ -153,7 +165,8 @@ def finetune_all(cfg: dict, force: bool = False) -> list[Path]:
                 "Run build_datasets.py first."
             )
         print(f"  {base_model_id}  x  {dataset_name}")
-        _finetune_one(base_model_id, dataset_name, recipe_path, out_dir, ft_cfg, token, force)
+        _finetune_one(base_model_id, dataset_name, recipe_path, out_dir, ft_cfg, token, force,
+                      sample_cache=sample_cache)
         produced.append(out_dir)
 
     return produced
@@ -175,4 +188,4 @@ if __name__ == "__main__":
         help="Retrain even if an adapter already exists at the output directory.",
     )
     args = parser.parse_args()
-    main(load_config(args.config), force=args.force)
+    main(expand_dataset_seeds(load_config(args.config)), force=args.force)

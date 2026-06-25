@@ -9,12 +9,17 @@ from src.core.protocols import Taxonomy, Embedder, ModelID
 from src.core.representation import ModelRepresentation
 from src.datasets.recipe import DatasetRecipe
 from src.datasets.class_recipe import ClassAwareDatasetRecipe
-from src.datasets.mixed_dataset import MixedDataset, ClassMixedDataset
+from src.datasets.mixed_dataset import MixedDataset, ClassMixedDataset, CachedMixedDataset
 
 if TYPE_CHECKING:
     from src.cache.dataset_embedding_cache import DatasetEmbeddingCache
+    from src.cache.sampled_dataset_cache import SampledDatasetCache
 
 _AnyRecipe = DatasetRecipe | ClassAwareDatasetRecipe
+
+# datasets dict values may be 2-tuples (recipe, n_samples) for backward compat,
+# or 3-tuples (recipe, n_samples, seed) when per-dataset seeds are needed.
+_DatasetEntry = tuple[_AnyRecipe, int] | tuple[_AnyRecipe, int, int]
 
 
 class DatasetEmbeddingTaxonomy(Taxonomy):
@@ -50,21 +55,27 @@ class DatasetEmbeddingTaxonomy(Taxonomy):
     def __init__(
         self,
         embedder: Embedder,
-        datasets: dict[str, tuple[_AnyRecipe, int]],
+        datasets: dict[str, _DatasetEntry],
         representation: Literal["matrix", "gram", "mean"] = "matrix",
         cache: DatasetEmbeddingCache | None = None,
         seed: int = 42,
         hf_token: str | None = None,
+        sample_cache: SampledDatasetCache | None = None,
     ) -> None:
         """
         Args:
             embedder: Embedder to call per element.
-            datasets: Mapping from ``recipe_id`` → ``(recipe, n_samples)``.
-                      Use ``from_recipes()`` to build this from a plain list.
-            representation: ``"matrix"`` or ``"gram"``.
-            cache: Optional ``DatasetEmbeddingCache`` for persistence.
-            seed: Random seed for dataset shuffling.
+            datasets: Mapping from ``recipe_id`` → ``(recipe, n_samples)`` or
+                      ``(recipe, n_samples, seed)``.  The optional third element
+                      overrides ``seed`` for that specific dataset; use this when
+                      running multi-seed experiments.
+            representation: ``"matrix"``, ``"gram"``, or ``"mean"``.
+            cache: Optional ``DatasetEmbeddingCache`` for embedding persistence.
+            seed: Global fallback seed for dataset shuffling (used when a dataset
+                  entry does not carry its own seed).
             hf_token: HuggingFace API token for gated datasets.
+            sample_cache: Optional ``SampledDatasetCache`` for raw-sample persistence.
+                          Populated on first load; avoids HF re-loading on reruns.
         """
         self.embedder = embedder
         self._datasets = datasets
@@ -72,6 +83,7 @@ class DatasetEmbeddingTaxonomy(Taxonomy):
         self.cache = cache
         self.seed = seed
         self.hf_token = hf_token
+        self.sample_cache = sample_cache
 
     # ------------------------------------------------------------------
     # Factory helpers
@@ -87,6 +99,7 @@ class DatasetEmbeddingTaxonomy(Taxonomy):
         cache: DatasetEmbeddingCache | None = None,
         seed: int = 42,
         hf_token: str | None = None,
+        sample_cache: SampledDatasetCache | None = None,
     ) -> DatasetEmbeddingTaxonomy:
         """Convenience constructor: build from a list of recipes and a shared sample count.
 
@@ -101,6 +114,7 @@ class DatasetEmbeddingTaxonomy(Taxonomy):
             cache=cache,
             seed=seed,
             hf_token=hf_token,
+            sample_cache=sample_cache,
         )
 
     def recipe_ids(self) -> list[str]:
@@ -125,7 +139,7 @@ class DatasetEmbeddingTaxonomy(Taxonomy):
     def extract(self, model_id: ModelID) -> ModelRepresentation:
         """Embed all elements of the recipe and return a ``ModelRepresentation``.
 
-        ``model_id`` here is a recipe hash returned by ``recipe_ids()``.
+        ``model_id`` here is a recipe ID returned by ``recipe_ids()``.
         """
         if model_id not in self._datasets:
             raise KeyError(
@@ -133,27 +147,35 @@ class DatasetEmbeddingTaxonomy(Taxonomy):
                 f"Known IDs: {list(self._datasets.keys())}"
             )
 
-        recipe, n_samples = self._datasets[model_id]
+        entry = self._datasets[model_id]
+        recipe, n_samples = entry[0], entry[1]
+        seed = entry[2] if len(entry) > 2 else self.seed  # type: ignore[misc]
 
-        # Cache lookup
+        # Use recipe_hash (not model_id) as the stable cache key — model_id may be
+        # a dataset name rather than a hash when called from make_dataset_embedding_taxonomy.
+        recipe_hash = recipe.recipe_hash()
+
+        # Embedding cache lookup
         if self.cache is not None:
             from src.cache.dataset_embedding_cache import DatasetEmbeddingCache
 
             emb_hash = DatasetEmbeddingCache.embedder_hash(
                 self.embedder.config_dict(), self.representation, n_samples
             )
-            if self.cache.exists(model_id, emb_hash):
-                return self.cache.load(model_id, emb_hash)
+            if self.cache.exists(recipe_hash, emb_hash):
+                return self.cache.load(recipe_hash, emb_hash)
 
-        # Build MixedDataset / ClassMixedDataset and sample texts
-        if isinstance(recipe, ClassAwareDatasetRecipe):
-            mixed = ClassMixedDataset(
-                recipe, total_samples=n_samples, seed=self.seed, hf_token=self.hf_token
-            )
+        # Sample cache lookup / population
+        mixed: MixedDataset | ClassMixedDataset | CachedMixedDataset
+        if self.sample_cache is not None:
+            cached_rows = self.sample_cache.get(recipe_hash, n_samples, seed)
+            if cached_rows is not None:
+                mixed = CachedMixedDataset(cached_rows, recipe)
+            else:
+                mixed = self._load_mixed(recipe, n_samples, seed)
+                self.sample_cache.put(recipe_hash, n_samples, seed, list(mixed))
         else:
-            mixed = MixedDataset(
-                recipe, total_samples=n_samples, seed=self.seed, hf_token=self.hf_token
-            )
+            mixed = self._load_mixed(recipe, n_samples, seed)
 
         texts = mixed.to_queries()
 
@@ -188,7 +210,7 @@ class DatasetEmbeddingTaxonomy(Taxonomy):
             metadata=metadata,
         )
 
-        # Persist to cache
+        # Persist embeddings to cache
         if self.cache is not None:
             self.cache.save(
                 recipe=recipe,
@@ -199,3 +221,21 @@ class DatasetEmbeddingTaxonomy(Taxonomy):
             )
 
         return rep
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _load_mixed(
+        self,
+        recipe: _AnyRecipe,
+        n_samples: int,
+        seed: int,
+    ) -> MixedDataset | ClassMixedDataset:
+        if isinstance(recipe, ClassAwareDatasetRecipe):
+            return ClassMixedDataset(
+                recipe, total_samples=n_samples, seed=seed, hf_token=self.hf_token
+            )
+        return MixedDataset(
+            recipe, total_samples=n_samples, seed=seed, hf_token=self.hf_token
+        )

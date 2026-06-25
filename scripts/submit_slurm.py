@@ -45,6 +45,8 @@ _DEFAULTS: dict = {
     "conda_env": None,
     "modules": [],
     "account": None,
+    "email": None,
+    "mail_type": "END,FAIL",
 }
 
 
@@ -64,6 +66,8 @@ def _build_slurm_params(cfg: dict, args: argparse.Namespace) -> dict:
         "cpus_per_task": args.cpus,
         "conda_env": args.conda_env,
         "account": args.account,
+        "email": args.email,
+        "mail_type": args.mail_type,
     }
     if args.modules:
         params["modules"] = args.modules
@@ -98,6 +102,9 @@ def _render_script(
     ]
     if slurm.get("account"):
         lines.append(f"#SBATCH --account={slurm['account']}")
+    if slurm.get("email"):
+        lines.append(f"#SBATCH --mail-user={slurm['email']}")
+        lines.append(f"#SBATCH --mail-type={slurm['mail_type']}")
 
     lines.append("")
     lines.append("set -euo pipefail")
@@ -178,6 +185,9 @@ def main() -> None:
     sl.add_argument("--conda-env", metavar="NAME", help="Conda env to activate.")
     sl.add_argument("--modules", nargs="+", metavar="NAME", help="Modules to load.")
     sl.add_argument("--account", metavar="NAME", help="Slurm account/project.")
+    sl.add_argument("--email", metavar="ADDR", help="Email address for job notifications.")
+    sl.add_argument("--mail-type", metavar="EVENTS", default=None,
+                    help="Slurm mail-type events (default: END,FAIL).")
 
     args = parser.parse_args()
 

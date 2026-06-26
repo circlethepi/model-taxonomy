@@ -12,7 +12,7 @@ slurm:
   mem_gb: 80
   time: "04:00:00"
   cpus_per_task: 8
-  conda_env: null
+  conda_env: taxonomy-env
   modules: []
   account: null
 

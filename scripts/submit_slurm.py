@@ -87,6 +87,7 @@ def _render_script(
 ) -> str:
     job_name = cfg.get("name", config_path.stem)
     output_dir = Path(cfg["output_dir"])
+    project_root = script_path.parent.parent.resolve()
 
     # -- SBATCH header --
     lines = ["#!/bin/bash"]
@@ -110,10 +111,8 @@ def _render_script(
     lines.append("set -euo pipefail")
     lines.append("")
 
-    # -- cd to project root (directory that contains this script) --
-    lines.append('# Change to project root regardless of where sbatch is called from.')
-    lines.append('SCRIPT_DIR="$(cd "$(dirname "$(realpath "${BASH_SOURCE[0]}")")" && pwd)"')
-    lines.append('cd "$SCRIPT_DIR/.."')
+    # Use an absolute path so the script works when SLURM copies it to /var/spool/slurmd/.
+    lines.append(f"cd {project_root}")
     lines.append("")
 
     # -- optional module loads --

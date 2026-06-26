@@ -18,16 +18,16 @@ slurm:
 
 # Yahoo Answers topics: topic 0 = Society & Culture, topic 1 = Science & Mathematics
 # Five mixtures spanning the full proportion range; 10 seeds each.
-# n_samples_sweep: nice expands to the 10^k×{1,2,5} series:
+# n_samples_sweep: nice 5 expands to the 10^k×{1,2,5} series:
 #   1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000, 10000, 20000, 50000, 100000
 # Combined with 10 seeds, this gives 16 × 5 × 10 = 800 datasets total.
 # Names follow the pattern: {base}_n{n_samples}_s{seed:02d}
 # e.g. yahoo_100t0_000t1_n1000_s03
 datasets:
   - name: yahoo_100t0_000t1
-    seeds: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+    seeds: [0, 1, 2]
     recipe_type: class_aware
-    n_samples_sweep: nice
+    n_samples_sweep: nice 5 5
     entries:
       - dataset_id: yahoo_answers_topics
         split: train
@@ -37,9 +37,9 @@ datasets:
         class_filter: [0]
 
   - name: yahoo_075t0_025t1
-    seeds: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+    seeds: [0, 1, 2]
     recipe_type: class_aware
-    n_samples_sweep: nice
+    n_samples_sweep: nice 5
     entries:
       - dataset_id: yahoo_answers_topics
         split: train
@@ -50,9 +50,9 @@ datasets:
         class_weights: {0: 3.0, 1: 1.0}
 
   - name: yahoo_050t0_050t1
-    seeds: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+    seeds: [0, 1, 2]
     recipe_type: class_aware
-    n_samples_sweep: nice
+    n_samples_sweep: nice 5
     entries:
       - dataset_id: yahoo_answers_topics
         split: train
@@ -63,9 +63,9 @@ datasets:
         class_weights: {0: 1.0, 1: 1.0}
 
   - name: yahoo_025t0_075t1
-    seeds: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+    seeds: [0, 1, 2]
     recipe_type: class_aware
-    n_samples_sweep: nice
+    n_samples_sweep: nice 5
     entries:
       - dataset_id: yahoo_answers_topics
         split: train
@@ -76,9 +76,9 @@ datasets:
         class_weights: {0: 1.0, 1: 3.0}
 
   - name: yahoo_000t0_100t1
-    seeds: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+    seeds: [0, 1, 2]
     recipe_type: class_aware
-    n_samples_sweep: nice
+    n_samples_sweep: nice 5
     entries:
       - dataset_id: yahoo_answers_topics
         split: train

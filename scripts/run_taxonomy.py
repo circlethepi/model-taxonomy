@@ -22,6 +22,7 @@ from scripts._utils import (
     load_config,
     expand_dataset_seeds,
     expand_dataset_n_samples,
+    apply_dataset_size_caps,
     get_cache_dir,
     hf_token,
     resolve_model_ids,
@@ -254,4 +255,5 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
     cfg = expand_dataset_seeds(expand_dataset_n_samples(load_config(args.config)))
+    cfg = apply_dataset_size_caps(cfg, hf_token=hf_token(cfg))
     main(cfg, only_taxonomies=args.taxonomy)

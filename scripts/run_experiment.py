@@ -54,7 +54,7 @@ class _Tee:
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from scripts._utils import load_config, expand_dataset_seeds, expand_dataset_n_samples
+from scripts._utils import load_config, expand_dataset_seeds, expand_dataset_n_samples, apply_dataset_size_caps, hf_token
 
 ALL_STEPS = ["build", "finetune", "extract", "taxonomy"]
 
@@ -73,6 +73,7 @@ def run_experiment(
     only_taxonomies: list[str] | None = None,
 ) -> None:
     cfg = expand_dataset_seeds(expand_dataset_n_samples(cfg))
+    cfg = apply_dataset_size_caps(cfg, hf_token=hf_token(cfg))
     output_dir = Path(cfg["output_dir"])
     output_dir.mkdir(parents=True, exist_ok=True)
 

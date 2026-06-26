@@ -12,8 +12,12 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import re
 import sys
+from collections import defaultdict
 from pathlib import Path
+
+from tqdm import tqdm
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
@@ -21,6 +25,8 @@ from scripts._utils import (
     load_config,
     expand_dataset_seeds,
     expand_dataset_n_samples,
+    apply_dataset_size_caps,
+    hf_token,
     get_cache_dir,
     resolve_model_ids,
     make_repr_cache,
@@ -73,19 +79,17 @@ def extract_representations(cfg: dict, only_taxonomies: list[str] | None = None)
         print(f"\n  [functional]  layers={fcfg.get('layer_indices', [-1, -4, -8])}"
               f"  mode={fcfg.get('activation_mode', 'input')}")
         taxonomy = make_functional_taxonomy(cfg, queries, cache=cache)
-        for i, model_id in enumerate(model_ids, 1):
-            print(f"    [{i}/{len(model_ids)}] {model_id}", end=" ... ", flush=True)
+        for model_id in tqdm(model_ids, desc="functional", unit="model"):
             rep = taxonomy.extract(model_id)
-            print(f"shape={rep.matrix.shape}  key={rep.cache_key}")
+            tqdm.write(f"    {model_id}  shape={rep.matrix.shape}  key={rep.cache_key}")
 
     # ── Behavioral taxonomy ────────────────────────────────────────────────────
     if bcfg.get("enabled", True) and (enabled is None or "behavioral" in enabled):
         print(f"\n  [behavioral]  max_new_tokens={bcfg.get('max_new_tokens', 64)}")
         taxonomy = make_behavioral_taxonomy(cfg, queries, cache=cache)
-        for i, model_id in enumerate(model_ids, 1):
-            print(f"    [{i}/{len(model_ids)}] {model_id}", end=" ... ", flush=True)
+        for model_id in tqdm(model_ids, desc="behavioral", unit="model"):
             rep = taxonomy.extract(model_id)
-            print(f"shape={rep.matrix.shape}  key={rep.cache_key}")
+            tqdm.write(f"    {model_id}  shape={rep.matrix.shape}  key={rep.cache_key}")
 
     # ── Dataset Embedding taxonomy ─────────────────────────────────────────────
     decfg = tax_cfgs.get("dataset_embedding", {})
@@ -95,10 +99,13 @@ def extract_representations(cfg: dict, only_taxonomies: list[str] | None = None)
         sample_cache = make_sampled_dataset_cache(cache_dir)
         taxonomy = make_dataset_embedding_taxonomy(cfg, cache=de_cache, sample_cache=sample_cache)
         recipe_ids = taxonomy.recipe_ids()
-        for i, recipe_id in enumerate(recipe_ids, 1):
-            print(f"    [{i}/{len(recipe_ids)}] {recipe_id}", end=" ... ", flush=True)
-            rep = taxonomy.extract(recipe_id)
-            print(f"shape={rep.matrix.shape}  key={rep.cache_key}")
+        de_groups: dict[str, list] = defaultdict(list)
+        for rid in recipe_ids:
+            de_groups[re.sub(r'_s\d{2}$', '', rid)].append(rid)
+        for group_name, group_ids in tqdm(de_groups.items(), desc="dataset_embedding", unit="group"):
+            for recipe_id in tqdm(group_ids, desc=group_name, unit="seed", leave=False):
+                rep = taxonomy.extract(recipe_id)
+                tqdm.write(f"    {recipe_id}  shape={rep.matrix.shape}  key={rep.cache_key}")
 
 
 def main(cfg: dict, only_taxonomies: list[str] | None = None) -> None:
@@ -120,4 +127,5 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
     cfg = expand_dataset_seeds(expand_dataset_n_samples(load_config(args.config)))
+    cfg = apply_dataset_size_caps(cfg, hf_token=hf_token(cfg))
     main(cfg, only_taxonomies=args.taxonomy)

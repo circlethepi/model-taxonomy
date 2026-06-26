@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import warnings
 from typing import TYPE_CHECKING, Iterator
 
 import numpy as np
@@ -82,7 +83,12 @@ class MixedDataset:
                 token=self.hf_token,
             )
             ds = ds.shuffle(seed=self.seed)
-            # Guard against requesting more than the dataset has
+            if count > len(ds):
+                warnings.warn(
+                    f"MixedDataset: '{entry.dataset_id}' has only {len(ds)} rows "
+                    f"but {count} were requested; capping to {len(ds)}.",
+                    UserWarning, stacklevel=4,
+                )
             count = min(count, len(ds))
             ds = ds.select(range(count))
             for row in ds:
@@ -262,6 +268,13 @@ class ClassMixedDataset:
                 continue
             cls_ds = ds.filter(lambda row, cv=cls_val: row[entry.class_field] == cv)
             cls_ds = cls_ds.shuffle(seed=int(rng.integers(0, 2**31)))
+            if cls_count > len(cls_ds):
+                warnings.warn(
+                    f"ClassMixedDataset: class {cls_val!r} in '{entry.dataset_id}' "
+                    f"has only {len(cls_ds)} rows but {cls_count} were requested; "
+                    f"capping to {len(cls_ds)}.",
+                    UserWarning, stacklevel=4,
+                )
             cls_count = min(cls_count, len(cls_ds))
             cls_ds = cls_ds.select(range(cls_count))
             for row in cls_ds:

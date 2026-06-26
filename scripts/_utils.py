@@ -8,6 +8,9 @@ import os
 from pathlib import Path
 from typing import Any
 
+import re
+import warnings
+
 import torch
 import yaml
 
@@ -19,20 +22,32 @@ def load_config(path: str | Path) -> dict:
         return yaml.safe_load(f)
 
 
-NICE_SAMPLE_SIZES = [1, 2, 5, 10, 20, 50, 100, 200, 500, 1000,
-                     2000, 5000, 10000, 20000, 50000, 100000]
+def _nice_sizes(k: int) -> list[int]:
+    """Sorted {1,2,5} × 10^j for j = 0 … k."""
+    return sorted({c * 10**j for c in (1, 2, 5) for j in range(k + 1)})
+
+
+def _tens_sizes(k: int) -> list[int]:
+    """[10^j for j = 0 … k]."""
+    return [10**j for j in range(k + 1)]
 
 
 def expand_dataset_n_samples(cfg: dict) -> dict:
     """Expand dataset blocks that carry an 'n_samples_sweep' field.
 
-    n_samples_sweep: nice          → NICE_SAMPLE_SIZES (10^k × {1,2,5} series)
+    n_samples_sweep: nice          → {1,2,5}×10^j for j=0..4  (15 values)
+    n_samples_sweep: nice 3        → {1,2,5}×10^j for j=0..3  (12 values)
+    n_samples_sweep: tens 4        → 10^j for j=0..4           (5 values)
     n_samples_sweep: [1, 10, 100]  → explicit list
+
+    An optional ``max_samples`` key on the dataset block pre-filters the
+    generated list at parse time: any size above the cap is skipped with a
+    UserWarning.
 
     Each value n produces an entry named ``{base_name}_n{n}`` with
     ``n_samples`` set to n.  Blocks without ``n_samples_sweep`` pass through
-    unchanged (backward compatible).  Call this before expand_dataset_seeds so
-    final names follow the pattern ``{base}_n{n}_s{seed:02d}``.
+    unchanged.  Call this before expand_dataset_seeds so final names follow
+    the pattern ``{base}_n{n}_s{seed:02d}``.
 
     Returns a new cfg dict (does not mutate the input).
     """
@@ -42,14 +57,31 @@ def expand_dataset_n_samples(cfg: dict) -> dict:
         sweep = ds.pop("n_samples_sweep", None)
         if sweep is None:
             expanded.append(ds)
+            continue
+        if isinstance(sweep, str):
+            parts = sweep.split()
+            k = int(parts[1]) if len(parts) > 1 else 4
+            sizes = _nice_sizes(k) if parts[0] == "nice" else _tens_sizes(k)
         else:
-            sizes = NICE_SAMPLE_SIZES if sweep == "nice" else list(sweep)
-            base_name = ds["name"]
-            for n in sizes:
-                entry = copy.deepcopy(ds)
-                entry["name"] = f"{base_name}_n{n}"
-                entry["n_samples"] = n
-                expanded.append(entry)
+            sizes = sorted(sweep)
+        # Optional parse-time cap via max_samples key
+        cap = ds.pop("max_samples", None)
+        if cap is not None:
+            kept = [n for n in sizes if n <= cap]
+            skipped = [n for n in sizes if n > cap]
+            if skipped:
+                warnings.warn(
+                    f"Dataset '{ds['name']}': skipping n_samples={skipped} "
+                    f"(exceed max_samples={cap}).",
+                    UserWarning, stacklevel=2,
+                )
+            sizes = kept
+        base_name = ds["name"]
+        for n in sizes:
+            entry = copy.deepcopy(ds)
+            entry["name"] = f"{base_name}_n{n}"
+            entry["n_samples"] = n
+            expanded.append(entry)
     cfg["datasets"] = expanded
     return cfg
 
@@ -78,6 +110,154 @@ def expand_dataset_seeds(cfg: dict) -> dict:
                 entry["seed"] = seed_val
                 expanded.append(entry)
     cfg["datasets"] = expanded
+    return cfg
+
+
+def build_recipe_from_cfg(ds_cfg: dict):
+    """Build a DatasetRecipe or ClassAwareDatasetRecipe from a YAML dataset block."""
+    name = ds_cfg["name"]
+    recipe_type = ds_cfg.get("recipe_type", "simple")
+    if recipe_type == "class_aware":
+        from src.datasets.class_recipe import ClassAwareDatasetRecipe, ClassDatasetEntry
+        entries = [
+            ClassDatasetEntry(
+                dataset_id=e["dataset_id"],
+                split=e.get("split", "train"),
+                weight=e.get("weight", 1.0),
+                text_field=e.get("text_field", "text"),
+                class_field=e.get("class_field", "label"),
+                subset=e.get("subset"),
+                class_filter=e.get("class_filter"),
+                class_weights=e.get("class_weights"),
+            )
+            for e in ds_cfg["entries"]
+        ]
+        return ClassAwareDatasetRecipe(name=name, datasets=entries)
+    else:
+        from src.datasets.recipe import DatasetRecipe, DatasetEntry
+        entries = [
+            DatasetEntry(
+                dataset_id=e["dataset_id"],
+                split=e.get("split", "train"),
+                weight=e.get("weight", 1.0),
+                text_field=e.get("text_field", "text"),
+                subset=e.get("subset"),
+            )
+            for e in ds_cfg["entries"]
+        ]
+        return DatasetRecipe(name=name, datasets=entries)
+
+
+def apply_dataset_size_caps(
+    cfg: dict,
+    hf_token: str | None = None,
+) -> dict:
+    """Probe each recipe's true capacity and trim the expanded dataset list.
+
+    Call this after ``expand_dataset_n_samples`` and ``expand_dataset_seeds``.
+
+    For each group of entries that share the same underlying recipe (same
+    ``recipe_hash``), the dataset is loaded once at ``total_samples=max_n``
+    to measure the true capacity.  If ``capacity < max_n``:
+
+    * All entries with ``n_samples > capacity`` are removed (with a warning).
+    * If no remaining entry has ``n_samples == capacity``, one entry per
+      unique name-prefix is inserted at that size (one per seed variant).
+
+    Datasets that have no ``n_samples`` (i.e. not from a sweep) and datasets
+    whose config lacks an ``entries`` key are passed through unchanged.
+
+    Returns a new cfg dict (does not mutate the input).
+    """
+    from collections import defaultdict
+
+    cfg = copy.deepcopy(cfg)
+    datasets = cfg.get("datasets", [])
+    if not datasets:
+        return cfg
+
+    recipe_by_hash: dict[str, Any] = {}
+    entry_hash: list[str | None] = []
+
+    for ds_cfg in datasets:
+        if "entries" not in ds_cfg or ds_cfg.get("n_samples") is None:
+            entry_hash.append(None)
+            continue
+        try:
+            recipe = build_recipe_from_cfg(ds_cfg)
+        except Exception:
+            entry_hash.append(None)
+            continue
+        rh = recipe.recipe_hash()
+        recipe_by_hash[rh] = recipe
+        entry_hash.append(rh)
+
+    groups: dict[str, list[int]] = defaultdict(list)
+    for i, rh in enumerate(entry_hash):
+        if rh is not None:
+            groups[rh].append(i)
+
+    to_skip: set[int] = set()
+    insert_before: dict[int, list[dict]] = defaultdict(list)
+
+    for rh, indices in groups.items():
+        n_vals = [datasets[i]["n_samples"] for i in indices]
+        max_n = max(n_vals)
+        recipe = recipe_by_hash[rh]
+
+        # Load at max_n: if capacity < max_n we get fewer samples back
+        probe = make_mixed_dataset(recipe, total_samples=max_n, seed=42, hf_token=hf_token)
+        capacity = len(probe)
+
+        if capacity >= max_n:
+            continue
+
+        above = [i for i in indices if datasets[i]["n_samples"] > capacity]
+        below = [i for i in indices if datasets[i]["n_samples"] <= capacity]
+
+        oversized = sorted({datasets[i]["n_samples"] for i in above})
+        warnings.warn(
+            f"Dataset cap: recipe capacity is {capacity}. "
+            f"Skipping n_samples={oversized} for '{datasets[indices[0]]['name']}' (and siblings).",
+            UserWarning, stacklevel=2,
+        )
+        to_skip.update(above)
+
+        remaining = {datasets[i]["n_samples"] for i in below}
+        if capacity in remaining:
+            continue
+
+        # Insert one entry at capacity per unique name-prefix (seed variant)
+        seen_bases: set[str] = set()
+        first_above = min(above)
+        for i in above:
+            base = re.sub(r"_n\d+(?=(_s\d+)?$)", "", datasets[i]["name"])
+            if base in seen_bases:
+                continue
+            seen_bases.add(base)
+            new_entry = copy.deepcopy(datasets[i])
+            if re.search(r"_s\d+$", base):
+                new_entry["name"] = re.sub(r"(_s\d+)$", f"_n{capacity}\\1", base)
+            else:
+                new_entry["name"] = f"{base}_n{capacity}"
+            new_entry["n_samples"] = capacity
+            insert_before[first_above].append(new_entry)
+
+        if insert_before.get(first_above):
+            warnings.warn(
+                f"Inserting {len(insert_before[first_above])} dataset(s) at "
+                f"n_samples={capacity} to fill the capacity gap.",
+                UserWarning, stacklevel=2,
+            )
+
+    new_datasets: list[dict] = []
+    for i, ds_cfg in enumerate(datasets):
+        for new_entry in insert_before.get(i, []):
+            new_datasets.append(new_entry)
+        if i not in to_skip:
+            new_datasets.append(ds_cfg)
+
+    cfg["datasets"] = new_datasets
     return cfg
 
 

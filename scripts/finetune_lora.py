@@ -21,6 +21,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from scripts._utils import (
     load_config,
     expand_dataset_seeds,
+    expand_dataset_n_samples,
     get_cache_dir,
     hf_token,
     adapter_dir,
@@ -188,4 +189,4 @@ if __name__ == "__main__":
         help="Retrain even if an adapter already exists at the output directory.",
     )
     args = parser.parse_args()
-    main(expand_dataset_seeds(load_config(args.config)), force=args.force)
+    main(expand_dataset_seeds(expand_dataset_n_samples(load_config(args.config))), force=args.force)

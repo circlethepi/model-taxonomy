@@ -42,7 +42,7 @@ _DEFAULTS: dict = {
     "mem_gb": 80,
     "time": "24:00:00",
     "cpus_per_task": 8,
-    "conda_env": None,
+    "conda_env": "taxonomy-env",
     "modules": [],
     "account": None,
     "email": None,
@@ -126,6 +126,7 @@ def _render_script(
     # -- optional conda activate --
     conda_env = slurm.get("conda_env")
     if conda_env:
+        lines.append('source "$(conda info --base)/etc/profile.d/conda.sh"')
         lines.append(f"conda activate {conda_env}")
         lines.append("")
 

@@ -19,6 +19,41 @@ def load_config(path: str | Path) -> dict:
         return yaml.safe_load(f)
 
 
+NICE_SAMPLE_SIZES = [1, 2, 5, 10, 20, 50, 100, 200, 500, 1000,
+                     2000, 5000, 10000, 20000, 50000, 100000]
+
+
+def expand_dataset_n_samples(cfg: dict) -> dict:
+    """Expand dataset blocks that carry an 'n_samples_sweep' field.
+
+    n_samples_sweep: nice          → NICE_SAMPLE_SIZES (10^k × {1,2,5} series)
+    n_samples_sweep: [1, 10, 100]  → explicit list
+
+    Each value n produces an entry named ``{base_name}_n{n}`` with
+    ``n_samples`` set to n.  Blocks without ``n_samples_sweep`` pass through
+    unchanged (backward compatible).  Call this before expand_dataset_seeds so
+    final names follow the pattern ``{base}_n{n}_s{seed:02d}``.
+
+    Returns a new cfg dict (does not mutate the input).
+    """
+    cfg = copy.deepcopy(cfg)
+    expanded: list[dict] = []
+    for ds in cfg.get("datasets", []):
+        sweep = ds.pop("n_samples_sweep", None)
+        if sweep is None:
+            expanded.append(ds)
+        else:
+            sizes = NICE_SAMPLE_SIZES if sweep == "nice" else list(sweep)
+            base_name = ds["name"]
+            for n in sizes:
+                entry = copy.deepcopy(ds)
+                entry["name"] = f"{base_name}_n{n}"
+                entry["n_samples"] = n
+                expanded.append(entry)
+    cfg["datasets"] = expanded
+    return cfg
+
+
 def expand_dataset_seeds(cfg: dict) -> dict:
     """Expand dataset blocks that carry a 'seeds' list into one block per seed.
 
@@ -333,7 +368,8 @@ def make_dataset_embedding_taxonomy(cfg: dict, cache=None, sample_cache=None):
     for ds in cfg.get("datasets", []):
         recipe_path = output_dir / "datasets" / f"{ds['name']}.recipe.json"
         per_ds_seed = ds.get("seed", global_seed)
-        datasets[ds["name"]] = (load_recipe(recipe_path), n_samples, per_ds_seed)
+        ds_n_samples = ds.get("n_samples", n_samples)
+        datasets[ds["name"]] = (load_recipe(recipe_path), ds_n_samples, per_ds_seed)
 
     embedder = SentenceTransformerEmbedder(
         model_name=ecfg.get("model_name", "sentence-transformers/all-MiniLM-L6-v2"),

@@ -54,7 +54,7 @@ class _Tee:
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from scripts._utils import load_config, expand_dataset_seeds
+from scripts._utils import load_config, expand_dataset_seeds, expand_dataset_n_samples
 
 ALL_STEPS = ["build", "finetune", "extract", "taxonomy"]
 
@@ -72,7 +72,7 @@ def run_experiment(
     force_finetune: bool = False,
     only_taxonomies: list[str] | None = None,
 ) -> None:
-    cfg = expand_dataset_seeds(cfg)
+    cfg = expand_dataset_seeds(expand_dataset_n_samples(cfg))
     output_dir = Path(cfg["output_dir"])
     output_dir.mkdir(parents=True, exist_ok=True)
 

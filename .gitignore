@@ -5,3 +5,4 @@ notebooks/*
 .venv
 .vscode
 results
+experiments/*.slurm.sh

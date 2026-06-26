@@ -21,6 +21,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from scripts._utils import (
     load_config,
     expand_dataset_seeds,
+    expand_dataset_n_samples,
     get_cache_dir,
     hf_token,
     resolve_model_ids,
@@ -252,5 +253,5 @@ if __name__ == "__main__":
         help="Only run these taxonomies (e.g. --taxonomy functional behavioral).",
     )
     args = parser.parse_args()
-    cfg = expand_dataset_seeds(load_config(args.config))
+    cfg = expand_dataset_seeds(expand_dataset_n_samples(load_config(args.config)))
     main(cfg, only_taxonomies=args.taxonomy)

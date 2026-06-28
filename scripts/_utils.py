@@ -113,152 +113,53 @@ def expand_dataset_seeds(cfg: dict) -> dict:
     return cfg
 
 
-def build_recipe_from_cfg(ds_cfg: dict):
-    """Build a DatasetRecipe or ClassAwareDatasetRecipe from a YAML dataset block."""
-    name = ds_cfg["name"]
-    recipe_type = ds_cfg.get("recipe_type", "simple")
-    if recipe_type == "class_aware":
-        from src.datasets.class_recipe import ClassAwareDatasetRecipe, ClassDatasetEntry
-        entries = [
-            ClassDatasetEntry(
-                dataset_id=e["dataset_id"],
-                split=e.get("split", "train"),
-                weight=e.get("weight", 1.0),
-                text_field=e.get("text_field", "text"),
-                class_field=e.get("class_field", "label"),
-                subset=e.get("subset"),
-                class_filter=e.get("class_filter"),
-                class_weights=e.get("class_weights"),
-            )
-            for e in ds_cfg["entries"]
-        ]
-        return ClassAwareDatasetRecipe(name=name, datasets=entries)
-    else:
-        from src.datasets.recipe import DatasetRecipe, DatasetEntry
-        entries = [
-            DatasetEntry(
-                dataset_id=e["dataset_id"],
-                split=e.get("split", "train"),
-                weight=e.get("weight", 1.0),
-                text_field=e.get("text_field", "text"),
-                subset=e.get("subset"),
-            )
-            for e in ds_cfg["entries"]
-        ]
-        return DatasetRecipe(name=name, datasets=entries)
+def compute_recipe_capacity(recipe, hf_token: str | None = None) -> int:
+    """Return the maximum sample count this recipe can deliver while maintaining
+    all class/entry weight ratios.
 
-
-def apply_dataset_size_caps(
-    cfg: dict,
-    hf_token: str | None = None,
-) -> dict:
-    """Probe each recipe's true capacity and trim the expanded dataset list.
-
-    Call this after ``expand_dataset_n_samples`` and ``expand_dataset_seeds``.
-
-    For each group of entries that share the same underlying recipe (same
-    ``recipe_hash``), the dataset is loaded once at ``total_samples=max_n``
-    to measure the true capacity.  If ``capacity < max_n``:
-
-    * All entries with ``n_samples > capacity`` are removed (with a warning).
-    * If no remaining entry has ``n_samples == capacity``, one entry per
-      unique name-prefix is inserted at that size (one per seed variant).
-
-    Datasets that have no ``n_samples`` (i.e. not from a sweep) and datasets
-    whose config lacks an ``entries`` key are passed through unchanged.
-
-    Returns a new cfg dict (does not mutate the input).
+    For each entry, finds the most-constrained class (or the dataset itself for
+    simple entries) and derives the effective total as ``min_c(size_c / w_c)``.
+    Across entries, takes the minimum of ``entry_capacity / entry_weight``.
     """
-    from collections import defaultdict
+    from collections import Counter
+    from datasets import load_dataset  # type: ignore[import]
+    from src.datasets.class_recipe import ClassDatasetEntry
 
-    cfg = copy.deepcopy(cfg)
-    datasets = cfg.get("datasets", [])
-    if not datasets:
-        return cfg
+    effective: float = float("inf")
 
-    recipe_by_hash: dict[str, Any] = {}
-    entry_hash: list[str | None] = []
-
-    for ds_cfg in datasets:
-        if "entries" not in ds_cfg or ds_cfg.get("n_samples") is None:
-            entry_hash.append(None)
+    for entry, w in zip(recipe.datasets, recipe.normalized_weights):
+        if w <= 0:
             continue
-        try:
-            recipe = build_recipe_from_cfg(ds_cfg)
-        except Exception:
-            entry_hash.append(None)
-            continue
-        rh = recipe.recipe_hash()
-        recipe_by_hash[rh] = recipe
-        entry_hash.append(rh)
-
-    groups: dict[str, list[int]] = defaultdict(list)
-    for i, rh in enumerate(entry_hash):
-        if rh is not None:
-            groups[rh].append(i)
-
-    to_skip: set[int] = set()
-    insert_before: dict[int, list[dict]] = defaultdict(list)
-
-    for rh, indices in groups.items():
-        n_vals = [datasets[i]["n_samples"] for i in indices]
-        max_n = max(n_vals)
-        recipe = recipe_by_hash[rh]
-
-        # Load at max_n: if capacity < max_n we get fewer samples back
-        probe = make_mixed_dataset(recipe, total_samples=max_n, seed=42, hf_token=hf_token)
-        capacity = len(probe)
-
-        if capacity >= max_n:
-            continue
-
-        above = [i for i in indices if datasets[i]["n_samples"] > capacity]
-        below = [i for i in indices if datasets[i]["n_samples"] <= capacity]
-
-        oversized = sorted({datasets[i]["n_samples"] for i in above})
-        warnings.warn(
-            f"Dataset cap: recipe capacity is {capacity}. "
-            f"Skipping n_samples={oversized} for '{datasets[indices[0]]['name']}' (and siblings).",
-            UserWarning, stacklevel=2,
+        ds = load_dataset(
+            entry.dataset_id,
+            getattr(entry, "subset", None),
+            split=getattr(entry, "split", "train"),
+            token=hf_token,
         )
-        to_skip.update(above)
 
-        remaining = {datasets[i]["n_samples"] for i in below}
-        if capacity in remaining:
-            continue
+        if isinstance(entry, ClassDatasetEntry):
+            if entry.class_filter is not None:
+                allowed = set(entry.class_filter)
+                ds = ds.filter(lambda row: row[entry.class_field] in allowed)
+            if len(ds) == 0:
+                return 0
 
-        # Insert one entry at capacity per unique name-prefix (seed variant)
-        seen_bases: set[str] = set()
-        first_above = min(above)
-        for i in above:
-            base = re.sub(r"_n\d+(?=(_s\d+)?$)", "", datasets[i]["name"])
-            if base in seen_bases:
-                continue
-            seen_bases.add(base)
-            new_entry = copy.deepcopy(datasets[i])
-            if re.search(r"_s\d+$", base):
-                new_entry["name"] = re.sub(r"(_s\d+)$", f"_n{capacity}\\1", base)
-            else:
-                new_entry["name"] = f"{base}_n{capacity}"
-            new_entry["n_samples"] = capacity
-            insert_before[first_above].append(new_entry)
+            class_norm_w = entry.normalized_class_weights
+            if class_norm_w is None:
+                present = list(set(ds[entry.class_field]))
+                class_norm_w = {c: 1.0 / len(present) for c in present}
 
-        if insert_before.get(first_above):
-            warnings.warn(
-                f"Inserting {len(insert_before[first_above])} dataset(s) at "
-                f"n_samples={capacity} to fill the capacity gap.",
-                UserWarning, stacklevel=2,
+            class_sizes: Counter = Counter(ds[entry.class_field])
+            entry_cap = min(
+                (class_sizes.get(c, 0) / cw for c, cw in class_norm_w.items() if cw > 0),
+                default=0.0,
             )
+        else:
+            entry_cap = float(len(ds))
 
-    new_datasets: list[dict] = []
-    for i, ds_cfg in enumerate(datasets):
-        for new_entry in insert_before.get(i, []):
-            new_datasets.append(new_entry)
-        if i not in to_skip:
-            new_datasets.append(ds_cfg)
+        effective = min(effective, entry_cap / w)
 
-    cfg["datasets"] = new_datasets
-    return cfg
+    return int(effective) if effective != float("inf") else 0
 
 
 def load_recipe(path: Path | str):

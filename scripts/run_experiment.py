@@ -54,9 +54,95 @@ class _Tee:
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from scripts._utils import load_config, expand_dataset_seeds, expand_dataset_n_samples, apply_dataset_size_caps, hf_token
+from scripts._utils import (
+    load_config,
+    expand_dataset_seeds,
+    expand_dataset_n_samples,
+    compute_recipe_capacity,
+    hf_token,
+), apply_dataset_size_caps, hf_token
 
 ALL_STEPS = ["build", "finetune", "extract", "taxonomy"]
+
+
+def apply_dataset_capacity_caps(cfg: dict) -> dict:
+    """Cap each dataset's n_samples to the true recipe capacity and rename it.
+
+    After ``expand_dataset_n_samples`` produces multiple blocks at different
+    sizes, some may exceed how many samples the underlying data can actually
+    deliver while maintaining class/entry proportions.  This function:
+
+    1. Computes the capacity for each unique recipe (loading dataset sizes from
+       HuggingFace cache; typically free after the first ``build`` step).
+    2. For any block whose n_samples exceeds the capacity, reduces n_samples
+       to the capacity and renames the block (``_n200000_`` → ``_n186667_``).
+    3. Removes duplicate blocks that collapse to the same name after renaming,
+       keeping only the first occurrence (lowest original n_samples).
+    4. Emits a UserWarning for every change and every removed duplicate.
+
+    Returns a new cfg dict (does not mutate the input).
+    """
+    import copy
+    import re
+    import warnings
+    from scripts._utils import load_recipe as _load_recipe
+    from pathlib import Path as _Path
+
+    cfg = copy.deepcopy(cfg)
+    output_dir = _Path(cfg["output_dir"])
+    token = hf_token(cfg)
+
+    # Build recipe objects grouped by recipe hash so we only compute capacity once.
+    recipe_capacity_cache: dict[str, int] = {}
+
+    updated: list[dict] = []
+    seen_names: set[str] = set()
+
+    for ds in cfg.get("datasets", []):
+        recipe_path = output_dir / "datasets" / f"{ds['name']}.recipe.json"
+
+        # If the recipe file doesn't exist yet (build step not run), skip capping.
+        if not recipe_path.exists():
+            if ds["name"] not in seen_names:
+                seen_names.add(ds["name"])
+                updated.append(ds)
+            continue
+
+        recipe = _load_recipe(recipe_path)
+        rhash = recipe.recipe_hash()
+
+        if rhash not in recipe_capacity_cache:
+            recipe_capacity_cache[rhash] = compute_recipe_capacity(recipe, hf_token=token)
+        capacity = recipe_capacity_cache[rhash]
+
+        n_samples = ds.get("n_samples")
+        if n_samples is not None and capacity > 0 and n_samples > capacity:
+            old_name = ds["name"]
+            # Replace the _n{number}_ or _n{number} suffix in the name.
+            new_name = re.sub(r"_n\d+(?=_|$)", f"_n{capacity}", old_name)
+            warnings.warn(
+                f"Dataset cap: recipe capacity is {capacity}. "
+                f"Reducing n_samples from {n_samples} to {capacity} "
+                f"and renaming '{old_name}' → '{new_name}'.",
+                stacklevel=2,
+            )
+            ds = dict(ds)
+            ds["name"] = new_name
+            ds["n_samples"] = capacity
+
+        if ds["name"] in seen_names:
+            warnings.warn(
+                f"Removing duplicate dataset '{ds['name']}' "
+                f"(collapsed to same capacity as an earlier entry).",
+                stacklevel=2,
+            )
+            continue
+
+        seen_names.add(ds["name"])
+        updated.append(ds)
+
+    cfg["datasets"] = updated
+    return cfg
 
 
 def _banner(title: str) -> None:
@@ -73,6 +159,7 @@ def run_experiment(
     only_taxonomies: list[str] | None = None,
 ) -> None:
     cfg = expand_dataset_seeds(expand_dataset_n_samples(cfg))
+    cfg = apply_dataset_capacity_caps(cfg)
     cfg = apply_dataset_size_caps(cfg, hf_token=hf_token(cfg))
     output_dir = Path(cfg["output_dir"])
     output_dir.mkdir(parents=True, exist_ok=True)

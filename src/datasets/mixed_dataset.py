@@ -68,9 +68,33 @@ class MixedDataset:
     # ------------------------------------------------------------------
 
     def _load(self) -> list[dict]:
+        import warnings
         from datasets import load_dataset  # type: ignore[import]
 
-        counts = _allocate_counts(self.recipe.normalized_weights, self.total_samples)
+        weights = self.recipe.normalized_weights
+
+        # Probe each entry's size and find the effective total that keeps all
+        # entry proportions intact even when one dataset is data-limited.
+        effective_total = self.total_samples
+        for entry, w in zip(self.recipe.datasets, weights):
+            if w > 0:
+                ds_size = len(load_dataset(
+                    entry.dataset_id,
+                    entry.subset,
+                    split=entry.split,
+                    token=self.hf_token,
+                ))
+                effective_total = min(effective_total, int(ds_size / w))
+
+        if effective_total < self.total_samples:
+            warnings.warn(
+                f"MixedDataset: recipe capacity is {effective_total} "
+                f"(requested {self.total_samples}); scaling entry counts "
+                f"proportionally to maintain ratios.",
+                stacklevel=3,
+            )
+
+        counts = _allocate_counts(weights, effective_total)
         all_samples: list[dict] = []
 
         for entry, count in zip(self.recipe.datasets, counts):
@@ -83,21 +107,14 @@ class MixedDataset:
                 token=self.hf_token,
             )
             ds = ds.shuffle(seed=self.seed)
-            if count > len(ds):
-                warnings.warn(
-                    f"MixedDataset: '{entry.dataset_id}' has only {len(ds)} rows "
-                    f"but {count} were requested; capping to {len(ds)}.",
-                    UserWarning, stacklevel=4,
-                )
-            count = min(count, len(ds))
             ds = ds.select(range(count))
             for row in ds:
                 all_samples.append(dict(row))
 
-        # Shuffle the merged list deterministically
+        # Shuffle the merged list deterministically; terminal cap enforces hard limit.
         rng = np.random.default_rng(self.seed)
         idx = rng.permutation(len(all_samples)).tolist()
-        return [all_samples[i] for i in idx]
+        return [all_samples[i] for i in idx][:self.total_samples]
 
     def _ensure_loaded(self) -> list[dict]:
         if self._samples is None:
@@ -230,7 +247,13 @@ class ClassMixedDataset:
     # ------------------------------------------------------------------
 
     def _load_entry(self, entry: ClassDatasetEntry, count: int) -> list[dict]:
-        """Load *count* samples from *entry*, respecting class weights/filter."""
+        """Load *count* samples from *entry*, respecting class weights/filter.
+
+        If the most-constrained class cannot meet its proportional quota, the
+        effective total is scaled down so that all class ratios are maintained.
+        """
+        import warnings
+        from collections import Counter
         from datasets import load_dataset  # type: ignore[import]
 
         ds = load_dataset(
@@ -256,10 +279,29 @@ class ClassMixedDataset:
             present = list({row[entry.class_field] for row in ds})
             class_norm_w = {c: 1.0 / len(present) for c in present}
 
-        # Allocate count per class
         classes = list(class_norm_w.keys())
         w_list = [class_norm_w[c] for c in classes]
-        per_class_counts = _allocate_counts(w_list, count)
+
+        # Read all class sizes in one Arrow column scan (fast, no per-class filter).
+        class_sizes: Counter = Counter(ds[entry.class_field])
+
+        # Find the constraining class and scale the effective total down so that
+        # all class proportions are preserved even when one class is data-limited.
+        effective_count = count
+        for cls_val, w in zip(classes, w_list):
+            if w > 0:
+                size = class_sizes.get(cls_val, 0)
+                effective_count = min(effective_count, int(size / w))
+
+        if effective_count < count:
+            warnings.warn(
+                f"ClassMixedDataset: recipe capacity for '{entry.dataset_id}' is "
+                f"{effective_count} (requested {count}); scaling all class counts "
+                f"proportionally to maintain ratios.",
+                stacklevel=4,
+            )
+
+        per_class_counts = _allocate_counts(w_list, effective_count)
 
         rng = np.random.default_rng(self.seed)
         samples: list[dict] = []
@@ -275,7 +317,7 @@ class ClassMixedDataset:
                     f"capping to {len(cls_ds)}.",
                     UserWarning, stacklevel=4,
                 )
-            cls_count = min(cls_count, len(cls_ds))
+            cls_count = min(cls_count, len(cls_ds))  # safety net
             cls_ds = cls_ds.select(range(cls_count))
             for row in cls_ds:
                 samples.append(dict(row))
@@ -290,7 +332,7 @@ class ClassMixedDataset:
 
         rng = np.random.default_rng(self.seed)
         idx = rng.permutation(len(all_samples)).tolist()
-        return [all_samples[i] for i in idx]
+        return [all_samples[i] for i in idx][:self.total_samples]
 
     def _ensure_loaded(self) -> list[dict]:
         if self._samples is None:

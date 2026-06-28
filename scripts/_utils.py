@@ -81,6 +81,55 @@ def expand_dataset_seeds(cfg: dict) -> dict:
     return cfg
 
 
+def compute_recipe_capacity(recipe, hf_token: str | None = None) -> int:
+    """Return the maximum sample count this recipe can deliver while maintaining
+    all class/entry weight ratios.
+
+    For each entry, finds the most-constrained class (or the dataset itself for
+    simple entries) and derives the effective total as ``min_c(size_c / w_c)``.
+    Across entries, takes the minimum of ``entry_capacity / entry_weight``.
+    """
+    from collections import Counter
+    from datasets import load_dataset  # type: ignore[import]
+    from src.datasets.class_recipe import ClassDatasetEntry
+
+    effective: float = float("inf")
+
+    for entry, w in zip(recipe.datasets, recipe.normalized_weights):
+        if w <= 0:
+            continue
+        ds = load_dataset(
+            entry.dataset_id,
+            getattr(entry, "subset", None),
+            split=getattr(entry, "split", "train"),
+            token=hf_token,
+        )
+
+        if isinstance(entry, ClassDatasetEntry):
+            if entry.class_filter is not None:
+                allowed = set(entry.class_filter)
+                ds = ds.filter(lambda row: row[entry.class_field] in allowed)
+            if len(ds) == 0:
+                return 0
+
+            class_norm_w = entry.normalized_class_weights
+            if class_norm_w is None:
+                present = list(set(ds[entry.class_field]))
+                class_norm_w = {c: 1.0 / len(present) for c in present}
+
+            class_sizes: Counter = Counter(ds[entry.class_field])
+            entry_cap = min(
+                (class_sizes.get(c, 0) / cw for c, cw in class_norm_w.items() if cw > 0),
+                default=0.0,
+            )
+        else:
+            entry_cap = float(len(ds))
+
+        effective = min(effective, entry_cap / w)
+
+    return int(effective) if effective != float("inf") else 0
+
+
 def load_recipe(path: Path | str):
     """Load DatasetRecipe or ClassAwareDatasetRecipe by inspecting recipe_type."""
     import json as _json

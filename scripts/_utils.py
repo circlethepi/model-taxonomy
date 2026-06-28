@@ -23,8 +23,9 @@ def load_config(path: str | Path) -> dict:
 
 
 def _nice_sizes(k: int) -> list[int]:
-    """Sorted {1,2,5} × 10^j for j = 0 … k."""
-    return sorted({c * 10**j for c in (1, 2, 5) for j in range(k + 1)})
+    """Sorted {1,2,5} × 10^j up to 10^k."""
+    cap = 10**k
+    return sorted({c * 10**j for c in (1, 2, 5) for j in range(k + 1) if c * 10**j <= cap})
 
 
 def _tens_sizes(k: int) -> list[int]:

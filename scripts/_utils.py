@@ -173,6 +173,76 @@ def load_recipe(path: Path | str):
     return DatasetRecipe.load(path)
 
 
+def apply_dataset_capacity_caps(cfg: dict) -> dict:
+    """Cap each dataset's n_samples to the true recipe capacity and rename it.
+
+    After ``expand_dataset_n_samples`` produces multiple blocks at different
+    sizes, some may exceed how many samples the underlying data can actually
+    deliver while maintaining class/entry proportions.  This function:
+
+    1. Computes the capacity for each unique recipe (loading dataset sizes from
+       HuggingFace cache; typically free after the first ``build`` step).
+    2. For any block whose n_samples exceeds the capacity, reduces n_samples
+       to the capacity and renames the block (``_n200000_`` → ``_n186667_``).
+    3. Removes duplicate blocks that collapse to the same name after renaming,
+       keeping only the first occurrence (lowest original n_samples).
+    4. Emits a UserWarning for every change and every removed duplicate.
+
+    Returns a new cfg dict (does not mutate the input).
+    """
+    cfg = copy.deepcopy(cfg)
+    output_dir = Path(cfg["output_dir"])
+    token = hf_token(cfg)
+
+    recipe_capacity_cache: dict[str, int] = {}
+    updated: list[dict] = []
+    seen_names: set[str] = set()
+
+    for ds in cfg.get("datasets", []):
+        recipe_path = output_dir / "datasets" / f"{ds['name']}.recipe.json"
+
+        if not recipe_path.exists():
+            if ds["name"] not in seen_names:
+                seen_names.add(ds["name"])
+                updated.append(ds)
+            continue
+
+        recipe = load_recipe(recipe_path)
+        rhash = recipe.recipe_hash()
+
+        if rhash not in recipe_capacity_cache:
+            recipe_capacity_cache[rhash] = compute_recipe_capacity(recipe, hf_token=token)
+        capacity = recipe_capacity_cache[rhash]
+
+        n_samples = ds.get("n_samples")
+        if n_samples is not None and capacity > 0 and n_samples > capacity:
+            old_name = ds["name"]
+            new_name = re.sub(r"_n\d+(?=_|$)", f"_n{capacity}", old_name)
+            warnings.warn(
+                f"Dataset cap: recipe capacity is {capacity}. "
+                f"Reducing n_samples from {n_samples} to {capacity} "
+                f"and renaming '{old_name}' → '{new_name}'.",
+                stacklevel=2,
+            )
+            ds = dict(ds)
+            ds["name"] = new_name
+            ds["n_samples"] = capacity
+
+        if ds["name"] in seen_names:
+            warnings.warn(
+                f"Removing duplicate dataset '{ds['name']}' "
+                f"(collapsed to same capacity as an earlier entry).",
+                stacklevel=2,
+            )
+            continue
+
+        seen_names.add(ds["name"])
+        updated.append(ds)
+
+    cfg["datasets"] = updated
+    return cfg
+
+
 def make_mixed_dataset(
     recipe,
     total_samples: int,

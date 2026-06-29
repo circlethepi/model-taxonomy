@@ -6,3 +6,4 @@ notebooks/*
 .vscode
 results
 experiments/*.slurm.sh
+experiments/archive/*

@@ -174,6 +174,20 @@ def load_recipe(path: Path | str):
     return DatasetRecipe.load(path)
 
 
+def build_recipe_from_cfg(ds_cfg: dict):
+    """Build a DatasetRecipe or ClassAwareDatasetRecipe from an expanded dataset config block."""
+    rtype = ds_cfg.get("recipe_type", "simple")
+    name = ds_cfg["name"]
+    entries_raw = ds_cfg.get("entries", [])
+    if rtype == "class_aware":
+        from src.datasets.class_recipe import ClassAwareDatasetRecipe, ClassDatasetEntry
+        entries = [ClassDatasetEntry.from_dict(e) for e in entries_raw]
+        return ClassAwareDatasetRecipe(name=name, datasets=entries)
+    from src.datasets.recipe import DatasetRecipe, DatasetEntry
+    entries = [DatasetEntry.from_dict(e) for e in entries_raw]
+    return DatasetRecipe(name=name, datasets=entries)
+
+
 def apply_dataset_capacity_caps(cfg: dict) -> dict:
     """Cap each dataset's n_samples to the true recipe capacity and rename it.
 

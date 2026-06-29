@@ -45,6 +45,57 @@ def scan_yahoo_cache(cache_root: Path | str) -> dict[str, dict[str, list]]:
     }
 
 
+def scan_yahoo_cache_detailed(
+    cache_root: Path | str,
+) -> dict[str, dict[int, list[int]]]:
+    """Scan the dataset_embeddings cache for Yahoo recipes, tracking seeds per n value.
+
+    Returns a nested dict ``{proportion: {n: [seeds]}}`` so you can see exactly
+    which seeds are present for each individual n value::
+
+        {
+            "100t0_000t1": {1: [0,1,2], 2: [0,1], 5: [0]},
+            ...
+        }
+    """
+    emb_dir = Path(cache_root) / "dataset_embeddings"
+    groups: dict[str, dict[int, set[int]]] = defaultdict(lambda: defaultdict(set))
+
+    for recipe_json in emb_dir.glob("*/recipe.json"):
+        try:
+            name = json.loads(recipe_json.read_text()).get("name", "")
+        except Exception:
+            continue
+        m = YAHOO_RECIPE_RE.match(name)
+        if not m:
+            continue
+        proportion, n, seed = m.group(1), int(m.group(2)), int(m.group(3))
+        groups[proportion][n].add(seed)
+
+    return {
+        prop: {n: sorted(seeds) for n, seeds in sorted(n_map.items())}
+        for prop, n_map in sorted(groups.items())
+    }
+
+
+def print_yahoo_coverage_detailed(cache_root: Path | str) -> None:
+    """Print a per-n-value coverage table showing seeds for each (proportion, n) pair."""
+    data = scan_yahoo_cache_detailed(cache_root)
+    if not data:
+        print("No Yahoo recipes found in cache.")
+        return
+
+    col1, col2 = 25, 9
+    header = f"{'Class Proportions':{col1}} | {'n':>{col2}} | seeds"
+    print(header)
+    print("-" * len(header))
+    for proportion, n_map in data.items():
+        prop_display = proportion.replace("_", " ")
+        for i, (n, seeds) in enumerate(n_map.items()):
+            label = prop_display if i == 0 else ""
+            print(f"{label:{col1}} | {n:>{col2}} | {seeds}")
+
+
 def print_yahoo_coverage(cache_root: Path | str) -> None:
     """Print a coverage table showing which (proportion, n, seed) triples are cached."""
     data = scan_yahoo_cache(cache_root)

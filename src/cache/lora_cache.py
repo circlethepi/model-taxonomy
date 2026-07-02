@@ -35,7 +35,7 @@ class LoRACache:
 
     def __init__(self, cache_root: Path | str) -> None:
         self.root = Path(cache_root)
-        self._loras_dir = self.root / "loras"
+        self._loras_dir = self.root / "adapters"
 
     def _adapter_dir(self, base_model_id: str, adapter_id: str) -> Path:
         return self._loras_dir / _slug(base_model_id) / _slug(adapter_id)

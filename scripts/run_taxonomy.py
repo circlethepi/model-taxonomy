@@ -48,7 +48,7 @@ def _to_list(v) -> list[str]:
 
 def _make_lora_cache(cfg: dict):
     from src.cache.lora_cache import LoRACache
-    return LoRACache(get_cache_dir(cfg) / "lora")
+    return LoRACache(get_cache_dir(cfg))
 
 
 def run_taxonomy(cfg: dict, only_taxonomies: list[str] | None = None) -> ModelTaxonomyProfile:

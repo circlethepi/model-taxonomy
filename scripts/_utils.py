@@ -318,17 +318,28 @@ def _model_slug(model_id: str) -> str:
     return model_id.replace("/", "--")
 
 
-def adapter_dir(output_dir: Path, base_model_id: str, dataset_name: str, lora_rank: int) -> Path:
-    return output_dir / "adapters" / _model_slug(base_model_id) / f"{dataset_name}_r{lora_rank}"
+def get_adapter_root(cfg: dict) -> Path:
+    """Return the root directory for raw PEFT adapter files.
+
+    When a shared ``cache_dir`` is configured, adapters are stored under
+    ``{cache_dir}/peft_adapters/`` so they are shared across experiments.
+    Falls back to ``{output_dir}/adapters/`` for backward compatibility.
+    """
+    if "cache_dir" in cfg:
+        return Path(cfg["cache_dir"]) / "peft_adapters"
+    return Path(cfg["output_dir"]) / "adapters"
 
 
-def discover_adapter_paths(output_dir: Path) -> list[str]:
+def adapter_dir(adapter_root: Path, base_model_id: str, dataset_name: str, lora_rank: int) -> Path:
+    return adapter_root / _model_slug(base_model_id) / f"{dataset_name}_r{lora_rank}"
+
+
+def discover_adapter_paths(adapter_root: Path) -> list[str]:
     """Return local paths of all trained adapters (those with experiment_meta.json)."""
-    adapters_root = output_dir / "adapters"
-    if not adapters_root.exists():
+    if not adapter_root.exists():
         return []
     paths = []
-    for meta_file in sorted(adapters_root.rglob("experiment_meta.json")):
+    for meta_file in sorted(adapter_root.rglob("experiment_meta.json")):
         paths.append(str(meta_file.parent))
     return paths
 
@@ -345,10 +356,9 @@ def resolve_model_ids(cfg: dict, section_key: str = "models") -> list[str]:
 
     Supports three tokens in the 'models' list:
       - "base_models"  → the base_models list from cfg
-      - "fine_tuned"   → all adapter paths discovered under output_dir/adapters/
+      - "fine_tuned"   → all adapter paths discovered under get_adapter_root(cfg)
       - any other str  → treated as an explicit HF ID or local path
     """
-    output_dir = Path(cfg["output_dir"])
     section = cfg.get(section_key, cfg)  # extraction or taxonomy sub-dict, or cfg itself
     model_tokens = section.get("models", ["base_models"])
 
@@ -362,7 +372,7 @@ def resolve_model_ids(cfg: dict, section_key: str = "models") -> list[str]:
                     model_ids.append(mid)
                     seen.add(mid)
         elif token == "fine_tuned":
-            for path in discover_adapter_paths(output_dir):
+            for path in discover_adapter_paths(get_adapter_root(cfg)):
                 if path not in seen:
                     model_ids.append(path)
                     seen.add(path)

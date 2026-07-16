@@ -23,6 +23,7 @@ from scripts._utils import (
     expand_dataset_seeds,
     expand_dataset_n_samples,
     get_cache_dir,
+    get_adapter_root,
     hf_token,
     adapter_dir,
     load_recipe,
@@ -146,19 +147,48 @@ def finetune_all(cfg: dict, force: bool = False) -> list[Path]:
         return []
 
     output_dir = Path(cfg["output_dir"])
+    adapter_root = get_adapter_root(cfg)
     token = hf_token(cfg)
     datasets_dir = output_dir / "datasets"
     sample_cache = make_sampled_dataset_cache(get_cache_dir(cfg))
 
     produced: list[Path] = []
+
+    # Resolve fine_tuning.datasets against the expanded cfg datasets.
+    # If the listed names are pre-expansion base names (e.g. "yahoo_100t0_000t1"),
+    # match any expanded dataset whose name starts with "{base}_", and inherit
+    # per-dataset n_samples/seed from the expanded block.  Exact-name matches and
+    # configs without a sweep fall through unchanged.
+    ft_base_names = set(ft_cfg.get("datasets", []))
+    resolved_datasets: list[dict] = []
+    for ds in cfg.get("datasets", []):
+        name = ds["name"]
+        if name in ft_base_names:
+            resolved_datasets.append(ds)
+        else:
+            for base in ft_base_names:
+                if name.startswith(base + "_"):
+                    resolved_datasets.append(ds)
+                    break
+    # Fallback: no expanded matches → use the base names directly (backward compat)
+    if not resolved_datasets:
+        resolved_datasets = [{"name": n} for n in ft_cfg.get("datasets", [])]
+
     pairs = [
         (base, ds)
         for base in cfg.get("base_models", [])
-        for ds in ft_cfg.get("datasets", [])
+        for ds in resolved_datasets
     ]
 
-    for base_model_id, dataset_name in pairs:
-        out_dir = adapter_dir(output_dir, base_model_id, dataset_name, ft_cfg["lora_rank"])
+    for base_model_id, ds_block in pairs:
+        dataset_name = ds_block["name"]
+        # Per-dataset overrides for n_samples and seed; fall back to ft_cfg globals
+        merged_ft_cfg = {
+            **ft_cfg,
+            "n_samples": ds_block.get("n_samples", ft_cfg.get("n_samples", 1000)),
+            "seed": ds_block.get("seed", ft_cfg.get("seed", 42)),
+        }
+        out_dir = adapter_dir(adapter_root, base_model_id, dataset_name, ft_cfg["lora_rank"])
         recipe_path = datasets_dir / f"{dataset_name}.recipe.json"
         if not recipe_path.exists():
             raise FileNotFoundError(
@@ -166,7 +196,7 @@ def finetune_all(cfg: dict, force: bool = False) -> list[Path]:
                 "Run build_datasets.py first."
             )
         print(f"  {base_model_id}  x  {dataset_name}")
-        _finetune_one(base_model_id, dataset_name, recipe_path, out_dir, ft_cfg, token, force,
+        _finetune_one(base_model_id, dataset_name, recipe_path, out_dir, merged_ft_cfg, token, force,
                       sample_cache=sample_cache)
         produced.append(out_dir)
 

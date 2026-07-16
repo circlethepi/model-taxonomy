@@ -9,7 +9,8 @@ The default mode (`lora_only=True`) uses only LoRA adapter matrices, making this
 1. Load the model on CPU (no GPU needed; no inference required).
 2. Identify the set of weight layers to compare (LoRA adapters or full weight matrices).
 3. For each layer, construct a vector:
-   - **LoRA mode**: concatenate the flattened A and B adapter matrices, then truncate/pad to `n_components`.
+   - **LoRA mode (`use_lora_product=True`, default)**: compute `(B @ A).flatten()`, then truncate/pad to `n_components`.
+   - **LoRA mode (`use_lora_product=False`)**: concatenate `A.flatten()` and `B.flatten()`, then truncate/pad to `n_components`.
    - **Full-weight mode**: flatten the weight matrix, then truncate/pad to `n_components`.
 4. Stack vectors across layers: final representation matrix of shape `(N_layers, n_components)`.
 5. Unload the model from memory.
@@ -105,7 +106,7 @@ This happens for base models (not fine-tuned with LoRA) and for models where LoR
 ### Directory structure
 
 ```
-cache_root/loras/
+cache_root/adapters/
   meta-llama--Llama-3.1-8B/            ← base model (/ replaced with --)
     some-org--my-adapter/               ← adapter (/ replaced with --)
       config.json
@@ -141,7 +142,7 @@ cache_root/loras/
 }
 ```
 
-`training_config` is populated automatically from the adapter's PEFT `adapter_config.json` (downloaded from the Hub). `dataset_recipe` is a documented stub for the dataset taxonomy feature (to be implemented separately).
+`training_config` is populated automatically from the adapter's PEFT `adapter_config.json` (downloaded from the Hub). `dataset_recipe` can be passed explicitly to `LoRACache.save()` to record the full mixing recipe; if omitted, a placeholder stub is written instead.
 
 ### Base model auto-detection
 

@@ -157,7 +157,7 @@ from src.cache import LoRACache
 lora_cache = LoRACache("./cache")
 
 # Directory structure:
-# ./cache/loras/meta-llama--Llama-3.1-8B/some-org--my-adapter/
+# ./cache/adapters/meta-llama--Llama-3.1-8B/some-org--my-adapter/
 #     config.json                 ← training details + dataset_recipe stub
 #     representation.safetensors  ← extracted representation matrix
 ```

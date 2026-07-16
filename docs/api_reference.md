@@ -616,6 +616,7 @@ class LoRACache:
         rep: ModelRepresentation,
         training_config: dict,
         extraction_config: dict,
+        dataset_recipe: dict | None = None,
     ) -> None
     def load(self, base_model_id: str, adapter_id: str) -> ModelRepresentation
     def load_config(self, base_model_id: str, adapter_id: str) -> dict

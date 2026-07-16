@@ -57,7 +57,7 @@ probes = [
 
 # 3. Configure the three pipeline steps
 taxonomy = FunctionalTaxonomy(
-    probes=probes,
+    queries=probes,
     layer_indices=[-1],           # last transformer layer
     cache=DiskCache("./cache"),   # safetensors format by default
     device="cpu",                 # use "cuda" for GPU
@@ -109,7 +109,7 @@ result.save("./results/run1")
 from src import BehavioralTaxonomy, SentenceTransformerEmbedder, DiskCache
 
 taxonomy = BehavioralTaxonomy(
-    probes=probes,
+    queries=probes,
     embedder=SentenceTransformerEmbedder(use_generated_text=True),
     cache=DiskCache("./cache"),
     device="cuda",
@@ -137,7 +137,7 @@ For models that require authentication (Llama, Gemma, etc.), pass your HuggingFa
 import os
 
 taxonomy = FunctionalTaxonomy(
-    probes=probes,
+    queries=probes,
     layer_indices=[-4, -3, -2, -1],
     hf_token=os.environ["HF_TOKEN"],   # or pass the string directly
 )

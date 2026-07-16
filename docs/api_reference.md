@@ -33,7 +33,7 @@ class ModelRepresentation:
     cache_key: str
 
     # Properties
-    n_probes: int
+    n_queries: int
     embedding_dim: int
 
     # Factory
@@ -55,8 +55,8 @@ Use `ModelRepresentation.create()` rather than the raw constructor — it comput
 | Taxonomy | Keys |
 |---|---|
 | `structural` | `n_layers`, `layer_labels`, `lora_only` |
-| `functional` | `n_probes`, `n_layers`, `layer_indices`, `activation_mode` |
-| `behavioral` | `n_probes`, `generated_texts` |
+| `functional` | `n_queries`, `n_layers`, `layer_indices`, `activation_mode`, `representation` |
+| `behavioral` | `n_queries`, `generated_texts` |
 
 ---
 
@@ -209,7 +209,7 @@ class Taxonomy(ABC):
 class BehavioralTaxonomy(Taxonomy):
     def __init__(
         self,
-        probes: Sequence[str],
+        queries: Sequence[str],
         embedder: Embedder,
         cache: DiskCache | None = None,
         device: str = "cuda",
@@ -235,7 +235,7 @@ Generated texts are stored in `ModelRepresentation.metadata["generated_texts"]` 
 class FunctionalTaxonomy(Taxonomy):
     def __init__(
         self,
-        probes: Sequence[str],
+        queries: Sequence[str],
         layer_indices: list[int],
         cache: DiskCache | None = None,
         device: str = "cuda",
@@ -246,6 +246,7 @@ class FunctionalTaxonomy(Taxonomy):
         normalize_activations: bool = True,
         activation_mode: Literal["input", "generation", "both"] = "input",
         max_new_tokens: int = 32,
+        representation: Literal["gram", "matrix"] = "gram",
     )
     taxonomy_name = "functional"
 ```
@@ -256,16 +257,24 @@ class FunctionalTaxonomy(Taxonomy):
 | `pooling` | How to pool the `(seq_len, d)` hidden state to a single vector per probe |
 | `normalize_activations` | L2-normalize activation vectors before computing Gram matrix; makes `G[i,i]=1` |
 | `activation_mode` | `"input"`: forward-pass activations on the prompt. `"generation"`: activations during decoding, mean-pooled over steps. `"both"`: both phases stacked. |
-| `max_new_tokens` | Tokens to generate per probe; used when `activation_mode` is `"generation"` or `"both"`. Ignored for `"input"`. |
+| `max_new_tokens` | Tokens to generate per query; used when `activation_mode` is `"generation"` or `"both"`. Ignored for `"input"`. |
+| `representation` | `"gram"` (default): upper-triangle of per-layer Gram matrices, shape `(N_layers, N_queries*(N_queries+1)//2)`. `"matrix"`: raw activations concatenated per query, shape `(N_queries, N_layers*d)`. |
 
-**Representation shape:**
+**Representation shape (`representation="gram"`, the default):**
 
 | `activation_mode` | Shape |
 |---|---|
-| `"input"` or `"generation"` | `(N_layers, N_probes*(N_probes+1)//2)` |
-| `"both"` | `(2*N_layers, N_probes*(N_probes+1)//2)` |
+| `"input"` or `"generation"` | `(N_layers, N_queries*(N_queries+1)//2)` |
+| `"both"` | `(2*N_layers, N_queries*(N_queries+1)//2)` |
 
-**Note on CKA:** `CKADistanceMetric(unbiased=True)` requires the matrix row count to be ≥ 4. For `"both"` mode this is `2 * N_layers`; for other modes it is `N_layers`. Use `unbiased=False` for smaller configurations.
+**Representation shape (`representation="matrix"`):**
+
+| `activation_mode` | Shape |
+|---|---|
+| `"input"` or `"generation"` | `(N_queries, N_layers * hidden_dim)` |
+| `"both"` | `(N_queries, 2*N_layers * hidden_dim)` |
+
+**Note on CKA:** `CKADistanceMetric(unbiased=True)` requires the matrix row count to be ≥ 4. For `gram` mode, rows = `N_layers` (or `2*N_layers` in `"both"`). For `matrix` mode, rows = `N_queries`. Use `unbiased=False` for smaller configurations.
 
 ---
 
@@ -299,6 +308,54 @@ class StructuralTaxonomy(Taxonomy):
 **Cache priority:** `lora_cache` is checked first; `cache` (flat `DiskCache`) is the fallback.
 
 **Representation shape:** `(N_layers, n_components)` — one row per weight layer or LoRA module.
+
+---
+
+### `DatasetEmbeddingTaxonomy`
+
+```python
+from src import DatasetEmbeddingTaxonomy
+
+class DatasetEmbeddingTaxonomy(Taxonomy):
+    def __init__(
+        self,
+        embedder: Embedder,
+        datasets: dict[str, tuple[DatasetRecipe | ClassAwareDatasetRecipe, int] |
+                              tuple[DatasetRecipe | ClassAwareDatasetRecipe, int, int]],
+        representation: Literal["matrix", "gram", "mean"] = "matrix",
+        cache: DatasetEmbeddingCache | None = None,
+        seed: int = 42,
+        hf_token: str | None = None,
+        sample_cache: SampledDatasetCache | None = None,
+    )
+
+    @classmethod
+    def from_recipes(
+        cls,
+        recipes: list[DatasetRecipe | ClassAwareDatasetRecipe],
+        n_samples: int,
+        embedder: Embedder,
+        representation: Literal["matrix", "gram", "mean"] = "matrix",
+        cache: DatasetEmbeddingCache | None = None,
+        seed: int = 42,
+        hf_token: str | None = None,
+        sample_cache: SampledDatasetCache | None = None,
+    ) -> DatasetEmbeddingTaxonomy
+
+    def recipe_ids(self) -> list[str]
+    taxonomy_name = "dataset_embedding"
+```
+
+Compares datasets by embedding their text elements with an `Embedder`. Pass `taxonomy.recipe_ids()` as the `model_ids` argument to `TaxonomyAnalyzer.fit()` — the taxonomy uses recipe hashes as model IDs.
+
+| Parameter | Description |
+|---|---|
+| `embedder` | Embedder to apply to each text element. Use `SentenceTransformerEmbedder(use_generated_text=False)` to embed dataset text directly. |
+| `datasets` | Mapping from recipe ID → `(recipe, n_samples)` or `(recipe, n_samples, seed)`. The optional third element overrides `seed` for that dataset. |
+| `representation` | `"matrix"`: raw `(N, d)` embedding matrix. `"gram"`: upper-triangle of `E @ E.T`, shape `(1, N*(N+1)//2)`. `"mean"`: column mean, shape `(1, d)`. |
+| `seed` | Global fallback seed for dataset shuffling. |
+
+`from_recipes` is a convenience constructor that registers each recipe under its `recipe_hash()`.
 
 ---
 
@@ -391,6 +448,28 @@ class CKADistanceMetric(DistanceMetric):
 ```
 
 Distance = `1 − CKA(A, B)`. Invariant to orthogonal transformations and isotropic scaling. `unbiased=True` requires the matrix row count to be ≥ 4 (rows = `N_layers` for functional, or `2*N_layers` in `"both"` mode).
+
+### `CosineDistanceMetric`
+
+```python
+from src.metrics.vector import CosineDistanceMetric
+
+class CosineDistanceMetric(DistanceMetric):
+    metric_name = "cosine"
+```
+
+Distance = `1 − cosine_similarity(a.flatten(), b.flatten())`. Scale-invariant; both matrices are flattened to 1-D before comparison. Natural companion to `DatasetEmbeddingTaxonomy(representation="mean")`.
+
+### `DotProductDistanceMetric`
+
+```python
+from src.metrics.vector import DotProductDistanceMetric
+
+class DotProductDistanceMetric(DistanceMetric):
+    metric_name = "dot_product"
+```
+
+Distance = `1 − dot(a.flatten(), b.flatten())`. Assumes pre-normalized embeddings (e.g. `SentenceTransformerEmbedder(normalize_embeddings=True)`). For unit vectors this is equivalent to cosine distance.
 
 ---
 
@@ -581,6 +660,39 @@ class CollectionCache:
 Stores distance matrices and geometry results for a model collection. `collection_info.json` records all models (and their LoRA adapter details if applicable), the metric and taxonomy used, and the list of geometry methods computed. `save_geometry` can be called multiple times to add PCA, MDS, and UMAP results to the same collection.
 
 `model_entries` is an ordered list of dicts describing each model in `distance_matrix.model_ids`. Each entry should have at minimum `{"model_id": ..., "entry_type": "base_model" | "lora_adapter"}`. LoRA adapter entries can additionally record `base_model_id` and `adapter_cache_slug` to allow cache lookup.
+
+---
+
+### `DatasetEmbeddingCache`
+
+```python
+from src import DatasetEmbeddingCache
+
+class DatasetEmbeddingCache:
+    def __init__(self, cache_root: Path | str)
+
+    def exists(self, recipe_hash: str, embedder_hash: str) -> bool
+    def save(
+        self,
+        recipe: DatasetRecipe | ClassAwareDatasetRecipe,
+        rep: ModelRepresentation,
+        embedder_config: dict,
+        representation: str,
+        n_samples: int,
+    ) -> None
+    def load(self, recipe_hash: str, embedder_hash: str) -> ModelRepresentation
+
+    @staticmethod
+    def embedder_hash(
+        embedder_config: dict,
+        representation: str,
+        n_samples: int,
+    ) -> str
+```
+
+Hierarchical cache for `DatasetEmbeddingTaxonomy` representations. Stores data under `cache_root/dataset_embeddings/{recipe_hash}/{embedder_hash}/`. Each entry contains a human-readable `recipe.json`, a `config.json` with embedder settings, and an `embeddings.safetensors` file. Pass a `DatasetEmbeddingCache` instance to `DatasetEmbeddingTaxonomy(cache=...)` to enable persistence.
+
+`embedder_hash` identifies a `(embedder_config, representation, n_samples)` triple and is used as the second-level directory key.
 
 ---
 

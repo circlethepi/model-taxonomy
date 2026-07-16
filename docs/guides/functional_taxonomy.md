@@ -66,7 +66,7 @@ Example: 4 layers, 50 probes, `"both"` mode → `(8, 1275)`.
 from src import FunctionalTaxonomy
 
 taxonomy = FunctionalTaxonomy(
-    probes=probes,                        # shared input strings
+    queries=probes,                        # shared input strings
     layer_indices=[-4, -3, -2, -1],       # which transformer layers to analyze
     cache=DiskCache("./cache"),           # safetensors format by default
     device="cuda",
@@ -203,7 +203,7 @@ probes = [row["question"] for row in ds]
 
 # Option A: input activations only (fastest)
 taxonomy = FunctionalTaxonomy(
-    probes=probes,
+    queries=probes,
     layer_indices=[-4, -3, -2, -1],
     cache=DiskCache("./cache"),
     device="cuda",
@@ -215,7 +215,7 @@ taxonomy = FunctionalTaxonomy(
 
 # Option B: generation activations only
 taxonomy_gen = FunctionalTaxonomy(
-    probes=probes,
+    queries=probes,
     layer_indices=[-4, -3, -2, -1],
     cache=DiskCache("./cache"),
     device="cuda",
@@ -228,7 +228,7 @@ taxonomy_gen = FunctionalTaxonomy(
 
 # Option C: both — (8, features) matrix per model
 taxonomy_both = FunctionalTaxonomy(
-    probes=probes,
+    queries=probes,
     layer_indices=[-4, -3, -2, -1],
     cache=DiskCache("./cache"),
     device="cuda",

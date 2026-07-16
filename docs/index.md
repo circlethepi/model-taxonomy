@@ -37,6 +37,7 @@ Collection of models
 | **Behavioral** | Mean-embedded outputs over probe inputs | Implemented |
 | **Functional** | Gram matrices of internal activations per layer | Implemented |
 | **Structural** | Weight matrices / LoRA adapter matrices | Implemented |
+| **Dataset Embedding** | Fine-tuning dataset text distribution | Implemented |
 | **Training Data** | Fine-tuning dataset distribution | Planned |
 
 ## Documentation

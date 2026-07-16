@@ -23,7 +23,7 @@ Generated texts are stored in `ModelRepresentation.metadata["generated_texts"]` 
 
 ```python
 BehavioralTaxonomy(
-    probes=probes,
+    queries=probes,
     embedder=embedder,
     cache=DiskCache("./cache"),   # safetensors format by default
     device="cuda",                # or "cpu"
@@ -131,7 +131,7 @@ ds = load_dataset("cais/mmlu", "all", split="test[:100]")
 probes = [row["question"] for row in ds]
 
 taxonomy = BehavioralTaxonomy(
-    probes=probes,
+    queries=probes,
     embedder=SentenceTransformerEmbedder(use_generated_text=True),
     cache=DiskCache("./cache"),
     device="cuda",

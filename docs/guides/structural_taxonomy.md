@@ -105,6 +105,18 @@ This happens for base models (not fine-tuned with LoRA) and for models where LoR
 
 ### Directory structure
 
+Locally trained adapters (produced by `scripts/finetune_lora.py`) are written to:
+
+```
+{output_dir}/adapters/
+  meta-llama--Llama-3.1-8B/
+    my_dataset_s42_r8_i00/    ← _s{seed} = data seed · _r{rank} = LoRA rank · _i{seed:02d} = init seed
+      adapter_config.json
+      adapter_model.safetensors
+```
+
+`LoRACache` stores extracted representations alongside a `config.json` under a parallel hierarchy:
+
 ```
 cache_root/adapters/
   meta-llama--Llama-3.1-8B/            ← base model (/ replaced with --)
@@ -124,6 +136,7 @@ cache_root/adapters/
   "training_config": {
     "lora_rank": 16,
     "lora_alpha": 32,
+    "lora_init_seed": 0,
     "target_modules": ["q_proj", "v_proj"],
     "lora_dropout": 0.05
   },
@@ -143,6 +156,8 @@ cache_root/adapters/
 ```
 
 `training_config` is populated automatically from the adapter's PEFT `adapter_config.json` (downloaded from the Hub). `dataset_recipe` can be passed explicitly to `LoRACache.save()` to record the full mixing recipe; if omitted, a placeholder stub is written instead.
+
+`lora_init_seed` records the random seed passed to `torch.manual_seed()` immediately before PEFT initialises the A and B matrices. Holding all other hyperparameters fixed while varying `lora_init_seed` produces a distinct adapter directory (`_i{seed:02d}` suffix), which makes seed-sensitivity studies straightforward to run and cache independently.
 
 ### Base model auto-detection
 

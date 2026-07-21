@@ -322,16 +322,16 @@ def get_adapter_root(cfg: dict) -> Path:
     """Return the root directory for raw PEFT adapter files.
 
     When a shared ``cache_dir`` is configured, adapters are stored under
-    ``{cache_dir}/peft_adapters/`` so they are shared across experiments.
+    ``{cache_dir}/adapters/`` so they are shared across experiments.
     Falls back to ``{output_dir}/adapters/`` for backward compatibility.
     """
     if "cache_dir" in cfg:
-        return Path(cfg["cache_dir"]) / "peft_adapters"
+        return Path(cfg["cache_dir"]) / "adapters"
     return Path(cfg["output_dir"]) / "adapters"
 
 
-def adapter_dir(adapter_root: Path, base_model_id: str, dataset_name: str, lora_rank: int) -> Path:
-    return adapter_root / _model_slug(base_model_id) / f"{dataset_name}_r{lora_rank}"
+def adapter_dir(adapter_root: Path, base_model_id: str, dataset_name: str, lora_rank: int, lora_init_seed: int = 0) -> Path:
+    return adapter_root / _model_slug(base_model_id) / f"{dataset_name}_r{lora_rank}_i{lora_init_seed:02d}"
 
 
 def discover_adapter_paths(adapter_root: Path) -> list[str]:

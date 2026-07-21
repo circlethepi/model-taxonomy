@@ -1,7 +1,10 @@
 """Step 2: fine-tune base models with LoRA adapters using PEFT + SFTTrainer.
 
 Produces one adapter per (base_model, dataset) pair, saved to:
-    {output_dir}/adapters/{base_model_slug}/{dataset_name}_r{lora_rank}/
+    {output_dir}/adapters/{base_model_slug}/{dataset_name}_r{lora_rank}_i{lora_init_seed:02d}/
+
+The ``_s{seed}`` suffix in dataset names encodes the data-sampling seed;
+the ``_i{seed}`` suffix in the adapter directory encodes the LoRA init seed.
 
 Usage:
     python scripts/finetune_lora.py experiments/example.yaml
@@ -78,6 +81,8 @@ def _finetune_one(
         bias="none",
         task_type=TaskType.CAUSAL_LM,
     )
+    lora_init_seed = ft_cfg.get("lora_init_seed", 0)
+    torch.manual_seed(lora_init_seed)
     model = get_peft_model(model, lora_config)
     model.print_trainable_parameters()
 
@@ -122,6 +127,7 @@ def _finetune_one(
         "lora_config": {
             "lora_rank": ft_cfg["lora_rank"],
             "lora_alpha": ft_cfg["lora_alpha"],
+            "lora_init_seed": lora_init_seed,
             "target_modules": ft_cfg.get("target_modules"),
             "lora_dropout": ft_cfg.get("lora_dropout", 0.05),
         },
@@ -188,7 +194,7 @@ def finetune_all(cfg: dict, force: bool = False) -> list[Path]:
             "n_samples": ds_block.get("n_samples", ft_cfg.get("n_samples", 1000)),
             "seed": ds_block.get("seed", ft_cfg.get("seed", 42)),
         }
-        out_dir = adapter_dir(adapter_root, base_model_id, dataset_name, ft_cfg["lora_rank"])
+        out_dir = adapter_dir(adapter_root, base_model_id, dataset_name, ft_cfg["lora_rank"], ft_cfg.get("lora_init_seed", 0))
         recipe_path = datasets_dir / f"{dataset_name}.recipe.json"
         if not recipe_path.exists():
             raise FileNotFoundError(

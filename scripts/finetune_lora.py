@@ -78,6 +78,8 @@ def _finetune_one(
         bias="none",
         task_type=TaskType.CAUSAL_LM,
     )
+    lora_init_seed = ft_cfg.get("lora_init_seed", 0)
+    torch.manual_seed(lora_init_seed)
     model = get_peft_model(model, lora_config)
     model.print_trainable_parameters()
 

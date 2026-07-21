@@ -48,6 +48,7 @@ fine_tuning:
   datasets: [my_dataset]       # dataset names defined above; one adapter per pair
   n_samples: 200               # samples drawn per (base_model, dataset) pair
   seed: 42
+  lora_init_seed: 0             # seed for LoRA A/B matrix initialization; independent of dataset seed
   lora_rank: 8                 # LoRA rank r; higher → more parameters, richer update
   lora_alpha: 16               # LoRA alpha; effective scale = alpha / rank
   target_modules: [q_proj, v_proj]  # transformer sub-modules to apply LoRA to

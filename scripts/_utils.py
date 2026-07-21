@@ -322,11 +322,11 @@ def get_adapter_root(cfg: dict) -> Path:
     """Return the root directory for raw PEFT adapter files.
 
     When a shared ``cache_dir`` is configured, adapters are stored under
-    ``{cache_dir}/peft_adapters/`` so they are shared across experiments.
+    ``{cache_dir}/adapters/`` so they are shared across experiments.
     Falls back to ``{output_dir}/adapters/`` for backward compatibility.
     """
     if "cache_dir" in cfg:
-        return Path(cfg["cache_dir"]) / "peft_adapters"
+        return Path(cfg["cache_dir"]) / "adapters"
     return Path(cfg["output_dir"]) / "adapters"
 
 

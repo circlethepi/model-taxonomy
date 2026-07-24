@@ -1,3 +1,7 @@
+# TODO (full-pipeline): assumes ModelRepresentation.matrix is a uniform 2D array
+# (N_layers × d). Needs updating before structural taxonomy representations can
+# flow through this path (rows may have variable natural lengths once truncation
+# is removed; see src/taxonomy/structural.py and memory/project_full_pipeline_metrics.md).
 from __future__ import annotations
 
 import numpy as np

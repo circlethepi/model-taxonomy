@@ -7,6 +7,8 @@ from pathlib import Path
 import numpy as np
 from tqdm.auto import tqdm
 
+from src.notebook.lora_weights import _PROJ_LONG
+
 
 def model_label(name: str) -> str:
     """Extract topic-0 percentage label from an adapter name.
@@ -18,6 +20,23 @@ def model_label(name: str) -> str:
         n0, n1 = int(m.group(1)), int(m.group(2))
         return str(round(100 * n0 / (n0 + n1)))
     return name
+
+
+def _normalize_layers(weights, layers: int | list[int] | None) -> list[int]:
+    """Resolve a layer arg to a sorted list; bare int/None both supported."""
+    if layers is None:
+        return sorted(weights.layers)
+    if isinstance(layers, int):
+        return [layers]
+    return sorted(layers)
+
+
+def _normalize_projections(weights, projections: str | list[str] | None) -> list[str]:
+    """Resolve a projections arg to a sorted list of short-form names."""
+    if projections is None:
+        return sorted(weights.projections)
+    raw = [projections] if isinstance(projections, str) else list(projections)
+    return sorted({_PROJ_LONG.get(p.lower(), p.lower()) for p in raw})
 
 
 # ---------------------------------------------------------------------------
@@ -139,18 +158,27 @@ def _load_or_compute_alignment(
 
 def frobenius_distance_matrix(
     weights,
-    layer: int,
-    proj: str,
+    layers: int | list[int] | None = None,
+    projections: str | list[str] | None = None,
     align: bool = False,
     cache_dir: Path | None = None,
 ) -> tuple[list[str], np.ndarray]:
-    """Pairwise Frobenius distance between LoRA products B @ A.
+    """Pairwise Frobenius distance between concatenated LoRA products B @ A.
 
-    Uses a low-rank formulation throughout (no d×d matrices formed):
+    Uses a low-rank formulation throughout (no d×d matrices formed), summed
+    over every selected (layer, proj) block:
 
-      ||P_i - P_j||_F^2 = tr_i + tr_j - 2·tr(B_i^T B_j · A_j A_i^T)   (all r×r)
+      ||v_i - v_j||_2^2 = Σ_{layer,proj} ||P_i - P_j||_F^2
+                         = Σ tr_i + Σ tr_j - 2·Σ tr(B_i^T B_j · A_j A_i^T)   (all r×r)
 
-    With ``align=True`` the Procrustes-aligned distance is returned instead:
+    where v_i is the vector obtained by raveling and concatenating each
+    B @ A product across the selected layers/projections — see
+    docs/notes/frobenius_bw_generalization.md for the proof that this equals
+    the true Frobenius/Euclidean distance between the concatenated vectors.
+
+    With ``align=True`` the Procrustes-aligned distance is returned instead;
+    this is only supported for a single (layer, proj) block (multi-block
+    Procrustes alignment is not implemented — raises ``ValueError``):
 
       ||P_i Q* - P_j||_F^2 = tr_i + tr_j - 2·sum(σ_ij)
 
@@ -160,38 +188,63 @@ def frobenius_distance_matrix(
     Parameters
     ----------
     weights : LoRAWeightCollection
-    layer, proj : layer index and projection short name
+    layers : layer indices to include; default is all layers loaded in *weights*
+    projections : projections to include, e.g. ``"o"`` or ``["k", "v"]``;
+        accepts short (``"o"``) or long (``"o_proj"``) forms.
+        Default is all projections loaded in *weights*.
     align : whether to apply Procrustes alignment before computing the norm
+        (single block only)
     cache_dir : directory for caching alignment matrices (None → no cache)
     """
     names = weights.keys()
     n = len(names)
 
-    # Precompute per-adapter quantities.
-    As: list[np.ndarray] = []
-    Bs: list[np.ndarray] = []
+    _layers = _normalize_layers(weights, layers)
+    _projs = _normalize_projections(weights, projections)
+    blocks = [(layer, proj) for layer in _layers for proj in _projs]
+
+    if align and len(blocks) != 1:
+        raise ValueError(
+            f"align=True is only supported for a single (layer, projection) "
+            f"block; got {len(blocks)} blocks. Multi-block Procrustes "
+            f"alignment is not implemented."
+        )
+
+    # Precompute per-adapter, per-block quantities.
+    As: list[list[np.ndarray]] = []
+    Bs: list[list[np.ndarray]] = []
     trs: list[float] = []
     for name in tqdm(names, desc="frobenius precompute"):
-        A = weights[name].matrix(layer, proj, "A").astype(np.float64)
-        B = weights[name].matrix(layer, proj, "B").astype(np.float64)
-        As.append(A)
-        Bs.append(B)
-        trs.append(_frob_sq(A, B))
+        adapter_As: list[np.ndarray] = []
+        adapter_Bs: list[np.ndarray] = []
+        total = 0.0
+        for layer, proj in blocks:
+            A = weights[name].matrix(layer, proj, "A").astype(np.float64)
+            B = weights[name].matrix(layer, proj, "B").astype(np.float64)
+            adapter_As.append(A)
+            adapter_Bs.append(B)
+            total += _frob_sq(A, B)
+        As.append(adapter_As)
+        Bs.append(adapter_Bs)
+        trs.append(total)
 
     D = np.zeros((n, n))
     pairs = list(combinations(range(n), 2))
     desc = "frobenius (aligned)" if align else "frobenius"
     for i, j in tqdm(pairs, desc=desc, total=len(pairs)):
         if align:
+            layer, proj = blocks[0]
             _, _, sigma, _, _ = _load_or_compute_alignment(
-                names[i], names[j], As[i], Bs[i], As[j], Bs[j],
+                names[i], names[j], As[i][0], Bs[i][0], As[j][0], Bs[j][0],
                 layer, proj, cache_dir,
             )
             d2 = trs[i] + trs[j] - 2.0 * float(np.sum(sigma))
         else:
-            K_ij = Bs[i].T @ Bs[j]                    # (r, r)
-            cross = np.trace(K_ij @ (As[j] @ As[i].T))  # (r, r) trace
-            d2 = trs[i] + trs[j] - 2.0 * float(cross)
+            cross = 0.0
+            for k in range(len(blocks)):
+                K_ij = Bs[i][k].T @ Bs[j][k]                    # (r, r)
+                cross += float(np.trace(K_ij @ (As[j][k] @ As[i][k].T)))
+            d2 = trs[i] + trs[j] - 2.0 * cross
         D[i, j] = D[j, i] = float(np.sqrt(max(d2, 0.0)))
     return list(names), D
 
@@ -265,59 +318,91 @@ def cka_distance_matrix(
 
 def bures_wasserstein_distance_matrix(
     weights,
-    layer: int,
-    proj: str,
+    layers: int | list[int] | None = None,
+    projections: str | list[str] | None = None,
     align: bool = False,
     cache_dir: Path | None = None,
 ) -> tuple[list[str], np.ndarray]:
     """Pairwise Bures-Wasserstein distance on the uncentered covariance Σ = P^T P.
 
-    Works entirely in rank-r space via thin SVD:
+    Works entirely in rank-N space (N = n_blocks·r) via thin SVD, where the
+    per-block low-rank factors are stacked across every selected (layer,
+    proj) block before the SVD:
 
-      B = Q R  (QR of B)
-      M = R A  (r×d)
-      SVD M → U_M, s           [r×d thin SVD]
-      M_i M_j^T = R_i (A_i A_j^T) R_j^T  (r×r)
-      G = U_Mi^T (M_i M_j^T) U_Mj         (r×r)
+      B = Q R  (QR of B, per block)
+      M = R A  (r×d, per block)         M_total = vstack over blocks  (N×d)
+      SVD M_total → U_M, s              [N×d thin SVD]
+      M_i M_j^T = M_i,total M_j,total^T  (N×N)
+      G = U_Mi^T (M_i M_j^T) U_Mj         (N×N)
       d_BW^2 = ||s_i||^2 + ||s_j||^2 - 2·nuclear_norm(G)
 
+    This is exact, not an approximation: Σ_total = Σ_blocks P^T P =
+    M_total^T M_total, and the algorithm above is a function purely of any
+    factor M with M^T M = Σ — see docs/notes/frobenius_bw_generalization.md
+    for the full proof.
+
     With ``align=True``, P_i is first rotated by the Procrustes Q* that
-    minimises ||P_i Q - P_j||_F before computing the BW distance.
-    The aligned A_i is formed as (A_i @ U_ij) @ V_ij^T — entirely r×r ops.
+    minimises ||P_i Q - P_j||_F before computing the BW distance. This is
+    only supported for a single (layer, proj) block (multi-block Procrustes
+    alignment is not implemented — raises ``ValueError``). The aligned A_i
+    is formed as (A_i @ U_ij) @ V_ij^T — entirely r×r ops.
 
     Parameters
     ----------
     weights : LoRAWeightCollection
-    layer, proj : layer index and projection short name
+    layers : layer indices to include; default is all layers loaded in *weights*
+    projections : projections to include, e.g. ``"o"`` or ``["k", "v"]``;
+        accepts short (``"o"``) or long (``"o_proj"``) forms.
+        Default is all projections loaded in *weights*.
     align : apply Procrustes alignment to P_i before computing BW
+        (single block only)
     cache_dir : directory for caching alignment matrices (None → no cache)
     """
     names = weights.keys()
     n = len(names)
 
-    # Per-adapter precompute: QR of B and thin SVD of M = R A.
-    Us: list[np.ndarray] = []   # U_M  (r, r) — from unaligned SVD
-    ss: list[np.ndarray] = []   # singular values (r,)
+    _layers = _normalize_layers(weights, layers)
+    _projs = _normalize_projections(weights, projections)
+    blocks = [(layer, proj) for layer in _layers for proj in _projs]
+
+    if align and len(blocks) != 1:
+        raise ValueError(
+            f"align=True is only supported for a single (layer, projection) "
+            f"block; got {len(blocks)} blocks. Multi-block Procrustes "
+            f"alignment is not implemented."
+        )
+
+    # Per-adapter precompute: stack QR(B)@A across blocks into M_total, then thin SVD.
+    Us: list[np.ndarray] = []   # U_M  (N, N) — from unaligned SVD of M_total
+    ss: list[np.ndarray] = []   # singular values (N,)
+    Ms: list[np.ndarray] = []   # M_total (N, d) — kept for the unaligned cross term
+    # Only populated when align=True (exactly one block, per the check above):
     Rs: list[np.ndarray] = []   # R from QR of B  (r, r)
     As: list[np.ndarray] = []   # A  (r, d)
     Bs: list[np.ndarray] = []   # B  (d, r)
     for name in tqdm(names, desc="bw precompute"):
-        A = weights[name].matrix(layer, proj, "A").astype(np.float64)
-        B = weights[name].matrix(layer, proj, "B").astype(np.float64)
-        _, R = np.linalg.qr(B)                          # R: (r, r)
-        M = R @ A                                        # (r, d)
-        U_M, s, _ = np.linalg.svd(M, full_matrices=False)
+        M_blocks = []
+        for layer, proj in blocks:
+            A = weights[name].matrix(layer, proj, "A").astype(np.float64)
+            B = weights[name].matrix(layer, proj, "B").astype(np.float64)
+            _, R = np.linalg.qr(B)                          # R: (r, r)
+            M_blocks.append(R @ A)                          # (r, d)
+            if align:
+                Rs.append(R)
+                As.append(A)
+                Bs.append(B)
+        M_total = np.concatenate(M_blocks, axis=0)          # (N, d)
+        U_M, s, _ = np.linalg.svd(M_total, full_matrices=False)
         Us.append(U_M)
         ss.append(s)
-        Rs.append(R)
-        As.append(A)
-        Bs.append(B)
+        Ms.append(M_total)
 
     D = np.zeros((n, n))
     pairs = list(combinations(range(n), 2))
     desc = "bw pairs (aligned)" if align else "bw pairs"
     for i, j in tqdm(pairs, desc=desc, total=len(pairs)):
         if align:
+            layer, proj = blocks[0]
             U_ij, V_ij, _, _, _ = _load_or_compute_alignment(
                 names[i], names[j], As[i], Bs[i], As[j], Bs[j],
                 layer, proj, cache_dir,
@@ -337,13 +422,82 @@ def bures_wasserstein_distance_matrix(
             nuclear = float(np.sum(np.linalg.svd(G, compute_uv=False)))
             d2 = float(np.dot(s_i, s_i)) + float(np.dot(ss[j], ss[j])) - 2.0 * nuclear
         else:
-            AiAj = As[i] @ As[j].T                    # (r, r)
-            MiMj = Rs[i] @ AiAj @ Rs[j].T             # (r, r)
-            G = Us[i].T @ MiMj @ Us[j]                # (r, r)
+            MiMj = Ms[i] @ Ms[j].T                    # (N, N)
+            G = Us[i].T @ MiMj @ Us[j]                # (N, N)
             nuclear = float(np.sum(np.linalg.svd(G, compute_uv=False)))
             d2 = float(np.dot(ss[i], ss[i])) + float(np.dot(ss[j], ss[j])) - 2.0 * nuclear
         D[i, j] = D[j, i] = float(np.sqrt(max(d2, 0.0)))
     return list(names), D
+
+
+# ---------------------------------------------------------------------------
+# Cosine similarity matrix
+# ---------------------------------------------------------------------------
+
+def cosine_similarity_matrix(
+    weights,
+    layers: list[int] | None = None,
+    projections: str | list[str] | None = None,
+) -> tuple[list[str], np.ndarray]:
+    """Pairwise cosine similarity between concatenated LoRA products B @ A.
+
+    Uses the same low-rank formulation as :func:`frobenius_distance_matrix`
+    throughout (no d×d matrices formed), generalized to a concatenation over
+    multiple (layer, proj) blocks:
+
+      dot(v_i, v_j) = Σ_{layer,proj} tr(B_i^T B_j · A_j A_i^T)   (all r×r)
+      ‖v_i‖^2       = Σ_{layer,proj} _frob_sq(A_i, B_i)
+
+    where v_i is the vector obtained by raveling and concatenating each
+    B @ A product across the selected layers/projections.
+
+    Parameters
+    ----------
+    weights : LoRAWeightCollection
+    layers : layer indices to include; default is all layers loaded in *weights*
+    projections : projections to include, e.g. ``"o"`` or ``["k", "v"]``;
+        accepts short (``"o"``) or long (``"o_proj"``) forms.
+        Default is all projections loaded in *weights*.
+
+    Returns
+    -------
+    names : list of adapter names in matrix order
+    S     : (n, n) float64 symmetric cosine similarity matrix, values in [-1, 1]
+    """
+    names = weights.keys()
+    n = len(names)
+
+    _layers = _normalize_layers(weights, layers)
+    _projs = _normalize_projections(weights, projections)
+
+    As: list[list[np.ndarray]] = []
+    Bs: list[list[np.ndarray]] = []
+    norm_sq: list[float] = []
+    for name in tqdm(names, desc="cosine precompute"):
+        adapter_As: list[np.ndarray] = []
+        adapter_Bs: list[np.ndarray] = []
+        total = 0.0
+        for layer in _layers:
+            for proj in _projs:
+                A = weights[name].matrix(layer, proj, "A").astype(np.float64)
+                B = weights[name].matrix(layer, proj, "B").astype(np.float64)
+                adapter_As.append(A)
+                adapter_Bs.append(B)
+                total += _frob_sq(A, B)
+        As.append(adapter_As)
+        Bs.append(adapter_Bs)
+        norm_sq.append(total)
+
+    S = np.ones((n, n), dtype=np.float64)
+    pairs = list(combinations(range(n), 2))
+    for i, j in tqdm(pairs, desc="cosine similarity", total=len(pairs)):
+        dot = 0.0
+        for k in range(len(As[i])):
+            K_ij = Bs[i][k].T @ Bs[j][k]                   # (r, r)
+            dot += float(np.trace(K_ij @ (As[j][k] @ As[i][k].T)))
+        S[i, j] = S[j, i] = dot / np.sqrt(norm_sq[i] * norm_sq[j])
+
+    return names, np.clip(S, -1.0, 1.0)
 
 
 # ---------------------------------------------------------------------------

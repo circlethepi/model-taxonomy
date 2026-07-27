@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import numpy as np
+from tqdm.auto import tqdm
 
 from src.core.protocols import ModelID
 from src.core.representation import ModelRepresentation
@@ -223,6 +224,85 @@ class LoRACache:
             for d in sorted(self._loras_dir.iterdir())
             if d.is_dir()
         ]
+
+    # ------------------------------------------------------------------
+    # Product vectorization
+    # ------------------------------------------------------------------
+
+    _PROJ_LONG_TO_SHORT = {"k_proj": "k", "q_proj": "q", "v_proj": "v", "o_proj": "o"}
+
+    def vectorize_products(
+        self,
+        base_model_id: str,
+        weights,
+        layers: list[int] | None = None,
+        projections: str | list[str] | None = None,
+        adapter_names: list[str] | None = None,
+    ) -> dict[str, np.ndarray]:
+        """Compute and cache per-adapter LoRA product vectors (B @ A) across layers and projections.
+
+        For each adapter in *weights*, products are computed for every (layer, projection)
+        pair in sorted order and concatenated into a single 1-D float32 array.
+
+        Results are stored under the same adapter directory layout used by :meth:`save`:
+        ``adapters/{base_model_slug}/{adapter_slug}/{config_hash}/`` with a ``config.json``
+        and ``vector.npy``.  Existing entries are returned without recomputation.
+
+        Parameters
+        ----------
+        base_model_id : base model string (e.g. ``"meta-llama/Llama-3.2-3B"``)
+        weights : LoRAWeightCollection
+        layers : layer indices to include; default is all layers loaded in *weights*
+        projections : projections to include, e.g. ``"o"`` or ``["k", "v"]``;
+            accepts short (``"o"``) or long (``"o_proj"``) forms.
+            Default is all projections loaded in *weights*.
+        adapter_names : subset of adapter names to process; default is all adapters in *weights*
+
+        Returns
+        -------
+        dict mapping adapter name → 1-D float32 array of length
+        ``n_layers × n_projections × out_features × in_features``
+        """
+        _layers = sorted(weights.layers if layers is None else layers)
+
+        if projections is None:
+            _projs = sorted(weights.projections)
+        else:
+            raw = [projections] if isinstance(projections, str) else list(projections)
+            _projs = sorted({self._PROJ_LONG_TO_SHORT.get(p.lower(), p.lower()) for p in raw})
+
+        vectorization_config = {
+            "type": "vectorized_product",
+            "layers": _layers,
+            "projections": _projs,
+        }
+        config_hash = self._config_hash(vectorization_config)
+
+        names = adapter_names if adapter_names is not None else weights.keys()
+
+        result: dict[str, np.ndarray] = {}
+        for name in tqdm(names, desc="vectorize products"):
+            vec_dir = self._adapter_dir(base_model_id, name) / config_hash
+            config_path = vec_dir / "config.json"
+            vector_path = vec_dir / "vector.npy"
+
+            if config_path.exists() and vector_path.exists():
+                result[name] = np.load(str(vector_path))
+                continue
+
+            vec = np.concatenate([
+                weights[name].product(layer, proj).ravel()
+                for layer in _layers
+                for proj in _projs
+            ]).astype(np.float32)
+
+            vec_dir.mkdir(parents=True, exist_ok=True)
+            config_path.write_text(json.dumps(vectorization_config, indent=2))
+            np.save(str(vector_path), vec)
+
+            result[name] = vec
+
+        return result
 
     # ------------------------------------------------------------------
     # Hub helpers

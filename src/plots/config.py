@@ -11,7 +11,9 @@ import seaborn as sns
 from matplotlib.ticker import ScalarFormatter
 
 # ── Figures output directory ──────────────────────────────────────────────────
-GLOBAL_FIGURES_DIR = Path("figures")
+#   Anchored to the repo base so figures land in the same place regardless of
+#   the working directory a script or notebook happens to run from.
+GLOBAL_FIGURES_DIR = Path(__file__).resolve().parents[2] / "figures"
 
 # ── Colorblind-safe palette ───────────────────────────────────────────────────
 PALETTE = sns.color_palette("colorblind", 10)

@@ -510,6 +510,9 @@ def plot_distance_analysis(
     title: str,
     ax_heat,
     ax_mds,
+    mds_dim = 2,
+    save: bool = False,
+    savepath: str | Path | None = None,
 ) -> None:
     """Draw a heatmap and an MDS scatter for one distance matrix.
 
@@ -527,11 +530,25 @@ def plot_distance_analysis(
         Subplot title.
     ax_heat, ax_mds:
         Matplotlib axes for the heatmap and MDS scatter respectively.
+    mds_dim:
+        Number of dimensions for the MDS embedding.
+    save:
+        Save the figure that owns *ax_heat* / *ax_mds*. Implied by *savepath*.
+    savepath:
+        Where to write it; defaults to ``figures/fig_<title>.png`` under the
+        repo base. A bare filename lands in that same ``figures/`` directory,
+        while a path with directories (or an absolute path) is used as given.
+        A non-image suffix gets ``.png`` appended.
+
+        When several calls share one figure — the usual grid layout, one call
+        per column — only the last call writes a fully populated image.
     """
     import matplotlib.colors as mcolors
     import matplotlib.pyplot as plt
     import seaborn as sns
     from sklearn.manifold import MDS
+
+    from src.plots import save_figure
 
     labels = [model_label(n) for n in names]
     values = [float(l) for l in labels]
@@ -553,7 +570,15 @@ def plot_distance_analysis(
     scatter_cmap = plt.cm.plasma
     scatter_norm = mcolors.Normalize(vmin=0, vmax=100)
 
-    coords = MDS(n_components=2, dissimilarity="precomputed", random_state=42).fit_transform(dist_mat)
+    coords = MDS(n_components=mds_dim, dissimilarity="precomputed", random_state=42).fit_transform(dist_mat)
+
+    if mds_dim == 1:
+        ax_mds.set_xlabel("MDS Dimension 1")
+        coords = np.hstack([coords, np.zeros_like(coords)])
+        ax_mds.set_yticks([])
+    else:
+        ax_mds.set_xlabel("MDS Dimension 1")
+        ax_mds.set_ylabel("MDS Dimension 2")
 
     for (x, y), label, val in zip(coords, labels, values):
         color = scatter_cmap(scatter_norm(val))
@@ -571,3 +596,6 @@ def plot_distance_analysis(
 
     ax_mds.axis("equal")
     ax_mds.set_title(title + " (MDS)")
+
+    if save or savepath is not None:
+        save_figure(ax_heat.get_figure(), savepath, title)

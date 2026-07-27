@@ -38,12 +38,17 @@ def make_series(
 
 # ── Shared helpers ────────────────────────────────────────────────────────────
 
+_IMAGE_SUFFIXES = {".png", ".pdf", ".svg", ".jpg", ".jpeg", ".eps", ".tif", ".tiff"}
+
+
 def _resolve_savepath(savepath: Any, title: str | None) -> Path:
-    """Return a .png Path, always inside GLOBAL_FIGURES_DIR unless absolute."""
+    """Return an image Path, always inside GLOBAL_FIGURES_DIR unless absolute."""
     if savepath is None:
         name = (title or "untitled").lower().replace(" ", "_")
         return GLOBAL_FIGURES_DIR / f"fig_{name}.png"
-    p = Path(savepath).with_suffix(".png")
+    p = Path(savepath)
+    if p.suffix.lower() not in _IMAGE_SUFFIXES:
+        p = p.with_name(p.name + ".png")
     if p.parent == Path("."):
         return GLOBAL_FIGURES_DIR / p
     return p
@@ -52,6 +57,18 @@ def _resolve_savepath(savepath: Any, title: str | None) -> Path:
 def _save(fig: plt.Figure, savepath: Path) -> None:
     savepath.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(savepath)
+
+
+def save_figure(fig: plt.Figure, savepath: Any = None, title: str | None = None) -> Path:
+    """Save *fig* and return where it went.
+
+    Bare filenames land in ``GLOBAL_FIGURES_DIR`` (the repo ``figures/``
+    directory); paths with directories and absolute paths are used as given.
+    With no *savepath*, the name is derived from *title*.
+    """
+    path = _resolve_savepath(savepath, title)
+    _save(fig, path)
+    return path
 
 
 def _short_id(model_id: str) -> str:

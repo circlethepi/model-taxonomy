@@ -12,7 +12,7 @@ therefore reindexes to the common set first, via :func:`match_models`.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Literal, Mapping, Sequence
+from typing import Callable, Literal, Mapping, Sequence
 
 import numpy as np
 
@@ -23,7 +23,7 @@ from src.core.protocols import ModelID
 CorrelationMethod = Literal["spearman", "pearson"]
 
 
-def match_models(*objs) -> tuple[list[ModelID], list[np.ndarray]]:
+def match_models(*objs, key: Callable[[ModelID], str] | None = None) -> tuple[list[ModelID], list[np.ndarray]]:
     """Reindex several objects onto their common models, in one shared order.
 
     This is bookkeeping — a set intersection plus a permutation — and has
@@ -33,6 +33,17 @@ def match_models(*objs) -> tuple[list[ModelID], list[np.ndarray]]:
     :class:`GeometryResult` (reindexed on rows only).  The shared order follows
     the first object's ``model_ids``, restricted to the intersection, so results
     are deterministic rather than set-ordering dependent.
+
+    Parameters
+    ----------
+    key:
+        Optional normalisation applied to every identifier before intersecting.
+        Two taxonomy levels can describe the same models under different naming
+        schemes — the dataset-level and model-level taxonomies being the case
+        that arises in practice — and a *key* reconciles them without touching
+        stored results.  Pass
+        :func:`src.analysis.identity.recipe_id_for` for that one.  The returned
+        ``model_ids`` are the normalised identifiers.
 
     Returns
     -------
@@ -44,7 +55,13 @@ def match_models(*objs) -> tuple[list[ModelID], list[np.ndarray]]:
     if len(objs) < 1:
         raise ValueError("match_models needs at least one object")
 
-    id_lists = [list(_model_ids(o)) for o in objs]
+    id_lists = [[key(m) for m in _model_ids(o)] if key else list(_model_ids(o)) for o in objs]
+    for obj, ids in zip(objs, id_lists):
+        if len(set(ids)) != len(ids):
+            raise ValueError(
+                f"{type(obj).__name__} has duplicate identifiers after applying "
+                f"key — its rows would be ambiguous. See src.analysis.relabel."
+            )
     common = set(id_lists[0]).intersection(*(set(x) for x in id_lists[1:]))
     if not common:
         raise ValueError(
@@ -96,14 +113,18 @@ def matrix_correlation(
     dm_a: DistanceMatrix,
     dm_b: DistanceMatrix,
     method: CorrelationMethod = "spearman",
+    key: Callable[[ModelID], str] | None = None,
 ) -> float:
     """Correlation between the two matrices' off-diagonal vectors.
 
     For five common models that is a correlation between two 10-element
     vectors, one entry per model pair: *do the two taxonomies rank model-pair
     similarity the same way?*
+
+    *key* is passed to :func:`match_models` to reconcile differing identifier
+    schemes.
     """
-    _, (a, b) = match_models(dm_a, dm_b)
+    _, (a, b) = match_models(dm_a, dm_b, key=key)
     return _corr(offdiag(a), offdiag(b), method)
 
 
@@ -144,6 +165,7 @@ def mantel_test(
     n_permutations: int = 9999,
     method: CorrelationMethod = "spearman",
     random_state: int | None = 0,
+    key: Callable[[ModelID], str] | None = None,
 ) -> MantelResult:
     """Permutation test for correspondence between two distance matrices.
 
@@ -157,8 +179,11 @@ def mantel_test(
     The p-value is one-sided (``P(null >= observed)``) with the observed value
     included in the count, so it can never be zero and is bounded below by
     ``1 / (n_permutations + 1)``.
+
+    *key* is passed to :func:`match_models` to reconcile differing identifier
+    schemes.
     """
-    ids, (a, b) = match_models(dm_a, dm_b)
+    ids, (a, b) = match_models(dm_a, dm_b, key=key)
     n = len(ids)
     if n < 3:
         raise ValueError(f"Mantel test needs at least 3 common models, got {n}")
@@ -187,6 +212,7 @@ def correlation_table(
     analyses,
     method: CorrelationMethod = "spearman",
     min_models: int = 3,
+    key: Callable[[ModelID], str] | None = None,
 ) -> tuple[list[str], np.ndarray]:
     """All-pairs correlation across taxonomy levels.
 
@@ -200,6 +226,10 @@ def correlation_table(
     min_models:
         Pairs sharing fewer than this many models are reported as ``nan``
         rather than as a correlation computed from too little data.
+    key:
+        Identifier normalisation, passed to :func:`match_models`.  Pass
+        :func:`src.analysis.identity.recipe_id_for` to bring
+        ``dataset_embedding`` into the table — see Notes.
 
     Returns
     -------
@@ -211,12 +241,17 @@ def correlation_table(
     Notes
     -----
     Entries are ``nan`` where two levels cannot be compared, rather than raising
-    — one incomparable pair should not destroy the whole table.  The case that
-    shows up in practice is ``dataset_embedding``, which
+    — one incomparable pair should not destroy the whole table.
+
+    With ``key=None`` that includes ``dataset_embedding``, which
     :class:`~src.taxonomy.dataset_embedding.DatasetEmbeddingTaxonomy` keys by
-    *recipe* ID while the model-level taxonomies key by adapter path.  Those are
-    different index spaces with no overlap, so comparing them requires first
-    relabelling one side onto the other's identifiers.
+    *recipe* ID (``yahoo_topic0_only``) while the model-level taxonomies key by
+    adapter path (``.../yahoo_topic0_only_r16``).  The two describe the same
+    experimental objects, so passing ``key=recipe_id_for`` maps the adapter
+    paths onto their training recipes and the whole table fills in.  A
+    dataset-level taxonomy can legitimately carry entries no adapter was trained
+    on — a held-out probe set, say — and those simply fall out of the
+    intersection.
     """
     mapping = _as_matrix_mapping(analyses)
     labels = list(mapping)
@@ -226,11 +261,15 @@ def correlation_table(
         for j in range(i + 1, n):
             a, b = mapping[labels[i]], mapping[labels[j]]
             try:
-                ids, _ = match_models(a, b)
+                ids, _ = match_models(a, b, key=key)
             except ValueError:
                 c = np.nan
             else:
-                c = matrix_correlation(a, b, method) if len(ids) >= min_models else np.nan
+                c = (
+                    matrix_correlation(a, b, method, key=key)
+                    if len(ids) >= min_models
+                    else np.nan
+                )
             table[i, j] = table[j, i] = c
     return labels, table
 

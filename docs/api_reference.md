@@ -726,21 +726,42 @@ save_collection(dm, geometries=(), cache_root=..., model_entries=None) -> str
 ### Distance-matrix comparison
 
 ```python
-match_models(*objs) -> tuple[list[ModelID], list[np.ndarray]]
+match_models(*objs, key=None) -> tuple[list[ModelID], list[np.ndarray]]
 offdiag(matrix) -> np.ndarray
-matrix_correlation(dm_a, dm_b, method="spearman") -> float
+matrix_correlation(dm_a, dm_b, method="spearman", key=None) -> float
 mantel_test(dm_a, dm_b, n_permutations=9999, method="spearman",
-            random_state=0) -> MantelResult
-correlation_table(analyses, method="spearman", min_models=3)
+            random_state=0, key=None) -> MantelResult
+correlation_table(analyses, method="spearman", min_models=3, key=None)
     -> tuple[list[str], np.ndarray]
 ```
 
 `match_models` is set intersection plus reindexing — bookkeeping, unrelated to
 Procrustes. `correlation_table` reports `nan` for pairs with no models in common
-rather than raising; `dataset_embedding` is keyed by recipe ID while model-level
-taxonomies are keyed by model ID, so that row is legitimately incomparable.
+rather than raising.
 
 `MantelResult`: `statistic`, `p_value`, `n_permutations`, `n_models`, `method`, `null`.
+
+### Identifier reconciliation
+
+```python
+recipe_id_for(model_id) -> str
+relabel(obj, key) -> DistanceMatrix | GeometryResult | dict
+id_overlap(*objs, key=None) -> dict
+```
+
+Model-level taxonomies key rows by adapter path
+(`.../yahoo_topic0_only_r16`); `DatasetEmbeddingTaxonomy` keys them by recipe ID
+(`yahoo_topic0_only`). `recipe_id_for` maps the former onto the latter, reading
+`dataset_name` from the adapter's `experiment_meta.json` and falling back to
+parsing the directory name; non-adapter identifiers pass through unchanged. Pass
+it as `key=` to any comparison function to bring `dataset_embedding` into a
+cross-taxonomy table.
+
+`relabel` returns a copy with rewritten `model_ids` (arrays shared, input
+untouched) and accepts a callable or a partial mapping. It raises if the rewrite
+would collide two distinct models — as a LoRA rank or init-seed sweep would,
+since those variants share one dataset. `id_overlap` reports identifier counts,
+intersection size and the entries unique to each side, with or without a `key`.
 
 ### Configuration comparison
 

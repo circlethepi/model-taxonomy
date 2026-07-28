@@ -7,9 +7,11 @@ Three levels of comparison, all built on the containers in :mod:`src.core`:
 * :mod:`~src.analysis.simplex` — positions within a simplex of anchor models.
 
 plus :mod:`~src.analysis.quality` for how faithfully an embedding represents the
-distances it came from, and :mod:`~src.analysis.bridge` for turning raw LoRA
-weights into the same typed containers so notebook work and pipeline results can
-be analysed with one set of tools.
+distances it came from, :mod:`~src.analysis.bridge` for turning raw LoRA weights
+into the same typed containers so notebook work and pipeline results can be
+analysed with one set of tools, and :mod:`~src.analysis.identity` for
+reconciling the identifier schemes different taxonomy levels use for the same
+models.
 """
 
 from .bridge import (
@@ -28,6 +30,7 @@ from .configurations import (
     procrustes_compare,
     protest,
 )
+from .identity import id_overlap, recipe_id_for, relabel
 from .matrices import (
     MantelResult,
     correlation_table,
@@ -52,6 +55,10 @@ __all__ = [
     "lora_distance_matrix",
     "fit_geometry",
     "save_collection",
+    # identity
+    "recipe_id_for",
+    "relabel",
+    "id_overlap",
     # matrices
     "match_models",
     "offdiag",

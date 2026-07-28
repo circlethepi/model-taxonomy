@@ -590,12 +590,80 @@ def t_cross_taxonomy():
     assert np.allclose(table, table.T, equal_nan=True)
 
     # dataset_embedding is keyed by recipe ID, the model-level taxonomies by
-    # adapter path, so that row is legitimately incomparable and must be nan
+    # adapter path, so with no key that row is incomparable and must be nan
     # rather than an exception that takes the whole table down with it.
     off = table[~np.eye(len(labels), dtype=bool)]
     n_comparable = int(np.sum(~np.isnan(off)) // 2)
     assert n_comparable > 0, "no taxonomy pair was comparable"
     return f"{len(labels)} levels, {n_comparable} comparable pair(s), rest nan"
+
+
+@check("[data] identity: recipe_id_for makes dataset_embedding comparable")
+def t_recipe_relabelling():
+    from src.core.analysis import ModelTaxonomyProfile
+    from src.analysis import id_overlap, recipe_id_for
+
+    root = REPO / "results/yahoo_topics/taxonomy"
+    if not (root / "meta.json").exists():
+        raise _Skip(f"{root} not present")
+
+    profile = ModelTaxonomyProfile.load(root)
+    mats = {k: v.distance_matrix for k, v in profile.analyses.items()}
+    if "dataset_embedding" not in mats:
+        raise _Skip("no dataset_embedding level in this profile")
+
+    model_level = next(k for k in ("structural", "functional", "behavioral") if k in mats)
+    de = mats["dataset_embedding"]
+
+    before = id_overlap(mats[model_level], de)
+    after = id_overlap(mats[model_level], de, key=recipe_id_for)
+    assert before["n_common"] == 0, "expected disjoint identifier spaces before relabelling"
+    assert after["n_common"] == len(mats[model_level].model_ids), after
+
+    # Every adapter must resolve, and to the recipe the fine-tuning script
+    # recorded — not merely to *some* string that happens to collide.
+    for mid in mats[model_level].model_ids:
+        rid = recipe_id_for(mid)
+        assert rid in de.model_ids, f"{mid} -> {rid} not a dataset_embedding id"
+
+    # An unadapted HuggingFace ID must survive untouched: it is not an adapter
+    # path, and stripping it at the "/" would silently produce "meta-llama".
+    assert recipe_id_for("meta-llama/Llama-3.2-3B") == "meta-llama/Llama-3.2-3B"
+
+    _, table = correlation_table(mats, key=recipe_id_for)
+    assert not np.isnan(table).any(), "table still has incomparable pairs"
+
+    return (
+        f"{after['n_common']} models matched, "
+        f"{len(de.model_ids) - after['n_common']} dataset-only entry(s) dropped; "
+        "full table"
+    )
+
+
+@check("identity: relabel refuses to collide distinct models")
+def t_relabel_collision():
+    from src.analysis import recipe_id_for, relabel
+
+    # Two adapters, same dataset, different LoRA rank — a rank sweep.  Mapping
+    # both to the recipe ID would make the rows ambiguous.
+    dm = as_distance_matrix(
+        ["a/yahoo_50t0_50t1_r8", "a/yahoo_50t0_50t1_r16"],
+        np.array([[0.0, 1.0], [1.0, 0.0]]),
+        "m",
+        "structural",
+    )
+    try:
+        relabel(dm, recipe_id_for)
+    except ValueError as e:
+        assert "same identifier" in str(e), str(e)
+    else:
+        raise AssertionError("expected a collision to be rejected")
+
+    # A mapping leaves unlisted identifiers alone.
+    out = relabel(dm, {"a/yahoo_50t0_50t1_r8": "rank8"})
+    assert out.model_ids == ["rank8", "a/yahoo_50t0_50t1_r16"], out.model_ids
+    assert dm.model_ids[0] == "a/yahoo_50t0_50t1_r8", "input was mutated"
+    return "collision rejected; mapping form is partial and non-mutating"
 
 
 # ── entry point ───────────────────────────────────────────────────────────────
@@ -606,9 +674,11 @@ SYNTHETIC = [
     t_mantel, t_procrustes, t_procrustes_vs_scipy, t_per_point_residuals,
     t_dispersion, t_quality, t_correlation_table, t_match_models, t_fit_geometry,
     t_similarity_conversion, t_simplex_roundtrip, t_cosine_equivalence,
+    t_relabel_collision,
 ]
 DATA_BACKED = [
     t_cosine_real_adapters, t_recovery, t_collection_roundtrip, t_cross_taxonomy,
+    t_recipe_relabelling,
 ]
 
 

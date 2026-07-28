@@ -237,6 +237,33 @@ enter the same layer via `src.analysis.lora_distance_matrix`, which returns an
 ordinary `DistanceMatrix` — so notebook work and pipeline runs are analysed and
 plotted with one set of tools.
 
+### Matching identifiers across levels
+
+The model-level taxonomies key their rows by **adapter path**
+(`results/yahoo_topics/adapters/meta-llama--Llama-3.2-3B/yahoo_topic0_only_r16`);
+`DatasetEmbeddingTaxonomy` keys its rows by **recipe ID** (`yahoo_topic0_only`),
+because its objects are datasets, not models. Those are the same experimental
+thing seen from two sides, but as strings they never match, so comparing the two
+levels directly finds nothing in common.
+
+`src.analysis.recipe_id_for` maps an adapter onto the recipe it was trained on —
+authoritatively, from the `dataset_name` that `finetune_lora.py` records in
+`experiment_meta.json` beside every adapter. Pass it as `key=` to any comparison
+function:
+
+```python
+from src.analysis import correlation_table, recipe_id_for
+
+labels, table = correlation_table(profile, key=recipe_id_for)
+```
+
+Dataset-level entries with no corresponding adapter — a held-out probe set, say
+— simply fall out of the intersection. Nothing on disk is rewritten; use
+`relabel()` if you want a copy carrying the new identifiers. Because the mapping
+is many-to-one (rank and seed variants of one dataset collapse together), a
+collection that sweeps those parameters must not be relabelled this way, and
+`relabel()` raises rather than let distinct models collide.
+
 ---
 
 ## Design principles

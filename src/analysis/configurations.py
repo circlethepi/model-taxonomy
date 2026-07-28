@@ -10,12 +10,17 @@ that MDS happened to pick, none of which carry meaning.
 Two geometries need not share dimensionality; the lower-dimensional one is
 padded with zero columns, which embeds it in the larger space without changing
 any of its internal distances.
+
+``disparity`` follows SciPy's convention — on unit-normalised inputs it is
+``1 - (Σσ)²`` and therefore lies in ``[0, 1]``, 0 meaning identical shape.
+``scripts/check_analysis.py::t_procrustes_vs_scipy`` pins it there against
+:func:`scipy.spatial.procrustes` so the two cannot drift apart.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Sequence
+from typing import Callable, Sequence
 
 import numpy as np
 
@@ -50,6 +55,35 @@ def _standardize(a: np.ndarray, scaling: bool) -> tuple[np.ndarray, np.ndarray, 
     return out / norm, centroid, norm
 
 
+# Why this is hand-written rather than a call into SciPy.
+#
+# SciPy offers two entry points, and neither covers what this module needs:
+#
+#   scipy.spatial.procrustes(data1, data2) -> (mtx1, mtx2, disparity)
+#       Takes no options at all.  It never returns the rotation or the scale, so
+#       `ProcrustesResult` could not expose them and `align_to_reference` would
+#       have no transform to apply; it always standardises, so `scaling=False`
+#       is unreachable; it always permits reflection; it rejects inputs of
+#       differing shape ("Input matrices must be of same shape"), which rules
+#       out comparing a 2-D embedding against a 3-D one; and it is pairwise, so
+#       fitting N geometries onto one frame is not expressible.
+#
+#   scipy.linalg.orthogonal_procrustes(A, B) -> (R, sum of singular values)
+#       Exactly what the `reflection=True` branch below computes — verified
+#       identical to the bit, in both R and the scale.  It has no notion of
+#       forbidding reflection, at this or any other level of the library.
+#
+# So the only genuinely custom piece is the det(R) = +1 correction.  It is not
+# split out to delegate the other half to SciPy because that branch needs the
+# singular values anyway: one SVD serves both cases here, whereas delegating
+# would leave two independent implementations of the same quantity.
+#
+# `scaling=False` is load-bearing rather than a convenience.  Under unit-norm
+# standardisation, displacing a single model redistributes the residual across
+# the whole configuration, which is enough to make `per_point_residuals` blame
+# the wrong model.  Isolating one point's movement requires switching scaling
+# off, and SciPy's interface cannot.
+
 def _optimal_rotation(
     source: np.ndarray, target: np.ndarray, reflection: bool
 ) -> tuple[np.ndarray, float]:
@@ -57,6 +91,8 @@ def _optimal_rotation(
 
     ``s`` is the sum of the singular values of ``sourceᵀ target``; for
     unit-norm inputs the resulting disparity is ``1 - s²``.
+
+    With ``reflection=True`` this is :func:`scipy.linalg.orthogonal_procrustes`.
     """
     u, sv, vt = np.linalg.svd(source.T @ target)
     if not reflection and np.linalg.det(u @ vt) < 0:
@@ -104,6 +140,7 @@ def procrustes_compare(
     geom_b: GeometryResult,
     scaling: bool = True,
     reflection: bool = True,
+    key: Callable[[ModelID], str] | None = None,
 ) -> ProcrustesResult:
     """Superimpose *geom_b* onto *geom_a* and report the leftover mismatch.
 
@@ -119,12 +156,18 @@ def procrustes_compare(
     reflection:
         Whether a reflection is permitted in addition to rotation.  MDS output
         is only defined up to reflection, so the default ``True`` is almost
-        always what you want.
+        always what you want, and no caller in this repo sets it otherwise.
+        ``False`` is for configurations where chirality is meaningful — where a
+        mirrored arrangement should count as a genuine disagreement rather than
+        the same shape seen the other way round.
 
     The returned ``aligned_a`` / ``aligned_b`` are new :class:`GeometryResult`
     objects sharing one frame, ready to plot on the same axes.
+
+    *key* is passed to :func:`~src.analysis.matrices.match_models` to reconcile
+    differing identifier schemes across taxonomy levels.
     """
-    ids, (a_raw, b_raw) = match_models(geom_a, geom_b)
+    ids, (a_raw, b_raw) = match_models(geom_a, geom_b, key=key)
     if len(ids) < 2:
         raise ValueError(f"Procrustes needs at least 2 common models, got {len(ids)}")
 
@@ -202,6 +245,7 @@ def protest(
     random_state: int | None = 0,
     scaling: bool = True,
     reflection: bool = True,
+    key: Callable[[ModelID], str] | None = None,
 ) -> ProtestResult:
     """Permutation test on the Procrustes disparity (PROTEST).
 
@@ -214,7 +258,7 @@ def protest(
     Because low disparity means good agreement, the p-value counts
     ``P(null <= observed)``; it is bounded below by ``1 / (n_permutations + 1)``.
     """
-    ids, (a_raw, b_raw) = match_models(geom_a, geom_b)
+    ids, (a_raw, b_raw) = match_models(geom_a, geom_b, key=key)
     n = len(ids)
     if n < 3:
         raise ValueError(f"PROTEST needs at least 3 common models, got {n}")
@@ -248,6 +292,7 @@ def align_to_reference(
     reference: GeometryResult | None = None,
     scaling: bool = True,
     reflection: bool = True,
+    key: Callable[[ModelID], str] | None = None,
 ) -> list[GeometryResult]:
     """Superimpose several configurations onto one common frame.
 
@@ -265,7 +310,7 @@ def align_to_reference(
         raise ValueError("align_to_reference needs at least one geometry")
     ref = geoms[0] if reference is None else reference
 
-    ids, arrays = match_models(ref, *geoms)
+    ids, arrays = match_models(ref, *geoms, key=key)
     ref_raw, others = arrays[0], arrays[1:]
 
     d = max(a.shape[1] for a in arrays)
@@ -307,6 +352,7 @@ def point_dispersion(
     reference: GeometryResult | None = None,
     scaling: bool = True,
     reflection: bool = True,
+    key: Callable[[ModelID], str] | None = None,
 ) -> DispersionResult:
     """Per-model positional spread across several configurations.
 
@@ -322,7 +368,7 @@ def point_dispersion(
     if len(geoms) < 2:
         raise ValueError(f"point_dispersion needs at least 2 geometries, got {len(geoms)}")
 
-    aligned = align_to_reference(geoms, reference, scaling, reflection)
+    aligned = align_to_reference(geoms, reference, scaling, reflection, key=key)
     stack = np.stack([np.asarray(g.coordinates, dtype=np.float64) for g in aligned])
 
     centroids = stack.mean(axis=0)

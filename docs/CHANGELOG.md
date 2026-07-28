@@ -29,6 +29,26 @@ intersection + reindexing, needed because taxonomy levels cover different model
 sets in different orders), `offdiag()`, `matrix_correlation()`, `mantel_test()`,
 `correlation_table()`.
 
+**`src/analysis/identity.py`** — reconciles the identifier schemes different
+taxonomy levels use for the same objects. `DatasetEmbeddingTaxonomy` keys by
+recipe ID (`yahoo_topic0_only`) while the model-level taxonomies key by adapter
+path (`.../yahoo_topic0_only_r16`), so a set intersection between them returned
+nothing and `dataset_embedding` was reported as incomparable in every
+cross-taxonomy table. `recipe_id_for()` maps an adapter to the recipe it was
+trained on, reading the `dataset_name` that `finetune_lora.py` records in
+`experiment_meta.json` (falling back to parsing the directory name only when
+that file is absent), and returns non-adapter identifiers unchanged.
+`relabel()` rewrites an object's `model_ids`, refusing any rewrite that would
+collide two distinct models onto one identifier — which is what a rank or
+init-seed sweep would do. `id_overlap()` reports why a comparison found nothing
+in common.
+
+All the comparison functions (`match_models`, `matrix_correlation`,
+`mantel_test`, `correlation_table`, `procrustes_compare`, `protest`,
+`align_to_reference`, `point_dispersion`) gained an optional `key=` argument
+that applies such a normalisation before intersecting. Stored results are never
+modified.
+
 **`src/analysis/configurations.py`** — point-configuration level, all Procrustes
 based and therefore invariant to the rotation/reflection/scale an embedding picks
 arbitrarily. `procrustes_compare()` (disparity matches `scipy.spatial.procrustes`),

@@ -546,8 +546,8 @@ def plot_distance_analysis(
     import matplotlib.colors as mcolors
     import matplotlib.pyplot as plt
     import seaborn as sns
-    from sklearn.manifold import MDS
 
+    from src.analysis.bridge import as_distance_matrix, fit_geometry
     from src.plots import save_figure
 
     labels = [model_label(n) for n in names]
@@ -570,7 +570,14 @@ def plot_distance_analysis(
     scatter_cmap = plt.cm.plasma
     scatter_norm = mcolors.Normalize(vmin=0, vmax=100)
 
-    coords = MDS(n_components=mds_dim, dissimilarity="precomputed", random_state=42).fit_transform(dist_mat)
+    # Routed through MDSGeometry so the whole repo has one MDS code path; the
+    # direct sklearn call this replaced used the `dissimilarity=` argument,
+    # which is deprecated in the pinned scikit-learn 1.9.
+    _dm = as_distance_matrix(names, dist_mat, metric=title, taxonomy="structural")
+    coords = np.asarray(
+        fit_geometry(_dm, method="mds", n_components=mds_dim, random_state=42).coordinates,
+        dtype=np.float64,
+    )
 
     if mds_dim == 1:
         ax_mds.set_xlabel("MDS Dimension 1")

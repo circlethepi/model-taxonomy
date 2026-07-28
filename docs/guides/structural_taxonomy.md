@@ -6,14 +6,24 @@ The default mode (`lora_only=True`) uses only LoRA adapter matrices, making this
 
 ## How it works
 
-1. Load the model on CPU (no GPU needed; no inference required).
+1. Obtain the adapter tensors — from `LoRACache`, from a local PEFT
+   `adapter_model.safetensors`, or by loading the model on CPU as a last resort
+   (no GPU needed; no inference required).
 2. Identify the set of weight layers to compare (LoRA adapters or full weight matrices).
 3. For each layer, construct a vector:
-   - **LoRA mode (`use_lora_product=True`, default)**: compute `(B @ A).flatten()`, then truncate/pad to `n_components`.
-   - **LoRA mode (`use_lora_product=False`)**: concatenate `A.flatten()` and `B.flatten()`, then truncate/pad to `n_components`.
-   - **Full-weight mode**: flatten the weight matrix, then truncate/pad to `n_components`.
-4. Stack vectors across layers: final representation matrix of shape `(N_layers, n_components)`.
+   - **LoRA mode (`use_lora_product=True`, default)**: `(B @ A).flatten()`.
+   - **LoRA mode (`use_lora_product=False`)**: `concat(A.flatten(), B.flatten())`.
+   - **Full-weight mode**: the flattened weight matrix.
+4. Stack vectors across layers, zero-padding shorter rows to the longest:
+   representation matrix of shape `(N_layers, max_len)`.
 5. Unload the model from memory.
+
+Vectors are kept at their full natural length — nothing is truncated, so no
+weight information is discarded. Padding is only there to make the rows
+stackable; the true pre-padding lengths are recorded in
+`metadata["layer_lengths"]` and in the cache `config.json`. Rows differ in length
+whenever the selected projections do (under GQA, `k_proj`/`v_proj` are narrower
+than `q_proj`/`o_proj`).
 
 ## Configuration
 
@@ -22,8 +32,9 @@ from src import StructuralTaxonomy
 from src.cache import LoRACache
 
 taxonomy = StructuralTaxonomy(
-    layer_names=None,              # None = auto-detect (LoRA modules or all 2-D weights)
-    n_components=256,              # per-layer vector length after truncate/pad
+    layer_names=None,              # explicit module-name prefixes; overrides the shorthands below
+    layer_indices="last",          # int, list[int], "last", or None for all layers
+    projections=["q", "o"],        # "k"/"q"/"v"/"o" (or long forms), a list, or None for all
     lora_only=True,                # use LoRA adapter matrices only (default)
     use_lora_product=True,         # True = compare B@A product; False = concat(A, B)
     lora_cache=LoRACache("./cache"),  # hierarchical cache (recommended for LoRA)
@@ -32,6 +43,10 @@ taxonomy = StructuralTaxonomy(
     hf_token=None,                 # falls back to HF_TOKEN env var
 )
 ```
+
+`layer_indices` and `projections` are architecture-agnostic shorthands matching
+the conventions of `load_lora_weights`. Pass `layer_names` when you need explicit
+control; it takes precedence over both.
 
 Cache priority: `lora_cache` is checked first; `cache` (flat `DiskCache`) is used as a fallback if set.
 
@@ -53,7 +68,7 @@ For `rank=16`, `in_features=out_features=4096`:
 |---|---|
 | Full weight matrix | 16 777 216 values |
 | LoRA A + B (concatenated) | 131 072 values |
-| After truncation to `n_components=256` | 256 values |
+| LoRA product `B @ A` | 16 777 216 values |
 
 The LoRA matrices encode the *delta* applied to the base model during fine-tuning. Comparing these deltas directly captures what changed during fine-tuning, independent of the shared base weights.
 
@@ -82,7 +97,7 @@ With `use_lora_product=False`, the raw adapter matrices are concatenated instead
 v = concat(lora_A.flatten(), lora_B.flatten())
 ```
 
-The product `B @ A` represents the direct change to the weight matrix, but it is much larger than the concatenated factors and may require a larger `n_components` to capture meaningful structure.
+The product `B @ A` represents the direct change to the weight matrix, but it is far larger than the concatenated factors — `out_features x in_features` rather than `rank x (in + out)`. Selecting fewer layers or projections is the way to keep representations small; for pairwise distances specifically, prefer the low-rank builders described under [Distance metrics](#distance-metrics), which compute the same numbers without ever materialising the product.
 
 ### When `lora_only=True` fails
 
@@ -147,13 +162,21 @@ cache_root/adapters/
     "num_samples": null
   },
   "extraction_config": {
-    "n_components": 256,
-    "use_lora_product": true,
-    "layer_names": null
+    "layer_names": null,
+    "layer_indices": [27],
+    "projections": ["o"],
+    "lora_only": true,
+    "use_lora_product": true
   },
+  "layer_lengths": [9437184],
   "extracted_at": "2026-06-15T00:00:00Z"
 }
 ```
+
+`extraction_config` is what the `{config_hash}` directory name is derived from, so
+two different layer/projection selections for the same adapter are cached side by
+side rather than overwriting each other. `layer_lengths` records each row's true
+length before zero-padding.
 
 `training_config` is populated automatically from the adapter's PEFT `adapter_config.json` (downloaded from the Hub). `dataset_recipe` can be passed explicitly to `LoRACache.save()` to record the full mixing recipe; if omitted, a placeholder stub is written instead.
 
@@ -176,15 +199,27 @@ taxonomy = StructuralTaxonomy(
 from src.cache import LoRACache
 
 lc = LoRACache("./cache")
+base, adapter = "meta-llama/Llama-3.1-8B", "some-org/my-adapter"
+
+# Which representation to address — the same dict StructuralTaxonomy uses to
+# build the {config_hash} directory name.
+cfg = {
+    "layer_names": None, "layer_indices": [27], "projections": ["o"],
+    "lora_only": True, "use_lora_product": True,
+}
 
 # Check and load
-lc.exists("meta-llama/Llama-3.1-8B", "some-org/my-adapter")   # → bool
-lc.load("meta-llama/Llama-3.1-8B", "some-org/my-adapter")     # → ModelRepresentation
-lc.load_config("meta-llama/Llama-3.1-8B", "some-org/my-adapter")  # → dict (config.json)
+lc.exists(base, adapter, cfg)       # → bool
+lc.load(base, adapter, cfg)         # → ModelRepresentation
+lc.load_config(base, adapter, cfg)  # → dict (config.json)
 
 # Browse
-lc.list_base_models()                              # → ["meta-llama/Llama-3.1-8B", ...]
-lc.list_adapters("meta-llama/Llama-3.1-8B")       # → ["some-org/my-adapter", ...]
+lc.list_base_models()                    # → ["meta-llama/Llama-3.1-8B", ...]
+lc.list_adapters(base)                   # → adapters with an extracted representation
+lc.list_raw_adapters(base)               # → adapters with raw PEFT files present
+lc.adapter_status(base)                  # → {"processed": [...], "raw": [...]}
+lc.adapter_count(base)                   # → {"processed": N, "raw": M}
+lc.list_representations(base, adapter)   # → [(config_hash, extraction_config), ...]
 ```
 
 ---
@@ -204,7 +239,6 @@ taxonomy = StructuralTaxonomy(
         "model.layers.1.self_attn.q_proj.weight",
         "model.layers.1.self_attn.v_proj.weight",
     ],
-    n_components=256,
 )
 ```
 
@@ -224,29 +258,36 @@ del model
 When `layer_names=None` and `lora_only=False`, all 2-D weight matrices with at least 1 024 elements are included automatically. This typically captures all attention and MLP projection matrices.
 
 ```python
-taxonomy = StructuralTaxonomy(lora_only=False, n_components=256)
+taxonomy = StructuralTaxonomy(lora_only=False)
 ```
 
 **Caution:** Different architectures name their layers differently. Comparing models across architectures in this mode will generally produce different `N_layers` values, which will fail shape validation in `TaxonomyAnalyzer`. The structural taxonomy is most meaningful when comparing models that share the same architecture.
 
 ---
 
-## `n_components`
+## Controlling representation size
 
-Each per-layer vector is truncated or zero-padded to exactly `n_components` values before stacking. This ensures the representation matrix has a fixed second dimension regardless of the actual layer sizes.
+There is no truncation parameter. Every vector is stored at full length, so the
+only way to control size is to select fewer blocks — via `layer_indices` and
+`projections` (or explicit `layer_names`).
 
 | Scenario | Recommendation |
 |---|---|
-| Comparing LoRA adapters (rank 4–16) | 64–256 (the adapter vectors are naturally small) |
-| Comparing attention weight matrices (4096×4096) | 512–2048 |
-| Quick comparison / diagnostic | 256 (default) |
+| Quick diagnostic | `layer_indices="last"`, `projections="o"` |
+| Depth sweep | `layer_indices=[0, 13, 27]`, one projection |
+| Full comparison | `layer_indices=None`, `projections=None` — but prefer the low-rank distance builders below |
 
 ---
 
 ## Distance metrics
 
+### Through the pipeline
+
 ```python
-from src import FrobeniusDistanceMetric, CKADistanceMetric
+from src import FrobeniusDistanceMetric, CKADistanceMetric, CosineDistanceMetric
+
+# Angle between the concatenated weight-delta vectors
+metric = CosineDistanceMetric()
 
 # Direct comparison of weight vector geometry
 metric = FrobeniusDistanceMetric(normalize=True)
@@ -256,6 +297,41 @@ metric = CKADistanceMetric(kernel="linear", unbiased=True)
 ```
 
 `CKADistanceMetric(unbiased=True)` requires `N_layers >= 4`. With fewer layers, use `unbiased=False`.
+
+`CosineDistanceMetric` flattens the whole representation before comparing. Since
+zeros contribute nothing to either a dot product or a norm, the zero padding
+described above is inert, and a consistent reordering of entries across both
+vectors leaves cosine unchanged — so it is well defined on structural
+representations exactly as stored. Select it from an experiment YAML with
+`metrics: {structural: cosine}`.
+
+> `FrobeniusDistanceMetric` and `CKADistanceMetric` both carry a
+> `TODO (full-pipeline)` noting they assume uniform-length rows and have not yet
+> been adapted to zero-padded structural representations. Cosine is unaffected.
+
+### Directly from LoRA factors (recommended)
+
+For pairwise distances there is no need to materialise `B @ A` at all. The
+builders in `src.notebook.structure` work entirely in rank space, and
+`src.analysis.lora_distance_matrix` wraps them so the result is an ordinary
+`DistanceMatrix`:
+
+```python
+from src.notebook.lora_weights import load_lora_weights
+from src.analysis import lora_distance_matrix, fit_geometry
+
+weights = load_lora_weights(adapter_names, adapter_root="results/shared_cache/adapters",
+                            layer_indices=list(range(28)), projections=["k", "q", "v", "o"])
+
+dm = lora_distance_matrix(weights, kind="cosine")     # or "frobenius", "bures_wasserstein", "cka"
+geo = fit_geometry(dm, method="mds", n_components=2)
+```
+
+`kind="cosine"` returns exactly what `CosineDistanceMetric` would, without ever
+forming a `d x d` matrix — the only tractable route at 28 layers x 4 projections
+x 3072². See `docs/notes/frobenius_bw_generalization.md` for why summing across
+blocks is exact, and `docs/notes/cka_notes.md` for why `kind="cka"` is restricted
+to a single block.
 
 ---
 
@@ -279,7 +355,8 @@ models = ModelCollection.from_ids([
 
 taxonomy = StructuralTaxonomy(
     lora_only=True,
-    n_components=256,
+    layer_indices="last",
+    projections="o",
     lora_cache=LoRACache("./cache"),
     # base_model_id auto-detected from each adapter's adapter_config.json
     hf_token="hf_...",
@@ -297,7 +374,11 @@ result.save("./results/structural_lora_cka")
 
 # Inspect the cached config for any adapter
 lc = LoRACache("./cache")
-cfg = lc.load_config("meta-llama/Llama-3.1-8B", "some-org/Llama-3.1-8B-lora-task-A")
+cfg = lc.load_config(
+    "meta-llama/Llama-3.1-8B",
+    "some-org/Llama-3.1-8B-lora-task-A",
+    taxonomy._extraction_config(),
+)
 print(cfg["training_config"])
 print(cfg["dataset_recipe"])   # stub, to be filled in
 ```
@@ -314,7 +395,6 @@ taxonomy = StructuralTaxonomy(
         f"model.layers.{i}.self_attn.q_proj.weight"
         for i in range(4)
     ],
-    n_components=512,
     cache=DiskCache("./cache"),
 )
 

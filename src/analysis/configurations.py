@@ -1,0 +1,342 @@
+"""Level 2 — comparison of the point configurations themselves.
+
+Where :mod:`src.analysis.matrices` compares distance matrices, this module
+compares the coordinates an embedding produced.  All comparisons are Procrustes
+based: each configuration is translated to the origin, optionally scaled to unit
+Frobenius norm, and then optimally rotated onto the other.  The result therefore
+depends on *shape alone* — not on the arbitrary orientation, reflection or scale
+that MDS happened to pick, none of which carry meaning.
+
+Two geometries need not share dimensionality; the lower-dimensional one is
+padded with zero columns, which embeds it in the larger space without changing
+any of its internal distances.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import Sequence
+
+import numpy as np
+
+from src.core.geometry import GeometryResult
+from src.core.protocols import ModelID
+
+from .matrices import match_models
+
+
+# ── low-level Procrustes machinery ────────────────────────────────────────────
+
+def _pad_to(a: np.ndarray, d: int) -> np.ndarray:
+    """Right-pad a coordinate array with zero columns to width *d*."""
+    if a.shape[1] == d:
+        return a
+    return np.hstack([a, np.zeros((a.shape[0], d - a.shape[1]), dtype=a.dtype)])
+
+
+def _standardize(a: np.ndarray, scaling: bool) -> tuple[np.ndarray, np.ndarray, float]:
+    """Center (and optionally unit-normalise) a configuration.
+
+    Returns the standardized array, the centroid that was removed, and the
+    Frobenius norm that was divided out (1.0 when ``scaling=False``).
+    """
+    centroid = a.mean(axis=0)
+    out = a - centroid
+    norm = float(np.linalg.norm(out))
+    if not scaling:
+        return out, centroid, 1.0
+    if norm < 1e-12:
+        raise ValueError("degenerate configuration: all points coincide")
+    return out / norm, centroid, norm
+
+
+def _optimal_rotation(
+    source: np.ndarray, target: np.ndarray, reflection: bool
+) -> tuple[np.ndarray, float]:
+    """Orthogonal ``R`` and scale ``s`` minimising ``‖s · source @ R - target‖_F``.
+
+    ``s`` is the sum of the singular values of ``sourceᵀ target``; for
+    unit-norm inputs the resulting disparity is ``1 - s²``.
+    """
+    u, sv, vt = np.linalg.svd(source.T @ target)
+    if not reflection and np.linalg.det(u @ vt) < 0:
+        # Flip the least-important singular direction to force det(R) = +1;
+        # that direction's contribution to the scale flips sign with it.
+        u = u.copy()
+        u[:, -1] *= -1.0
+        sv = sv.copy()
+        sv[-1] *= -1.0
+    return u @ vt, float(sv.sum())
+
+
+def _superimpose(
+    target: np.ndarray, source: np.ndarray, reflection: bool, apply_scale: bool
+) -> tuple[np.ndarray, np.ndarray, float, float]:
+    """Fit *source* onto *target*; return (aligned, rotation, scale, disparity)."""
+    rotation, scale = _optimal_rotation(source, target, reflection)
+    if not apply_scale:
+        scale = 1.0
+    aligned = scale * (source @ rotation)
+    disparity = float(np.sum((target - aligned) ** 2))
+    return aligned, rotation, scale, disparity
+
+
+@dataclass
+class ProcrustesResult:
+    """Superposition of two point configurations."""
+
+    disparity: float
+    aligned_a: GeometryResult
+    aligned_b: GeometryResult
+    rotation: np.ndarray
+    scale: float
+    model_ids: list[ModelID]
+
+    def __repr__(self) -> str:  # pragma: no cover - display only
+        return (
+            f"ProcrustesResult(disparity={self.disparity:.6f}, "
+            f"n_models={len(self.model_ids)}, dim={self.rotation.shape[0]})"
+        )
+
+
+def procrustes_compare(
+    geom_a: GeometryResult,
+    geom_b: GeometryResult,
+    scaling: bool = True,
+    reflection: bool = True,
+) -> ProcrustesResult:
+    """Superimpose *geom_b* onto *geom_a* and report the leftover mismatch.
+
+    Parameters
+    ----------
+    scaling:
+        When ``True`` (default) both configurations are scaled to unit Frobenius
+        norm and an optimal scale factor is fitted, making the comparison
+        scale-free and putting ``disparity`` on a ``[0, 1]`` scale where 0 means
+        identical shape.  This matches :func:`scipy.spatial.procrustes`.  With
+        ``False`` the configurations are only centered, no scale is fitted, and
+        ``disparity`` is in raw squared coordinate units.
+    reflection:
+        Whether a reflection is permitted in addition to rotation.  MDS output
+        is only defined up to reflection, so the default ``True`` is almost
+        always what you want.
+
+    The returned ``aligned_a`` / ``aligned_b`` are new :class:`GeometryResult`
+    objects sharing one frame, ready to plot on the same axes.
+    """
+    ids, (a_raw, b_raw) = match_models(geom_a, geom_b)
+    if len(ids) < 2:
+        raise ValueError(f"Procrustes needs at least 2 common models, got {len(ids)}")
+
+    d = max(a_raw.shape[1], b_raw.shape[1])
+    a_std, _, _ = _standardize(_pad_to(a_raw, d), scaling)
+    b_std, _, _ = _standardize(_pad_to(b_raw, d), scaling)
+
+    b_aligned, rotation, scale, disparity = _superimpose(a_std, b_std, reflection, scaling)
+
+    return ProcrustesResult(
+        disparity=disparity,
+        aligned_a=_as_geometry(a_std, ids, geom_a, "procrustes"),
+        aligned_b=_as_geometry(b_aligned, ids, geom_b, "procrustes"),
+        rotation=rotation,
+        scale=scale,
+        model_ids=ids,
+    )
+
+
+def _as_geometry(
+    coords: np.ndarray,
+    ids: list[ModelID],
+    source: GeometryResult,
+    tag: str,
+) -> GeometryResult:
+    meta = dict(source.metadata)
+    meta["aligned_by"] = tag
+    meta["source_method"] = source.method
+    return GeometryResult(
+        coordinates=coords.astype(np.float32),
+        model_ids=list(ids),
+        method=source.method,
+        taxonomy=source.taxonomy,
+        n_components=coords.shape[1],
+        stress=source.stress,
+        metadata=meta,
+    )
+
+
+def per_point_residuals(result: ProcrustesResult) -> np.ndarray:
+    """Per-model distance between the two superimposed positions.
+
+    The *which models disagree* diagnostic.  A low overall ``disparity`` paired
+    with one large residual means the two taxonomies agree about everything
+    except that one model — which the single summary number hides entirely.
+
+    Returns a ``(n_models,)`` array in ``result.model_ids`` order.
+    """
+    a = np.asarray(result.aligned_a.coordinates, dtype=np.float64)
+    b = np.asarray(result.aligned_b.coordinates, dtype=np.float64)
+    return np.linalg.norm(a - b, axis=1)
+
+
+@dataclass
+class ProtestResult:
+    """Outcome of a PROTEST permutation test between two configurations."""
+
+    disparity: float
+    p_value: float
+    n_permutations: int
+    n_models: int
+    null: np.ndarray = field(repr=False)
+
+    def __repr__(self) -> str:  # pragma: no cover - display only
+        return (
+            f"ProtestResult(disparity={self.disparity:.6f}, p_value={self.p_value:.4g}, "
+            f"n_models={self.n_models}, n_permutations={self.n_permutations})"
+        )
+
+
+def protest(
+    geom_a: GeometryResult,
+    geom_b: GeometryResult,
+    n_permutations: int = 9999,
+    random_state: int | None = 0,
+    scaling: bool = True,
+    reflection: bool = True,
+) -> ProtestResult:
+    """Permutation test on the Procrustes disparity (PROTEST).
+
+    The configuration-level counterpart to
+    :func:`src.analysis.matrices.mantel_test`, and built on the same null:
+    permute which model is which in one configuration, re-superimpose, and see
+    how often random labelling fits as well as the real correspondence.  Each
+    configuration's internal shape is untouched.
+
+    Because low disparity means good agreement, the p-value counts
+    ``P(null <= observed)``; it is bounded below by ``1 / (n_permutations + 1)``.
+    """
+    ids, (a_raw, b_raw) = match_models(geom_a, geom_b)
+    n = len(ids)
+    if n < 3:
+        raise ValueError(f"PROTEST needs at least 3 common models, got {n}")
+
+    d = max(a_raw.shape[1], b_raw.shape[1])
+    a_std, _, _ = _standardize(_pad_to(a_raw, d), scaling)
+    b_std, _, _ = _standardize(_pad_to(b_raw, d), scaling)
+
+    def _disparity(b: np.ndarray) -> float:
+        return _superimpose(a_std, b, reflection, scaling)[3]
+
+    observed = _disparity(b_std)
+
+    rng = np.random.default_rng(random_state)
+    null = np.empty(n_permutations, dtype=np.float64)
+    for i in range(n_permutations):
+        null[i] = _disparity(b_std[rng.permutation(n)])
+
+    p_value = float((np.sum(null <= observed) + 1) / (n_permutations + 1))
+    return ProtestResult(
+        disparity=observed,
+        p_value=p_value,
+        n_permutations=n_permutations,
+        n_models=n,
+        null=null,
+    )
+
+
+def align_to_reference(
+    geometries: Sequence[GeometryResult],
+    reference: GeometryResult | None = None,
+    scaling: bool = True,
+    reflection: bool = True,
+) -> list[GeometryResult]:
+    """Superimpose several configurations onto one common frame.
+
+    Use this before plotting geometries side by side, or before
+    :func:`point_dispersion`.  It replaces hand-tuned flips and rotations such
+    as :func:`src.notebook.utils.transform_geometry`, which has to be re-guessed
+    for every new figure.
+
+    *reference* defaults to the first geometry.  All returned geometries —
+    including the one matching the reference — are expressed in the reference's
+    standardized frame, restricted to the models common to every input.
+    """
+    geoms = list(geometries)
+    if not geoms:
+        raise ValueError("align_to_reference needs at least one geometry")
+    ref = geoms[0] if reference is None else reference
+
+    ids, arrays = match_models(ref, *geoms)
+    ref_raw, others = arrays[0], arrays[1:]
+
+    d = max(a.shape[1] for a in arrays)
+    ref_std, _, _ = _standardize(_pad_to(ref_raw, d), scaling)
+
+    out: list[GeometryResult] = []
+    for geom, raw in zip(geoms, others):
+        std, _, _ = _standardize(_pad_to(raw, d), scaling)
+        aligned, _, _, _ = _superimpose(ref_std, std, reflection, scaling)
+        out.append(_as_geometry(aligned, ids, geom, "align_to_reference"))
+    return out
+
+
+@dataclass
+class DispersionResult:
+    """How stably each model is placed across a set of configurations."""
+
+    per_model: np.ndarray
+    model_ids: list[ModelID]
+    mean_disparity: float
+    n_geometries: int
+
+    def sorted_models(self) -> list[tuple[ModelID, float]]:
+        """Models ranked from least to most stable."""
+        pairs = list(zip(self.model_ids, (float(v) for v in self.per_model)))
+        return sorted(pairs, key=lambda x: x[1])
+
+    def __repr__(self) -> str:  # pragma: no cover - display only
+        return (
+            f"DispersionResult(n_geometries={self.n_geometries}, "
+            f"n_models={len(self.model_ids)}, "
+            f"mean_disparity={self.mean_disparity:.6f}, "
+            f"max_dispersion={float(self.per_model.max()):.6f})"
+        )
+
+
+def point_dispersion(
+    geometries: Sequence[GeometryResult],
+    reference: GeometryResult | None = None,
+    scaling: bool = True,
+    reflection: bool = True,
+) -> DispersionResult:
+    """Per-model positional spread across several configurations.
+
+    Superimposes every geometry onto a common frame, after which each model has
+    one point per geometry.  Its dispersion is the RMS distance of those points
+    from their own centroid: *which models sit in a stable place across seeds,
+    and which jump around?*
+
+    ``mean_disparity`` is the mean pairwise Procrustes disparity over the set —
+    a single number for how much the configurations agree overall.
+    """
+    geoms = list(geometries)
+    if len(geoms) < 2:
+        raise ValueError(f"point_dispersion needs at least 2 geometries, got {len(geoms)}")
+
+    aligned = align_to_reference(geoms, reference, scaling, reflection)
+    stack = np.stack([np.asarray(g.coordinates, dtype=np.float64) for g in aligned])
+
+    centroids = stack.mean(axis=0)
+    per_model = np.sqrt(((stack - centroids) ** 2).sum(axis=2).mean(axis=0))
+
+    disparities = [
+        float(np.sum((stack[i] - stack[j]) ** 2))
+        for i in range(len(stack))
+        for j in range(i + 1, len(stack))
+    ]
+
+    return DispersionResult(
+        per_model=per_model,
+        model_ids=list(aligned[0].model_ids),
+        mean_disparity=float(np.mean(disparities)) if disparities else 0.0,
+        n_geometries=len(geoms),
+    )

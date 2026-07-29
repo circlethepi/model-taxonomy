@@ -342,6 +342,15 @@ def per_point_residuals(result: ProcrustesResult) -> np.ndarray:
     except that one model — which the single summary number hides entirely.
 
     Returns a ``(n_models,)`` array in ``result.model_ids`` order.
+
+    Unlike ``disparity``, this is **not symmetric in the argument order** of
+    :func:`procrustes_compare` whenever a scale was fitted.  Forward it measures
+    ``‖aᵢ − s·bᵢR‖``; with the arguments swapped it measures ``‖s·aᵢ − bᵢR‖``,
+    and those agree only when ``s == 1``.  ``disparity`` is immune because it
+    reduces to ``1 − (Σσ)²`` and ``BᵀA`` and ``AᵀB`` share their singular values,
+    but a per-row norm has no such cancellation.  So decide which configuration
+    is the reference before reading these numbers — and note ``scaling=False``
+    makes them symmetric as well as more localised.
     """
     a = np.asarray(result.aligned_a.coordinates, dtype=np.float64)
     b = np.asarray(result.aligned_b.coordinates, dtype=np.float64)

@@ -404,6 +404,316 @@ def t_simplex_roundtrip():
     return "weights, residuals and metadata preserved"
 
 
+# ── ground truth from recipes ─────────────────────────────────────────────────
+
+@check("ground truth: mixture components for the three recipe forms")
+def t_mixture_weights():
+    from src.analysis import mixture_weights
+    from src.datasets.class_recipe import ClassAwareDatasetRecipe, ClassDatasetEntry
+    from src.datasets.recipe import DatasetEntry, DatasetRecipe
+
+    # Whole datasets mixed: one vertex each, weights straight from the recipe.
+    three = DatasetRecipe(
+        name="three",
+        datasets=[DatasetEntry("dsA", weight=5.0), DatasetEntry("dsB", weight=3.0),
+                  DatasetEntry("dsC", weight=2.0)],
+    )
+    got = mixture_weights(three)
+    assert got == {"dsA": 0.5, "dsB": 0.3, "dsC": 0.2}, got
+
+    # Classes mixed inside one dataset: still two things being mixed, so two
+    # vertices — not one degenerate vertex for the dataset.
+    ca = ClassAwareDatasetRecipe(
+        name="mix",
+        datasets=[ClassDatasetEntry("yahoo", class_field="topic", class_filter=[0, 1],
+                                    class_weights={0: 1.0, 1: 3.0})],
+    )
+    got = mixture_weights(ca)
+    assert got == {"yahoo[topic=0]": 0.25, "yahoo[topic=1]": 0.75}, got
+
+    # The dict form, which is what recipe.json holds, must agree exactly — its
+    # class keys are strings where the object's are ints.
+    assert mixture_weights(ca.to_dict()) == got, "dict and object forms disagree"
+
+    # Both kinds of mixing at once: dsA split by class, dsB taken whole. An entry
+    # with no class_filter/class_weights is one vertex for the dataset itself —
+    # its weight is known even though the split inside it is not.
+    mixed = ClassAwareDatasetRecipe(
+        name="both",
+        datasets=[
+            ClassDatasetEntry("dsA", weight=1.0, class_field="c", class_filter=[0, 1]),
+            ClassDatasetEntry("dsB", weight=1.0),
+        ],
+    )
+    got = mixture_weights(mixed)
+    assert set(got) == {"dsA[c=0]", "dsA[c=1]", "dsB"}, got
+    assert abs(sum(got.values()) - 1.0) < 1e-12
+    return "3 datasets, 2 classes, dict==object, and the mixed case"
+
+
+@check("ground truth: a dataset cannot be both split and whole in one collection")
+def t_split_and_whole_rejected():
+    """The one case where an unsplit entry is genuinely ambiguous.
+
+    Taking a dataset whole is a valid vertex, and splitting it by class is a
+    valid pair of vertices — but a collection that does both has a whole-dataset
+    vertex that is an unknown mixture of the per-class ones, so they are not
+    independent corners and the simplex would be fictitious.
+    """
+    from src.analysis import ground_truth_weights
+
+    split = {
+        "recipe_type": "class_aware", "normalized_weights": [1.0],
+        "datasets": [{"dataset_id": "dsA", "class_field": "c",
+                      "normalized_class_weights": {"0": 0.5, "1": 0.5}}],
+    }
+    whole = {
+        "recipe_type": "class_aware", "normalized_weights": [1.0],
+        "datasets": [{"dataset_id": "dsA", "class_field": "c"}],
+    }
+    try:
+        ground_truth_weights({"split": split, "whole": whole})
+    except ValueError as e:
+        assert "not " in str(e) and "independent" in str(e), e
+    else:
+        raise AssertionError("expected the mixed treatment to be rejected")
+
+    # Either treatment on its own is fine.
+    v1, _ = ground_truth_weights({"a": split, "b": split})
+    v2, _ = ground_truth_weights({"a": whole, "b": whole})
+    assert v1 == ["dsA[c=0]", "dsA[c=1]"], v1
+    assert v2 == ["dsA"], v2
+    return "mixed treatment rejected; each treatment alone accepted"
+
+
+@check("ground truth: simplex is regular and round-trips through barycentric")
+def t_simplex_geometry():
+    from scipy.spatial.distance import pdist
+
+    from src.analysis import (barycentric, evaluation_points, ground_truth_weights,
+                              pure_anchors, simplex_geometry, simplex_vertices,
+                              truth_matrix)
+
+    for k in (2, 3, 4):
+        edges = pdist(simplex_vertices(k))
+        assert np.allclose(edges, 1.0), f"k={k} edges not equal: {edges}"
+
+    recipes = {
+        "pureA": {"recipe_type": "simple", "normalized_weights": [1.0],
+                  "datasets": [{"dataset_id": "A"}]},
+        "pureB": {"recipe_type": "simple", "normalized_weights": [1.0],
+                  "datasets": [{"dataset_id": "B"}]},
+        "pureC": {"recipe_type": "simple", "normalized_weights": [1.0],
+                  "datasets": [{"dataset_id": "C"}]},
+        "mix":   {"recipe_type": "simple", "normalized_weights": [0.5, 0.3, 0.2],
+                  "datasets": [{"dataset_id": "A"}, {"dataset_id": "B"}, {"dataset_id": "C"}]},
+    }
+    vertices, weights = ground_truth_weights(recipes)
+    assert vertices == ["A", "B", "C"], vertices
+
+    ids = list(recipes)
+    geo = simplex_geometry(weights, ids, vertices)
+    assert geo.n_components == 2, geo.n_components
+
+    anchors = pure_anchors(vertices, weights)
+    assert anchors == ["pureA", "pureB", "pureC"], anchors
+    assert evaluation_points(ids, anchors) == ["mix"]
+
+    proj = barycentric(geo, anchors)
+    back = np.vstack([proj.weight_for(m) for m in ids])
+    delta = float(np.abs(back - truth_matrix(weights, ids)).max())
+    assert delta < 1e-6, f"round-trip error {delta:.2e}"
+    return f"regular for k=2,3,4; round-trip error {delta:.1e}"
+
+
+@check("ground truth: a k-vertex simplex needs k-1 dimensions, and says so")
+def t_simplex_dimension_requirement():
+    """The executable form of the dimension question.
+
+    A simplex on k vertices lives in k-1 dimensions, and barycentric coordinates
+    are undefined below that because the anchors stop being affinely independent.
+    Pinned here so the claim cannot quietly stop being true.
+    """
+    from src.analysis import barycentric, ground_truth_weights, pure_anchors, simplex_geometry
+
+    recipes = {
+        f"pure{c}": {"recipe_type": "simple", "normalized_weights": [1.0],
+                     "datasets": [{"dataset_id": c}]}
+        for c in "ABCD"
+    }
+    recipes["mix"] = {
+        "recipe_type": "simple", "normalized_weights": [0.4, 0.3, 0.2, 0.1],
+        "datasets": [{"dataset_id": c} for c in "ABCD"],
+    }
+    vertices, weights = ground_truth_weights(recipes)
+    ids = list(recipes)
+    anchors = pure_anchors(vertices, weights)
+    k = len(vertices)
+
+    full = simplex_geometry(weights, ids, vertices)
+    assert full.n_components == k - 1 == 3
+
+    barycentric(full, anchors)  # k-1 works
+
+    squashed = GeometryResult(
+        coordinates=np.asarray(full.coordinates)[:, : k - 2],
+        model_ids=ids, method="mds", taxonomy="t", n_components=k - 2,
+    )
+    try:
+        barycentric(squashed, anchors)
+    except ValueError as e:
+        assert "affinely dependent" in str(e), e
+        return f"k={k}: {k - 1}d accepted, {k - 2}d refused with a usable message"
+    raise AssertionError(f"expected {k - 2}d to be refused for a {k}-vertex simplex")
+
+
+@check("ground truth: residuals vanish when projecting from exactly k-1 dimensions")
+def t_projection_dimension_matters():
+    """Why the comparison projects from the largest embedding, not from k-1.
+
+    With k anchors in exactly k-1 dimensions the anchors' affine hull *is* the
+    whole space, so every residual is identically zero and "how far off the
+    simplex is this model?" can no longer be asked.  One dimension more and the
+    diagnostic comes back.
+    """
+    from src.analysis import barycentric
+
+    # Two anchors, one point deliberately off the line between them.
+    coords = np.array([[0.0, 0.0], [1.0, 0.0], [0.5, 0.4]])
+    ids = ["a0", "a1", "off"]
+    in_2d = barycentric(_geometry(coords, ids=ids), ["a0", "a1"])
+    in_1d = barycentric(_geometry(coords[:, :1], ids=ids), ["a0", "a1"])
+
+    assert float(in_1d.residuals.max()) < 1e-9, in_1d.residuals
+    assert in_2d.residuals[2] > 0.3, in_2d.residuals
+    return (
+        f"k-1=1d max residual {float(in_1d.residuals.max()):.1e} (blind); "
+        f"2d {float(in_2d.residuals[2]):.3f} (sees it)"
+    )
+
+
+@check("procrustes: the stored map reproduces the fit, and applies off it")
+def t_procrustes_transform():
+    """A round trip proves bytes survived; this proves the stored pieces are the map.
+
+    ``procrustes_compare`` standardises both configurations before rotating one, so
+    the rotation alone is not the transformation — the centroid and norm that were
+    divided out are part of it.  They used to be discarded, which left the fit
+    inspectable but impossible to apply to any point outside it.
+    """
+    import tempfile
+
+    rng = np.random.default_rng(31)
+    a = rng.normal(size=(7, 2))
+    b = rng.normal(size=(7, 2))
+    res = procrustes_compare(_geometry(a), _geometry(b))
+
+    # The map must reproduce its own output.
+    got = res.transform(b)
+    ref = np.asarray(res.aligned_b.coordinates, dtype=np.float64)
+    delta = float(np.abs(got - ref).max())
+    assert delta < 1e-5, f"transform does not reproduce aligned_b: {delta:.2e}"
+    assert np.allclose(
+        res.transform(a, which="a"), res.aligned_a.coordinates, atol=1e-5
+    ), "which='a' does not reproduce aligned_a"
+
+    # Applicability to a point that was not part of the fit. A duplicate of row 3
+    # is well defined without refitting, and is exactly what the dropped
+    # centroid/norm made impossible.
+    outside = res.transform(b[3][None, :])
+    assert np.allclose(outside[0], ref[3], atol=1e-5), outside
+
+    # scaling=False must leave the norms inert rather than silently rescaling.
+    unscaled = procrustes_compare(_geometry(a), _geometry(b), scaling=False)
+    assert unscaled.norm_a == 1.0 and unscaled.norm_b == 1.0
+    assert np.allclose(
+        unscaled.transform(b), unscaled.aligned_b.coordinates, atol=1e-5
+    )
+
+    # The case this project actually runs: a 2-D embedding against a 1-D truth.
+    mixed = procrustes_compare(_geometry(a), _geometry(b[:, :1]))
+    assert np.allclose(
+        mixed.transform(b[:, :1]), mixed.aligned_b.coordinates, atol=1e-5
+    ), "zero-padding path is wrong for differing dimensions"
+
+    with tempfile.TemporaryDirectory() as td:
+        res.save(Path(td))
+        back = type(res).load(Path(td))
+    assert np.allclose(back.rotation, res.rotation)
+    assert abs(back.scale - res.scale) < 1e-12
+    assert abs(back.disparity - res.disparity) < 1e-12
+    assert back.model_ids == res.model_ids
+    assert (back.scaling, back.reflection) == (res.scaling, res.reflection)
+    assert np.allclose(back.transform(b), got, atol=1e-9), "reloaded map differs"
+    return (
+        f"reproduces aligned_b to {delta:.1e}, applies off the fit, "
+        "survives save/load, and handles 2-D vs 1-D"
+    )
+
+
+@check("cache: 1-D and 2-D embeddings of one collection coexist")
+def t_collection_multidim():
+    """Coordinates used to be keyed by method alone, so these overwrote each other."""
+    import tempfile
+
+    from src.analysis import fit_geometry
+    from src.cache import CollectionCache
+
+    dm = _random_dm(6, seed=3)
+    with tempfile.TemporaryDirectory() as td:
+        cc = CollectionCache(td)
+        chash = cc.save_distance_matrix(dm, label="check", slice_key={"n_samples": 10})
+        made = {n: fit_geometry(dm, "mds", n_components=n, random_state=0) for n in (1, 2)}
+        for geo in made.values():
+            cc.save_geometry(chash, geo)
+
+        assert sorted(cc.list_geometries(chash)) == [("mds", 1), ("mds", 2)]
+        for n, geo in made.items():
+            back = cc.load_geometry(chash, "mds", n)
+            assert back.coordinates.shape == (6, n), back.coordinates.shape
+            assert np.allclose(back.coordinates, geo.coordinates, atol=1e-6)
+            assert back.stress is not None, "stress lost on reload"
+
+        try:
+            cc.load_geometry(chash, "mds")   # ambiguous without n_components
+        except ValueError as e:
+            assert "dimensions" in str(e), e
+        else:
+            raise AssertionError("expected an ambiguity error")
+
+        assert cc.find(taxonomy=dm.taxonomy, metric=dm.metric) == [chash]
+    return "both dimensions kept, stress preserved, ambiguity reported, index queryable"
+
+
+@check("core: TaxonomyAnalysis keeps every geometry, old profiles still load")
+def t_analysis_geometries():
+    import tempfile
+
+    from src.analysis import fit_geometry
+    from src.core.analysis import TaxonomyAnalysis
+
+    dm = _random_dm(5, seed=4)
+    analysis = TaxonomyAnalysis("structural", list(dm.model_ids), [], dm)
+    for n in (1, 2, 3):
+        analysis.add_geometry(fit_geometry(dm, "mds", n_components=n, random_state=0))
+    analysis.add_geometry(fit_geometry(dm, "pca", n_components=2))
+
+    with tempfile.TemporaryDirectory() as td:
+        analysis.save(Path(td))
+        back = TaxonomyAnalysis.load(Path(td))
+        assert sorted(back.geometries) == ["mds_1d", "mds_2d", "mds_3d", "pca_2d"], sorted(back.geometries)
+        for key, geo in analysis.geometries.items():
+            assert np.allclose(back.geometries[key].coordinates, geo.coordinates, atol=1e-6)
+        assert back.geometry is not None, "primary slot lost"
+
+        # A profile written before geometries/ existed must still load.
+        import shutil
+        shutil.rmtree(Path(td) / "geometries")
+        legacy = TaxonomyAnalysis.load(Path(td))
+        assert legacy.geometries == {} and legacy.geometry is not None
+    return "4 embeddings round-tripped; pre-existing profiles unaffected"
+
+
 # ── data-backed checks ────────────────────────────────────────────────────────
 
 @lru_cache(maxsize=4)
@@ -536,11 +846,16 @@ def t_recovery():
     # Anchors are fixed points of the projection; this catches ordering bugs.
     assert abs(proj.weight_for(anchors[0])[0] - 1.0) < 1e-9
     assert abs(proj.weight_for(anchors[1])[0] - 0.0) < 1e-9
+    assert np.all(np.isfinite(rec.recovered)), rec.recovered
 
     print("      true      :", np.round(rec.true, 3).tolist())
     print("      recovered :", np.round(rec.recovered, 3).tolist())
     print("      residuals :", np.round(rec.residuals, 4).tolist())
-    assert abs(rec.rho) > 0.85, f"weak rank agreement: rho={rec.rho}"
+    # Deliberately no threshold on r or rho. Those are measurements of how well
+    # this taxonomy tracks the training mixture — a finding to read, not a
+    # contract to enforce. A weak correlation should show up as a number worth
+    # investigating, not as a red FAIL that invites tuning until it passes.
+    # Only the structural invariants above are asserted.
     return f"r={rec.r:.4f}, rho={rec.rho:.4f}, max residual={float(rec.residuals.max()):.4g}"
 
 
@@ -640,6 +955,138 @@ def t_recipe_relabelling():
     )
 
 
+@check("[data] discovery: the cache scan joins adapters to their recipes")
+def t_scan_cache():
+    from src.analysis import scan_cache
+
+    root = REPO / "results/shared_cache"
+    if not (root / "adapters").exists():
+        raise _Skip(f"{root}/adapters not present")
+
+    index = scan_cache(root)
+    if not len(index):
+        raise _Skip("no adapters with experiment_meta.json in the cache")
+
+    # The join is on recipe_hash, which finetune_lora.py recorded — not on a
+    # parsed directory name.
+    joined = [e for e in index if e.recipe is not None]
+    assert joined, "no adapter resolved to a recipe"
+    for e in joined:
+        assert e.recipe_hash and e.recipe.get("recipe_hash") == e.recipe_hash, e.adapter_name
+
+    usable = index.with_available("structural_weights", "dataset_embedding")
+    groupings = {
+        by: usable.slices(by=by)
+        for by in [("n_samples", "seed"), ("n_samples",), ("seed",), ()]
+    }
+    for by, slices in groupings.items():
+        assert slices, f"grouping {by} produced nothing"
+        total = sum(len(s) for s in slices.values())
+        assert total == len(usable), f"grouping {by} lost models: {total} != {len(usable)}"
+
+    shapes = ", ".join(
+        f"{'+'.join(by) or 'pooled'}={len(s)}" for by, s in groupings.items()
+    )
+    return (
+        f"{len(index)} adapter(s), {len(joined)} with recipes, "
+        f"{len(usable)} usable; slices: {shapes}"
+    )
+
+
+@check("[data] comparison: end-to-end on one slice, reported not asserted")
+def t_comparison_end_to_end():
+    """Full chain on real adapters: cache -> distances -> MDS -> simplex -> truth.
+
+    Only structural invariants are asserted.  The recovery correlations and
+    Procrustes disparities are printed, because they are measurements of the
+    taxonomies rather than properties of the code.
+    """
+    import tempfile
+
+    from src.analysis import build_taxonomy_artifacts, compare_taxonomies, scan_cache
+
+    root = REPO / "results/shared_cache"
+    if not (root / "adapters").exists():
+        raise _Skip(f"{root}/adapters not present")
+
+    index = scan_cache(root).with_available("structural_weights", "dataset_embedding")
+    slices = index.slices(("n_samples", "seed"))
+    if not slices:
+        raise _Skip("no complete (n_samples, seed) slice in the cache")
+    key = max(slices)                       # the largest sample size available
+    sub = slices[key]
+    if len(sub) < 3:
+        raise _Skip(f"slice {key} has only {len(sub)} model(s)")
+
+    with tempfile.TemporaryDirectory() as td:
+        matrices = {}
+        for tax in ("structural", "dataset_embedding"):
+            # One layer and one projection keeps this to a few hundred KB per
+            # adapter; the dense B @ A product is never formed.
+            matrices[tax], _ = build_taxonomy_artifacts(
+                sub, tax, "cosine", cache_root=td, n_components=(2,),
+                layers=[27], projections="o",
+            )
+        result = compare_taxonomies(
+            matrices, sub.recipes(), n_permutations=199,
+            slice_key=dict(zip(("n_samples", "seed"), key)),
+        )
+        saved = result.save(Path(td) / "report")
+        reloaded = type(result).load(saved)
+
+    n, k = len(result.model_ids), len(result.vertices)
+    assert result.simplex_dim == k - 1, (result.simplex_dim, k)
+    assert result.projection_dim >= result.simplex_dim
+    assert len(result.anchors) == k, result.anchors
+    assert set(result.anchors) & set(result.eval_points) == set()
+    assert np.allclose(result.ground_truth_weights.sum(axis=1), 1.0)
+
+    for tax in result.taxonomies:
+        proj = result.projections[tax]
+        assert np.allclose(proj.weights.sum(axis=1), 1.0), tax
+        for j, anchor in enumerate(result.anchors):
+            onehot = np.zeros(k)
+            onehot[j] = 1.0
+            assert np.allclose(proj.weight_for(anchor), onehot, atol=1e-9), (tax, anchor)
+        assert np.isfinite(result.stress[tax])
+        assert np.isfinite(result.procrustes_vs_truth[tax].disparity)
+
+    assert reloaded.model_ids == result.model_ids, "save/load lost the model order"
+    assert sorted(reloaded.projections) == sorted(result.projections)
+
+    # The fitted map onto the ground-truth simplex must survive the real save/load
+    # path, not just an in-memory round trip, and must still be applicable.
+    assert sorted(reloaded.procrustes_vs_truth) == sorted(result.procrustes_vs_truth), (
+        sorted(reloaded.procrustes_vs_truth)
+    )
+    for tax, restored in reloaded.procrustes_vs_truth.items():
+        source = result.geometries[tax][f"mds_{result.projection_dim}d"]
+        replayed = restored.transform(np.asarray(source.coordinates, dtype=np.float64))
+        expected = np.asarray(restored.aligned_b.coordinates, dtype=np.float64)
+        dev = float(np.abs(replayed - expected).max())
+        assert dev < 1e-4, f"{tax}: reloaded map does not replay its own fit ({dev:.2e})"
+        assert result.report["per_taxonomy"][tax]["procrustes_scale"] is not None
+
+    print(f"      slice n_samples={key[0]}, seed={key[1]}: {n} models, {k} vertices")
+    print(f"      projecting from {result.projection_dim}-D MDS "
+          f"(simplex is {result.simplex_dim}-D)")
+    for tax in result.taxonomies:
+        rep = result.report["per_taxonomy"][tax]
+        ev = rep["recovery_eval_only"] or {}
+        print(
+            f"      {tax:18s} stress={rep['stress']:.4f} "
+            f"r={_show(ev.get('pearson_mean'))} rho={_show(ev.get('spearman_mean'))} "
+            f"meanL1={_show(ev.get('mean_l1'))} maxres={_show(ev.get('max_residual'))} "
+            f"procrustes={_show(rep['procrustes_vs_truth'])} "
+            f"p={_show(rep['protest_p_value'])}"
+        )
+    return f"{n} models, {len(result.taxonomies)} taxonomies, report round-tripped"
+
+
+def _show(value) -> str:
+    return "—" if value is None else f"{float(value):.4f}"
+
+
 @check("identity: relabel refuses to collide distinct models")
 def t_relabel_collision():
     from src.analysis import recipe_id_for, relabel
@@ -675,10 +1122,14 @@ SYNTHETIC = [
     t_dispersion, t_quality, t_correlation_table, t_match_models, t_fit_geometry,
     t_similarity_conversion, t_simplex_roundtrip, t_cosine_equivalence,
     t_relabel_collision,
+    # ground truth from recipes, and the storage it needs
+    t_mixture_weights, t_split_and_whole_rejected, t_simplex_geometry,
+    t_simplex_dimension_requirement, t_projection_dimension_matters,
+    t_procrustes_transform, t_collection_multidim, t_analysis_geometries,
 ]
 DATA_BACKED = [
     t_cosine_real_adapters, t_recovery, t_collection_roundtrip, t_cross_taxonomy,
-    t_recipe_relabelling,
+    t_recipe_relabelling, t_scan_cache, t_comparison_end_to_end,
 ]
 
 

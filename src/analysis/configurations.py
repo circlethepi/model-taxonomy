@@ -19,7 +19,9 @@ any of its internal distances.
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Callable, Sequence
 
 import numpy as np
@@ -113,13 +115,21 @@ def _superimpose(
     if not apply_scale:
         scale = 1.0
     aligned = scale * (source @ rotation)
-    disparity = float(np.sum((target - aligned) ** 2))
+    disparity = float(np.sum((target - aligned) ** 2)) # sum of squares distances
     return aligned, rotation, scale, disparity
 
 
 @dataclass
 class ProcrustesResult:
-    """Superposition of two point configurations."""
+    """Superposition of two point configurations, and the map that produced it.
+
+    ``disparity`` scores the fit; the remaining fields *are* the fit, and together
+    they reconstruct it exactly.  The centroid and norm matter as much as the
+    rotation: a superposition standardises both configurations before rotating
+    one, so without the shift and scale that were divided out, the map can be
+    inspected but not applied to any point that was not in the original fit.
+    :meth:`transform` is what they buy.
+    """
 
     disparity: float
     aligned_a: GeometryResult
@@ -127,11 +137,119 @@ class ProcrustesResult:
     rotation: np.ndarray
     scale: float
     model_ids: list[ModelID]
+    #: Centroids removed by ``_standardize`` before fitting.
+    centroid_a: np.ndarray | None = None
+    centroid_b: np.ndarray | None = None
+    #: Frobenius norms divided out; 1.0 when ``scaling=False``.
+    norm_a: float = 1.0
+    norm_b: float = 1.0
+    #: The options the fit was made under, recorded so the map is interpretable.
+    scaling: bool = True
+    reflection: bool = True
 
     def __repr__(self) -> str:  # pragma: no cover - display only
         return (
             f"ProcrustesResult(disparity={self.disparity:.6f}, "
             f"n_models={len(self.model_ids)}, dim={self.rotation.shape[0]})"
+        )
+
+    # ── applying the fitted map ───────────────────────────────────────────────
+
+    def transform(self, coords: np.ndarray, which: str = "b") -> np.ndarray:
+        """Put coordinates into the superimposed frame using the stored map.
+
+        For ``which="b"`` this is the full fitted map,
+        ``((X - centroid_b) / norm_b) @ rotation * scale``.  For ``which="a"`` it
+        is only ``(X - centroid_a) / norm_a``, because *a* is the target frame —
+        it was standardised but never rotated.
+
+        The point of exposing this rather than only ``aligned_b`` is that it
+        applies to coordinates that were **not** part of the fit: a newly trained
+        adapter, a held-out mixture, or the same models embedded at a different
+        sample size.  Comparing maps fitted on different collections by applying
+        them to one common set of points is what makes them comparable at all.
+
+        *coords* is ``(n, d)`` and is zero-padded to the fitted width if narrower,
+        which embeds it without changing any of its internal distances.
+        """
+        if which not in ("a", "b"):
+            raise ValueError(f"which must be 'a' or 'b', got {which!r}")
+        centroid = self.centroid_a if which == "a" else self.centroid_b
+        if centroid is None:
+            raise ValueError(
+                "this ProcrustesResult predates the stored centroid/norm and so "
+                "cannot be applied to new points; recompute it with "
+                "procrustes_compare()."
+            )
+
+        width = self.rotation.shape[0]
+        x = np.asarray(coords, dtype=np.float64)
+        if x.ndim == 1:
+            x = x[None, :]
+        if x.shape[1] > width:
+            raise ValueError(
+                f"coords have {x.shape[1]} dimensions but the map was fitted in "
+                f"{width}"
+            )
+        x = _pad_to(x, width)
+
+        norm = self.norm_a if which == "a" else self.norm_b
+        centered = (x - centroid) / norm
+        if which == "a":
+            return centered
+        return self.scale * (centered @ self.rotation)
+
+    # ── persistence ───────────────────────────────────────────────────────────
+
+    def save(self, path: Path | str) -> None:
+        """Persist the map and both aligned configurations."""
+        from safetensors.numpy import save_file
+
+        path = Path(path)
+        path.mkdir(parents=True, exist_ok=True)
+
+        meta = {
+            "disparity": self.disparity,
+            "scale": self.scale,
+            "model_ids": self.model_ids,
+            "norm_a": self.norm_a,
+            "norm_b": self.norm_b,
+            "scaling": self.scaling,
+            "reflection": self.reflection,
+        }
+        width = self.rotation.shape[0]
+        tensors = {
+            "rotation": np.ascontiguousarray(self.rotation.astype(np.float64)),
+            "centroid_a": np.ascontiguousarray(
+                (self.centroid_a if self.centroid_a is not None else np.zeros(width)
+                 ).astype(np.float64)
+            ),
+            "centroid_b": np.ascontiguousarray(
+                (self.centroid_b if self.centroid_b is not None else np.zeros(width)
+                 ).astype(np.float64)
+            ),
+            "_meta_json": np.frombuffer(
+                json.dumps(meta).encode("utf-8"), dtype=np.uint8
+            ),
+        }
+        save_file(tensors, str(path / "procrustes.safetensors"))
+        self.aligned_a.save(path / "aligned_a")
+        self.aligned_b.save(path / "aligned_b")
+
+    @classmethod
+    def load(cls, path: Path | str) -> "ProcrustesResult":
+        from safetensors.numpy import load_file
+
+        path = Path(path)
+        tensors = load_file(str(path / "procrustes.safetensors"))
+        meta = json.loads(tensors["_meta_json"].tobytes().decode("utf-8"))
+        return cls(
+            aligned_a=GeometryResult.load(path / "aligned_a"),
+            aligned_b=GeometryResult.load(path / "aligned_b"),
+            rotation=tensors["rotation"],
+            centroid_a=tensors["centroid_a"],
+            centroid_b=tensors["centroid_b"],
+            **meta,
         )
 
 
@@ -172,8 +290,11 @@ def procrustes_compare(
         raise ValueError(f"Procrustes needs at least 2 common models, got {len(ids)}")
 
     d = max(a_raw.shape[1], b_raw.shape[1])
-    a_std, _, _ = _standardize(_pad_to(a_raw, d), scaling)
-    b_std, _, _ = _standardize(_pad_to(b_raw, d), scaling)
+    # The centroid and norm are kept rather than dropped: without them the fitted
+    # map cannot be applied to any point outside this call. See
+    # ProcrustesResult.transform.
+    a_std, centroid_a, norm_a = _standardize(_pad_to(a_raw, d), scaling)
+    b_std, centroid_b, norm_b = _standardize(_pad_to(b_raw, d), scaling)
 
     b_aligned, rotation, scale, disparity = _superimpose(a_std, b_std, reflection, scaling)
 
@@ -184,6 +305,12 @@ def procrustes_compare(
         rotation=rotation,
         scale=scale,
         model_ids=ids,
+        centroid_a=centroid_a,
+        centroid_b=centroid_b,
+        norm_a=norm_a,
+        norm_b=norm_b,
+        scaling=scaling,
+        reflection=reflection,
     )
 
 

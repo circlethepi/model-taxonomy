@@ -20,6 +20,12 @@ from .bridge import (
     lora_distance_matrix,
     save_collection,
 )
+from .comparison import (
+    TaxonomyComparison,
+    build_taxonomy_artifacts,
+    compare_all_slices,
+    compare_taxonomies,
+)
 from .configurations import (
     DispersionResult,
     ProcrustesResult,
@@ -29,6 +35,18 @@ from .configurations import (
     point_dispersion,
     procrustes_compare,
     protest,
+)
+from .discovery import CacheEntry, CacheIndex, scan_cache
+from .ground_truth import (
+    MixtureComponent,
+    evaluation_points,
+    ground_truth_weights,
+    mixture_weights,
+    pure_anchors,
+    simplex_distance_matrix,
+    simplex_geometry,
+    simplex_vertices,
+    truth_matrix,
 )
 from .identity import id_overlap, recipe_id_for, relabel
 from .matrices import (
@@ -85,4 +103,23 @@ __all__ = [
     "SimplexComparison",
     "anchor_weight_vs_truth",
     "RecoveryResult",
+    # discovery
+    "scan_cache",
+    "CacheIndex",
+    "CacheEntry",
+    # ground truth
+    "MixtureComponent",
+    "mixture_weights",
+    "ground_truth_weights",
+    "truth_matrix",
+    "simplex_vertices",
+    "simplex_geometry",
+    "simplex_distance_matrix",
+    "pure_anchors",
+    "evaluation_points",
+    # comparison
+    "build_taxonomy_artifacts",
+    "compare_taxonomies",
+    "compare_all_slices",
+    "TaxonomyComparison",
 ]

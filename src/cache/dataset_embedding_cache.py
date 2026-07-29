@@ -203,3 +203,21 @@ class DatasetEmbeddingCache:
             if d.is_dir() and cfg_path.exists():
                 configs.append(json.loads(cfg_path.read_text()))
         return configs
+
+    def list_embedder_hashes(self, recipe_hash: str) -> list[str]:
+        """Return the embedder hashes stored for a recipe, without reading configs.
+
+        The hash is what :meth:`load` needs, and it is simply the subdirectory
+        name — so this answers "does this recipe have embeddings, and under which
+        keys?" with a directory listing rather than one JSON parse per entry.
+        That matters when scanning a cache holding a four-figure number of
+        recipes.
+        """
+        recipe_dir = self._recipe_dir(recipe_hash)
+        if not recipe_dir.exists():
+            return []
+        return [
+            d.name
+            for d in sorted(recipe_dir.iterdir())
+            if d.is_dir() and (d / "config.json").exists()
+        ]

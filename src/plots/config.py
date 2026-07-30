@@ -10,23 +10,33 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 from matplotlib.ticker import ScalarFormatter
 
+#   Anchored to the repo base so paths resolve the same regardless of the working
+#   directory a script or notebook happens to run from.
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+
 # ── Figures output directory ──────────────────────────────────────────────────
-#   Anchored to the repo base so figures land in the same place regardless of
-#   the working directory a script or notebook happens to run from.
-GLOBAL_FIGURES_DIR = Path(__file__).resolve().parents[2] / "figures"
+GLOBAL_FIGURES_DIR = _REPO_ROOT / "figures"
 
 # ── Colorblind-safe palette ───────────────────────────────────────────────────
 PALETTE = sns.color_palette("colorblind", 10)
 
 # ── Font registration (silent no-op if file not found) ───────────────────────
+#   Checked in order; the first hit wins.  When none resolve, set_style() falls
+#   back to DejaVu Sans (see "font.sans-serif" below).
+#     MODEL_TAXONOMY_FONT  explicit override, wins when set
+#     <repo>/fonts/        drop or symlink the .ttf here (gitignored)
+#     per-user font dirs   macOS, then the XDG and legacy Linux locations
 _FONT_PATHS = [
-    "/weka/home/mohata1/scratchcpriebe1/MO/fonts/LibreFranklin[wght].ttf",
-    "/Users/mnzk/Library/Fonts/LibreFranklin-VariableFont_wght.ttf",
+    os.environ.get("MODEL_TAXONOMY_FONT"),
+    _REPO_ROOT / "fonts" / "LibreFranklin[wght].ttf",
+    Path.home() / "Library/Fonts/LibreFranklin-VariableFont_wght.ttf",
+    Path.home() / ".local/share/fonts/LibreFranklin[wght].ttf",
+    Path.home() / ".fonts/LibreFranklin[wght].ttf",
 ]
 _LIBRE_FRANKLIN_LOADED = False
 for _fp in _FONT_PATHS:
-    if os.path.exists(_fp):
-        fm.fontManager.addfont(_fp)
+    if _fp and os.path.exists(_fp):
+        fm.fontManager.addfont(str(_fp))
         _LIBRE_FRANKLIN_LOADED = True
         # Variable fonts register at a single weight; suppress the harmless
         # "failed to find font weight X" warnings that follow from this.

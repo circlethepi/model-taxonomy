@@ -72,7 +72,7 @@ read the real cache); the data-backed ones report `SKIP` when a path is missing
 rather than passing vacuously, so they fail loudly on a missed migration. Run it
 before and after any of the items above and compare the pass/skip profile.
 
-Baseline as of 2026-07-29, on `/weka/home/mohata1/miniforge3/envs/taxonomy-env`
-(the repo's `numpy` is not in the base env, so use that interpreter explicitly):
-**35 passed, 0 failed, 0 skipped**, with `t_scan_cache` reporting 25 adapters, 20
-with recipes, 20 usable.
+Run it in the project conda environment (`conda activate taxonomy-env`, the same one
+the SLURM scripts activate) — `numpy` is not installed in the base env, so the
+checks fail at import there. Baseline as of 2026-07-29: **35 passed, 0 failed, 0
+skipped**, with `t_scan_cache` reporting 25 adapters, 20 with recipes, 20 usable.

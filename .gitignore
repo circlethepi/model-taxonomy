@@ -7,3 +7,4 @@ notebooks/*
 results
 experiments/*.slurm.sh
 experiments/archive/*
+fonts/

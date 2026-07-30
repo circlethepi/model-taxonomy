@@ -314,7 +314,7 @@ def _structural_matrix(
 
     weights = load_lora_weights(
         [e.adapter_name for e in index.entries],
-        adapter_root=Path(root) / "adapters",
+        adapter_root=Path(root) / "03_adapters",
         layer_indices=layers if layers is not None else "last",
         projections=projections if projections is not None else "o",
     )

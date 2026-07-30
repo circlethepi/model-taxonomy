@@ -210,7 +210,7 @@ def save_collection(
     results, instead of existing only until the kernel restarts.
 
     Returns the collection hash (the directory name under
-    ``{cache_root}/collections/``).
+    ``{cache_root}/06_collections/``).
     """
     from src.cache.collection_cache import CollectionCache
 

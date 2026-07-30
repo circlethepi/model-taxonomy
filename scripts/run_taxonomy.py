@@ -103,14 +103,15 @@ def run_taxonomy(cfg: dict, only_taxonomies: list[str] | None = None) -> ModelTa
 
     backend = LocalBackend(n_jobs=1)
     cache_dir = get_cache_dir(cfg)
-    repr_cache = make_repr_cache(cache_dir)
     profile = ModelTaxonomyProfile(model_ids=model_ids)
 
     # ── Functional ─────────────────────────────────────────────────────────────
     if "functional" in configured_taxonomies:
         print("\n  [functional]")
         queries = make_queries(cfg)
-        taxonomy = make_functional_taxonomy(cfg, queries, cache=repr_cache)
+        taxonomy = make_functional_taxonomy(
+            cfg, queries, cache=make_repr_cache(cache_dir, "functional")
+        )
         metric_names = _to_list(metrics_cfg.get("functional", "cka"))
 
         for metric_name in metric_names:
@@ -129,7 +130,9 @@ def run_taxonomy(cfg: dict, only_taxonomies: list[str] | None = None) -> ModelTa
     if "behavioral" in configured_taxonomies:
         print("\n  [behavioral]")
         queries = make_queries(cfg)
-        taxonomy = make_behavioral_taxonomy(cfg, queries, cache=repr_cache)
+        taxonomy = make_behavioral_taxonomy(
+            cfg, queries, cache=make_repr_cache(cache_dir, "behavioral")
+        )
         metric_names = _to_list(metrics_cfg.get("behavioral", "frobenius"))
 
         for metric_name in metric_names:
@@ -191,7 +194,6 @@ def run_taxonomy(cfg: dict, only_taxonomies: list[str] | None = None) -> ModelTa
             base_model_id = meta.get("base_model_id")
             stax = StructuralTaxonomy(
                 lora_only=True,
-                cache=repr_cache,
                 lora_cache=lora_cache,
                 base_model_id=base_model_id,
                 hf_token=hf_token(cfg),

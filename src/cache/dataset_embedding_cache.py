@@ -21,7 +21,7 @@ class DatasetEmbeddingCache:
 
     Directory layout::
 
-        cache_root/dataset_embeddings/{recipe_hash}/
+        cache_root/02_dataset_embeddings/{recipe_hash}/
             recipe.json                ← human-readable recipe (plain-text)
             {embedder_hash}/
                 config.json            ← embedder config + representation + n_samples
@@ -33,7 +33,7 @@ class DatasetEmbeddingCache:
 
     def __init__(self, cache_root: Path | str) -> None:
         self.root = Path(cache_root)
-        self._base = self.root / "dataset_embeddings"
+        self._base = self.root / "02_dataset_embeddings"
 
     # ------------------------------------------------------------------
     # Path helpers

@@ -1,9 +1,23 @@
 # Numbering the shared cache directories
 
-**Status:** agreed, not yet done. Deliberately deferred so it would not land in the
-same pass as the comparison machinery — it touches five cache classes, ~1,700
-on-disk directories and the notebooks, and mixing it with new code is where
-mistakes come from.
+**Status: DONE** (task 1). Applied by `scripts/migrate_cache_layout.py --apply`;
+that script remains the record of what moved and carries a `--revert`. This note is
+kept for the reasoning, not as a plan.
+
+Two things changed relative to the sketch below, both decided in conversation:
+
+- `adapter_alignments` became **`03A_adapter_alignments`**, not `03_...` — a letter
+  suffix marks analysis *of* the objects at that stage rather than a stage of its own.
+- The `DiskCache` fallback was **removed from `StructuralTaxonomy`** rather than
+  merely left unused. Its only live construction site always supplies a `LoRACache`,
+  so the branches were unreachable; structural now has exactly one caching protocol.
+
+Recipe backfill result: 564 of 564 hashes resolved — 562 copied from the
+dataset-embedding cache, 2 recovered by re-hashing `results/*/datasets/*.recipe.json`.
+
+Originally deferred so it would not land in the same pass as the comparison
+machinery — it touches five cache classes, ~1,700 on-disk directories and the
+notebooks, and mixing it with new code is where mistakes come from.
 
 **Strategy chosen:** move the directories and update every path. **No
 compatibility shim** — a fallback layer would leave two live layouts and quietly

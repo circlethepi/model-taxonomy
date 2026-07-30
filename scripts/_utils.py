@@ -271,10 +271,15 @@ def make_mixed_dataset(
     ``(recipe_hash, total_samples, seed)`` and returns a ``CachedMixedDataset``
     on a hit.  On a miss the dataset is loaded from HuggingFace and the rows
     are written to the cache for future calls.
+
+    The recipe itself is mirrored alongside the rows on either path, so the cache
+    stays the hash-indexed home for recipes rather than depending on the dataset
+    having also been embedded.
     """
     from src.datasets.class_recipe import ClassAwareDatasetRecipe
 
     if sample_cache is not None:
+        sample_cache.put_recipe(recipe.recipe_hash(), recipe.to_dict())
         cached_rows = sample_cache.get(recipe.recipe_hash(), total_samples, seed)
         if cached_rows is not None:
             from src.datasets.mixed_dataset import CachedMixedDataset
@@ -322,11 +327,13 @@ def get_adapter_root(cfg: dict) -> Path:
     """Return the root directory for raw PEFT adapter files.
 
     When a shared ``cache_dir`` is configured, adapters are stored under
-    ``{cache_dir}/adapters/`` so they are shared across experiments.
-    Falls back to ``{output_dir}/adapters/`` for backward compatibility.
+    ``{cache_dir}/03_adapters/`` so they are shared across experiments.
+    Falls back to ``{output_dir}/adapters/`` for backward compatibility — the
+    numeric prefixes describe shared-cache pipeline stages, and an experiment
+    output directory has no such ordering, so that name is left unnumbered.
     """
     if "cache_dir" in cfg:
-        return Path(cfg["cache_dir"]) / "adapters"
+        return Path(cfg["cache_dir"]) / "03_adapters"
     return Path(cfg["output_dir"]) / "adapters"
 
 
@@ -392,9 +399,33 @@ def parse_dtype(name: str) -> torch.dtype:
 
 # ── Cache factories ───────────────────────────────────────────────────────────
 
-def make_repr_cache(cache_dir: Path):
+#: Where each taxonomy's representations live under the shared cache.  Structural is
+#: absent on purpose: its representations are written by LoRACache, beside the adapter
+#: weights they were derived from, rather than into a stage directory of their own.
+REPR_CACHE_DIRS = {
+    "functional": "04_activations",
+    "behavioral": "05_generated",
+}
+
+
+def make_repr_cache(cache_dir: Path, taxonomy: str):
+    """DiskCache for one taxonomy's representations.
+
+    Functional and behavioral get separate directories so the two are visibly
+    distinct on disk rather than interleaved content hashes in one.  Both are
+    provisional homes: when those levels are built out they are expected to grow
+    their own cache classes the way structural has LoRACache.
+    """
     from src.cache.disk import DiskCache
-    return DiskCache(cache_dir / "representations")
+
+    try:
+        subdir = REPR_CACHE_DIRS[taxonomy]
+    except KeyError:
+        raise ValueError(
+            f"no representation cache directory for taxonomy {taxonomy!r}; "
+            f"choose from {sorted(REPR_CACHE_DIRS)}"
+        ) from None
+    return DiskCache(cache_dir / subdir)
 
 
 def make_dataset_embedding_cache(cache_dir: Path):
@@ -404,7 +435,7 @@ def make_dataset_embedding_cache(cache_dir: Path):
 
 def make_sampled_dataset_cache(cache_dir: Path):
     from src.cache.sampled_dataset_cache import SampledDatasetCache
-    return SampledDatasetCache(cache_dir / "sampled_datasets")
+    return SampledDatasetCache(cache_dir)
 
 
 # ── Taxonomy / metric / geometry factories ────────────────────────────────────
@@ -484,12 +515,11 @@ def make_behavioral_taxonomy(cfg: dict, queries: list[str], cache=None):
     )
 
 
-def make_structural_taxonomy(cfg: dict, cache=None, lora_cache=None):
+def make_structural_taxonomy(cfg: dict, lora_cache=None):
     from src.taxonomy.structural import StructuralTaxonomy
 
     return StructuralTaxonomy(
         lora_only=True,
-        cache=cache,
         lora_cache=lora_cache,
         hf_token=hf_token(cfg),
     )

@@ -11,7 +11,6 @@ import numpy as np
 
 from src.core.protocols import Taxonomy, ModelID
 from src.core.representation import ModelRepresentation
-from src.cache.disk import DiskCache
 from src.cache.lora_cache import LoRACache
 
 # ---------------------------------------------------------------------------
@@ -184,17 +183,17 @@ class StructuralTaxonomy(Taxonomy):
 
     Extraction priority:
         1. LoRACache hit         — return existing representation immediately.
-        2. DiskCache hit         — return existing representation immediately.
-        3. Local safetensors     — read A/B tensors directly from the PEFT
+        2. Local safetensors     — read A/B tensors directly from the PEFT
                                    ``adapter_model.safetensors`` file stored in the
                                    LoRACache adapter directory (no base model load).
-        4. Full model load       — ``AutoModelForCausalLM.from_pretrained`` fallback
+        3. Full model load       — ``AutoModelForCausalLM.from_pretrained`` fallback
                                    for when raw PEFT files are not available locally.
 
     Cache storage:
-        ``lora_cache`` (LoRACache) — checked first when set; organises representations
-        under ``base_model_id → adapter_id → config_hash``.
-        ``cache`` (DiskCache) — flat hash-keyed fallback.
+        ``lora_cache`` (LoRACache) — organises representations under
+        ``base_model_id → adapter_id → config_hash``, so a structural representation
+        lands beside the adapter weights it was derived from.  Without one there is
+        no caching and every call recomputes, which is also true of weight loading.
     """
 
     def __init__(
@@ -204,7 +203,6 @@ class StructuralTaxonomy(Taxonomy):
         projections: str | list[str] | None = None,
         lora_only: bool = True,
         use_lora_product: bool = True,
-        cache: DiskCache | None = None,
         lora_cache: LoRACache | None = None,
         base_model_id: str | None = None,
         hf_token: str | None = None,
@@ -214,7 +212,6 @@ class StructuralTaxonomy(Taxonomy):
         self.projections = projections
         self.lora_only = lora_only
         self.use_lora_product = use_lora_product
-        self.cache = cache
         self.lora_cache = lora_cache
         self.base_model_id = base_model_id
         self.hf_token = hf_token or os.environ.get("HF_TOKEN")
@@ -258,12 +255,7 @@ class StructuralTaxonomy(Taxonomy):
             if self.lora_cache.exists(base_id, model_id, extraction_config):
                 return self.lora_cache.load(base_id, model_id, extraction_config)
 
-        # 2. DiskCache hit
-        cache_key = DiskCache.key_for(model_id, self.config_dict()) if self.cache else ""
-        if self.cache is not None and self.cache.exists(cache_key):
-            return self.cache.load(cache_key)
-
-        # 3. Fast path: read directly from local PEFT safetensors (no base model load)
+        # 2. Fast path: read directly from local PEFT safetensors (no base model load)
         vectors: list[np.ndarray] | None = None
         labels: list[str] | None = None
         local_adapter_dir: Path | None = None
@@ -275,7 +267,7 @@ class StructuralTaxonomy(Taxonomy):
             if st_path.exists():
                 vectors, labels = self._extract_from_safetensors(st_path)
 
-        # 4. Full model load fallback
+        # 3. Full model load fallback
         if vectors is None:
             vectors, labels = self._extract_via_model(model_id)
 
@@ -303,8 +295,6 @@ class StructuralTaxonomy(Taxonomy):
                 extraction_config=extraction_config,
                 layer_lengths=layer_lengths,
             )
-        elif self.cache is not None:
-            self.cache.save(cache_key, rep)
 
         return rep
 

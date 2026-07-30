@@ -696,7 +696,7 @@ class DatasetEmbeddingCache:
     ) -> str
 ```
 
-Hierarchical cache for `DatasetEmbeddingTaxonomy` representations. Stores data under `cache_root/dataset_embeddings/{recipe_hash}/{embedder_hash}/`. Each entry contains a human-readable `recipe.json`, a `config.json` with embedder settings, and an `embeddings.safetensors` file. Pass a `DatasetEmbeddingCache` instance to `DatasetEmbeddingTaxonomy(cache=...)` to enable persistence.
+Hierarchical cache for `DatasetEmbeddingTaxonomy` representations. Stores data under `cache_root/02_dataset_embeddings/{recipe_hash}/{embedder_hash}/`. Each entry contains a human-readable `recipe.json`, a `config.json` with embedder settings, and an `embeddings.safetensors` file. Pass a `DatasetEmbeddingCache` instance to `DatasetEmbeddingTaxonomy(cache=...)` to enable persistence.
 
 `embedder_hash` identifies a `(embedder_config, representation, n_samples)` triple and is used as the second-level directory key.
 

@@ -168,6 +168,9 @@ class DatasetEmbeddingTaxonomy(Taxonomy):
         # Sample cache lookup / population
         mixed: MixedDataset | ClassMixedDataset | CachedMixedDataset
         if self.sample_cache is not None:
+            # Mirror the recipe beside its rows on either path, so the sample cache
+            # stays the hash-indexed home for recipes.
+            self.sample_cache.put_recipe(recipe_hash, recipe.to_dict())
             cached_rows = self.sample_cache.get(recipe_hash, n_samples, seed)
             if cached_rows is not None:
                 mixed = CachedMixedDataset(cached_rows, recipe)

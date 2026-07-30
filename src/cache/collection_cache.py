@@ -17,7 +17,7 @@ class CollectionCache:
 
     Directory layout::
 
-        cache_root/collections/
+        cache_root/06_collections/
             index.json                      ← readable catalogue of every collection
             {collection_hash}/
                 collection_info.json        ← model entries + reconstruction info
@@ -47,7 +47,7 @@ class CollectionCache:
 
     def __init__(self, cache_root: Path | str) -> None:
         self.root = Path(cache_root)
-        self._collections_dir = self.root / "collections"
+        self._collections_dir = self.root / "06_collections"
 
     # ------------------------------------------------------------------
     # Hash helpers

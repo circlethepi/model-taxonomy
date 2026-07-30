@@ -40,7 +40,7 @@ from src.analysis import (
 from src.core.geometry import GeometryResult
 
 REPO = Path(__file__).parent.parent
-ADAPTER_ROOT = REPO / "results/shared_cache/adapters"
+ADAPTER_ROOT = REPO / "results/shared_cache/03_adapters"
 BASE_MODEL = "meta-llama/Llama-3.2-3B"
 YAHOO_ADAPTERS = [
     "yahoo_100t0_000t1_n1000_s00_r16_i00",
@@ -69,6 +69,7 @@ def check(name: str):
                 _RESULTS.append(("FAIL", name, f"{type(e).__name__}: {e}"))
                 traceback.print_exc()
         wrapped.__name__ = fn.__name__
+        wrapped.check_name = name  # so --list and -k can match on the description
         return wrapped
     return deco
 
@@ -960,8 +961,8 @@ def t_scan_cache():
     from src.analysis import scan_cache
 
     root = REPO / "results/shared_cache"
-    if not (root / "adapters").exists():
-        raise _Skip(f"{root}/adapters not present")
+    if not (root / "03_adapters").exists():
+        raise _Skip(f"{root}/03_adapters not present")
 
     index = scan_cache(root)
     if not len(index):
@@ -1006,8 +1007,8 @@ def t_comparison_end_to_end():
     from src.analysis import build_taxonomy_artifacts, compare_taxonomies, scan_cache
 
     root = REPO / "results/shared_cache"
-    if not (root / "adapters").exists():
-        raise _Skip(f"{root}/adapters not present")
+    if not (root / "03_adapters").exists():
+        raise _Skip(f"{root}/03_adapters not present")
 
     index = scan_cache(root).with_available("structural_weights", "dataset_embedding")
     slices = index.slices(("n_samples", "seed"))
@@ -1136,15 +1137,44 @@ DATA_BACKED = [
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--synthetic-only", action="store_true",
-                        help="Skip checks that read from results/.")
+                        help="Skip checks that read from results/. Keeps the run in-memory "
+                             "and avoids touching the cache at all.")
+    parser.add_argument("--data-only", action="store_true",
+                        help="Run only the checks that read the real cache — the ones that "
+                             "catch a broken path after a cache migration.")
+    parser.add_argument("-k", metavar="PATTERN",
+                        help="Run only checks whose description contains PATTERN "
+                             "(case-insensitive substring, e.g. -k 'cache').")
+    parser.add_argument("--list", action="store_true",
+                        help="Print the check names and exit without running anything.")
     args = parser.parse_args()
+
+    if args.synthetic_only and args.data_only:
+        parser.error("--synthetic-only and --data-only are mutually exclusive")
+
+    if args.data_only:
+        checks = list(DATA_BACKED)
+    elif args.synthetic_only:
+        checks = list(SYNTHETIC)
+    else:
+        checks = SYNTHETIC + DATA_BACKED
+
+    if args.k:
+        pattern = args.k.lower()
+        checks = [fn for fn in checks if pattern in fn.check_name.lower()]
+        if not checks:
+            parser.error(f"no check matches {args.k!r}; use --list to see the names")
+
+    if args.list:
+        for fn in checks:
+            print(f"  {fn.check_name}")
+        print(f"\n{len(checks)} check(s)")
+        return 0
 
     try:
         from threadpoolctl import threadpool_limits
     except ImportError:
         threadpool_limits = None
-
-    checks = SYNTHETIC + ([] if args.synthetic_only else DATA_BACKED)
 
     print("=== src/analysis checks ===\n")
     ctx = threadpool_limits(1) if threadpool_limits is not None else None

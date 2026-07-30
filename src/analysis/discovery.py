@@ -290,9 +290,9 @@ def scan_cache(
         recipe and the cache can hold thousands.
     """
     root = Path(cache_root)
-    adapters_root = root / "adapters"
-    embeddings_root = root / "dataset_embeddings"
-    sampled_root = root / "sampled_datasets"
+    adapters_root = root / "03_adapters"
+    embeddings_root = root / "02_dataset_embeddings"
+    sampled_root = root / "01_datasets"
 
     if not adapters_root.exists():
         return CacheIndex([], root)
@@ -336,8 +336,8 @@ def scan_cache(
 
             if entry.recipe_hash and resolve_recipes:
                 if entry.recipe_hash not in recipe_cache:
-                    recipe_cache[entry.recipe_hash] = _read_json(
-                        embeddings_root / entry.recipe_hash / "recipe.json"
+                    recipe_cache[entry.recipe_hash] = _resolve_recipe(
+                        entry.recipe_hash, sampled_root, embeddings_root
                     )
                 entry.recipe = recipe_cache[entry.recipe_hash]
 
@@ -357,7 +357,7 @@ def scan_cache(
             entries.append(entry)
 
     if scan_all_recipes:
-        _attach_unreferenced_recipes(entries, de_cache, embeddings_root)
+        _attach_unreferenced_recipes(entries, de_cache, sampled_root, embeddings_root)
 
     return CacheIndex(entries, root)
 
@@ -421,7 +421,7 @@ def _sampled_rows_exist(
 
 
 def _attach_unreferenced_recipes(
-    entries: list[CacheEntry], de_cache, embeddings_root: Path
+    entries: list[CacheEntry], de_cache, sampled_root: Path, embeddings_root: Path
 ) -> None:
     """Append recipe-only entries for recipes no discovered adapter was trained on.
 
@@ -433,7 +433,7 @@ def _attach_unreferenced_recipes(
     for recipe_hash in de_cache.list_recipes():
         if recipe_hash in seen:
             continue
-        recipe = _read_json(embeddings_root / recipe_hash / "recipe.json")
+        recipe = _resolve_recipe(recipe_hash, sampled_root, embeddings_root)
         if recipe is None:
             continue
         recipe_id = recipe.get("name")
@@ -457,6 +457,25 @@ def _attach_unreferenced_recipes(
                 },
             )
         )
+
+
+def _resolve_recipe(
+    recipe_hash: str, sampled_root: Path, embeddings_root: Path
+) -> dict | None:
+    """The mixing spec a recipe hash identifies, or None if it is nowhere on disk.
+
+    ``01_datasets`` is the authoritative home: a recipe hash names a dataset, and the
+    dataset's own directory is where its definition belongs.  The dataset-embedding
+    cache is consulted second only because it writes its own copy, so a recipe that
+    was embedded without ever going through the sample cache still resolves.  Before
+    ``01_datasets`` existed the embedding cache was the *only* source, which meant any
+    recipe sampled but never embedded could not be resolved at all — that is the
+    defect this ordering fixes, not a layout fallback.
+    """
+    recipe = _read_json(sampled_root / recipe_hash / "recipe.json")
+    if recipe is not None:
+        return recipe
+    return _read_json(embeddings_root / recipe_hash / "recipe.json")
 
 
 def _read_json(path: Path) -> dict | None:

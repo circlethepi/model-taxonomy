@@ -38,6 +38,30 @@ from src.datasets import (
     ClassMixedDataset,
 )
 
+from src.analysis import (
+    as_distance_matrix,
+    lora_distance_matrix,
+    fit_geometry,
+    save_collection,
+    recipe_id_for,
+    relabel,
+    match_models,
+    matrix_correlation,
+    mantel_test,
+    correlation_table,
+    procrustes_compare,
+    per_point_residuals,
+    protest,
+    align_to_reference,
+    point_dispersion,
+    kruskal_stress,
+    shepard,
+    SimplexProjection,
+    barycentric,
+    compare_simplices,
+    anchor_weight_vs_truth,
+)
+
 __all__ = [
     # core types
     "ModelID",
@@ -78,4 +102,26 @@ __all__ = [
     "ClassAwareDatasetRecipe",
     "MixedDataset",
     "ClassMixedDataset",
+    # analysis
+    "as_distance_matrix",
+    "lora_distance_matrix",
+    "fit_geometry",
+    "save_collection",
+    "recipe_id_for",
+    "relabel",
+    "match_models",
+    "matrix_correlation",
+    "mantel_test",
+    "correlation_table",
+    "procrustes_compare",
+    "per_point_residuals",
+    "protest",
+    "align_to_reference",
+    "point_dispersion",
+    "kruskal_stress",
+    "shepard",
+    "SimplexProjection",
+    "barycentric",
+    "compare_simplices",
+    "anchor_weight_vs_truth",
 ]

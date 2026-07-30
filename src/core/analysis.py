@@ -13,6 +13,15 @@ from .distance import DistanceMatrix
 from .geometry import GeometryResult
 
 
+def geometry_key(method: str, n_components: int) -> str:
+    """Name one embedding: ``"mds", 2`` → ``"mds_2d"``.
+
+    Defined here and reused by :class:`~src.cache.collection_cache.CollectionCache`
+    so an embedding is called the same thing in memory and on disk.
+    """
+    return f"{method}_{n_components}d"
+
+
 @dataclass
 class TaxonomyAnalysis:
     """Complete result for one taxonomy applied to a model collection."""
@@ -21,7 +30,23 @@ class TaxonomyAnalysis:
     model_ids: list[ModelID]
     representations: list[ModelRepresentation]
     distance_matrix: DistanceMatrix
+    #: The primary embedding, kept for callers written against the single-geometry
+    #: API.  When several were fitted this is the first of them.
     geometry: GeometryResult | None = None
+    #: Every embedding fitted for this analysis, keyed ``{method}_{n_components}d``
+    #: — the same key :class:`~src.cache.collection_cache.CollectionCache` uses.
+    #: A single slot was not enough: a simplex projection needs ``k-1`` dimensions
+    #: while a plot needs two, and configuring both previously meant the earlier
+    #: one was computed and then silently overwritten.
+    geometries: dict[str, GeometryResult] = field(default_factory=dict)
+
+    def add_geometry(self, geometry: GeometryResult) -> str:
+        """Record an embedding, and adopt it as ``geometry`` if it is the first."""
+        key = geometry_key(geometry.method, geometry.n_components)
+        self.geometries[key] = geometry
+        if self.geometry is None:
+            self.geometry = geometry
+        return key
 
     def save(self, path: Path) -> None:
         from safetensors.numpy import save_file
@@ -31,6 +56,8 @@ class TaxonomyAnalysis:
         self.distance_matrix.save(path / "distance_matrix")
         if self.geometry is not None:
             self.geometry.save(path / "geometry")
+        for key, geo in self.geometries.items():
+            geo.save(path / "geometries" / key)
         for rep in self.representations:
             rep_dir = path / "representations" / rep.cache_key
             rep_dir.mkdir(parents=True, exist_ok=True)
@@ -63,6 +90,14 @@ class TaxonomyAnalysis:
         geometry: GeometryResult | None = None
         if (path / "geometry").exists():
             geometry = GeometryResult.load(path / "geometry")
+        # Profiles saved before multiple geometries were supported have no
+        # geometries/ directory; they load with just the single slot populated.
+        geometries: dict[str, GeometryResult] = {}
+        geo_root = path / "geometries"
+        if geo_root.exists():
+            for geo_dir in sorted(geo_root.iterdir()):
+                if geo_dir.is_dir() and (geo_dir / "geometry.safetensors").exists():
+                    geometries[geo_dir.name] = GeometryResult.load(geo_dir)
         representations: list[ModelRepresentation] = []
         rep_root = path / "representations"
         if rep_root.exists():
@@ -87,6 +122,7 @@ class TaxonomyAnalysis:
             representations=representations,
             distance_matrix=distance_matrix,
             geometry=geometry,
+            geometries=geometries,
         )
 
 

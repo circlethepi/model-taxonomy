@@ -5,6 +5,7 @@ All public classes are importable directly from `src`:
 ```python
 from src import BehavioralTaxonomy, CKADistanceMetric, MDSGeometry, ...
 from src.cache import DiskCache, LoRACache, CollectionCache
+from src.analysis import barycentric, mantel_test, procrustes_compare, ...
 ```
 
 ---
@@ -284,8 +285,9 @@ class FunctionalTaxonomy(Taxonomy):
 class StructuralTaxonomy(Taxonomy):
     def __init__(
         self,
-        layer_names: list[str] | None = None,    # None = auto-detect
-        n_components: int = 256,                  # per-layer vector length after truncate/pad
+        layer_names: list[str] | None = None,     # explicit module-name prefixes
+        layer_indices: int | list[int] | Literal["last"] | None = None,
+        projections: str | list[str] | None = None,   # "k"/"q"/"v"/"o" or list
         lora_only: bool = True,                   # use LoRA adapter matrices only
         use_lora_product: bool = True,            # True = store B@A; False = concat(A, B)
         cache: DiskCache | None = None,           # flat hash-keyed fallback
@@ -298,16 +300,19 @@ class StructuralTaxonomy(Taxonomy):
 
 | Parameter | Description |
 |---|---|
-| `layer_names` | Explicit parameter names; `None` = auto-detect LoRA pairs or all 2-D weights |
-| `n_components` | Each per-layer weight vector is truncated or zero-padded to this length |
+| `layer_names` | Explicit module-name prefixes; takes precedence over `layer_indices` / `projections` when set |
+| `layer_indices` | Shorthand layer selector: int, list of ints, `"last"`, or `None` for all layers |
+| `projections` | Shorthand projection selector: `"k"`, `"q"`, `"v"`, `"o"` (or long forms), a list, or `None` for all |
 | `lora_only` | `True` (default): use only `.lora_A.` / `.lora_B.` parameters; raises `ValueError` if none found |
 | `use_lora_product` | `True`: compare `(B @ A).flatten()`; `False`: compare `concat(A.flatten(), B.flatten())` |
-| `lora_cache` | `LoRACache` for hierarchical storage under `base_model → adapter` |
+| `lora_cache` | `LoRACache` for hierarchical storage under `base_model → adapter → config_hash` |
 | `base_model_id` | Base model HF ID; if `None`, read from PEFT `adapter_config.json` on the Hub |
 
-**Cache priority:** `lora_cache` is checked first; `cache` (flat `DiskCache`) is the fallback.
+**Extraction priority:** `LoRACache` hit → `DiskCache` hit → local PEFT `adapter_model.safetensors` (no base model load) → full `AutoModelForCausalLM.from_pretrained`.
 
-**Representation shape:** `(N_layers, n_components)` — one row per weight layer or LoRA module.
+**Representation shape:** `(N_layers, max_len)` — one row per weight layer or LoRA module. Each vector is stored at its full natural length; rows shorter than the longest are zero-padded so the matrix can be stacked, and the true pre-padding lengths are kept in `metadata["layer_lengths"]` and in the cache `config.json`.
+
+> There is no `n_components` parameter. Vectors were truncated/padded to a fixed width in earlier versions; that was removed so no weight information is discarded.
 
 ---
 
@@ -694,6 +699,126 @@ class DatasetEmbeddingCache:
 Hierarchical cache for `DatasetEmbeddingTaxonomy` representations. Stores data under `cache_root/dataset_embeddings/{recipe_hash}/{embedder_hash}/`. Each entry contains a human-readable `recipe.json`, a `config.json` with embedder settings, and an `embeddings.safetensors` file. Pass a `DatasetEmbeddingCache` instance to `DatasetEmbeddingTaxonomy(cache=...)` to enable persistence.
 
 `embedder_hash` identifies a `(embedder_config, representation, n_samples)` triple and is used as the second-level directory key.
+
+---
+
+## Analysis
+
+Import from `src.analysis` (also re-exported from `src`). Everything here
+consumes `DistanceMatrix` / `GeometryResult`; nothing loads a model or touches a
+GPU.
+
+### Bridge — raw LoRA weights → core types
+
+```python
+as_distance_matrix(names, matrix, metric, taxonomy="structural",
+                   similarity=False) -> DistanceMatrix
+lora_distance_matrix(weights, kind="cosine", layers=None, projections=None,
+                     align=False, cache_dir=None) -> DistanceMatrix
+fit_geometry(dm, method="mds", n_components=2, **kwargs) -> GeometryResult
+save_collection(dm, geometries=(), cache_root=..., model_entries=None) -> str
+```
+
+`kind` is one of `"cosine"`, `"frobenius"`, `"bures_wasserstein"`, `"cka"`.
+`similarity=True` converts `1 - S`, needed for `cosine_similarity_matrix`.
+`"cka"` accepts a single `(layer, projection)` block only.
+
+### Distance-matrix comparison
+
+```python
+match_models(*objs, key=None) -> tuple[list[ModelID], list[np.ndarray]]
+offdiag(matrix) -> np.ndarray
+matrix_correlation(dm_a, dm_b, method="spearman", key=None) -> float
+mantel_test(dm_a, dm_b, n_permutations=9999, method="spearman",
+            random_state=0, key=None) -> MantelResult
+correlation_table(analyses, method="spearman", min_models=3, key=None)
+    -> tuple[list[str], np.ndarray]
+```
+
+`match_models` is set intersection plus reindexing — bookkeeping, unrelated to
+Procrustes. `correlation_table` reports `nan` for pairs with no models in common
+rather than raising.
+
+`MantelResult`: `statistic`, `p_value`, `n_permutations`, `n_models`, `method`, `null`.
+
+### Identifier reconciliation
+
+```python
+recipe_id_for(model_id) -> str
+relabel(obj, key) -> DistanceMatrix | GeometryResult | dict
+id_overlap(*objs, key=None) -> dict
+```
+
+Model-level taxonomies key rows by adapter path
+(`.../yahoo_topic0_only_r16`); `DatasetEmbeddingTaxonomy` keys them by recipe ID
+(`yahoo_topic0_only`). `recipe_id_for` maps the former onto the latter, reading
+`dataset_name` from the adapter's `experiment_meta.json` and falling back to
+parsing the directory name; non-adapter identifiers pass through unchanged. Pass
+it as `key=` to any comparison function to bring `dataset_embedding` into a
+cross-taxonomy table.
+
+`relabel` returns a copy with rewritten `model_ids` (arrays shared, input
+untouched) and accepts a callable or a partial mapping. It raises if the rewrite
+would collide two distinct models — as a LoRA rank or init-seed sweep would,
+since those variants share one dataset. `id_overlap` reports identifier counts,
+intersection size and the entries unique to each side, with or without a `key`.
+
+### Configuration comparison
+
+```python
+procrustes_compare(geom_a, geom_b, scaling=True, reflection=True) -> ProcrustesResult
+per_point_residuals(result) -> np.ndarray
+protest(geom_a, geom_b, n_permutations=9999, random_state=0, ...) -> ProtestResult
+align_to_reference(geometries, reference=None, ...) -> list[GeometryResult]
+point_dispersion(geometries, reference=None, ...) -> DispersionResult
+```
+
+`ProcrustesResult`: `disparity`, `aligned_a`, `aligned_b`, `rotation`, `scale`,
+`model_ids`. With `scaling=True` the disparity matches
+`scipy.spatial.procrustes` and lies in `[0, 1]`.
+
+`DispersionResult`: `per_model`, `model_ids`, `mean_disparity`, `n_geometries`,
+`sorted_models()`.
+
+### Embedding fidelity
+
+```python
+kruskal_stress(dm, geometry) -> float
+shepard(dm, geometry) -> tuple[np.ndarray, np.ndarray]
+```
+
+### Anchor simplex
+
+```python
+barycentric(geometry, anchors, clip=True) -> SimplexProjection
+compare_simplices(a, b) -> SimplexComparison
+anchor_weight_vs_truth(projection, true_values, anchor=0) -> RecoveryResult
+```
+
+```python
+@dataclass
+class SimplexProjection:
+    weights:    np.ndarray   # (n, k), rows sum to 1
+    model_ids:  list[ModelID]
+    anchor_ids: list[ModelID]
+    residuals:  np.ndarray   # (n,) distance from the simplex / its affine hull
+    taxonomy:   str
+    method:     str
+    clipped:    bool
+```
+
+with `weight_for()`, `anchor_column()`, `save()` and `load()`.
+
+`SimplexComparison`: `l1`, `total_variation`, `l2`, `per_anchor_spearman`,
+`mean_total_variation`, `max_total_variation`, `sorted_models()`.
+
+`RecoveryResult`: `true`, `recovered`, `pearson`, `spearman`, `residuals`,
+`columns`, `mean_l1`, plus `.r` / `.rho` / `.pairs()` for single-column
+comparisons. `true_values` accepts a mapping keyed by model ID or an array of
+shape `(n,)` or `(n, k)`.
+
+See [Core Concepts](concepts.md) for why barycentric coordinates make two
+geometries comparable without a Procrustes step.
 
 ---
 

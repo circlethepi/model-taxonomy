@@ -512,18 +512,40 @@ def make_metric(name: str):
         raise ValueError(f"Unknown metric: {name!r}. Choose from cka, frobenius, cosine, dot_product.")
 
 
-def make_geometry(name: str):
+def make_geometry(name: str, n_components: int = 2):
+    """Build a geometry method at a chosen dimension.
+
+    The dimension used to be fixed at 2, which is right for a plot but rules out
+    everything else: a barycentric projection onto a simplex with k vertices is
+    undefined below k-1 dimensions, so a three-way dataset mixture could not be
+    analysed at all through this path.  See ``taxonomy.n_components`` in the
+    experiment YAML, and :func:`src.analysis.bridge.fit_geometry` for the
+    library-level equivalent.
+    """
     if name == "pca":
         from src.geometry_methods.pca import PCAGeometry
-        return PCAGeometry(n_components=2)
+        return PCAGeometry(n_components=n_components)
     elif name == "mds":
         from src.geometry_methods.mds import MDSGeometry
-        return MDSGeometry(n_components=2)
+        return MDSGeometry(n_components=n_components)
     elif name == "umap":
         from src.geometry_methods.umap import UMAPGeometry
-        return UMAPGeometry(n_components=2)
+        return UMAPGeometry(n_components=n_components)
     else:
         raise ValueError(f"Unknown geometry method: {name!r}. Choose from pca, mds, umap.")
+
+
+def geometry_dims(cfg: dict) -> list[int]:
+    """Dimensions to embed at, from ``taxonomy.n_components`` in the YAML.
+
+    Accepts a scalar or a list; defaults to ``[2]``, which is what every existing
+    config produces.
+    """
+    raw = cfg.get("taxonomy", {}).get("n_components", 2)
+    dims = [raw] if isinstance(raw, int) else list(raw)
+    if not dims or any(int(d) < 1 for d in dims):
+        raise ValueError(f"taxonomy.n_components must be >= 1, got {raw!r}")
+    return sorted({int(d) for d in dims})
 
 
 def make_dataset_embedding_taxonomy(cfg: dict, cache=None, sample_cache=None):

@@ -158,9 +158,17 @@ lora_cache = LoRACache("./cache")
 
 # Directory structure:
 # ./cache/adapters/meta-llama--Llama-3.1-8B/some-org--my-adapter/
-#     config.json                 ← training details + dataset_recipe stub
-#     representation.safetensors  ← extracted representation matrix
+#     adapter_model.safetensors       ← raw PEFT weights (untouched)
+#     adapter_config.json
+#     {config_hash}/                  ← one dir per extraction configuration
+#         config.json                 ← training details + dataset_recipe stub
+#         representation.safetensors  ← extracted representation matrix
 ```
+
+The `{config_hash}` level lets several extraction configurations (different
+layers, projections, or `use_lora_product`) coexist for one adapter. Accordingly
+`exists()`, `load()`, `load_config()` and `save()` all take an
+`extraction_config: dict` identifying which one to use.
 
 Pass it to `StructuralTaxonomy` instead of (or in addition to) `DiskCache`:
 
@@ -185,6 +193,76 @@ info = cc.load_info(chash)   # collection_info.json as dict
 ```
 
 `collection_info.json` records the models and LoRA adapters in the collection, the metric and taxonomy used, and the list of geometry methods computed — enough to reconstruct the collection from scratch if needed.
+
+---
+
+## Analysing the results
+
+`src/analysis` sits on top of `DistanceMatrix` and `GeometryResult` and compares
+them at three levels.
+
+**Distance matrices** (`src.analysis.matrices`). Correlate two taxonomies'
+off-diagonal vectors — for five models, two 10-element vectors, one entry per
+model pair — to ask whether they rank model-pair similarity the same way.
+`mantel_test` puts a p-value on it by permuting model labels jointly across rows
+and columns, which destroys the correspondence between the two matrices while
+leaving each one's internal structure untouched.
+
+**Point configurations** (`src.analysis.configurations`). An embedding fixes
+coordinates only up to rotation, reflection, translation and scale, and picks
+among those arbitrarily. Procrustes superposition quotients that out, so
+`procrustes_compare` depends on shape alone. `per_point_residuals` then says
+*which* models the two taxonomies disagree about, and `point_dispersion` says
+which models sit stably across seeds.
+
+**Anchor simplices** (`src.analysis.simplex`). Choose `k` models as anchors and
+write every model in barycentric coordinates of the simplex they span — with two
+anchors, a position along the segment between them, plus a residual for how far
+off that line the model actually sits.
+
+Barycentric coordinates are the natural currency for comparing geometries: for a
+point in the anchors' affine hull they are invariant under *any* invertible
+affine map, and for points off the hull the least-squares projection is invariant
+under similarity transforms — which is exactly the ambiguity an embedding leaves.
+Two geometries from different taxonomies are therefore directly comparable in
+barycentric form, with no Procrustes step in between.
+
+This is also where the pipeline can be checked against something it never saw.
+Every other measure here compares one derived quantity to another; with adapters
+fine-tuned on known topic mixtures, `anchor_weight_vs_truth` compares the
+recovered mixing proportion against the real one.
+
+Distance matrices computed directly from LoRA factors (`src.notebook.structure`)
+enter the same layer via `src.analysis.lora_distance_matrix`, which returns an
+ordinary `DistanceMatrix` — so notebook work and pipeline runs are analysed and
+plotted with one set of tools.
+
+### Matching identifiers across levels
+
+The model-level taxonomies key their rows by **adapter path**
+(`results/yahoo_topics/adapters/meta-llama--Llama-3.2-3B/yahoo_topic0_only_r16`);
+`DatasetEmbeddingTaxonomy` keys its rows by **recipe ID** (`yahoo_topic0_only`),
+because its objects are datasets, not models. Those are the same experimental
+thing seen from two sides, but as strings they never match, so comparing the two
+levels directly finds nothing in common.
+
+`src.analysis.recipe_id_for` maps an adapter onto the recipe it was trained on —
+authoritatively, from the `dataset_name` that `finetune_lora.py` records in
+`experiment_meta.json` beside every adapter. Pass it as `key=` to any comparison
+function:
+
+```python
+from src.analysis import correlation_table, recipe_id_for
+
+labels, table = correlation_table(profile, key=recipe_id_for)
+```
+
+Dataset-level entries with no corresponding adapter — a held-out probe set, say
+— simply fall out of the intersection. Nothing on disk is rewritten; use
+`relabel()` if you want a copy carrying the new identifiers. Because the mapping
+is many-to-one (rank and seed variants of one dataset collapse together), a
+collection that sweeps those parameters must not be relabelled this way, and
+`relabel()` raises rather than let distinct models collide.
 
 ---
 

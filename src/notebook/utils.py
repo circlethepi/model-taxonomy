@@ -23,7 +23,13 @@ def sort_taxonomy(values):
 
 
 def transform_geometry(coords, xflip=False, yflip=False, rotation=None):
-    """transforms calculated coordinates"""
+    """transforms calculated coordinates
+
+    Manual, 2-D only, and re-guessed per figure. To put several geometries in a
+    common frame automatically — at any dimensionality — use
+    ``src.analysis.configurations.align_to_reference``, which solves for the
+    optimal rotation/reflection instead of taking it as an argument.
+    """
 
     coords = np.array(coords, dtype=float)
     if xflip:

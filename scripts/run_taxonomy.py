@@ -23,6 +23,7 @@ from scripts._utils import (
     expand_dataset_seeds,
     expand_dataset_n_samples,
     apply_dataset_capacity_caps,
+    geometry_dims,
     get_cache_dir,
     hf_token,
     resolve_model_ids,
@@ -46,6 +47,30 @@ def _to_list(v) -> list[str]:
     return v if isinstance(v, list) else [v]
 
 
+def _add_geometries(analysis, geometry_names, dims, metric_name: str) -> None:
+    """Fit every (method, dimension) pair and keep them all.
+
+    Each result used to be assigned to the single ``analysis.geometry`` slot
+    inside the loop, so configuring more than one method computed them all and
+    saved only the last.  ``TaxonomyAnalysis.add_geometry`` keys them by method
+    and dimension instead, which is also what makes a 1-D embedding for a simplex
+    projection coexist with a 2-D one for plotting.
+    """
+    dm = analysis.distance_matrix
+    n_models = len(dm.model_ids)
+    for geo_name in geometry_names:
+        for n in dims:
+            if n >= n_models:
+                print(f"    geometry [{geo_name} {n}d] skipped (needs > {n} models, have {n_models})")
+                continue
+            if geo_name == "umap" and n_models < 3:
+                print(f"    geometry [{geo_name} {n}d] skipped (needs >= 3 models)")
+                continue
+            key = analysis.add_geometry(make_geometry(geo_name, n_components=n).fit(dm))
+            shape = analysis.geometries[key].coordinates.shape
+            print(f"    [{metric_name}] geometry [{key}] computed  coords={shape}")
+
+
 def _make_lora_cache(cfg: dict):
     from src.cache.lora_cache import LoRACache
     return LoRACache(get_cache_dir(cfg))
@@ -60,6 +85,7 @@ def run_taxonomy(cfg: dict, only_taxonomies: list[str] | None = None) -> ModelTa
     tax_cfg = cfg.get("taxonomy", {})
     configured_taxonomies = tax_cfg.get("taxonomies", ["functional", "behavioral"])
     geometry_names = tax_cfg.get("geometry", ["pca"])
+    dims = geometry_dims(cfg)
     metrics_cfg = tax_cfg.get("metrics", {})
 
     if only_taxonomies:
@@ -92,10 +118,7 @@ def run_taxonomy(cfg: dict, only_taxonomies: list[str] | None = None) -> ModelTa
             analyzer = TaxonomyAnalyzer(taxonomy, metric, backend)
             analysis = analyzer.fit(model_ids)
 
-            for geo_name in geometry_names:
-                geo = make_geometry(geo_name)
-                analysis.geometry = geo.fit(analysis.distance_matrix)
-                print(f"    [{metric_name}] geometry [{geo_name}] computed  coords={analysis.geometry.coordinates.shape}")
+            _add_geometries(analysis, geometry_names, dims, metric_name)
 
             if len(metric_names) > 1:
                 analysis.taxonomy_name = f"functional_{metric_name}"
@@ -114,10 +137,7 @@ def run_taxonomy(cfg: dict, only_taxonomies: list[str] | None = None) -> ModelTa
             analyzer = TaxonomyAnalyzer(taxonomy, metric, backend)
             analysis = analyzer.fit(model_ids)
 
-            for geo_name in geometry_names:
-                geo = make_geometry(geo_name)
-                analysis.geometry = geo.fit(analysis.distance_matrix)
-                print(f"    [{metric_name}] geometry [{geo_name}] computed  coords={analysis.geometry.coordinates.shape}")
+            _add_geometries(analysis, geometry_names, dims, metric_name)
 
             if len(metric_names) > 1:
                 analysis.taxonomy_name = f"behavioral_{metric_name}"
@@ -142,10 +162,7 @@ def run_taxonomy(cfg: dict, only_taxonomies: list[str] | None = None) -> ModelTa
             analysis = analyzer.fit(recipe_ids)
             analysis.representations = []  # already cached in DatasetEmbeddingCache
 
-            for geo_name in geometry_names:
-                geo = make_geometry(geo_name)
-                analysis.geometry = geo.fit(analysis.distance_matrix)
-                print(f"    [{metric_name}] geometry [{geo_name}] computed  coords={analysis.geometry.coordinates.shape}")
+            _add_geometries(analysis, geometry_names, dims, metric_name)
 
             if len(metric_names) > 1:
                 analysis.taxonomy_name = f"dataset_embedding_{metric_name}"
@@ -217,13 +234,7 @@ def run_taxonomy(cfg: dict, only_taxonomies: list[str] | None = None) -> ModelTa
                     distance_matrix=dm,
                 )
 
-                for geo_name in geometry_names:
-                    if len(representations) < 3 and geo_name == "umap":
-                        print(f"    geometry [{geo_name}] skipped (need ≥3 models)")
-                        continue
-                    geo = make_geometry(geo_name)
-                    analysis.geometry = geo.fit(dm)
-                    print(f"    [{metric_name}] geometry [{geo_name}] computed  coords={analysis.geometry.coordinates.shape}")
+                _add_geometries(analysis, geometry_names, dims, metric_name)
 
                 profile.add(analysis)
 

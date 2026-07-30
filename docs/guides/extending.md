@@ -6,6 +6,13 @@ The library is designed so that new taxonomies, distance metrics, geometry metho
 
 To add a new taxonomy (e.g., `StructuralTaxonomy` comparing model weights), subclass `Taxonomy` and implement three methods:
 
+> The code below is a self-contained teaching example of how to write *a*
+> taxonomy — it is deliberately simple and is **not** a description of the real
+> `StructuralTaxonomy`, which has since dropped the `n_components` truncation
+> shown here. For the actual class see
+> [Structural Taxonomy](structural_taxonomy.md) and the
+> [API Reference](../api_reference.md).
+
 ```python
 # src/taxonomy/structural.py
 

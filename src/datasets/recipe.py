@@ -63,22 +63,37 @@ class DatasetRecipe:
     # ------------------------------------------------------------------
 
     def _canonical(self) -> str:
-        """Deterministic JSON string used to derive the recipe hash."""
+        """Deterministic JSON string used to derive the recipe hash.
+
+        Content only — ``name`` is deliberately *not* hashed.  The entries fully
+        determine the sampling distribution, so two recipes with the same entries
+        produce the same draws and are the same recipe however they are labelled.
+        Keeping the name out means one mixture has one hash regardless of how many
+        ``_n{n}_s{seed}`` variants of its name exist in configs.
+
+        ``recipe_type`` *is* hashed: it is the only field that distinguishes this
+        from :class:`~src.datasets.class_recipe.ClassAwareDatasetRecipe`, whose
+        canonical form is otherwise structurally identical.
+        """
         return json.dumps(
             {
-                "name": self.name,
+                "recipe_type": "simple",
                 "datasets": [e.to_dict() for e in self.datasets],
             },
             sort_keys=True,
         )
 
     def recipe_hash(self) -> str:
-        """16-char SHA-256 prefix that uniquely identifies this recipe."""
+        """16-char SHA-256 prefix that uniquely identifies this recipe's content."""
         return hashlib.sha256(self._canonical().encode()).hexdigest()[:16]
 
     def to_dict(self) -> dict:
+        # schema_version 2 = content-addressed hash (name no longer hashed).  A "1"
+        # file's stored recipe_hash is a legacy hash this code will not reproduce, so
+        # the version has to be distinguishable rather than silently recomputed.
+        # Versioned independently of the draw-manifest schema in SampledDatasetCache.
         return {
-            "schema_version": "1",
+            "schema_version": "2",
             "recipe_type": "simple",
             "name": self.name,
             "recipe_hash": self.recipe_hash(),

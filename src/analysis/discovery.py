@@ -377,6 +377,19 @@ def _build_entry(adapter_dir: Path, base_id: str, meta: dict) -> CacheEntry:
     if n_samples is None:
         # The name did not carry a size; the training record still does.
         n_samples = training.get("n_samples")
+    if seed is None:
+        # Likewise for the sampling seed.  finetune_lora.py records it because the
+        # recipe no longer can: the hash is content-addressed and its name carries
+        # neither n nor seed.
+        seed = training.get("seed")
+    if n_samples is None or seed is None:
+        # Older adapters predate both conventions, but their directory name is
+        # {expanded_block_name}_r{rank}_i{init} and the block name did carry them.
+        m = _ADAPTER_DIR_RE.match(adapter_dir.name)
+        if m:
+            _, dir_n, dir_seed = _parse_dataset_name(m.group("name"))
+            n_samples = n_samples if n_samples is not None else dir_n
+            seed = seed if seed is not None else dir_seed
 
     rank = lora_cfg.get("lora_rank")
     init_seed = lora_cfg.get("lora_init_seed")
@@ -416,8 +429,8 @@ def _sampled_rows_exist(
 ) -> bool:
     if not recipe_hash or n_samples is None or seed is None:
         return False
-    # SampledDatasetCache._path: {recipe_hash}/{n_samples}_{seed:010d}.json
-    return (sampled_root / recipe_hash / f"{n_samples}_{seed:010d}.json").exists()
+    # SampledDatasetCache._path: {recipe_hash}/n{n_samples}_s{seed}.json
+    return (sampled_root / recipe_hash / f"n{n_samples}_s{seed}.json").exists()
 
 
 def _attach_unreferenced_recipes(
@@ -436,27 +449,49 @@ def _attach_unreferenced_recipes(
         recipe = _resolve_recipe(recipe_hash, sampled_root, embeddings_root)
         if recipe is None:
             continue
-        recipe_id = recipe.get("name")
-        mixture, n_samples, seed = _parse_dataset_name(recipe_id)
-        entries.append(
-            CacheEntry(
-                model_id=recipe_id or recipe_hash,
-                adapter_name=recipe_id or recipe_hash,
-                recipe_id=recipe_id,
-                recipe_hash=recipe_hash,
-                recipe=recipe,
-                mixture=mixture,
-                n_samples=n_samples,
-                seed=seed,
-                embedder_hashes=de_cache.list_embedder_hashes(recipe_hash),
-                available={
-                    "structural_weights": False,
-                    "structural_repr": False,
-                    "dataset_embedding": True,
-                    "sampled_rows": False,
-                },
+        mixture = recipe.get("name")
+        # One entry per draw, not per recipe.  The hash is content-addressed, so it
+        # identifies a mixture and says nothing about n or seed — those live in the draw
+        # filenames beside it, and a mixture typically has a hundred of them.  Reading
+        # them off disk also makes these entries describe draws that exist rather than
+        # draws a name implied.
+        for n_samples, seed in sorted(_draws_for(sampled_root, recipe_hash)):
+            recipe_id = f"{mixture}_n{n_samples}_s{seed:02d}" if mixture else recipe_hash
+            entries.append(
+                CacheEntry(
+                    model_id=recipe_id,
+                    adapter_name=recipe_id,
+                    recipe_id=recipe_id,
+                    recipe_hash=recipe_hash,
+                    recipe=recipe,
+                    mixture=mixture,
+                    n_samples=n_samples,
+                    seed=seed,
+                    embedder_hashes=de_cache.list_embedder_hashes(recipe_hash),
+                    available={
+                        "structural_weights": False,
+                        "structural_repr": False,
+                        "dataset_embedding": True,
+                        "sampled_rows": True,
+                    },
+                )
             )
-        )
+
+
+_DRAW_FILE_RE = re.compile(r"^n(?P<n>\d+)_s(?P<seed>\d+)$")
+
+
+def _draws_for(sampled_root: Path, recipe_hash: str) -> list[tuple[int, int]]:
+    """The ``(n_samples, seed)`` draws cached under a recipe hash."""
+    directory = sampled_root / recipe_hash
+    if not directory.is_dir():
+        return []
+    draws = []
+    for path in directory.glob("n*_s*.json"):
+        m = _DRAW_FILE_RE.match(path.stem)
+        if m:
+            draws.append((int(m.group("n")), int(m.group("seed"))))
+    return draws
 
 
 def _resolve_recipe(

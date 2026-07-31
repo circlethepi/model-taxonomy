@@ -93,7 +93,7 @@ def _finetune_one(
 
     print(f"    Building dataset: {n_samples} samples from '{dataset_name}' (field: {text_field!r})")
     mixed = make_mixed_dataset(recipe, total_samples=n_samples, seed=seed, hf_token=token,
-                               sample_cache=sample_cache)
+                               sample_cache=sample_cache, name=dataset_name)
     hf_dataset = Dataset.from_list(list(mixed.for_finetuning()))
 
     sft_cfg = SFTConfig(
@@ -133,6 +133,12 @@ def _finetune_one(
         },
         "training": {
             "n_samples": n_samples,
+            # The data-sampling seed, which picks which rows this adapter saw.  Recorded
+            # because it is no longer recoverable from the recipe: the recipe hash is
+            # content-addressed and its name no longer carries _s{seed}.  The block name
+            # in dataset_name still does, but that is a convention, not a guarantee, and
+            # CacheIndex has no other fallback for seed.
+            "seed": ft_cfg.get("seed", 42),
             "n_epochs": ft_cfg.get("n_epochs", 3),
             "learning_rate": ft_cfg.get("learning_rate", 2e-4),
         },

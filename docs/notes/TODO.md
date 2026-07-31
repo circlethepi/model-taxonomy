@@ -11,16 +11,15 @@ re-deriving. Two caveats that apply to all of them: notes are point-in-time, so
 confirm the cited paths still exist first; and line numbers move, so grep rather
 than trusting them.
 
-The numbering is for reference in conversation. It is not a strict execution order,
-with one exception: **2 is meant to follow 1**. Other dependencies are called out in
-the State column.
+The numbering is for reference in conversation. It is not a strict execution order.
+Dependencies are called out in the State column.
 
 ## Items
 
 | # | Item | Note | State |
 |---|---|---|---|
 | ~~1~~ | ~~Number the shared cache to `01_datasets` … `06_collections`~~ | [cache_layout_migration.md](cache_layout_migration.md) | **Done.** Migrated by `scripts/migrate_cache_layout.py`; recipes now have a hash-indexed home at `01_datasets/{recipe_hash}/recipe.json`, and the structural `DiskCache` fallback was removed. |
-| 2 | Sampled-dataset storage, and whether n/seed belong in recipe identity | [sampled_dataset_storage.md](sampled_dataset_storage.md) | Take this next. The two questions are one question: the row-ordering scheme is unreachable while the recipe name carries `_n{n}_s{seed}`, since that makes every n a different hash. Needs a decision in conversation before code. |
+| ~~2~~ | ~~Sampled-dataset storage, and whether n/seed belong in recipe identity~~ | [sampled_dataset_storage.md](sampled_dataset_storage.md) | **Done.** `recipe_hash` is now content-addressed over `{recipe_type, datasets}` — 880 old hashes collapsed to 6 — and draws are stored as source indices (2.07 GiB → 40 MiB), keyed `n{n}_s{seed}.json`. Migrated by `scripts/migrate_recipe_identity.py`. The row-ordering/prefix-nesting scheme in the note is now moot: indices already beat it. |
 | 3 | `scripts/run_comparison.py` + a YAML `comparison:` block | [comparison_followups.md](comparison_followups.md) §1 | One decision open: build a `CacheIndex` from resolved model IDs, or let `comparison.models` accept the same `base_models` / `fine_tuned` tokens the other config sections use. The second is more consistent. |
 | 4 | `src/plots/simplex.py` + `notebooks/4_taxonomy_comparison.ipynb` | [comparison_followups.md](comparison_followups.md) §2 | Five figures specced: ternary/simplex, recovered-vs-true, cross-taxonomy disparity heatmap, Shepard diagram, convergence-in-`n`. Load the `dataviz` skill first, and match `src/plots/config.py`. |
 | 5 | `docs/guides/pipeline_stages.md` — a runnable template YAML per stage | [comparison_followups.md](comparison_followups.md) §3 | Unblocked by 1 — the "what it writes to the cache" column can now quote the final directory names. |
@@ -68,6 +67,30 @@ Recorded so they survive; each is cheap and independent.
   Renaming it would break `ModelTaxonomyProfile.load` on every existing saved
   profile. Left untouched by 1 on purpose — see the "Two traps" section of
   [cache_layout_migration.md](cache_layout_migration.md).
+- **Converting a stored draw to indices must content-match, not re-sample.** The
+  obvious implementation — re-run the sampler and record what it selects — answers
+  "what would we draw now", not "what was drawn", and those differ for any draw the
+  sampler no longer reproduces. `source_registry.locate_rows` matches stored rows back
+  to source positions instead.
+
+  5 draws were affected, all in `yahoo_075t0_025t1`, whose capacity is 186,666:
+  n=190000 seeds 0–2 (187,500 rows stored vs 186,666 today) and n=265000 seeds 0–1
+  (206,250 vs 186,666). They predated the proportional class scale-down in
+  `ClassMixedDataset._load_entry`, which caps the *total* to preserve class ratios where
+  the older code let per-class counts clip individually.
+
+  **Those 5 have since been deleted, along with the 4 dataset embeddings derived from
+  them**, so the cache now contains nothing the current sampler would not reproduce
+  (521 draws, verified). Both deleted n values exceeded the mixture's capacity anyway —
+  under today's semantics a request for either clamps to the same 186,666-row draw, so
+  they were never the distinct sweep points their names claimed. No adapter was trained
+  on them. Nothing regenerates them: `n_samples_sweep: nice 4` tops out at 500,000 and
+  `apply_dataset_capacity_caps` collapses everything above capacity to a single
+  n=186666 block.
+
+  The rule survives the cleanup: **any future migration of stored draws must recover
+  indices by content-matching, not by re-running the sampler.** Sampling logic will keep
+  evolving, and a stored draw is a record of what was drawn, not a recipe for redrawing.
 - **`{output_dir}/adapters/` is deliberately unnumbered.** The numeric prefixes
   describe shared-cache pipeline stages; an experiment output directory has no such
   ordering, and renaming it would disturb the `LoRACache` slugs in the legacy
@@ -76,10 +99,16 @@ Recorded so they survive; each is cheap and independent.
 ## Verification
 
 `python scripts/check_analysis.py` is the sharpest instrument in the repo and the
-only test harness — there is no pytest. It registers 35 checks (28 synthetic, 7 that
+only test harness — there is no pytest. It registers 40 checks (32 synthetic, 8 that
 read the real cache); the data-backed ones report `SKIP` when a path is missing
 rather than passing vacuously, so they fail loudly on a missed migration. Run it
 before and after any of the items above and compare the pass/skip profile.
+
+`python scripts/verify_sampled_cache.py --full` is the second instrument, and the one
+that matters for the dataset cache specifically: draws are stored as source indices, so
+it rehydrates each one and checks it against a recorded `rows_sha256`. Nothing else
+would notice if the upstream HuggingFace dataset changed underneath. `--fast` checks
+revisions and row counts only and takes seconds.
 
 The full run is ~7 s and ~220 MB, so it is cheap enough to run freely. Four flags
 narrow it further when you want a fast loop:
@@ -92,6 +121,11 @@ narrow it further when you want a fast loop:
 
 Run it in the project conda environment (`conda activate taxonomy-env`, the same one
 the SLURM scripts activate) — `numpy` is not installed in the base env, so the
-checks fail at import there. Baseline as of 2026-07-30, after task 1: **35 passed,
-0 failed, 0 skipped**, with `t_scan_cache` reporting 25 adapters, 20 with recipes,
-20 usable — unchanged from before the cache migration.
+checks fail at import there. Baseline as of 2026-07-31, after task 2: **40 passed,
+0 failed, 0 skipped**, with `t_scan_cache` reporting 25 adapters, **25 with recipes,
+25 usable**, and `verify_sampled_cache --fast` reporting 521 draws ok.
+
+The jump from 20 usable to 25 is task 2's doing, not a change in the data: the five
+oldest adapters were trained under the pre-rename naming (`yahoo_25t0_75t1`) and used to
+dangle, because their recipe hash matched nothing in the shared cache. Content-addressing
+merged them with their zero-padded twins, so they now resolve.

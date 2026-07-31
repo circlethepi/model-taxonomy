@@ -82,6 +82,11 @@ def expand_dataset_n_samples(cfg: dict) -> dict:
             entry = copy.deepcopy(ds)
             entry["name"] = f"{base_name}_n{n}"
             entry["n_samples"] = n
+            # The block name must stay unique — it keys the datasets dict, the taxonomy
+            # labels and the per-experiment recipe filename.  'mixture' remembers the
+            # name before expansion, and that is what names the recipe, so all n of one
+            # mixture share a single content-addressed recipe.
+            entry.setdefault("mixture", base_name)
             expanded.append(entry)
     cfg["datasets"] = expanded
     return cfg
@@ -109,6 +114,10 @@ def expand_dataset_seeds(cfg: dict) -> dict:
                 entry = copy.deepcopy(ds)
                 entry["name"] = f"{base_name}_s{seed_val:02d}"
                 entry["seed"] = seed_val
+                # setdefault, not assignment: when expand_dataset_n_samples ran first
+                # base_name already carries _n{n}, and the mixture it recorded is the
+                # one we want to keep.
+                entry.setdefault("mixture", base_name)
                 expanded.append(entry)
     cfg["datasets"] = expanded
     return cfg
@@ -175,9 +184,17 @@ def load_recipe(path: Path | str):
 
 
 def build_recipe_from_cfg(ds_cfg: dict):
-    """Build a DatasetRecipe or ClassAwareDatasetRecipe from an expanded dataset config block."""
+    """Build a DatasetRecipe or ClassAwareDatasetRecipe from an expanded dataset config block.
+
+    The recipe is named for the *mixture*, not the expanded block.  The block name
+    carries ``_n{n}_s{seed}`` so it can key the datasets dict and label taxonomy points;
+    the recipe underneath is the same mixing spec at every n and seed, and the recipe
+    hash is content-addressed anyway, so giving it the expanded name would only put a
+    misleading label on a shared object.  Blocks written by hand, with no ``mixture``
+    key, fall back to their own name.
+    """
     rtype = ds_cfg.get("recipe_type", "simple")
-    name = ds_cfg["name"]
+    name = ds_cfg.get("mixture", ds_cfg["name"])
     entries_raw = ds_cfg.get("entries", [])
     if rtype == "class_aware":
         from src.datasets.class_recipe import ClassAwareDatasetRecipe, ClassDatasetEntry
@@ -264,26 +281,38 @@ def make_mixed_dataset(
     seed: int = 42,
     hf_token: str | None = None,
     sample_cache=None,
+    name: str | None = None,
 ):
     """Instantiate MixedDataset or ClassMixedDataset depending on recipe type.
 
-    If *sample_cache* is provided, checks for a cached list[dict] keyed by
+    If *sample_cache* is provided, checks for a cached draw keyed by
     ``(recipe_hash, total_samples, seed)`` and returns a ``CachedMixedDataset``
-    on a hit.  On a miss the dataset is loaded from HuggingFace and the rows
-    are written to the cache for future calls.
+    on a hit.  On a miss the dataset is loaded from HuggingFace and the draw
+    is written to the cache for future calls.
 
-    The recipe itself is mirrored alongside the rows on either path, so the cache
+    The recipe itself is mirrored alongside its draws on either path, so the cache
     stays the hash-indexed home for recipes rather than depending on the dataset
-    having also been embedded.
+    having also been embedded.  *name*, when given, is recorded as a label for the
+    recipe: the hash is content-addressed, so several config-block names legitimately
+    resolve to one recipe and the cache keeps all of them.
     """
     from src.datasets.class_recipe import ClassAwareDatasetRecipe
 
+    recipe_hash = recipe.recipe_hash()
+
     if sample_cache is not None:
-        sample_cache.put_recipe(recipe.recipe_hash(), recipe.to_dict())
-        cached_rows = sample_cache.get(recipe.recipe_hash(), total_samples, seed)
+        sample_cache.put_recipe(recipe_hash, recipe.to_dict())
+        sample_cache.add_name(recipe_hash, name)
+        cached_rows = sample_cache.get(recipe_hash, total_samples, seed, hf_token=hf_token)
         if cached_rows is not None:
             from src.datasets.mixed_dataset import CachedMixedDataset
-            return CachedMixedDataset(cached_rows, recipe)
+            manifest = sample_cache.get_manifest(recipe_hash, total_samples, seed) or {}
+            return CachedMixedDataset(
+                cached_rows,
+                recipe,
+                source_indices=[tuple(p) for p in manifest.get("indices", [])] or None,
+                sources=manifest.get("sources"),
+            )
 
     if isinstance(recipe, ClassAwareDatasetRecipe):
         from src.datasets.mixed_dataset import ClassMixedDataset
@@ -293,7 +322,11 @@ def make_mixed_dataset(
         ds = MixedDataset(recipe, total_samples=total_samples, seed=seed, hf_token=hf_token)
 
     if sample_cache is not None:
-        sample_cache.put(recipe.recipe_hash(), total_samples, seed, list(ds))
+        rows = list(ds)
+        sample_cache.put(
+            recipe_hash, total_samples, seed,
+            rows=rows, indices=ds.source_indices, sources=ds.sources,
+        )
 
     return ds
 

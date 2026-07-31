@@ -140,7 +140,7 @@ numeric prefixes so a directory listing reads in pipeline order:
 
 ```
 results/shared_cache/
-    01_datasets/                 {recipe_hash}/recipe.json + {n}_{seed}.json
+    01_datasets/                 {recipe_hash}/recipe.json + names.json + n{n}_s{seed}.json
     02_dataset_embeddings/       {recipe_hash}/{embedder_hash}/
     03_adapters/                 raw PEFT weights + extracted structural representations
     03A_adapter_alignments/      pairwise Procrustes alignments
@@ -166,6 +166,20 @@ Three things about this layout are worth stating rather than leaving to be disco
   self-describing on its own, but resolution goes through `01_`. Before this existed
   the embedding cache was the only hash-indexed source, so a recipe that was sampled
   but never embedded could not be resolved at all.
+- **`recipe_hash` is content-addressed: one mixture, one directory.** It is a SHA-256
+  of `{recipe_type, datasets}` — the *name is not hashed*. n and seed live in the draw
+  filename, not the identity, so a mixture swept over 19 sizes and 10 seeds is one
+  recipe with ~190 draws beside it rather than 190 near-duplicate recipes. Two
+  consequences worth knowing: `names.json` accumulates every config-block name that
+  resolved to the hash, because several legitimately do; and `seed` had to join
+  `DatasetEmbeddingCache.embedder_hash`, since the recipe hash no longer separates
+  seeds and without it a seed sweep would silently collapse onto one embedding.
+- **Draws store source indices, not rows.** `n{n}_s{seed}.json` records which rows of
+  which upstream split were drawn, in order, with the Hub revision pinned and a
+  `rows_sha256` over the result — not the row text, which is already sitting in the
+  HuggingFace cache. That is ~85× smaller (2.07 GiB → 40 MiB across 564 draws) and
+  rehydrates faster, at the cost of a dependency on the upstream dataset that
+  `scripts/verify_sampled_cache.py` exists to audit.
 - **The numbering applies to the shared cache only.** `{output_dir}/adapters/` — the
   fallback when no `cache_dir` is configured — stays unnumbered, because an experiment
   output directory has no pipeline ordering to describe. Legacy per-experiment cache

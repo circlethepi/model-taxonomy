@@ -160,7 +160,7 @@ class DatasetEmbeddingTaxonomy(Taxonomy):
             from src.cache.dataset_embedding_cache import DatasetEmbeddingCache
 
             emb_hash = DatasetEmbeddingCache.embedder_hash(
-                self.embedder.config_dict(), self.representation, n_samples
+                self.embedder.config_dict(), self.representation, n_samples, seed
             )
             if self.cache.exists(recipe_hash, emb_hash):
                 return self.cache.load(recipe_hash, emb_hash)
@@ -168,15 +168,27 @@ class DatasetEmbeddingTaxonomy(Taxonomy):
         # Sample cache lookup / population
         mixed: MixedDataset | ClassMixedDataset | CachedMixedDataset
         if self.sample_cache is not None:
-            # Mirror the recipe beside its rows on either path, so the sample cache
-            # stays the hash-indexed home for recipes.
+            # Mirror the recipe beside its draws on either path, so the sample cache
+            # stays the hash-indexed home for recipes.  model_id is the caller's label
+            # for this point; the content-addressed hash does not carry it.
             self.sample_cache.put_recipe(recipe_hash, recipe.to_dict())
+            self.sample_cache.add_name(recipe_hash, model_id)
             cached_rows = self.sample_cache.get(recipe_hash, n_samples, seed)
             if cached_rows is not None:
-                mixed = CachedMixedDataset(cached_rows, recipe)
+                manifest = self.sample_cache.get_manifest(recipe_hash, n_samples, seed) or {}
+                mixed = CachedMixedDataset(
+                    cached_rows,
+                    recipe,
+                    source_indices=[tuple(p) for p in manifest.get("indices", [])] or None,
+                    sources=manifest.get("sources"),
+                )
             else:
                 mixed = self._load_mixed(recipe, n_samples, seed)
-                self.sample_cache.put(recipe_hash, n_samples, seed, list(mixed))
+                rows = list(mixed)
+                self.sample_cache.put(
+                    recipe_hash, n_samples, seed,
+                    rows=rows, indices=mixed.source_indices, sources=mixed.sources,
+                )
         else:
             mixed = self._load_mixed(recipe, n_samples, seed)
 
@@ -202,6 +214,7 @@ class DatasetEmbeddingTaxonomy(Taxonomy):
         metadata: dict[str, Any] = {
             "recipe": recipe.to_dict(),
             "n_samples": n_samples,
+            "seed": seed,
             "representation": self.representation,
             "embedder": self.embedder.config_dict(),
         }
@@ -221,6 +234,7 @@ class DatasetEmbeddingTaxonomy(Taxonomy):
                 embedder_config=self.embedder.config_dict(),
                 representation=self.representation,
                 n_samples=n_samples,
+                seed=seed,
             )
 
         return rep

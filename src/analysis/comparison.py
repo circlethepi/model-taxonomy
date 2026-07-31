@@ -344,7 +344,7 @@ def _dataset_embedding_matrix(
 
     cache = DatasetEmbeddingCache(root)
     chosen = (
-        {e.recipe_hash: embedder_hash for e in index.entries}
+        {_draw_key(e): embedder_hash for e in index.entries}
         if embedder_hash
         else _embedder_choice(cache, index)
     )
@@ -353,7 +353,7 @@ def _dataset_embedding_matrix(
     for entry in index.entries:
         if not entry.recipe_hash:
             raise ValueError(f"{entry.adapter_name} has no recipe_hash to look up")
-        emb = chosen[entry.recipe_hash]
+        emb = chosen[_draw_key(entry)]
         if not cache.exists(entry.recipe_hash, emb):
             raise ValueError(
                 f"no dataset embedding for recipe {entry.recipe_id!r} under "
@@ -377,8 +377,18 @@ def _dataset_embedding_matrix(
     )
 
 
-def _embedder_choice(cache, index: CacheIndex) -> dict[str, str]:
-    """Pick one embedding per recipe: ``{recipe_hash: embedder_hash}``.
+def _draw_key(entry) -> tuple:
+    """What identifies the dataset embedding an entry needs.
+
+    Not the recipe hash alone.  That hash is content-addressed, so every n and seed of
+    one mixture shares it; keying on it would hand two seeds the same embedding and
+    quietly collapse a seed sweep to a single point.
+    """
+    return (entry.recipe_hash, entry.n_samples, entry.seed)
+
+
+def _embedder_choice(cache, index: CacheIndex) -> dict[tuple, str]:
+    """Pick one embedding per draw: ``{(recipe_hash, n_samples, seed): embedder_hash}``.
 
     The embedder hash bundles ``(embedder_config, representation, n_samples)``, so
     requiring one shared *hash* across a collection would also require one shared
@@ -401,11 +411,14 @@ def _embedder_choice(cache, index: CacheIndex) -> dict[str, str]:
                 [cfg.get("embedder_config"), cfg.get("representation")], sort_keys=True
             )
             emb_hash = cache.embedder_hash(
-                cfg["embedder_config"], cfg["representation"], cfg["n_samples"]
+                cfg["embedder_config"], cfg["representation"],
+                cfg["n_samples"], cfg.get("seed"),
             )
-            # Prefer the embedding whose sample count matches the dataset the
-            # model was actually trained on; anything else is a different dataset.
-            if signature not in by_signature or cfg["n_samples"] == entry.n_samples:
+            # Prefer the embedding of the exact draw the model was trained on; anything
+            # else is a different dataset.  Seed counts as much as n_samples here, since
+            # the two are what distinguish draws of one content-addressed recipe.
+            exact = cfg["n_samples"] == entry.n_samples and cfg.get("seed") == entry.seed
+            if signature not in by_signature or exact:
                 by_signature[signature] = emb_hash
         if not by_signature:
             raise ValueError(
@@ -429,7 +442,7 @@ def _embedder_choice(cache, index: CacheIndex) -> dict[str, str]:
 
     signature = next(iter(common))
     return {
-        e.recipe_hash: s[signature] for e, s in zip(index.entries, signatures)
+        _draw_key(e): s[signature] for e, s in zip(index.entries, signatures)
     }
 
 

@@ -1,5 +1,46 @@
 # Sampled-dataset storage, and whether n/seed belong in recipe identity
 
+**Status: done, 2026-07-31.** Kept as the record of how the decision was reached; what
+follows below is the analysis as written *before* the work, so read it as history rather
+than as a description of the code.
+
+What was actually built, and where it departed from this note:
+
+- **n and seed left recipe identity, and so did the name.** The hash is a SHA-256 of
+  `{recipe_type, datasets}` — content only. 880 old hashes collapsed to 6. This note
+  framed the choice as "should identity-for-the-taxonomy and identity-for-the-cache be
+  the same string"; the answer was that the taxonomy never needed the hash for labels
+  (it keys on the config-block name), so identity could become purely content-addressed.
+- **The row-ordering / prefix-nesting scheme below was not built, and is now moot.**
+  It was the way to get 2.07 GiB → 0.87 GiB. Storing source indices instead gets
+  2.07 GiB → 39 MiB without touching the sampler at all, which also avoided the
+  reproducibility break the scheme required accepting.
+- **The "store source row indices" option under *Cheaper options*, dismissed here as
+  costing the provenance property, is what shipped.** The dismissal was too quick: a
+  pinned Hub revision plus a per-draw `rows_sha256` keeps drift detectable, and
+  `scripts/verify_sampled_cache.py` audits it.
+- **One thing this note did not anticipate:** converting stored draws could not be done
+  by re-running the sampler. 5 draws — n=190000 seeds 0–2 and n=265000 seeds 0–1, all
+  `yahoo_075t0_025t1` — predated the proportional class scale-down in
+  `ClassMixedDataset._load_entry` and no longer reproduced; the n=265000 one held 206,250
+  rows where today's code yields 186,666. `source_registry.locate_rows` matches rows back
+  to source positions by content instead, preserving what was actually drawn. This
+  affected the migration only: normal operation rehydrates, it does not resample.
+
+  Those 5 draws and their 4 derived embeddings were deleted afterwards, since both n
+  values exceed the mixture's 186,666 capacity and would clamp to the same draw today.
+  The cache is now 521 draws, all reproducible. The content-matching rule stands for any
+  future migration regardless — see the "do not simplify" section of
+  [TODO.md](TODO.md).
+- **Two hazards found during the work**, neither mentioned below: `embedder_hash` had to
+  gain `seed` (it had `n_samples` but not seed, so all 10 seeds of a mixture would have
+  collapsed onto one embedding entry), and `_embedder_choice` in `comparison.py` keyed on
+  `recipe_hash` alone, which had the same effect one layer up.
+
+---
+
+**Original note follows.**
+
 **Status:** agreed as the item to take immediately after the cache renumbering
 (task 1). Two questions that turned out to be the same question, so they are filed
 together — the storage win is unreachable while recipe identity stays as it is.

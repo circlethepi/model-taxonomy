@@ -360,7 +360,7 @@ Compares datasets by embedding their text elements with an `Embedder`. Pass `tax
 | `representation` | `"matrix"`: raw `(N, d)` embedding matrix. `"gram"`: upper-triangle of `E @ E.T`, shape `(1, N*(N+1)//2)`. `"mean"`: column mean, shape `(1, d)`. |
 | `seed` | Global fallback seed for dataset shuffling. |
 
-`from_recipes` is a convenience constructor that registers each recipe under its `recipe_hash()`.
+`from_recipes` is a convenience constructor that registers each recipe under its `recipe_hash()`. Note that the hash is content-addressed, so it does *not* distinguish n or seed: if you register several draws of one mixture this way they collide on the same key. Use explicit recipe IDs (as `make_dataset_embedding_taxonomy` does, keying on the config-block name) whenever n or seed varies.
 
 ---
 
@@ -685,6 +685,7 @@ class DatasetEmbeddingCache:
         embedder_config: dict,
         representation: str,
         n_samples: int,
+        seed: int | None = None,
     ) -> None
     def load(self, recipe_hash: str, embedder_hash: str) -> ModelRepresentation
 
@@ -693,12 +694,13 @@ class DatasetEmbeddingCache:
         embedder_config: dict,
         representation: str,
         n_samples: int,
+        seed: int | None = None,
     ) -> str
 ```
 
 Hierarchical cache for `DatasetEmbeddingTaxonomy` representations. Stores data under `cache_root/02_dataset_embeddings/{recipe_hash}/{embedder_hash}/`. Each entry contains a human-readable `recipe.json`, a `config.json` with embedder settings, and an `embeddings.safetensors` file. Pass a `DatasetEmbeddingCache` instance to `DatasetEmbeddingTaxonomy(cache=...)` to enable persistence.
 
-`embedder_hash` identifies a `(embedder_config, representation, n_samples)` triple and is used as the second-level directory key.
+`embedder_hash` identifies an `(embedder_config, representation, n_samples, seed)` key and is used as the second-level directory key. `seed` is part of it because `recipe_hash` is content-addressed and therefore shared by every draw of a mixture — without the seed, all seeds would resolve to one entry.
 
 ---
 

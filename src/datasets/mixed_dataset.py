@@ -62,6 +62,11 @@ class MixedDataset:
         self.seed = seed
         self.hf_token = hf_token
         self._samples: list[dict] | None = None
+        #: Source descriptors, one per recipe entry — see src.datasets.source_registry.
+        self.sources: list[dict] | None = None
+        #: ``(entry_index, row_index)`` per returned row, in the same order.  This is
+        #: what SampledDatasetCache persists in place of the row text.
+        self.source_indices: list[tuple[int, int]] | None = None
 
     # ------------------------------------------------------------------
     # Internal loading
@@ -69,22 +74,24 @@ class MixedDataset:
 
     def _load(self) -> list[dict]:
         import warnings
-        from datasets import load_dataset  # type: ignore[import]
+
+        from src.datasets import source_registry
 
         weights = self.recipe.normalized_weights
 
         # Probe each entry's size and find the effective total that keeps all
         # entry proportions intact even when one dataset is data-limited.
         effective_total = self.total_samples
+        sources: list[dict] = []
         for entry, w in zip(self.recipe.datasets, weights):
+            ds = source_registry.get(
+                entry.dataset_id, entry.subset, entry.split, token=self.hf_token
+            )
+            sources.append(
+                source_registry.describe(ds, entry.dataset_id, entry.subset, entry.split)
+            )
             if w > 0:
-                ds_size = len(load_dataset(
-                    entry.dataset_id,
-                    entry.subset,
-                    split=entry.split,
-                    token=self.hf_token,
-                ))
-                effective_total = min(effective_total, int(ds_size / w))
+                effective_total = min(effective_total, int(len(ds) / w))
 
         if effective_total < self.total_samples:
             warnings.warn(
@@ -96,24 +103,29 @@ class MixedDataset:
 
         counts = _allocate_counts(weights, effective_total)
         all_samples: list[dict] = []
+        all_indices: list[tuple[int, int]] = []
 
-        for entry, count in zip(self.recipe.datasets, counts):
+        for entry_index, (entry, count) in enumerate(zip(self.recipe.datasets, counts)):
             if count == 0:
                 continue
-            ds = load_dataset(
-                entry.dataset_id,
-                entry.subset,
-                split=entry.split,
-                token=self.hf_token,
+            ds = source_registry.get(
+                entry.dataset_id, entry.subset, entry.split, token=self.hf_token
             )
+            # The index column is attached before shuffling, so it records a position
+            # in the original split.  Verified not to change which rows are selected.
+            ds = source_registry.with_row_index(ds)
             ds = ds.shuffle(seed=self.seed)
             ds = ds.select(range(count))
             for row in ds:
-                all_samples.append(dict(row))
+                row = dict(row)
+                all_indices.append((entry_index, row.pop(source_registry.ROW_INDEX_COLUMN)))
+                all_samples.append(row)
 
         # Shuffle the merged list deterministically; terminal cap enforces hard limit.
         rng = np.random.default_rng(self.seed)
         idx = rng.permutation(len(all_samples)).tolist()
+        self.sources = sources
+        self.source_indices = [all_indices[i] for i in idx][:self.total_samples]
         return [all_samples[i] for i in idx][:self.total_samples]
 
     def _ensure_loaded(self) -> list[dict]:
@@ -174,12 +186,23 @@ class CachedMixedDataset:
     as MixedDataset / ClassMixedDataset, so it can be used as a drop-in replacement.
     """
 
-    def __init__(self, samples: list[dict], recipe: DatasetRecipe | ClassAwareDatasetRecipe) -> None:
+    def __init__(
+        self,
+        samples: list[dict],
+        recipe: DatasetRecipe | ClassAwareDatasetRecipe,
+        source_indices: list[tuple[int, int]] | None = None,
+        sources: list[dict] | None = None,
+    ) -> None:
         self._samples = samples
         self.recipe = recipe
         self.total_samples = len(samples)
         self.seed: int | None = None
         self.hf_token: str | None = None
+        # Carried through from the manifest so a draw read from one cache can be
+        # written to another.  Without these a round-trip through the cache would lose
+        # its provenance, and SampledDatasetCache.put would refuse the re-write.
+        self.sources = sources
+        self.source_indices = source_indices
 
     def to_queries(self, n: int | None = None) -> list[str]:
         samples = self._samples[:n] if n is not None else self._samples
@@ -241,27 +264,35 @@ class ClassMixedDataset:
         self.seed = seed
         self.hf_token = hf_token
         self._samples: list[dict] | None = None
+        #: Source descriptors, one per recipe entry — see src.datasets.source_registry.
+        self.sources: list[dict] | None = None
+        #: ``(entry_index, row_index)`` per returned row, in the same order.  This is
+        #: what SampledDatasetCache persists in place of the row text.
+        self.source_indices: list[tuple[int, int]] | None = None
 
     # ------------------------------------------------------------------
     # Internal loading
     # ------------------------------------------------------------------
 
-    def _load_entry(self, entry: ClassDatasetEntry, count: int) -> list[dict]:
+    def _load_entry(self, entry: ClassDatasetEntry, count: int) -> tuple[list[dict], list[int]]:
         """Load *count* samples from *entry*, respecting class weights/filter.
 
         If the most-constrained class cannot meet its proportional quota, the
         effective total is scaled down so that all class ratios are maintained.
+
+        Returns the rows and their positions in the *unfiltered* source split.  The
+        index column is attached before either filter, so it survives both and still
+        refers to the original split rather than the filtered view.
         """
         import warnings
         from collections import Counter
-        from datasets import load_dataset  # type: ignore[import]
 
-        ds = load_dataset(
-            entry.dataset_id,
-            entry.subset,
-            split=entry.split,
-            token=self.hf_token,
+        from src.datasets import source_registry
+
+        ds = source_registry.get(
+            entry.dataset_id, entry.subset, entry.split, token=self.hf_token
         )
+        ds = source_registry.with_row_index(ds)
 
         # Apply class_filter
         if entry.class_filter is not None:
@@ -269,7 +300,7 @@ class ClassMixedDataset:
             ds = ds.filter(lambda row: row[entry.class_field] in allowed)
 
         if len(ds) == 0:
-            return []
+            return [], []
 
         # Determine per-class normalized weights
         if entry.normalized_class_weights is not None:
@@ -305,6 +336,7 @@ class ClassMixedDataset:
 
         rng = np.random.default_rng(self.seed)
         samples: list[dict] = []
+        indices: list[int] = []
         for cls_val, cls_count in zip(classes, per_class_counts):
             if cls_count == 0:
                 continue
@@ -320,18 +352,34 @@ class ClassMixedDataset:
             cls_count = min(cls_count, len(cls_ds))  # safety net
             cls_ds = cls_ds.select(range(cls_count))
             for row in cls_ds:
-                samples.append(dict(row))
-        return samples
+                row = dict(row)
+                indices.append(row.pop(source_registry.ROW_INDEX_COLUMN))
+                samples.append(row)
+        return samples, indices
 
     def _load(self) -> list[dict]:
+        from src.datasets import source_registry
+
         counts = _allocate_counts(self.recipe.normalized_weights, self.total_samples)
         all_samples: list[dict] = []
-        for entry, count in zip(self.recipe.datasets, counts):
+        all_indices: list[tuple[int, int]] = []
+        sources: list[dict] = []
+        for entry_index, (entry, count) in enumerate(zip(self.recipe.datasets, counts)):
+            ds = source_registry.get(
+                entry.dataset_id, entry.subset, entry.split, token=self.hf_token
+            )
+            sources.append(
+                source_registry.describe(ds, entry.dataset_id, entry.subset, entry.split)
+            )
             if count > 0:
-                all_samples.extend(self._load_entry(entry, count))
+                rows, row_indices = self._load_entry(entry, count)
+                all_samples.extend(rows)
+                all_indices.extend((entry_index, i) for i in row_indices)
 
         rng = np.random.default_rng(self.seed)
         idx = rng.permutation(len(all_samples)).tolist()
+        self.sources = sources
+        self.source_indices = [all_indices[i] for i in idx][:self.total_samples]
         return [all_samples[i] for i in idx][:self.total_samples]
 
     def _ensure_loaded(self) -> list[dict]:

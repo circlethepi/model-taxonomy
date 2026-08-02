@@ -47,13 +47,21 @@ Recorded so they survive; each is cheap and independent.
 - ~~**Fix the nonexistent default in `load_lora_weights`.**~~ Done during 1 — it
   defaulted to `results/shared_cache/peft_adapters`, which never existed; now
   `results/shared_cache/03_adapters`.
-- **Read the configured device for the sentence embedders.** Both
-  `SentenceTransformerEmbedder` construction sites hardcode `device="cpu"` —
-  `scripts/_utils.py:469` (behavioral) and `scripts/_utils.py:574`
-  (dataset_embedding) — so every sentence embedding the pipeline has produced so
-  far, including the populated `02_dataset_embeddings` cache, was computed on CPU.
-  Fine for MiniLM-L6, a bottleneck for anything larger. Fix both together. See 9,
-  "Things to check", item 1.
+- ~~**Read the configured device for the sentence embedders.**~~ Done. Both
+  `SentenceTransformerEmbedder` construction sites hardcoded `device="cpu"`, so every
+  sentence embedding the pipeline had produced — including the whole populated
+  `02_dataset_embeddings` cache — was computed on CPU. Now routed through
+  `_utils.resolve_device`: an explicit per-embedder `device`, else
+  `extraction.device`, else auto-detect. `device` is deliberately outside
+  `config_dict()`, so no cache key changed and nothing was invalidated.
+- ~~**Prepend nomic's task-instruction prefix.**~~ Done. `prompt_name="document"` was
+  a **silent no-op** — nomic ships no `prompts` map, sentence-transformers synthesises
+  `{"query": "", "document": ""}`, and the empty string was prepended without error.
+  All 520 cached dataset embeddings are therefore bare-text. They are **geometrically
+  equivalent** (MDS recovery 0.9977 vs 0.9976 pearson, spearman 1.0000 both ways) and
+  are being kept, but they are unreachable under the new `embedder_hash` by design.
+  Full write-up, including the `max_seq_length` cap to use if you ever batch a
+  re-embed: **`docs/notes/embedder_task_prefixes.md`**.
 
 ## Do not "simplify" these
 
@@ -124,9 +132,9 @@ narrow it further when you want a fast loop:
 
 Run it in the project conda environment (`conda activate taxonomy-env`, the same one
 the SLURM scripts activate) — `numpy` is not installed in the base env, so the
-checks fail at import there. Baseline as of 2026-08-02, after the behavioral work:
-**43 passed, 0 failed, 1 skipped** across 44 registered checks (35 synthetic, 9
-`[data]`), plus 1 `[gpu]` check behind `--include-gpu`. The one skip is
+checks fail at import there. Baseline as of 2026-08-02, after the behavioral work and
+the nomic prefix fix: **45 passed, 0 failed, 1 skipped** across 46 registered checks
+(37 synthetic, 9 `[data]`), plus 1 `[gpu]` check behind `--include-gpu`. The one skip is
 `[data] behavioral: cached representations are well formed`, which skips until
 `05_generated/` is populated — it must **skip**, never pass, while empty. Before
 that work the baseline was 40 passed / 0 / 0. `t_scan_cache` reports 25 adapters,

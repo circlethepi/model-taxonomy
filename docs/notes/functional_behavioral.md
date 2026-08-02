@@ -89,7 +89,7 @@ representations". Open question 1 is about what such a token would even mean.
 
 **3. Test coverage: behavioral now, functional still not.**
 `scripts/check_analysis.py` is the repo's verification script and its only test
-harness — there is no pytest. It registers checks in three tiers: **35 synthetic,
+harness — there is no pytest. It registers checks in three tiers: **37 synthetic,
 9 that read the real cache (`[data]`), and 1 that needs a GPU (`[gpu]`)**. The GPU
 tier is off unless `--include-gpu` is passed, because it loads a multi-GB model;
 the SLURM job passes it after extraction, while the device is still allocated.

@@ -1265,6 +1265,96 @@ def t_cache_fully_migrated():
             f"{len(legacy_draws)} still storing rows")
 
 
+# ── embedder task prefixes ────────────────────────────────────────────────────
+
+@check("embedder: prefix-required models always resolve a non-empty task prefix")
+def t_embedder_prefix_resolved():
+    """The regression guard for a bug whose whole character was silence.
+
+    ``nomic-embed-text-v1.5`` ships no ``prompts`` map, so sentence-transformers
+    synthesises ``{"query": "", "document": ""}`` and ``prompt_name="document"``
+    resolved to a valid key that prepended the empty string — no error, no warning,
+    and output that looked entirely plausible.  A check that merely asserted
+    "prompt_name is document" would have passed throughout.  What has to be asserted
+    is that a real prefix comes out the other end, including when nothing was asked
+    for.
+    """
+    import warnings as _warnings
+
+    from src.embedders.sentence_transformer import (
+        _NOMIC_PREFIXES, _PREFIX_REQUIRED_MODELS, SentenceTransformerEmbedder,
+    )
+
+    nomic = "nomic-ai/nomic-embed-text-v1.5"
+    assert nomic.startswith(_PREFIX_REQUIRED_MODELS), "nomic no longer matches the list"
+
+    # Every alias must produce a non-empty literal, not just a recognised name.
+    for name in sorted(_NOMIC_PREFIXES):
+        e = SentenceTransformerEmbedder(model_name=nomic, prompt_name=name)
+        assert e.prompt_prefix, f"prompt_name={name!r} resolved to an empty prefix"
+        assert e.prompt_prefix.endswith(": "), e.prompt_prefix
+
+    # Omitted: must still prefix, and must say so.
+    with _warnings.catch_warnings(record=True) as caught:
+        _warnings.simplefilter("always")
+        default = SentenceTransformerEmbedder(model_name=nomic)
+    assert default.prompt_prefix == "search_document: ", default.prompt_prefix
+    assert len(caught) == 1, f"expected one warning when defaulting, got {len(caught)}"
+
+    # A typo must not quietly take the default — that would restore the silence.
+    try:
+        SentenceTransformerEmbedder(model_name=nomic, prompt_name="documnet")
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("an unknown prompt_name was accepted")
+
+    # Non-prefix models keep their old behaviour untouched.
+    mini = SentenceTransformerEmbedder(model_name="sentence-transformers/all-MiniLM-L6-v2")
+    assert mini.prompt_prefix == "", mini.prompt_prefix
+    assert not mini.requires_prefix
+    return f"{len(_NOMIC_PREFIXES)} aliases resolve; default 'search_document: '; typo raises"
+
+
+@check("embedder: prompt_prefix is in the cache key, so bare and prefixed cannot collide")
+def t_embedder_prefix_in_cache_key():
+    """Bare-text and correctly-prefixed embeddings must never share an embedder_hash.
+
+    They are computed from the same ``model_name`` and the same ``prompt_name``, so
+    without the resolved literal in the key they hash identically — and the cache
+    would hand back one where the other was asked for.  Their distances live on
+    different scales, so mixing them in a single comparison is silently wrong.
+    """
+    from src.cache.dataset_embedding_cache import DatasetEmbeddingCache
+    from src.embedders.sentence_transformer import SentenceTransformerEmbedder
+
+    e = SentenceTransformerEmbedder(
+        model_name="nomic-ai/nomic-embed-text-v1.5", prompt_name="document",
+        use_generated_text=False, trust_remote_code=True,
+    )
+    cfg = e.config_dict()
+    assert "prompt_prefix" in cfg, "prompt_prefix missing from config_dict"
+    assert cfg["prompt_prefix"] == "search_document: ", cfg["prompt_prefix"]
+
+    # What the key looked like before the fix: same fields, no resolved literal.
+    bare = {k: v for k, v in cfg.items() if k != "prompt_prefix"}
+    h_new = DatasetEmbeddingCache.embedder_hash(cfg, "mean", 1000)
+    h_old = DatasetEmbeddingCache.embedder_hash(bare, "mean", 1000)
+    assert h_new != h_old, (
+        "prefixed and bare embeddings hash identically; the cache would treat them "
+        "as interchangeable"
+    )
+
+    # Different prefixes must also separate.
+    q = SentenceTransformerEmbedder(
+        model_name="nomic-ai/nomic-embed-text-v1.5", prompt_name="search_query",
+        use_generated_text=False, trust_remote_code=True,
+    )
+    h_q = DatasetEmbeddingCache.embedder_hash(q.config_dict(), "mean", 1000)
+    assert h_q != h_new, "search_query and search_document share a hash"
+    return f"bare={h_old} document={h_new} query={h_q}, all distinct"
+
+
 # ── behavioral taxonomy ───────────────────────────────────────────────────────
 
 def _behavioral_config_hashes() -> tuple:
@@ -1551,6 +1641,8 @@ SYNTHETIC = [
     t_recipe_identity, t_embedder_hash_seed, t_draw_schema_roundtrip, t_names_merge,
     # behavioral taxonomy: its cache, and the padding property batch invariance needs
     t_generated_cache_roundtrip, t_generated_cache_hash_stable, t_behavioral_padding_side,
+    # embedder task prefixes: the model is misused without them, and the failure is silent
+    t_embedder_prefix_resolved, t_embedder_prefix_in_cache_key,
 ]
 DATA_BACKED = [
     t_cosine_real_adapters, t_recovery, t_collection_roundtrip, t_cross_taxonomy,

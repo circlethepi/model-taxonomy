@@ -435,19 +435,21 @@ def parse_dtype(name: str) -> torch.dtype:
 #: Where each taxonomy's representations live under the shared cache.  Structural is
 #: absent on purpose: its representations are written by LoRACache, beside the adapter
 #: weights they were derived from, rather than into a stage directory of their own.
+#: behavioral is absent: it outgrew DiskCache and has its own GeneratedTextCache,
+#: which owns ``05_generated`` and lays it out differently.  Leaving the entry here
+#: would let make_repr_cache hand back a DiskCache pointed at the same directory,
+#: giving that tree two writers with incompatible layouts.
 REPR_CACHE_DIRS = {
     "functional": "04_activations",
-    "behavioral": "05_generated",
 }
 
 
 def make_repr_cache(cache_dir: Path, taxonomy: str):
     """DiskCache for one taxonomy's representations.
 
-    Functional and behavioral get separate directories so the two are visibly
-    distinct on disk rather than interleaved content hashes in one.  Both are
-    provisional homes: when those levels are built out they are expected to grow
-    their own cache classes the way structural has LoRACache.
+    Functional's provisional home: when that level is built out it is expected to
+    grow its own cache class the way structural has LoRACache and behavioral now
+    has GeneratedTextCache.
     """
     from src.cache.disk import DiskCache
 
@@ -471,10 +473,55 @@ def make_sampled_dataset_cache(cache_dir: Path):
     return SampledDatasetCache(cache_dir)
 
 
+def make_generated_text_cache(cache_dir: Path):
+    from src.cache.generated_text_cache import GeneratedTextCache
+    return GeneratedTextCache(cache_dir)
+
+
 # ── Taxonomy / metric / geometry factories ────────────────────────────────────
 
-def make_queries(cfg: dict) -> list[str]:
-    """Load query strings from the configured queries_dataset."""
+def resolve_device(cfg: dict, override: str | None = None) -> str:
+    """Device for an embedder, most specific setting first.
+
+    1. *override* — a per-embedder ``device:`` from the taxonomy's own block.
+    2. ``extraction.device`` — the experiment-wide setting.
+    3. auto-detect.
+
+    Auto-detection is the tier that matters: the old default handed the literal
+    string ``"cuda"`` to whatever machine happened to be running, so a CPU-only
+    host failed at model-load time rather than degrading to CPU.
+
+    ``device`` is deliberately absent from
+    :meth:`SentenceTransformerEmbedder.config_dict`, so changing it does not
+    change any cache key and does not invalidate existing embeddings.  The flip
+    side is that CPU- and GPU-computed embeddings share a key and differ in the
+    low-order bits (different reduction orders, fused multiply-add, TF32 on
+    Ampere+).  That is ~1e-6 on L2-normalized vectors — far below anything the
+    comparison layer treats as signal — but it does mean byte-level equality
+    across machines is not a property this cache has.
+    """
+    if override:
+        return override
+    configured = cfg.get("extraction", {}).get("device")
+    if configured:
+        return configured
+    return "cuda" if torch.cuda.is_available() else "cpu"
+
+def make_queries(cfg: dict) -> tuple[list[str], dict]:
+    """Load query strings from the configured queries_dataset.
+
+    Returns ``(queries, query_key)``, where *query_key* is the
+    ``{recipe_hash, n_samples, seed}`` triple identifying the draw in
+    ``01_datasets``.  Callers that cache representations keyed on the query set
+    should store the key rather than the strings themselves: the strings are
+    derived data, and hashing all of them makes a cache entry sensitive to every
+    upstream change that shifts the draw, with no way to tell from the key which
+    draw an entry belonged to.
+
+    The draw is requested at exactly *n_queries*.  ``n`` enters the sampler, so a
+    32-row draw is not the first 32 rows of a 64-row one — never slice a larger
+    draw down.
+    """
     output_dir = Path(cfg["output_dir"])
     ext_cfg = cfg.get("extraction", {})
     dataset_name = ext_cfg.get("queries_dataset")
@@ -494,8 +541,21 @@ def make_queries(cfg: dict) -> list[str]:
         42,
     )
     recipe = load_recipe(recipe_path)
-    mixed = make_mixed_dataset(recipe, total_samples=n_queries, seed=seed, hf_token=hf_token(cfg))
-    return mixed.to_queries(n=n_queries)
+    sample_cache = make_sampled_dataset_cache(get_cache_dir(cfg))
+    mixed = make_mixed_dataset(
+        recipe,
+        total_samples=n_queries,
+        seed=seed,
+        hf_token=hf_token(cfg),
+        sample_cache=sample_cache,
+        name=dataset_name,
+    )
+    query_key = {
+        "recipe_hash": recipe.recipe_hash(),
+        "n_samples": n_queries,
+        "seed": seed,
+    }
+    return mixed.to_queries(n=n_queries), query_key
 
 
 def make_functional_taxonomy(cfg: dict, queries: list[str], cache=None):
@@ -520,7 +580,7 @@ def make_functional_taxonomy(cfg: dict, queries: list[str], cache=None):
     )
 
 
-def make_behavioral_taxonomy(cfg: dict, queries: list[str], cache=None):
+def make_behavioral_taxonomy(cfg: dict, queries: list[str], query_key: dict | None = None, cache=None):
     from src.taxonomy.behavioral import BehavioralTaxonomy
     from src.embedders.sentence_transformer import SentenceTransformerEmbedder
 
@@ -530,7 +590,7 @@ def make_behavioral_taxonomy(cfg: dict, queries: list[str], cache=None):
 
     embedder = SentenceTransformerEmbedder(
         model_name=ecfg.get("model_name", "sentence-transformers/all-MiniLM-L6-v2"),
-        device="cpu",
+        device=resolve_device(cfg, ecfg.get("device")),
         use_generated_text=True,
         normalize_embeddings=ecfg.get("normalize_embeddings", True),
         trust_remote_code=ecfg.get("trust_remote_code", False),
@@ -539,6 +599,7 @@ def make_behavioral_taxonomy(cfg: dict, queries: list[str], cache=None):
     return BehavioralTaxonomy(
         queries=queries,
         embedder=embedder,
+        query_key=query_key,
         cache=cache,
         device=ext_cfg.get("device", "cuda"),
         batch_size=ext_cfg.get("batch_size", 8),
@@ -634,7 +695,7 @@ def make_dataset_embedding_taxonomy(cfg: dict, cache=None, sample_cache=None):
 
     embedder = SentenceTransformerEmbedder(
         model_name=ecfg.get("model_name", "sentence-transformers/all-MiniLM-L6-v2"),
-        device="cpu",
+        device=resolve_device(cfg, ecfg.get("device")),
         use_generated_text=False,
         normalize_embeddings=ecfg.get("normalize_embeddings", True),
         trust_remote_code=ecfg.get("trust_remote_code", False),

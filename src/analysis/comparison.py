@@ -100,6 +100,7 @@ def build_taxonomy_artifacts(
     layers: int | list[int] | None = None,
     projections: str | list[str] | None = None,
     embedder_hash: str | None = None,
+    behavioral_config_hash: str | None = None,
     id_scheme: str = "recipe_id",
     mds_kwargs: Mapping[str, Any] | None = None,
 ) -> tuple[DistanceMatrix, dict[str, GeometryResult]]:
@@ -118,14 +119,14 @@ def build_taxonomy_artifacts(
     structural          LoRA A/B factors from the adapter files     low-rank builders
     dataset_embedding   ``DatasetEmbeddingCache``                   ``src.metrics`` pairwise
     functional          ``DiskCache``                               ``src.metrics`` pairwise
-    behavioral          ``DiskCache``                               ``src.metrics`` pairwise
+    behavioral          ``GeneratedTextCache``                      ``src.metrics`` pairwise
     ==================  ==========================================  ==========================
 
     The structural row is the one exception to using :mod:`src.metrics`.  Its
     builders in :mod:`src.notebook.structure` work directly on the rank-``r``
     factors and never form the ``d × d`` product ``B @ A`` — which for these
     adapters would be ~37 MB each — and they sidestep the variable-row-length
-    limitation recorded at the top of :mod:`src.metrics.vector`.
+    limitation recorded in :mod:`src.metrics.cka` and :mod:`src.metrics.frobenius`.
     ``scripts/check_analysis.py::t_cosine_equivalence`` pins the two to identical
     numbers, so this is a cost and robustness choice, not a different metric.
 
@@ -134,6 +135,13 @@ def build_taxonomy_artifacts(
     n_components:
         Dimensions to embed at.  A simplex projection needs ``k-1``; a plot needs
         2.  Both are usually wanted, and the cache now keeps them apart.
+    behavioral_config_hash:
+        Which cached behavioral run to read.  Optional while only one exists; once
+        there are several they differ in queries, embedder or generation settings
+        and are not comparable, so one must be named.  Note the collection cache
+        keys on ``(ids, taxonomy, metric)`` only — as it already does for
+        ``embedder_hash`` — so switching runs at one metric wants a fresh
+        ``cache_root`` or a cleared entry.
     id_scheme:
         ``"recipe_id"`` (default) keys the result by training recipe, which is the
         namespace every taxonomy shares.  Use ``"model_id"`` when a collection
@@ -159,6 +167,7 @@ def build_taxonomy_artifacts(
         dm = _compute_distance_matrix(
             index, taxonomy, metric, ids,
             layers=layers, projections=projections, embedder_hash=embedder_hash,
+            behavioral_config_hash=behavioral_config_hash,
         )
         if cache is not None:
             chash = cache.save_distance_matrix(
@@ -276,12 +285,15 @@ def _compute_distance_matrix(
     layers=None,
     projections=None,
     embedder_hash: str | None = None,
+    behavioral_config_hash: str | None = None,
 ) -> DistanceMatrix:
     if taxonomy == "structural":
         return _structural_matrix(index, metric, ids, layers, projections)
     if taxonomy == "dataset_embedding":
         return _dataset_embedding_matrix(index, metric, ids, embedder_hash)
-    if taxonomy in ("functional", "behavioral"):
+    if taxonomy == "behavioral":
+        return _behavioral_matrix(index, metric, ids, behavioral_config_hash)
+    if taxonomy == "functional":
         raise NotImplementedError(
             f"the {taxonomy!r} taxonomy has no cached representations to read. "
             "Run scripts/extract_reprs.py for it first, then re-run this "
@@ -374,6 +386,66 @@ def _dataset_embedding_matrix(
         model_ids=list(ids),
         metric=metric_obj.metric_name,
         taxonomy="dataset_embedding",
+    )
+
+
+def _behavioral_matrix(
+    index: CacheIndex, metric: Any, ids: Sequence[ModelID], config_hash: str | None
+) -> DistanceMatrix:
+    """Pairwise distances over cached behavioral representations.
+
+    Simpler than :func:`_dataset_embedding_matrix` because there is nothing to
+    negotiate: that function needs ``_embedder_choice`` to find one
+    ``(embedder_config, representation)`` shared across recipes drawn at different
+    ``n_samples``, whereas one behavioral config hash already covers every model in
+    a run.  Picking the hash is therefore a choice between whole runs, not a
+    per-model reconciliation.
+    """
+    from src.cache.generated_text_cache import GeneratedTextCache
+
+    root = index.cache_root
+    if root is None:
+        raise ValueError("index has no cache_root; cannot locate behavioral representations")
+
+    cache = GeneratedTextCache(root)
+
+    if config_hash is None:
+        available = cache.list_configs()
+        if not available:
+            raise ValueError(
+                "no behavioral representations have been extracted yet. Run "
+                "scripts/extract_reprs.py --taxonomy behavioral first."
+            )
+        if len(available) > 1:
+            raise ValueError(
+                f"{len(available)} behavioral runs are cached: {available}. They differ "
+                "in queries, embedder or generation settings and are not comparable, so "
+                "pass behavioral_config_hash= to choose one."
+            )
+        config_hash = available[0]
+
+    reps = []
+    for entry in index.entries:
+        if not cache.exists(config_hash, entry.model_id):
+            raise ValueError(
+                f"no behavioral representation for {entry.adapter_name!r} under config "
+                f"{config_hash}. Present under it: {cache.list_models(config_hash)}. "
+                "Filter with index.with_available('behavioral_repr')."
+            )
+        reps.append(cache.load(config_hash, entry.model_id))
+
+    metric_obj = _resolve_metric(metric)
+    n = len(reps)
+    arr = np.zeros((n, n), dtype=np.float64)
+    for i in range(n):
+        for j in range(i + 1, n):
+            arr[i, j] = arr[j, i] = metric_obj.compute(reps[i], reps[j])
+
+    return DistanceMatrix(
+        matrix=arr,
+        model_ids=list(ids),
+        metric=metric_obj.metric_name,
+        taxonomy="behavioral",
     )
 
 

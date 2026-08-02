@@ -87,11 +87,23 @@ tokens, which is how a comparison selects a usable model set. There is no token 
 functional or behavioral, so there is no way to ask "which models have functional
 representations". Open question 1 is about what such a token would even mean.
 
-**3. There is no test coverage.** `scripts/check_analysis.py` is the repo's
-verification script and its only test harness — there is no pytest. It registers 35
-checks (28 synthetic, 7 that read the real cache). None of them touch either level;
-the single mention of the words is a fallback that picks whichever model-level
-taxonomy happens to be present (`scripts/check_analysis.py:930`).
+**3. Test coverage: behavioral now, functional still not.**
+`scripts/check_analysis.py` is the repo's verification script and its only test
+harness — there is no pytest. It registers checks in three tiers: **35 synthetic,
+9 that read the real cache (`[data]`), and 1 that needs a GPU (`[gpu]`)**. The GPU
+tier is off unless `--include-gpu` is passed, because it loads a multi-GB model;
+the SLURM job passes it after extraction, while the device is still allocated.
+
+Behavioral is covered: cache round-trip, config-hash stability, the
+`padding_side="left"` pin, representation well-formedness, batch invariance, and a
+row in `t_comparison_end_to_end`. **Functional still has none**, and the only
+mention of it remains a fallback that picks whichever model-level taxonomy happens
+to be present.
+
+(The figures above are counted from the lists themselves — re-count
+`len(SYNTHETIC)` / `len(DATA_BACKED)` / `len(GPU_BACKED)` rather than trusting this
+sentence, which has gone stale once already: it read "35 checks (28 synthetic, 7)"
+for some time after the cache migration added five.)
 
 ---
 

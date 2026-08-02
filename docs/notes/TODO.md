@@ -115,15 +115,22 @@ narrow it further when you want a fast loop:
 
     --list              print the check names, run nothing
     -k PATTERN          only checks whose description contains PATTERN
-    --data-only         only the 7 that read the real cache — what catches a
+    --data-only         only the 9 that read the real cache — what catches a
                         broken path after a migration
     --synthetic-only    skip the cache entirely
+    --include-gpu       additionally run the [gpu] tier, which loads a real model
+                        onto a CUDA device. Off by default; the SLURM job passes it
+                        after extraction, while the GPU is still allocated.
 
 Run it in the project conda environment (`conda activate taxonomy-env`, the same one
 the SLURM scripts activate) — `numpy` is not installed in the base env, so the
-checks fail at import there. Baseline as of 2026-07-31, after task 2: **40 passed,
-0 failed, 0 skipped**, with `t_scan_cache` reporting 25 adapters, **25 with recipes,
-25 usable**, and `verify_sampled_cache --fast` reporting 521 draws ok.
+checks fail at import there. Baseline as of 2026-08-02, after the behavioral work:
+**43 passed, 0 failed, 1 skipped** across 44 registered checks (35 synthetic, 9
+`[data]`), plus 1 `[gpu]` check behind `--include-gpu`. The one skip is
+`[data] behavioral: cached representations are well formed`, which skips until
+`05_generated/` is populated — it must **skip**, never pass, while empty. Before
+that work the baseline was 40 passed / 0 / 0. `t_scan_cache` reports 25 adapters,
+**25 with recipes, 25 usable**, and `verify_sampled_cache --fast` reports 521 draws ok.
 
 The jump from 20 usable to 25 is task 2's doing, not a change in the data: the five
 oldest adapters were trained under the pre-rename naming (`yahoo_25t0_75t1`) and used to

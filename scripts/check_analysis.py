@@ -1543,23 +1543,38 @@ def t_behavioral_reps_well_formed():
 def t_behavioral_batch_invariance():
     """Re-generate a few queries at batch_size=1 and compare with the cached run.
 
-    At ``batch_size=1`` there is no padding at all, which makes it the clean
-    reference: if left padding is right, batched greedy decoding must reproduce it
-    exactly.  The *strings* are asserted; the embeddings are only reported, since
-    fp16 reductions vary with tensor shape and demanding bitwise equality there
-    would be wrong.
+    **Exact equality is not assertable, and demanding it was a mistake.** Two earlier
+    versions of this check asserted that batched greedy decoding reproduces
+    ``batch_size=1`` byte for byte. It does not, and cannot: batched matmuls tile
+    differently, so fp16 logits differ in their last bits, and greedy ``argmax``
+    flips wherever two tokens are near-tied. The sequences then diverge and never
+    reconverge. That is ordinary behaviour for batched transformer inference, not a
+    defect.
 
-    **Both arms are generated here, in this process, on this GPU.**  An earlier
-    version compared a fresh ``batch_size=1`` run against the *cached* generations,
-    which conflated three variables — batch size, hardware and time — and duly
-    failed the moment the two ran on different nodes: the same config passed on an
-    A100 and failed on an L40S with 2/8 texts differing.  That is greedy decoding
-    flipping on near-ties under different fp16 kernels, not a padding bug, but the
-    check could not tell the difference.  Generating both arms together isolates
-    batch size as the only variable, which is what the name promises.
+    Measured on an L40S (job 1987293), 8 queries, batch 1 vs batch 8:
 
-    The cache is still used, but only for *inputs* — which model, which queries,
-    which generation settings — never as an expected output.
+    - 6/8 byte-identical — **including the shortest prompt**, which carries the most
+      left padding and would be the first casualty of a padding bug.
+    - The 2 divergent ones split ~10 % in, after ~50 characters of shared coherent
+      prefix, into two equally fluent continuations (``"…it is a device that "`` →
+      ``"is designed to protect you"`` vs ``"will cut off the current"``).
+    - No correlation with padding amount: the 3-word and 17-word prompts were both
+      identical; the divergent ones were 5 and 10 words.
+
+    So the property worth asserting is not equality but the **signature** that
+    separates tie-flipping from broken padding:
+
+    1. the majority survive batching unchanged — a padding bug corrupts most of a
+       batch, since most sequences carry padding;
+    2. any divergence happens *after* a shared prefix — a padding bug decodes from
+       the wrong position and so differs from the first token;
+    3. identical text yields identical embeddings — a separate property, catching
+       nondeterminism in the embedder rather than the decoder.
+
+    Both arms are generated here, in this process, on this GPU. An earlier version
+    compared against the *cached* generations, which conflated batch size, hardware
+    and time; the cache is now read only for *inputs* — which model, which queries,
+    which settings — never as an expected output.
 
     Kept out of DATA_BACKED because it loads a multi-GB model — this tier only
     runs under --include-gpu, which the SLURM job passes while the GPU is still
@@ -1625,19 +1640,48 @@ def t_behavioral_batch_invariance():
     batched = _run(n)          # one batch, so padding is maximally exercised
 
     a, b = single.metadata["generated_texts"], batched.metadata["generated_texts"]
-    mismatched = [i for i in range(n) if a[i] != b[i]]
-    assert not mismatched, (
-        f"{len(mismatched)}/{n} generations differ between batch_size=1 and "
-        f"batch_size={n} on the same GPU in the same process (first at index "
-        f"{mismatched[0]}). Batch size is the only variable here, so suspect the "
-        f"padding side before trusting any distance from this run."
+    identical = [i for i in range(n) if a[i] == b[i]]
+    diverged = [i for i in range(n) if a[i] != b[i]]
+
+    def _shared_prefix(x: str, y: str) -> int:
+        k = 0
+        while k < min(len(x), len(y)) and x[k] == y[k]:
+            k += 1
+        return k
+
+    # 1. A padding bug corrupts the *majority* of a batch, because most sequences
+    #    are shorter than the longest and so carry padding.  Tie-flipping touches a
+    #    minority.  Measured on a real L40S run: 6/8 identical.
+    assert len(identical) * 2 >= n, (
+        f"only {len(identical)}/{n} generations survive batching unchanged. That is "
+        f"too many to be greedy tie-flipping — suspect padding_side, which must be "
+        f"'left' for decoder-only generation."
     )
 
+    # 2. A padding bug diverges from the *first* generated token, because the
+    #    sequence starts decoding from the wrong position.  Tie-flipping diverges
+    #    somewhere in the middle, after a shared, coherent prefix.
+    immediate = [i for i in diverged if _shared_prefix(a[i], b[i]) < 10]
+    assert not immediate, (
+        f"{len(immediate)}/{n} generations differ from the very first characters "
+        f"(indices {immediate[:3]}). That is the signature of a padding bug, not of "
+        f"fp16 tie-flipping — check padding_side before trusting any distance."
+    )
+
+    # 3. The embedder must be deterministic: identical text, identical vector.  This
+    #    is separate from the decoding question and would catch nondeterminism in the
+    #    sentence-transformer itself.
+    for i in identical:
+        d = float(np.abs(single.matrix[i] - batched.matrix[i]).max())
+        assert d < 1e-5, f"query {i}: same text, embeddings differ by {d:.2e}"
+
+    prefixes = [_shared_prefix(a[i], b[i]) for i in diverged]
     delta = float(np.abs(single.matrix - batched.matrix).max())
-    assert delta < 1e-2, f"embeddings diverge far beyond fp16 noise: max|delta|={delta:.2e}"
-    return (f"{n} queries on {Path(model_id).name}, batch 1 vs {n} on "
-            f"{torch.cuda.get_device_name(0)}: texts identical, "
-            f"max|delta| embeddings = {delta:.2e}")
+    return (
+        f"{len(identical)}/{n} identical on {torch.cuda.get_device_name(0)}; "
+        f"{len(diverged)} diverged after {prefixes} shared chars (fp16 tie-flips, "
+        f"not padding); max|delta| over all rows = {delta:.2e}"
+    )
 
 
 # ── entry point ───────────────────────────────────────────────────────────────

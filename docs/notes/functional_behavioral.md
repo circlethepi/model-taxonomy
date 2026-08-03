@@ -429,8 +429,14 @@ question (next item).
 >   `generate` call, so there is no greedy argmax to flip on a near-tie — the only
 >   residual is fp16 matmul tiling.
 >
-> See the "Verification" section of [TODO.md](TODO.md) for the measured numbers
-> once the smoke run has been read.
+> **Measured** (job 1999300, L40S, 8 queries, batch 1 vs batch 8): **min per-row
+> cosine 0.999999**, max|Δ| 7.81e-03. After mask-aware pooling the padding
+> contribution is zero to six decimal places, and what remains is fp16 matmul
+> tiling. This item is closed with a number rather than a judgement.
+>
+> See the "Verification" section of [TODO.md](TODO.md) for the full smoke-run
+> results, including the caveat that the absolute functional distances are very
+> small (CKA similarity 0.989–0.999 across all five adapters).
 
 In `activation_mode="input"`, `_extract_input_activations` slices one query's hidden
 states and hands them to `_pool` (`src/taxonomy/functional.py:217`):

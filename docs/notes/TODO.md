@@ -143,7 +143,55 @@ now populated, so nothing skips; the `[data]` checks for each must **skip**, nev
 pass, whenever their stage directory is absent. Earlier baselines: 45/0/1 after the
 behavioral work (the one skip being functional's absent `04_activations/`), and
 40/0/0 before either. `t_scan_cache` reports 25 adapters,
-**25 with recipes, 25 usable**, and `verify_sampled_cache --fast` reports 521 draws ok.
+**25 with recipes, 25 usable**, and `verify_sampled_cache --fast` reports **523** draws
+ok, 0 legacy, 0 failed. (The "521" recorded here previously was already stale before
+the functional work — the count was 523 both before and after that run, which reused
+an existing draw rather than adding one. Re-read the number; do not trust this line.)
+
+### What the functional smoke run showed (job 1999300, L40S, 1m48s)
+
+Five adapters spanning the mixing range, 64 queries, all 29 hidden states, `input`
+mode, mean pooling — `experiments/yahoo_functional_smoke.yaml`. Stored `(64, 3072)`
+per layer per model; the `concat` view is `(64, 89088)`.
+
+**The level carries signal, and the ordering is exactly right.** CKA distance from
+the pure topic-0 anchor is **monotone** in the true mixing proportion:
+
+| adapter | true topic-0 | distance from 100/0 |
+|---|---|---|
+| `yahoo_100t0_000t1` | 1.00 | 0.0000 |
+| `yahoo_075t0_025t1` | 0.75 | 0.0045 |
+| `yahoo_050t0_050t1` | 0.50 | 0.0084 |
+| `yahoo_025t0_075t1` | 0.25 | 0.0098 |
+| `yahoo_000t0_100t1` | 0.00 | 0.0107 |
+
+Against the full pairwise `|mixing gap|`: **Pearson r = 0.803** (p = 0.005),
+**Spearman ρ = 0.833** (p = 0.003). Off-diagonal spread 0.0011–0.0107, non-constant
+and finite. In the end-to-end slice: stress 0.0212, r = 1.0000, ρ = 1.0000,
+Procrustes 0.2399 (p = 0.015) — better than structural (0.4500) and worse than
+dataset_embedding (0.0041). Functional↔behavioral correlate at **0.382**;
+functional↔structural at **−0.006**.
+
+**The caveat worth carrying forward: the absolute distances are tiny.** A CKA
+distance of 0.011 is a CKA *similarity* of 0.989 — all five models are nearly
+identical in activation space, which is what you would expect from rank-16 LoRAs
+over one frozen base. So the ordering is recovered from a **small perturbation on a
+dominant shared base-model geometry**, not from a well-separated set of points.
+That is a real result but a fragile-looking one: it is worth checking whether the
+separation survives more adapters, more seeds, and a larger query draw before
+treating functional distances as interchangeable with the other levels'.
+
+**Batch invariance, measured rather than assumed** (`[gpu]` check, same job): batch 1
+versus one batch of 8 gives **min per-row cosine 0.999999**, max|Δ| 7.81e-03. That is
+fp16 matmul tiling and nothing else — the padding contribution the note asked to
+quantify is, after mask-aware pooling, zero to six decimal places.
+
+**Disk cost was ~2× the estimate**, and the reason is worth knowing: 219 MB for five
+models, not the ~114 MB the plan projected. The projection covered the stored
+activations (29 × 64 × 3072 × 4 B ≈ 22.8 MB per model) but not the **written-back
+surrogate**, which is the same size again because the default `concat` view over all
+layers is exactly as large as the layers it concatenates. Still cheap, but a
+surrogate is not free the way a small derived view would be.
 
 The jump from 20 usable to 25 is task 2's doing, not a change in the data: the five
 oldest adapters were trained under the pre-rename naming (`yahoo_25t0_75t1`) and used to

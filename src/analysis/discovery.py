@@ -44,12 +44,31 @@ _DATASET_NAME_RE = re.compile(r"^(?P<mixture>.+?)_n(?P<n>\d+)_s(?P<seed>\d+)$")
 # _i suffix absent on adapters trained before it was introduced.
 _ADAPTER_DIR_RE = re.compile(r"^(?P<name>.+?)_r(?P<rank>\d+)(?:_i(?P<init>\d+))?$")
 
+# Order is load-bearing: summary() builds its per-model flag string by walking this
+# tuple and emitting each name's first letter, so position i here is position i in
+# the flag string and letter i of the "WRDSB" header.  Append, never insert.
 _TAXONOMY_AVAILABILITY = (
     "structural_weights",
     "structural_repr",
     "dataset_embedding",
     "sampled_rows",
+    "behavioral_repr",
 )
+
+#: Flag letter per token, for the compact availability column in summary().
+#: Explicit rather than ``name[0].upper()``: that rule gives three of these five
+#: tokens the letter "S" (structural_weights, structural_repr, sampled_rows), so a
+#: fully-available model printed "SSDS" under a header advertising "WRDS" — the
+#: header could not be used to read the column it labelled.  Keep this in sync with
+#: the tuple above; _AVAILABILITY_HEADER is derived from it so they cannot drift.
+_AVAILABILITY_LETTERS = {
+    "structural_weights": "W",
+    "structural_repr": "R",
+    "dataset_embedding": "D",
+    "sampled_rows": "S",
+    "behavioral_repr": "B",
+}
+_AVAILABILITY_HEADER = "".join(_AVAILABILITY_LETTERS[n] for n in _TAXONOMY_AVAILABILITY)
 
 
 @dataclass
@@ -231,7 +250,7 @@ class CacheIndex:
             key=lambda x: (x.mixture or "", x.n_samples or 0, x.seed or 0),
         ):
             flags = "".join(
-                name[0].upper() if e.available.get(name) else "-"
+                _AVAILABILITY_LETTERS[name] if e.available.get(name) else "-"
                 for name in _TAXONOMY_AVAILABILITY
             )
             rows.append(
@@ -245,7 +264,7 @@ class CacheIndex:
                 )
             )
 
-        headers = ("mixture", "n", "seed", "rank", "WRDS", "recipe")
+        headers = ("mixture", "n", "seed", "rank", _AVAILABILITY_HEADER, "recipe")
         widths = [
             max(len(h), max(len(r[i]) for r in rows)) for i, h in enumerate(headers)
         ]
@@ -259,7 +278,9 @@ class CacheIndex:
         out += ["  ".join(c.ljust(w) for c, w in zip(r, widths)) for r in rows]
         out += [
             "",
-            "WRDS = structural_Weights / structural_Repr / Dataset_embedding / Sampled_rows",
+            f"{_AVAILABILITY_HEADER} = " + " / ".join(
+                f"{_AVAILABILITY_LETTERS[n]}={n}" for n in _TAXONOMY_AVAILABILITY
+            ),
         ]
         return "\n".join(out)
 
@@ -271,6 +292,7 @@ def scan_cache(
     base_model_id: str | None = None,
     resolve_recipes: bool = True,
     scan_all_recipes: bool = False,
+    behavioral_config_hash: str | None = None,
 ) -> CacheIndex:
     """Walk the shared cache and join adapters to the recipes they were trained on.
 
@@ -288,6 +310,17 @@ def scan_cache(
         Additionally enumerate *every* recipe in the dataset-embedding cache, not
         just the referenced ones.  Off by default because that is one read per
         recipe and the cache can hold thousands.
+    behavioral_config_hash:
+        Which behavioral run the ``behavioral_repr`` token should report on.
+
+        **The meaning of the token depends on this argument, so read it before
+        relying on it.**  When a hash is given, ``behavioral_repr`` is exact: True
+        means *this model has a representation under this exact config*.  When it
+        is omitted the token degrades to "some behavioral representation exists for
+        this model, under some config" — which is weaker than it looks, because a
+        representation generated from different queries or a different embedder is
+        not interchangeable with the one a caller probably wants.  Pass the hash
+        whenever the answer will be used to select models for a comparison.
     """
     root = Path(cache_root)
     adapters_root = root / "03_adapters"
@@ -298,10 +331,15 @@ def scan_cache(
         return CacheIndex([], root)
 
     from src.cache.dataset_embedding_cache import DatasetEmbeddingCache
+    from src.cache.generated_text_cache import GeneratedTextCache
     from src.cache.lora_cache import LoRACache
 
     lora_cache = LoRACache(root)
     de_cache = DatasetEmbeddingCache(root)
+    gen_cache = GeneratedTextCache(root)
+    behavioral_hashes = (
+        [behavioral_config_hash] if behavioral_config_hash else gen_cache.list_configs()
+    )
 
     slugs = (
         [base_model_id.replace("/", "--")]
@@ -352,6 +390,11 @@ def scan_cache(
                 "dataset_embedding": bool(entry.embedder_hashes),
                 "sampled_rows": _sampled_rows_exist(
                     sampled_root, entry.recipe_hash, entry.n_samples, entry.seed
+                ),
+                # Ask the cache where its own files live rather than rebuilding the
+                # path here — see _sampled_rows_exist below for why that matters.
+                "behavioral_repr": any(
+                    gen_cache.exists(h, entry.model_id) for h in behavioral_hashes
                 ),
             }
             entries.append(entry)
@@ -473,6 +516,9 @@ def _attach_unreferenced_recipes(
                         "structural_repr": False,
                         "dataset_embedding": True,
                         "sampled_rows": True,
+                        # These entries are recipes, not models — there is no adapter
+                        # to generate from, so behavioral can never be available.
+                        "behavioral_repr": False,
                     },
                 )
             )

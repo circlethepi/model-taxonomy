@@ -87,11 +87,50 @@ tokens, which is how a comparison selects a usable model set. There is no token 
 functional or behavioral, so there is no way to ask "which models have functional
 representations". Open question 1 is about what such a token would even mean.
 
-**3. There is no test coverage.** `scripts/check_analysis.py` is the repo's
-verification script and its only test harness — there is no pytest. It registers 35
-checks (28 synthetic, 7 that read the real cache). None of them touch either level;
-the single mention of the words is a fallback that picks whichever model-level
-taxonomy happens to be present (`scripts/check_analysis.py:930`).
+**Greedy decoding is not reproducible across batch sizes, and that is not a bug.**
+Worth stating because two versions of the batch-invariance check assumed otherwise.
+Batched matmuls tile differently, so fp16 logits differ in their last bits, and
+greedy `argmax` flips wherever two tokens are near-tied; the sequences then diverge
+and never reconverge. Measured on an L40S (job 1987293, 8 queries, batch 1 vs 8):
+**6/8 byte-identical**, the 2 divergent ones splitting ~10 % in after ~50 characters
+of shared prefix into two equally fluent continuations, with **no correlation to
+padding amount** — the shortest prompt (most padding) was identical, the divergent
+ones were mid-length.
+
+Left padding is therefore correct. The distinguishing signature, which
+`t_behavioral_batch_invariance` now asserts instead of equality:
+
+| | fp16 tie-flipping | broken padding |
+|---|---|---|
+| how many diverge | a minority | most of the batch |
+| where they diverge | mid-sequence, after a shared prefix | from the first generated token |
+| correlation with padding amount | none | shortest prompts worst |
+
+Practical consequence: a behavioral representation is reproducible only at a fixed
+batch size, and `batch_size` is deliberately **not** in `config_dict()`, so the cache
+will not distinguish two runs that used different ones. `metadata` records
+`batch_size` and `device_name` for exactly this reason. Distances are affected only
+to the extent that a minority of generations differ, and the observed per-row cosine
+between batch-1 and batch-8 vectors was 1.000 for matching rows and 0.84–0.87 for the
+two that flipped.
+
+**3. Test coverage: behavioral now, functional still not.**
+`scripts/check_analysis.py` is the repo's verification script and its only test
+harness — there is no pytest. It registers checks in three tiers: **37 synthetic,
+9 that read the real cache (`[data]`), and 1 that needs a GPU (`[gpu]`)**. The GPU
+tier is off unless `--include-gpu` is passed, because it loads a multi-GB model;
+the SLURM job passes it after extraction, while the device is still allocated.
+
+Behavioral is covered: cache round-trip, config-hash stability, the
+`padding_side="left"` pin, representation well-formedness, batch invariance, and a
+row in `t_comparison_end_to_end`. **Functional still has none**, and the only
+mention of it remains a fallback that picks whichever model-level taxonomy happens
+to be present.
+
+(The figures above are counted from the lists themselves — re-count
+`len(SYNTHETIC)` / `len(DATA_BACKED)` / `len(GPU_BACKED)` rather than trusting this
+sentence, which has gone stale once already: it read "35 checks (28 synthetic, 7)"
+for some time after the cache migration added five.)
 
 ---
 

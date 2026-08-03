@@ -26,8 +26,10 @@ Dependencies are called out in the State column.
 | 6 | Add distance correlation (dCor); demote Mantel's p-value to descriptive | [distance_matrix_comparison.md](distance_matrix_comparison.md) §1 | Mantel has inflated type-I error on dependent off-diagonal entries; PROTEST is already implemented and better calibrated. Do **not** drop Mantel — existing figures reference it. |
 | 7 | Fit `T: D_taxonomy → D_simplex` and test whether it converges in `n` | [distance_matrix_comparison.md](distance_matrix_comparison.md) §2 | Research, not plumbing. The data already exists: the `by_seed/` grouping varies `n_samples` at fixed seed, and `compare_taxonomies` already persists a restricted `T_n`. Fit on distance matrices, not raw MDS coordinates. |
 | 8 | Make `src/metrics/` handle variable-length representation rows | in-code TODOs at `src/metrics/cka.py:1`, `src/metrics/frobenius.py:1`, `src/taxonomy/structural.py` | Blocks the full structural pipeline through `ModelRepresentation`. Storage format still undecided (zero-pad / per-module-type / a ragged type). Also relevant to 9 — see its open question 4. |
-| 9 | Functional/behavioral: run them, then wire them into the comparison layer | [functional_behavioral.md](functional_behavioral.md) | Both levels are fully implemented and have never been run in the shared cache; `04_activations/` and `05_generated/` do not exist yet. Four open design questions and three things to check on first run. |
+| 9 | Functional/behavioral: run them, then wire them into the comparison layer | [functional_behavioral.md](functional_behavioral.md) | **Behavioral done**; functional still untouched. `05_generated/` is populated and behavioral is readable by the comparison layer, with `GeneratedTextCache`, a `behavioral_repr` availability token, `_behavioral_matrix`, and synthetic/`[data]`/`[gpu]` checks. `04_activations/` still does not exist. Functional keeps its three open questions (representation mode, layer alignment, pooling over pad positions). |
+| 11 | **`text_field` disagrees between training and behavioral extraction** | this row; see also 2 and [embedder_task_prefixes.md](embedder_task_prefixes.md) | Training sets `text_field: best_answer` and `finetune_lora.py` hands it to `SFTTrainer` as `dataset_text_field`, so adapters are fit as a plain causal LM on **bare answer prose — no question, no template**. The behavioral query set sets `question_title`, so extraction prompts them with a **question** to continue. That shape never appeared in training, so behavioral distances are measured out-of-distribution. Same signature as the nomic prefix bug: no error, fluent output, effect invisible until measured against a correctly-formed input. **Not a one-line fix** — `ClassDatasetEntry.text_field` is a single string selecting one column at read time, so question+answer is not expressible in YAML and needs a *composition* mechanism in the recipe layer. **Blast radius:** it changes `recipe_hash`, so every affected draw re-materialises and all 25 adapters need retraining. **It splits the levels:** dataset embeddings also use `best_answer`, so if training moves to combined text and the dataset level does not follow, "what a 75/25 mixture means" stops being the same thing at each level — decide both together. **It revives item 2's parked question:** if `text_field` becomes a composition rather than a column selector, the "it is only a read-time projection" argument for keeping it out of the recipe hash weakens considerably. |
 | 10 | Generalize CKA to multi-layer / multi-projection sweeps | [cka_notes.md](cka_notes.md) | Parked on a genuine modeling choice, not on effort. Needs a decision in conversation before any code. The other three distance builders were already generalized — see [frobenius_bw_generalization.md](frobenius_bw_generalization.md) for those proofs. |
+| 12 | **Behavioral representations have no `representation:` knob, unlike the dataset level** | this row; see also 8 | **What is on disk today** (verified against `05_generated/5191ad734b81daff/`): `embeddings/{slug}.safetensors` holds `matrix` as **`(n_queries, 768)` float32** — one row per query, each row L2-normalized, no pooling across queries — plus a `_meta_json` blob carrying `model_id`, `taxonomy` and `metadata`. The generated **text is not in the tensor file**: it lives beside it in `generations/{slug}.json`, and `GeneratedTextCache.load()` folds it back into `metadata["generated_texts"]` so callers see the original object. At `n_queries=64` that is ~192 KB of tensor + ~33 KB of text per model, growing linearly in `n_queries`. **The asymmetry:** `DatasetEmbeddingTaxonomy` takes `representation: mean\|matrix` and the populated `02_dataset_embeddings` all use `mean` (a `(1, d)` centroid), but `BehavioralTaxonomy` has no such parameter — it always stores the full matrix. **Why that matters less than it looks:** `CosineDistanceMetric` flattens both matrices before comparing, and because row *i* is query *i* for every model and every row is unit-norm, the flattened cosine reduces exactly to the **mean per-query cosine similarity** — `cos(A_flat, B_flat) = (1/n)·Σᵢ⟨aᵢ,bᵢ⟩`. So the metric already averages over queries; keeping the full matrix costs disk but is what makes per-query analysis (centering, subsetting, per-query variance) possible at all — and those are the levers if the signal stays weak. **Decide:** whether behavioral gains a `representation:` option for symmetry, and whether a pooled `(1, 768)` variant is stored alongside so behavioral and dataset centroids are directly comparable. Note a pooled behavioral vector is **not** the same as the flattened cosine — averaging vectors then comparing differs from comparing then averaging. |
 
 ## Small wins
 
@@ -47,13 +49,21 @@ Recorded so they survive; each is cheap and independent.
 - ~~**Fix the nonexistent default in `load_lora_weights`.**~~ Done during 1 — it
   defaulted to `results/shared_cache/peft_adapters`, which never existed; now
   `results/shared_cache/03_adapters`.
-- **Read the configured device for the sentence embedders.** Both
-  `SentenceTransformerEmbedder` construction sites hardcode `device="cpu"` —
-  `scripts/_utils.py:469` (behavioral) and `scripts/_utils.py:574`
-  (dataset_embedding) — so every sentence embedding the pipeline has produced so
-  far, including the populated `02_dataset_embeddings` cache, was computed on CPU.
-  Fine for MiniLM-L6, a bottleneck for anything larger. Fix both together. See 9,
-  "Things to check", item 1.
+- ~~**Read the configured device for the sentence embedders.**~~ Done. Both
+  `SentenceTransformerEmbedder` construction sites hardcoded `device="cpu"`, so every
+  sentence embedding the pipeline had produced — including the whole populated
+  `02_dataset_embeddings` cache — was computed on CPU. Now routed through
+  `_utils.resolve_device`: an explicit per-embedder `device`, else
+  `extraction.device`, else auto-detect. `device` is deliberately outside
+  `config_dict()`, so no cache key changed and nothing was invalidated.
+- ~~**Prepend nomic's task-instruction prefix.**~~ Done. `prompt_name="document"` was
+  a **silent no-op** — nomic ships no `prompts` map, sentence-transformers synthesises
+  `{"query": "", "document": ""}`, and the empty string was prepended without error.
+  All 520 cached dataset embeddings are therefore bare-text. They are **geometrically
+  equivalent** (MDS recovery 0.9977 vs 0.9976 pearson, spearman 1.0000 both ways) and
+  are being kept, but they are unreachable under the new `embedder_hash` by design.
+  Full write-up, including the `max_seq_length` cap to use if you ever batch a
+  re-embed: **`docs/notes/embedder_task_prefixes.md`**.
 
 ## Do not "simplify" these
 
@@ -115,15 +125,22 @@ narrow it further when you want a fast loop:
 
     --list              print the check names, run nothing
     -k PATTERN          only checks whose description contains PATTERN
-    --data-only         only the 7 that read the real cache — what catches a
+    --data-only         only the 9 that read the real cache — what catches a
                         broken path after a migration
     --synthetic-only    skip the cache entirely
+    --include-gpu       additionally run the [gpu] tier, which loads a real model
+                        onto a CUDA device. Off by default; the SLURM job passes it
+                        after extraction, while the GPU is still allocated.
 
 Run it in the project conda environment (`conda activate taxonomy-env`, the same one
 the SLURM scripts activate) — `numpy` is not installed in the base env, so the
-checks fail at import there. Baseline as of 2026-07-31, after task 2: **40 passed,
-0 failed, 0 skipped**, with `t_scan_cache` reporting 25 adapters, **25 with recipes,
-25 usable**, and `verify_sampled_cache --fast` reporting 521 draws ok.
+checks fail at import there. Baseline as of 2026-08-02, after the behavioral work and
+the nomic prefix fix: **45 passed, 0 failed, 1 skipped** across 46 registered checks
+(37 synthetic, 9 `[data]`), plus 1 `[gpu]` check behind `--include-gpu`. The one skip is
+`[data] behavioral: cached representations are well formed`, which skips until
+`05_generated/` is populated — it must **skip**, never pass, while empty. Before
+that work the baseline was 40 passed / 0 / 0. `t_scan_cache` reports 25 adapters,
+**25 with recipes, 25 usable**, and `verify_sampled_cache --fast` reports 521 draws ok.
 
 The jump from 20 usable to 25 is task 2's doing, not a change in the data: the five
 oldest adapters were trained under the pre-rename naming (`yahoo_25t0_75t1`) and used to

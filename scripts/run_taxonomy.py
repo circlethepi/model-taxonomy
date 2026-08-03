@@ -28,6 +28,7 @@ from scripts._utils import (
     hf_token,
     resolve_model_ids,
     make_repr_cache,
+    make_generated_text_cache,
     make_queries,
     make_functional_taxonomy,
     make_behavioral_taxonomy,
@@ -108,7 +109,7 @@ def run_taxonomy(cfg: dict, only_taxonomies: list[str] | None = None) -> ModelTa
     # ── Functional ─────────────────────────────────────────────────────────────
     if "functional" in configured_taxonomies:
         print("\n  [functional]")
-        queries = make_queries(cfg)
+        queries, _ = make_queries(cfg)
         taxonomy = make_functional_taxonomy(
             cfg, queries, cache=make_repr_cache(cache_dir, "functional")
         )
@@ -129,23 +130,26 @@ def run_taxonomy(cfg: dict, only_taxonomies: list[str] | None = None) -> ModelTa
     # ── Behavioral ─────────────────────────────────────────────────────────────
     if "behavioral" in configured_taxonomies:
         print("\n  [behavioral]")
-        queries = make_queries(cfg)
+        queries, query_key = make_queries(cfg)
         taxonomy = make_behavioral_taxonomy(
-            cfg, queries, cache=make_repr_cache(cache_dir, "behavioral")
+            cfg, queries, query_key, cache=make_generated_text_cache(cache_dir)
         )
         metric_names = _to_list(metrics_cfg.get("behavioral", "frobenius"))
 
-        for metric_name in metric_names:
-            metric = make_metric(metric_name)
-            analyzer = TaxonomyAnalyzer(taxonomy, metric, backend)
-            analysis = analyzer.fit(model_ids)
+        try:
+            for metric_name in metric_names:
+                metric = make_metric(metric_name)
+                analyzer = TaxonomyAnalyzer(taxonomy, metric, backend)
+                analysis = analyzer.fit(model_ids)
 
-            _add_geometries(analysis, geometry_names, dims, metric_name)
+                _add_geometries(analysis, geometry_names, dims, metric_name)
 
-            if len(metric_names) > 1:
-                analysis.taxonomy_name = f"behavioral_{metric_name}"
+                if len(metric_names) > 1:
+                    analysis.taxonomy_name = f"behavioral_{metric_name}"
 
-            profile.add(analysis)
+                profile.add(analysis)
+        finally:
+            taxonomy.close()
 
     # ── Dataset Embedding ──────────────────────────────────────────────────────
     if "dataset_embedding" in configured_taxonomies:

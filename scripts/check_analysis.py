@@ -1010,7 +1010,28 @@ def t_comparison_end_to_end():
     if not (root / "03_adapters").exists():
         raise _Skip(f"{root}/03_adapters not present")
 
-    index = scan_cache(root).with_available("structural_weights", "dataset_embedding")
+    # Behavioral joins only when every model in the slice has a representation
+    # under one config.  "05_generated exists" is not enough: a slice missing one
+    # adapter would build a matrix and then fail on it, reporting FAIL where the
+    # honest answer is "that model was never extracted".
+    from src.cache.generated_text_cache import GeneratedTextCache
+
+    behavioral_hash = None
+    gen_configs = GeneratedTextCache(root).list_configs()
+    if len(gen_configs) == 1:
+        behavioral_hash = gen_configs[0]
+
+    index = scan_cache(root, behavioral_config_hash=behavioral_hash)
+    tokens = ["structural_weights", "dataset_embedding"]
+    taxonomies = ["structural", "dataset_embedding"]
+    if behavioral_hash is not None:
+        candidate = index.with_available(*tokens, "behavioral_repr")
+        cand_slices = candidate.slices(("n_samples", "seed"))
+        if cand_slices and len(cand_slices[max(cand_slices)]) >= 3:
+            tokens.append("behavioral_repr")
+            taxonomies.append("behavioral")
+
+    index = index.with_available(*tokens)
     slices = index.slices(("n_samples", "seed"))
     if not slices:
         raise _Skip("no complete (n_samples, seed) slice in the cache")
@@ -1021,12 +1042,13 @@ def t_comparison_end_to_end():
 
     with tempfile.TemporaryDirectory() as td:
         matrices = {}
-        for tax in ("structural", "dataset_embedding"):
+        for tax in taxonomies:
             # One layer and one projection keeps this to a few hundred KB per
             # adapter; the dense B @ A product is never formed.
             matrices[tax], _ = build_taxonomy_artifacts(
                 sub, tax, "cosine", cache_root=td, n_components=(2,),
                 layers=[27], projections="o",
+                behavioral_config_hash=behavioral_hash,
             )
         result = compare_taxonomies(
             matrices, sub.recipes(), n_permutations=199,
@@ -1243,6 +1265,425 @@ def t_cache_fully_migrated():
             f"{len(legacy_draws)} still storing rows")
 
 
+# ── embedder task prefixes ────────────────────────────────────────────────────
+
+@check("embedder: prefix-required models always resolve a non-empty task prefix")
+def t_embedder_prefix_resolved():
+    """The regression guard for a bug whose whole character was silence.
+
+    ``nomic-embed-text-v1.5`` ships no ``prompts`` map, so sentence-transformers
+    synthesises ``{"query": "", "document": ""}`` and ``prompt_name="document"``
+    resolved to a valid key that prepended the empty string — no error, no warning,
+    and output that looked entirely plausible.  A check that merely asserted
+    "prompt_name is document" would have passed throughout.  What has to be asserted
+    is that a real prefix comes out the other end, including when nothing was asked
+    for.
+    """
+    import warnings as _warnings
+
+    from src.embedders.sentence_transformer import (
+        _NOMIC_PREFIXES, _PREFIX_REQUIRED_MODELS, SentenceTransformerEmbedder,
+    )
+
+    nomic = "nomic-ai/nomic-embed-text-v1.5"
+    assert nomic.startswith(_PREFIX_REQUIRED_MODELS), "nomic no longer matches the list"
+
+    # Every alias must produce a non-empty literal, not just a recognised name.
+    for name in sorted(_NOMIC_PREFIXES):
+        e = SentenceTransformerEmbedder(model_name=nomic, prompt_name=name)
+        assert e.prompt_prefix, f"prompt_name={name!r} resolved to an empty prefix"
+        assert e.prompt_prefix.endswith(": "), e.prompt_prefix
+
+    # Omitted: must still prefix, and must say so.
+    with _warnings.catch_warnings(record=True) as caught:
+        _warnings.simplefilter("always")
+        default = SentenceTransformerEmbedder(model_name=nomic)
+    assert default.prompt_prefix == "search_document: ", default.prompt_prefix
+    assert len(caught) == 1, f"expected one warning when defaulting, got {len(caught)}"
+
+    # A typo must not quietly take the default — that would restore the silence.
+    try:
+        SentenceTransformerEmbedder(model_name=nomic, prompt_name="documnet")
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("an unknown prompt_name was accepted")
+
+    # Non-prefix models keep their old behaviour untouched.
+    mini = SentenceTransformerEmbedder(model_name="sentence-transformers/all-MiniLM-L6-v2")
+    assert mini.prompt_prefix == "", mini.prompt_prefix
+    assert not mini.requires_prefix
+    return f"{len(_NOMIC_PREFIXES)} aliases resolve; default 'search_document: '; typo raises"
+
+
+@check("embedder: prompt_prefix is in the cache key, so bare and prefixed cannot collide")
+def t_embedder_prefix_in_cache_key():
+    """Bare-text and correctly-prefixed embeddings must never share an embedder_hash.
+
+    They are computed from the same ``model_name`` and the same ``prompt_name``, so
+    without the resolved literal in the key they hash identically — and the cache
+    would hand back one where the other was asked for.  Their distances live on
+    different scales, so mixing them in a single comparison is silently wrong.
+    """
+    from src.cache.dataset_embedding_cache import DatasetEmbeddingCache
+    from src.embedders.sentence_transformer import SentenceTransformerEmbedder
+
+    e = SentenceTransformerEmbedder(
+        model_name="nomic-ai/nomic-embed-text-v1.5", prompt_name="document",
+        use_generated_text=False, trust_remote_code=True,
+    )
+    cfg = e.config_dict()
+    assert "prompt_prefix" in cfg, "prompt_prefix missing from config_dict"
+    assert cfg["prompt_prefix"] == "search_document: ", cfg["prompt_prefix"]
+
+    # What the key looked like before the fix: same fields, no resolved literal.
+    bare = {k: v for k, v in cfg.items() if k != "prompt_prefix"}
+    h_new = DatasetEmbeddingCache.embedder_hash(cfg, "mean", 1000)
+    h_old = DatasetEmbeddingCache.embedder_hash(bare, "mean", 1000)
+    assert h_new != h_old, (
+        "prefixed and bare embeddings hash identically; the cache would treat them "
+        "as interchangeable"
+    )
+
+    # Different prefixes must also separate.
+    q = SentenceTransformerEmbedder(
+        model_name="nomic-ai/nomic-embed-text-v1.5", prompt_name="search_query",
+        use_generated_text=False, trust_remote_code=True,
+    )
+    h_q = DatasetEmbeddingCache.embedder_hash(q.config_dict(), "mean", 1000)
+    assert h_q != h_new, "search_query and search_document share a hash"
+    return f"bare={h_old} document={h_new} query={h_q}, all distinct"
+
+
+# ── behavioral taxonomy ───────────────────────────────────────────────────────
+
+def _behavioral_config_hashes() -> tuple:
+    """``(GeneratedTextCache, [config_hash, ...])`` for the real cache."""
+    from src.cache.generated_text_cache import GeneratedTextCache
+
+    root = REPO / "results/shared_cache"
+    if not (root / "05_generated").exists():
+        raise _Skip(f"{root}/05_generated not present — behavioral has not been run")
+    cache = GeneratedTextCache(root)
+    hashes = cache.list_configs()
+    if not hashes:
+        raise _Skip("05_generated exists but holds no complete config")
+    return cache, hashes
+
+
+@check("behavioral: GeneratedTextCache round-trips matrix, metadata and generations")
+def t_generated_cache_roundtrip():
+    import tempfile
+
+    from src.cache.generated_text_cache import GeneratedTextCache
+    from src.core.representation import ModelRepresentation
+
+    config = {"taxonomy": "behavioral", "max_new_tokens": 16,
+              "embedder": {"model_name": "stub"}}
+    chash = GeneratedTextCache.config_hash(config)
+    model_id = "/some/abs/path/yahoo_050t0_050t1_n1000_s00_r16_i00"
+    texts = ["first continuation", "second", "third", "fourth"]
+    matrix = np.arange(12, dtype=np.float32).reshape(4, 3)
+
+    with tempfile.TemporaryDirectory() as td:
+        cache = GeneratedTextCache(td)
+        assert not cache.exists(chash, model_id), "empty cache reports a hit"
+
+        rep = ModelRepresentation.create(
+            model_id=model_id, taxonomy="behavioral", matrix=matrix, config=config,
+            metadata={"n_queries": 4, "generated_texts": texts},
+        )
+        cache.save(chash, rep, config=config, queries=["q0", "q1", "q2", "q3"],
+                   query_key={"recipe_hash": "abc", "n_samples": 4, "seed": 0})
+        assert cache.exists(chash, model_id)
+
+        got = cache.load(chash, model_id)
+        assert np.array_equal(got.matrix, matrix), "matrix changed across the round trip"
+        assert got.matrix.dtype == np.float32, got.matrix.dtype
+        assert got.model_id == model_id and got.taxonomy == "behavioral"
+        # generated_texts lives in generations/, not in the tensor file; load() has
+        # to fold it back in or every consumer of metadata breaks.
+        assert got.metadata["generated_texts"] == texts, got.metadata
+        assert got.metadata["n_queries"] == 4
+
+        # Reading text must not require touching the tensors.
+        assert cache.load_generations(chash, model_id) == texts
+        assert cache.load_config(chash)["query_key"]["recipe_hash"] == "abc"
+        assert cache.list_configs() == [chash]
+        assert len(cache.list_models(chash)) == 1
+
+        # Idempotent: a second save of different data is a no-op, because there is
+        # no invalidation path — a changed config yields a new hash instead.
+        rep2 = ModelRepresentation.create(
+            model_id=model_id, taxonomy="behavioral",
+            matrix=np.zeros((4, 3), dtype=np.float32), config=config,
+            metadata={"generated_texts": ["x"] * 4},
+        )
+        cache.save(chash, rep2, config=config)
+        assert np.array_equal(cache.load(chash, model_id).matrix, matrix), (
+            "save overwrote an existing entry"
+        )
+    return f"round-tripped (4, 3) + 4 generations under {chash}"
+
+
+@check("behavioral: config_hash is stable under dict key reordering")
+def t_generated_cache_hash_stable():
+    from src.cache.generated_text_cache import GeneratedTextCache, model_slug
+
+    a = {"taxonomy": "behavioral", "max_new_tokens": 128,
+         "embedder": {"model_name": "nomic", "normalize_embeddings": True},
+         "query_key": {"recipe_hash": "abc", "n_samples": 64, "seed": 0}}
+    b = {"query_key": {"seed": 0, "n_samples": 64, "recipe_hash": "abc"},
+         "embedder": {"normalize_embeddings": True, "model_name": "nomic"},
+         "max_new_tokens": 128, "taxonomy": "behavioral"}
+    assert GeneratedTextCache.config_hash(a) == GeneratedTextCache.config_hash(b), (
+        "config_hash depends on dict ordering; equivalent configs would split the cache"
+    )
+    c = dict(a, max_new_tokens=64)
+    assert GeneratedTextCache.config_hash(a) != GeneratedTextCache.config_hash(c), (
+        "config_hash ignores max_new_tokens"
+    )
+
+    # Adapter dirs share basenames across base models, so the slug must not
+    # collapse two different absolute paths onto one filename.
+    s1 = model_slug("/cache/03_adapters/meta-llama--Llama-3.2-3B/yahoo_050t0_050t1_n1000_s00_r16_i00")
+    s2 = model_slug("/cache/03_adapters/meta-llama--Llama-3.1-8B/yahoo_050t0_050t1_n1000_s00_r16_i00")
+    assert s1 != s2, f"slug collision between different base models: {s1}"
+    assert "/" not in s1, s1
+    return f"hash stable under reordering; slugs distinct ({s1[-8:]} vs {s2[-8:]})"
+
+
+@check("behavioral: the taxonomy pins left padding")
+def t_behavioral_padding_side():
+    """Left padding is what makes batched greedy generation match batch_size=1.
+
+    With right padding the pad tokens sit between the prompt and the first
+    generated token, so every sequence shorter than the batch maximum decodes
+    from the wrong position — silently, with plausible-looking output.  The GPU
+    batch-invariance check is what proves it end to end; this is the cheap guard
+    that runs everywhere and fails the moment the line is removed.
+    """
+    from src.taxonomy.behavioral import BehavioralTaxonomy
+
+    class _StubTokenizer:
+        padding_side = "right"
+        pad_token = None
+        eos_token = "</s>"
+
+    stub = _StubTokenizer()
+
+    class _Probe(BehavioralTaxonomy):
+        def _load_tokenizer(self, model_id, base_model_id):   # noqa: ARG002
+            tok = stub
+            tok.padding_side = "left"
+            if tok.pad_token is None:
+                tok.pad_token = tok.eos_token
+            return tok
+
+    class _StubEmbedder:
+        def config_dict(self):
+            return {"embedder_class": "stub"}
+
+        def embed(self, output, query):   # noqa: ARG002
+            return np.zeros(3, dtype=np.float32)
+
+    tax = _Probe(queries=["q"], embedder=_StubEmbedder(), max_new_tokens=8)
+    tok = tax._load_tokenizer("anything", None)
+    assert tok.padding_side == "left", tok.padding_side
+    assert tok.pad_token is not None, "pad_token left unset; batching would fail"
+
+    # The real implementation must contain the pin, not just the probe above.
+    import inspect
+    src = inspect.getsource(BehavioralTaxonomy._load_tokenizer)
+    assert 'padding_side = "left"' in src, "BehavioralTaxonomy no longer pins padding_side"
+    return "padding_side='left' pinned, pad_token defaulted to eos"
+
+
+@check("[data] behavioral: cached representations are well formed")
+def t_behavioral_reps_well_formed():
+    cache, hashes = _behavioral_config_hashes()
+
+    checked, shapes = 0, set()
+    for chash in hashes:
+        queries = cache.load_queries(chash).get("queries", [])
+        n_queries = len(queries)
+        for slug in cache.list_models(chash):
+            path = cache._config_dir(chash) / "embeddings" / f"{slug}.safetensors"
+            from safetensors.numpy import load_file
+            import json as _json
+            tensors = load_file(str(path))
+            matrix = tensors["matrix"]
+            meta = _json.loads(tensors["_meta_json"].tobytes().decode("utf-8"))
+            model_id = meta["model_id"]
+
+            assert matrix.dtype == np.float32, f"{slug}: dtype {matrix.dtype}"
+            assert matrix.ndim == 2, f"{slug}: shape {matrix.shape}"
+            if n_queries:
+                assert matrix.shape[0] == n_queries, (
+                    f"{slug}: {matrix.shape[0]} rows for {n_queries} queries"
+                )
+            assert np.isfinite(matrix).all(), f"{slug}: non-finite values"
+
+            texts = cache.load_generations(chash, model_id)
+            assert len(texts) == matrix.shape[0], (
+                f"{slug}: {len(texts)} generations for {matrix.shape[0]} rows"
+            )
+            empty = [i for i, t in enumerate(texts) if not t.strip()]
+            assert not empty, f"{slug}: {len(empty)} empty generation(s) at {empty[:3]}"
+
+            shapes.add(matrix.shape)
+            checked += 1
+
+    if not checked:
+        raise _Skip("no behavioral representations stored under any config")
+    return f"{checked} representation(s) across {len(hashes)} config(s), shapes {sorted(shapes)}"
+
+
+@check("[gpu] behavioral: generation is invariant to batch size")
+def t_behavioral_batch_invariance():
+    """Re-generate a few queries at batch_size=1 and compare with the cached run.
+
+    **Exact equality is not assertable, and demanding it was a mistake.** Two earlier
+    versions of this check asserted that batched greedy decoding reproduces
+    ``batch_size=1`` byte for byte. It does not, and cannot: batched matmuls tile
+    differently, so fp16 logits differ in their last bits, and greedy ``argmax``
+    flips wherever two tokens are near-tied. The sequences then diverge and never
+    reconverge. That is ordinary behaviour for batched transformer inference, not a
+    defect.
+
+    Measured on an L40S (job 1987293), 8 queries, batch 1 vs batch 8:
+
+    - 6/8 byte-identical — **including the shortest prompt**, which carries the most
+      left padding and would be the first casualty of a padding bug.
+    - The 2 divergent ones split ~10 % in, after ~50 characters of shared coherent
+      prefix, into two equally fluent continuations (``"…it is a device that "`` →
+      ``"is designed to protect you"`` vs ``"will cut off the current"``).
+    - No correlation with padding amount: the 3-word and 17-word prompts were both
+      identical; the divergent ones were 5 and 10 words.
+
+    So the property worth asserting is not equality but the **signature** that
+    separates tie-flipping from broken padding:
+
+    1. the majority survive batching unchanged — a padding bug corrupts most of a
+       batch, since most sequences carry padding;
+    2. any divergence happens *after* a shared prefix — a padding bug decodes from
+       the wrong position and so differs from the first token;
+    3. identical text yields identical embeddings — a separate property, catching
+       nondeterminism in the embedder rather than the decoder.
+
+    Both arms are generated here, in this process, on this GPU. An earlier version
+    compared against the *cached* generations, which conflated batch size, hardware
+    and time; the cache is now read only for *inputs* — which model, which queries,
+    which settings — never as an expected output.
+
+    Kept out of DATA_BACKED because it loads a multi-GB model — this tier only
+    runs under --include-gpu, which the SLURM job passes while the GPU is still
+    allocated.
+    """
+    import torch
+
+    if not torch.cuda.is_available():
+        raise _Skip("no CUDA device available")
+
+    cache, hashes = _behavioral_config_hashes()
+    chash = hashes[0]
+    slugs = cache.list_models(chash)
+    if not slugs:
+        raise _Skip(f"config {chash} has no stored models")
+
+    stored = cache.load_queries(chash)
+    queries = stored.get("queries", [])
+    if not queries:
+        raise _Skip(f"config {chash} has no queries.json to replay")
+
+    config = cache.load_config(chash)
+    import json as _json
+    from safetensors.numpy import load_file
+
+    path = cache._config_dir(chash) / "embeddings" / f"{slugs[0]}.safetensors"
+    tensors = load_file(str(path))
+    model_id = _json.loads(tensors["_meta_json"].tobytes().decode("utf-8"))["model_id"]
+    if not Path(model_id).exists():
+        raise _Skip(f"adapter directory {model_id} is no longer on disk")
+
+    n = min(8, len(queries))
+
+    from src.embedders.sentence_transformer import SentenceTransformerEmbedder
+    from src.taxonomy.behavioral import BehavioralTaxonomy
+
+    ecfg = dict(config.get("embedder", {}))
+    dtype = torch.float16 if "float16" in str(config.get("torch_dtype", "")) else torch.float32
+
+    def _run(batch_size: int):
+        # cache=None bypasses storage entirely: batch_size is not part of
+        # config_dict(), so a cached run would hit the same key and compare a
+        # matrix with itself.
+        embedder = SentenceTransformerEmbedder(
+            model_name=ecfg.get("model_name", "sentence-transformers/all-MiniLM-L6-v2"),
+            device="cuda",
+            use_generated_text=True,
+            normalize_embeddings=ecfg.get("normalize_embeddings", True),
+            trust_remote_code=ecfg.get("trust_remote_code", False),
+            prompt_name=ecfg.get("prompt_name"),
+        )
+        tax = BehavioralTaxonomy(
+            queries=queries[:n], embedder=embedder, query_key=config.get("query_key"),
+            cache=None, batch_size=batch_size,
+            max_new_tokens=config.get("max_new_tokens", 64), torch_dtype=dtype,
+        )
+        try:
+            return tax.extract(model_id)
+        finally:
+            tax.close()
+
+    single = _run(1)
+    batched = _run(n)          # one batch, so padding is maximally exercised
+
+    a, b = single.metadata["generated_texts"], batched.metadata["generated_texts"]
+    identical = [i for i in range(n) if a[i] == b[i]]
+    diverged = [i for i in range(n) if a[i] != b[i]]
+
+    def _shared_prefix(x: str, y: str) -> int:
+        k = 0
+        while k < min(len(x), len(y)) and x[k] == y[k]:
+            k += 1
+        return k
+
+    # 1. A padding bug corrupts the *majority* of a batch, because most sequences
+    #    are shorter than the longest and so carry padding.  Tie-flipping touches a
+    #    minority.  Measured on a real L40S run: 6/8 identical.
+    assert len(identical) * 2 >= n, (
+        f"only {len(identical)}/{n} generations survive batching unchanged. That is "
+        f"too many to be greedy tie-flipping — suspect padding_side, which must be "
+        f"'left' for decoder-only generation."
+    )
+
+    # 2. A padding bug diverges from the *first* generated token, because the
+    #    sequence starts decoding from the wrong position.  Tie-flipping diverges
+    #    somewhere in the middle, after a shared, coherent prefix.
+    immediate = [i for i in diverged if _shared_prefix(a[i], b[i]) < 10]
+    assert not immediate, (
+        f"{len(immediate)}/{n} generations differ from the very first characters "
+        f"(indices {immediate[:3]}). That is the signature of a padding bug, not of "
+        f"fp16 tie-flipping — check padding_side before trusting any distance."
+    )
+
+    # 3. The embedder must be deterministic: identical text, identical vector.  This
+    #    is separate from the decoding question and would catch nondeterminism in the
+    #    sentence-transformer itself.
+    for i in identical:
+        d = float(np.abs(single.matrix[i] - batched.matrix[i]).max())
+        assert d < 1e-5, f"query {i}: same text, embeddings differ by {d:.2e}"
+
+    prefixes = [_shared_prefix(a[i], b[i]) for i in diverged]
+    delta = float(np.abs(single.matrix - batched.matrix).max())
+    return (
+        f"{len(identical)}/{n} identical on {torch.cuda.get_device_name(0)}; "
+        f"{len(diverged)} diverged after {prefixes} shared chars (fp16 tie-flips, "
+        f"not padding); max|delta| over all rows = {delta:.2e}"
+    )
+
+
 # ── entry point ───────────────────────────────────────────────────────────────
 
 SYNTHETIC = [
@@ -1258,11 +1699,21 @@ SYNTHETIC = [
     t_procrustes_transform, t_collection_multidim, t_analysis_geometries,
     # content-addressed recipe identity, and the draw storage it enables
     t_recipe_identity, t_embedder_hash_seed, t_draw_schema_roundtrip, t_names_merge,
+    # behavioral taxonomy: its cache, and the padding property batch invariance needs
+    t_generated_cache_roundtrip, t_generated_cache_hash_stable, t_behavioral_padding_side,
+    # embedder task prefixes: the model is misused without them, and the failure is silent
+    t_embedder_prefix_resolved, t_embedder_prefix_in_cache_key,
 ]
 DATA_BACKED = [
     t_cosine_real_adapters, t_recovery, t_collection_roundtrip, t_cross_taxonomy,
     t_recipe_relabelling, t_scan_cache, t_comparison_end_to_end,
-    t_cache_fully_migrated,
+    t_cache_fully_migrated, t_behavioral_reps_well_formed,
+]
+#: A third tier: real checks that need a GPU and a multi-GB model load, so they are
+#: too slow for a harness meant to run in seconds around every edit.  Off unless
+#: --include-gpu is passed, which the SLURM job does while the GPU is allocated.
+GPU_BACKED = [
+    t_behavioral_batch_invariance,
 ]
 
 
@@ -1274,6 +1725,11 @@ def main() -> int:
     parser.add_argument("--data-only", action="store_true",
                         help="Run only the checks that read the real cache — the ones that "
                              "catch a broken path after a cache migration.")
+    parser.add_argument("--include-gpu", action="store_true",
+                        help="Also run the [gpu] checks, which load a real model onto a "
+                             "CUDA device. Off by default: a local run should never pay "
+                             "for a multi-GB load. Intended for the SLURM job, after "
+                             "extraction, while the GPU is still allocated.")
     parser.add_argument("-k", metavar="PATTERN",
                         help="Run only checks whose description contains PATTERN "
                              "(case-insensitive substring, e.g. -k 'cache').")
@@ -1290,6 +1746,11 @@ def main() -> int:
         checks = list(SYNTHETIC)
     else:
         checks = SYNTHETIC + DATA_BACKED
+
+    # --synthetic-only stays honest: it promises to touch nothing outside memory,
+    # and a GPU check reads the cache and loads a model.
+    if args.include_gpu and not args.synthetic_only:
+        checks = checks + GPU_BACKED
 
     if args.k:
         pattern = args.k.lower()

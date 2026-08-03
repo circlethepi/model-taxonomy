@@ -30,6 +30,7 @@ from scripts._utils import (
     get_cache_dir,
     resolve_model_ids,
     make_repr_cache,
+    make_generated_text_cache,
     make_queries,
     make_functional_taxonomy,
     make_behavioral_taxonomy,
@@ -68,10 +69,11 @@ def extract_representations(cfg: dict, only_taxonomies: list[str] | None = None)
     )
 
     queries: list[str] = []
+    query_key: dict = {}
     if model_ids and need_queries:
         print("  Loading queries...")
-        queries = make_queries(cfg)
-        print(f"  Got {len(queries)} queries.")
+        queries, query_key = make_queries(cfg)
+        print(f"  Got {len(queries)} queries.  draw={query_key}")
 
     # ── Functional taxonomy ────────────────────────────────────────────────────
     if fcfg.get("enabled", True) and (enabled is None or "functional" in enabled):
@@ -88,11 +90,16 @@ def extract_representations(cfg: dict, only_taxonomies: list[str] | None = None)
     if bcfg.get("enabled", True) and (enabled is None or "behavioral" in enabled):
         print(f"\n  [behavioral]  max_new_tokens={bcfg.get('max_new_tokens', 64)}")
         taxonomy = make_behavioral_taxonomy(
-            cfg, queries, cache=make_repr_cache(cache_dir, "behavioral")
+            cfg, queries, query_key, cache=make_generated_text_cache(cache_dir)
         )
-        for model_id in tqdm(model_ids, desc="behavioral", unit="model"):
-            rep = taxonomy.extract(model_id)
-            tqdm.write(f"    {model_id}  shape={rep.matrix.shape}  key={rep.cache_key}")
+        try:
+            for model_id in tqdm(model_ids, desc="behavioral", unit="model"):
+                rep = taxonomy.extract(model_id)
+                tqdm.write(f"    {model_id}  shape={rep.matrix.shape}  key={rep.cache_key}")
+        finally:
+            # The base model is held across extractions and freed once, here — see
+            # BehavioralTaxonomy.close.
+            taxonomy.close()
 
     # ── Dataset Embedding taxonomy ─────────────────────────────────────────────
     decfg = tax_cfgs.get("dataset_embedding", {})

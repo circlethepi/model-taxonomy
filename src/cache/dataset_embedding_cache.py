@@ -21,7 +21,7 @@ class DatasetEmbeddingCache:
 
     Directory layout::
 
-        cache_root/dataset_embeddings/{recipe_hash}/
+        cache_root/02_dataset_embeddings/{recipe_hash}/
             recipe.json                ← human-readable recipe (plain-text)
             {embedder_hash}/
                 config.json            ← embedder config + representation + n_samples
@@ -33,7 +33,7 @@ class DatasetEmbeddingCache:
 
     def __init__(self, cache_root: Path | str) -> None:
         self.root = Path(cache_root)
-        self._base = self.root / "dataset_embeddings"
+        self._base = self.root / "02_dataset_embeddings"
 
     # ------------------------------------------------------------------
     # Path helpers
@@ -54,13 +54,24 @@ class DatasetEmbeddingCache:
         embedder_config: dict,
         representation: str,
         n_samples: int,
+        seed: int | None = None,
     ) -> str:
-        """16-char SHA-256 prefix identifying a (embedder, mode, n_samples) triple."""
+        """16-char SHA-256 prefix identifying an (embedder, mode, n_samples, seed) key.
+
+        *seed* is part of the key because the recipe hash no longer distinguishes draws.
+        It once did — the recipe name carried ``_s{seed}``, so two seeds of one mixture
+        were two recipes and landed in two directories.  Now that the hash is
+        content-addressed they share a recipe directory, and seed is the only thing left
+        separating their embeddings.  Without it all seeds of a mixture would collapse
+        onto one entry and the seed sweep would silently read one draw's embedding for
+        every seed.
+        """
         payload = json.dumps(
             {
                 "embedder_config": embedder_config,
                 "representation": representation,
                 "n_samples": n_samples,
+                "seed": seed,
             },
             sort_keys=True,
         ).encode()
@@ -85,6 +96,7 @@ class DatasetEmbeddingCache:
         embedder_config: dict,
         representation: str,
         n_samples: int,
+        seed: int | None = None,
     ) -> None:
         """Atomically write recipe.json, config.json, and embeddings.safetensors.
 
@@ -95,7 +107,7 @@ class DatasetEmbeddingCache:
         from safetensors.numpy import save_file
 
         recipe_hash = recipe.recipe_hash()
-        emb_hash = self.embedder_hash(embedder_config, representation, n_samples)
+        emb_hash = self.embedder_hash(embedder_config, representation, n_samples, seed)
 
         entry_dir = self._entry_dir(recipe_hash, emb_hash)
         entry_dir.mkdir(parents=True, exist_ok=True)
@@ -114,11 +126,12 @@ class DatasetEmbeddingCache:
 
             # Write config.json
             config = {
-                "schema_version": "1",
+                "schema_version": "2",
                 "recipe_hash": recipe_hash,
                 "embedder_config": embedder_config,
                 "representation": representation,
                 "n_samples": n_samples,
+                "seed": seed,
                 "embedded_at": datetime.now(timezone.utc).isoformat(),
             }
             config_path = entry_dir / "config.json"

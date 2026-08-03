@@ -82,6 +82,11 @@ def expand_dataset_n_samples(cfg: dict) -> dict:
             entry = copy.deepcopy(ds)
             entry["name"] = f"{base_name}_n{n}"
             entry["n_samples"] = n
+            # The block name must stay unique — it keys the datasets dict, the taxonomy
+            # labels and the per-experiment recipe filename.  'mixture' remembers the
+            # name before expansion, and that is what names the recipe, so all n of one
+            # mixture share a single content-addressed recipe.
+            entry.setdefault("mixture", base_name)
             expanded.append(entry)
     cfg["datasets"] = expanded
     return cfg
@@ -109,6 +114,10 @@ def expand_dataset_seeds(cfg: dict) -> dict:
                 entry = copy.deepcopy(ds)
                 entry["name"] = f"{base_name}_s{seed_val:02d}"
                 entry["seed"] = seed_val
+                # setdefault, not assignment: when expand_dataset_n_samples ran first
+                # base_name already carries _n{n}, and the mixture it recorded is the
+                # one we want to keep.
+                entry.setdefault("mixture", base_name)
                 expanded.append(entry)
     cfg["datasets"] = expanded
     return cfg
@@ -175,9 +184,17 @@ def load_recipe(path: Path | str):
 
 
 def build_recipe_from_cfg(ds_cfg: dict):
-    """Build a DatasetRecipe or ClassAwareDatasetRecipe from an expanded dataset config block."""
+    """Build a DatasetRecipe or ClassAwareDatasetRecipe from an expanded dataset config block.
+
+    The recipe is named for the *mixture*, not the expanded block.  The block name
+    carries ``_n{n}_s{seed}`` so it can key the datasets dict and label taxonomy points;
+    the recipe underneath is the same mixing spec at every n and seed, and the recipe
+    hash is content-addressed anyway, so giving it the expanded name would only put a
+    misleading label on a shared object.  Blocks written by hand, with no ``mixture``
+    key, fall back to their own name.
+    """
     rtype = ds_cfg.get("recipe_type", "simple")
-    name = ds_cfg["name"]
+    name = ds_cfg.get("mixture", ds_cfg["name"])
     entries_raw = ds_cfg.get("entries", [])
     if rtype == "class_aware":
         from src.datasets.class_recipe import ClassAwareDatasetRecipe, ClassDatasetEntry
@@ -264,21 +281,38 @@ def make_mixed_dataset(
     seed: int = 42,
     hf_token: str | None = None,
     sample_cache=None,
+    name: str | None = None,
 ):
     """Instantiate MixedDataset or ClassMixedDataset depending on recipe type.
 
-    If *sample_cache* is provided, checks for a cached list[dict] keyed by
+    If *sample_cache* is provided, checks for a cached draw keyed by
     ``(recipe_hash, total_samples, seed)`` and returns a ``CachedMixedDataset``
-    on a hit.  On a miss the dataset is loaded from HuggingFace and the rows
-    are written to the cache for future calls.
+    on a hit.  On a miss the dataset is loaded from HuggingFace and the draw
+    is written to the cache for future calls.
+
+    The recipe itself is mirrored alongside its draws on either path, so the cache
+    stays the hash-indexed home for recipes rather than depending on the dataset
+    having also been embedded.  *name*, when given, is recorded as a label for the
+    recipe: the hash is content-addressed, so several config-block names legitimately
+    resolve to one recipe and the cache keeps all of them.
     """
     from src.datasets.class_recipe import ClassAwareDatasetRecipe
 
+    recipe_hash = recipe.recipe_hash()
+
     if sample_cache is not None:
-        cached_rows = sample_cache.get(recipe.recipe_hash(), total_samples, seed)
+        sample_cache.put_recipe(recipe_hash, recipe.to_dict())
+        sample_cache.add_name(recipe_hash, name)
+        cached_rows = sample_cache.get(recipe_hash, total_samples, seed, hf_token=hf_token)
         if cached_rows is not None:
             from src.datasets.mixed_dataset import CachedMixedDataset
-            return CachedMixedDataset(cached_rows, recipe)
+            manifest = sample_cache.get_manifest(recipe_hash, total_samples, seed) or {}
+            return CachedMixedDataset(
+                cached_rows,
+                recipe,
+                source_indices=[tuple(p) for p in manifest.get("indices", [])] or None,
+                sources=manifest.get("sources"),
+            )
 
     if isinstance(recipe, ClassAwareDatasetRecipe):
         from src.datasets.mixed_dataset import ClassMixedDataset
@@ -288,7 +322,11 @@ def make_mixed_dataset(
         ds = MixedDataset(recipe, total_samples=total_samples, seed=seed, hf_token=hf_token)
 
     if sample_cache is not None:
-        sample_cache.put(recipe.recipe_hash(), total_samples, seed, list(ds))
+        rows = list(ds)
+        sample_cache.put(
+            recipe_hash, total_samples, seed,
+            rows=rows, indices=ds.source_indices, sources=ds.sources,
+        )
 
     return ds
 
@@ -322,11 +360,13 @@ def get_adapter_root(cfg: dict) -> Path:
     """Return the root directory for raw PEFT adapter files.
 
     When a shared ``cache_dir`` is configured, adapters are stored under
-    ``{cache_dir}/adapters/`` so they are shared across experiments.
-    Falls back to ``{output_dir}/adapters/`` for backward compatibility.
+    ``{cache_dir}/03_adapters/`` so they are shared across experiments.
+    Falls back to ``{output_dir}/adapters/`` for backward compatibility — the
+    numeric prefixes describe shared-cache pipeline stages, and an experiment
+    output directory has no such ordering, so that name is left unnumbered.
     """
     if "cache_dir" in cfg:
-        return Path(cfg["cache_dir"]) / "adapters"
+        return Path(cfg["cache_dir"]) / "03_adapters"
     return Path(cfg["output_dir"]) / "adapters"
 
 
@@ -392,9 +432,33 @@ def parse_dtype(name: str) -> torch.dtype:
 
 # ── Cache factories ───────────────────────────────────────────────────────────
 
-def make_repr_cache(cache_dir: Path):
+#: Where each taxonomy's representations live under the shared cache.  Structural is
+#: absent on purpose: its representations are written by LoRACache, beside the adapter
+#: weights they were derived from, rather than into a stage directory of their own.
+REPR_CACHE_DIRS = {
+    "functional": "04_activations",
+    "behavioral": "05_generated",
+}
+
+
+def make_repr_cache(cache_dir: Path, taxonomy: str):
+    """DiskCache for one taxonomy's representations.
+
+    Functional and behavioral get separate directories so the two are visibly
+    distinct on disk rather than interleaved content hashes in one.  Both are
+    provisional homes: when those levels are built out they are expected to grow
+    their own cache classes the way structural has LoRACache.
+    """
     from src.cache.disk import DiskCache
-    return DiskCache(cache_dir / "representations")
+
+    try:
+        subdir = REPR_CACHE_DIRS[taxonomy]
+    except KeyError:
+        raise ValueError(
+            f"no representation cache directory for taxonomy {taxonomy!r}; "
+            f"choose from {sorted(REPR_CACHE_DIRS)}"
+        ) from None
+    return DiskCache(cache_dir / subdir)
 
 
 def make_dataset_embedding_cache(cache_dir: Path):
@@ -404,7 +468,7 @@ def make_dataset_embedding_cache(cache_dir: Path):
 
 def make_sampled_dataset_cache(cache_dir: Path):
     from src.cache.sampled_dataset_cache import SampledDatasetCache
-    return SampledDatasetCache(cache_dir / "sampled_datasets")
+    return SampledDatasetCache(cache_dir)
 
 
 # ── Taxonomy / metric / geometry factories ────────────────────────────────────
@@ -484,12 +548,11 @@ def make_behavioral_taxonomy(cfg: dict, queries: list[str], cache=None):
     )
 
 
-def make_structural_taxonomy(cfg: dict, cache=None, lora_cache=None):
+def make_structural_taxonomy(cfg: dict, lora_cache=None):
     from src.taxonomy.structural import StructuralTaxonomy
 
     return StructuralTaxonomy(
         lora_only=True,
-        cache=cache,
         lora_cache=lora_cache,
         hf_token=hf_token(cfg),
     )

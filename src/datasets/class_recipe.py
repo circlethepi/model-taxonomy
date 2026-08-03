@@ -119,21 +119,28 @@ class ClassAwareDatasetRecipe:
     # ------------------------------------------------------------------
 
     def _canonical(self) -> str:
+        """Deterministic JSON string used to derive the recipe hash.
+
+        Content only — see :meth:`src.datasets.recipe.DatasetRecipe._canonical` for why
+        ``name`` is excluded and ``recipe_type`` included.  Both classes must apply the
+        same rule; they are structural duplicates by design.
+        """
         return json.dumps(
             {
-                "name": self.name,
+                "recipe_type": "class_aware",
                 "datasets": [e.to_dict() for e in self.datasets],
             },
             sort_keys=True,
         )
 
     def recipe_hash(self) -> str:
-        """16-char SHA-256 prefix that uniquely identifies this recipe."""
+        """16-char SHA-256 prefix that uniquely identifies this recipe's content."""
         return hashlib.sha256(self._canonical().encode()).hexdigest()[:16]
 
     def to_dict(self) -> dict:
+        # schema_version 2 = content-addressed hash; see DatasetRecipe.to_dict.
         return {
-            "schema_version": "1",
+            "schema_version": "2",
             "recipe_type": "class_aware",
             "name": self.name,
             "recipe_hash": self.recipe_hash(),

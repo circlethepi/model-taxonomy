@@ -35,9 +35,13 @@ Both are complete implementations, constructed by `make_functional_taxonomy` /
 `scripts/run_taxonomy.py` (which turns them into distance matrices), and configured
 under `extraction.taxonomies` in `experiments/example.yaml:79-102`.
 
-What is missing is that **nothing has ever populated their cache**. Both write to a
-`DiskCache` rooted at `results/shared_cache/representations/`, and that directory is
-empty. Three consequences follow, and all three are about the absence of data rather
+What is missing is that **nothing has ever populated their cache**. They write to
+separate `DiskCache` instances rooted at `results/shared_cache/04_activations/` and
+`05_generated/` (one flat `representations/` before the cache renumbering), and
+neither directory exists yet. Both are provisional homes — when these levels are
+built out they are expected to grow their own cache classes the way structural has
+`LoRACache`, at which point these are the natural directories for whatever those
+classes write. Three consequences follow, and all three are about the absence of data rather
 than about the extraction code:
 
 **1. The comparison layer cannot read them.** The *comparison layer* is
@@ -179,11 +183,11 @@ matrices, so distances between them must go through `src/metrics/` (`cka.py`,
 `frobenius.py`, `vector.py`). That makes wiring them in the **first** thing to call
 `src/metrics/` from the comparison layer, and those modules carry a known
 limitation — they assume `ModelRepresentation.matrix` has uniform row lengths
-(`src/metrics/cka.py:1`, `src/metrics/frobenius.py:1`; tracked as item G in
+(`src/metrics/cka.py:1`, `src/metrics/frobenius.py:1`; tracked as item 8 in
 `TODO.md`).
 
 That limitation is benign *for these two levels*, whose matrices are uniform by
-construction. The point is that item G stops being purely a structural-pipeline
+construction. The point is that item 8 stops being purely a structural-pipeline
 concern once this path exists, so the two items should be sequenced with that in
 mind.
 
@@ -325,14 +329,14 @@ to know before starting"): keep the canonical query set in `01_datasets`, keyed 
 `(recipe_hash, n_samples, seed)` like any other sampled dataset, plus a convenience
 `queries.json` in `04_activations` / `05_generated` with that key recorded in
 `config.json` so the canonical copy stays authoritative. Doing the cache renumbering
-(item A in `TODO.md`) first therefore removes this problem rather than working
+(item 1 in `TODO.md`, now done) therefore removed this problem rather than working
 around it.
 
 ---
 
 ## Smallest run that would settle this
 
-1. Pick 3-5 adapters that already exist in `results/shared_cache/adapters/`.
+1. Pick 3-5 adapters that already exist in `results/shared_cache/03_adapters/`.
 2. Run `python scripts/extract_reprs.py <config> --taxonomy functional behavioral`
    with a small `extraction.n_queries` (16-32 is enough to expose shape and padding
    questions).

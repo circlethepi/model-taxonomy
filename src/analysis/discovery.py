@@ -290,9 +290,9 @@ def scan_cache(
         recipe and the cache can hold thousands.
     """
     root = Path(cache_root)
-    adapters_root = root / "adapters"
-    embeddings_root = root / "dataset_embeddings"
-    sampled_root = root / "sampled_datasets"
+    adapters_root = root / "03_adapters"
+    embeddings_root = root / "02_dataset_embeddings"
+    sampled_root = root / "01_datasets"
 
     if not adapters_root.exists():
         return CacheIndex([], root)
@@ -336,8 +336,8 @@ def scan_cache(
 
             if entry.recipe_hash and resolve_recipes:
                 if entry.recipe_hash not in recipe_cache:
-                    recipe_cache[entry.recipe_hash] = _read_json(
-                        embeddings_root / entry.recipe_hash / "recipe.json"
+                    recipe_cache[entry.recipe_hash] = _resolve_recipe(
+                        entry.recipe_hash, sampled_root, embeddings_root
                     )
                 entry.recipe = recipe_cache[entry.recipe_hash]
 
@@ -357,7 +357,7 @@ def scan_cache(
             entries.append(entry)
 
     if scan_all_recipes:
-        _attach_unreferenced_recipes(entries, de_cache, embeddings_root)
+        _attach_unreferenced_recipes(entries, de_cache, sampled_root, embeddings_root)
 
     return CacheIndex(entries, root)
 
@@ -377,6 +377,19 @@ def _build_entry(adapter_dir: Path, base_id: str, meta: dict) -> CacheEntry:
     if n_samples is None:
         # The name did not carry a size; the training record still does.
         n_samples = training.get("n_samples")
+    if seed is None:
+        # Likewise for the sampling seed.  finetune_lora.py records it because the
+        # recipe no longer can: the hash is content-addressed and its name carries
+        # neither n nor seed.
+        seed = training.get("seed")
+    if n_samples is None or seed is None:
+        # Older adapters predate both conventions, but their directory name is
+        # {expanded_block_name}_r{rank}_i{init} and the block name did carry them.
+        m = _ADAPTER_DIR_RE.match(adapter_dir.name)
+        if m:
+            _, dir_n, dir_seed = _parse_dataset_name(m.group("name"))
+            n_samples = n_samples if n_samples is not None else dir_n
+            seed = seed if seed is not None else dir_seed
 
     rank = lora_cfg.get("lora_rank")
     init_seed = lora_cfg.get("lora_init_seed")
@@ -416,12 +429,12 @@ def _sampled_rows_exist(
 ) -> bool:
     if not recipe_hash or n_samples is None or seed is None:
         return False
-    # SampledDatasetCache._path: {recipe_hash}/{n_samples}_{seed:010d}.json
-    return (sampled_root / recipe_hash / f"{n_samples}_{seed:010d}.json").exists()
+    # SampledDatasetCache._path: {recipe_hash}/n{n_samples}_s{seed}.json
+    return (sampled_root / recipe_hash / f"n{n_samples}_s{seed}.json").exists()
 
 
 def _attach_unreferenced_recipes(
-    entries: list[CacheEntry], de_cache, embeddings_root: Path
+    entries: list[CacheEntry], de_cache, sampled_root: Path, embeddings_root: Path
 ) -> None:
     """Append recipe-only entries for recipes no discovered adapter was trained on.
 
@@ -433,30 +446,71 @@ def _attach_unreferenced_recipes(
     for recipe_hash in de_cache.list_recipes():
         if recipe_hash in seen:
             continue
-        recipe = _read_json(embeddings_root / recipe_hash / "recipe.json")
+        recipe = _resolve_recipe(recipe_hash, sampled_root, embeddings_root)
         if recipe is None:
             continue
-        recipe_id = recipe.get("name")
-        mixture, n_samples, seed = _parse_dataset_name(recipe_id)
-        entries.append(
-            CacheEntry(
-                model_id=recipe_id or recipe_hash,
-                adapter_name=recipe_id or recipe_hash,
-                recipe_id=recipe_id,
-                recipe_hash=recipe_hash,
-                recipe=recipe,
-                mixture=mixture,
-                n_samples=n_samples,
-                seed=seed,
-                embedder_hashes=de_cache.list_embedder_hashes(recipe_hash),
-                available={
-                    "structural_weights": False,
-                    "structural_repr": False,
-                    "dataset_embedding": True,
-                    "sampled_rows": False,
-                },
+        mixture = recipe.get("name")
+        # One entry per draw, not per recipe.  The hash is content-addressed, so it
+        # identifies a mixture and says nothing about n or seed — those live in the draw
+        # filenames beside it, and a mixture typically has a hundred of them.  Reading
+        # them off disk also makes these entries describe draws that exist rather than
+        # draws a name implied.
+        for n_samples, seed in sorted(_draws_for(sampled_root, recipe_hash)):
+            recipe_id = f"{mixture}_n{n_samples}_s{seed:02d}" if mixture else recipe_hash
+            entries.append(
+                CacheEntry(
+                    model_id=recipe_id,
+                    adapter_name=recipe_id,
+                    recipe_id=recipe_id,
+                    recipe_hash=recipe_hash,
+                    recipe=recipe,
+                    mixture=mixture,
+                    n_samples=n_samples,
+                    seed=seed,
+                    embedder_hashes=de_cache.list_embedder_hashes(recipe_hash),
+                    available={
+                        "structural_weights": False,
+                        "structural_repr": False,
+                        "dataset_embedding": True,
+                        "sampled_rows": True,
+                    },
+                )
             )
-        )
+
+
+_DRAW_FILE_RE = re.compile(r"^n(?P<n>\d+)_s(?P<seed>\d+)$")
+
+
+def _draws_for(sampled_root: Path, recipe_hash: str) -> list[tuple[int, int]]:
+    """The ``(n_samples, seed)`` draws cached under a recipe hash."""
+    directory = sampled_root / recipe_hash
+    if not directory.is_dir():
+        return []
+    draws = []
+    for path in directory.glob("n*_s*.json"):
+        m = _DRAW_FILE_RE.match(path.stem)
+        if m:
+            draws.append((int(m.group("n")), int(m.group("seed"))))
+    return draws
+
+
+def _resolve_recipe(
+    recipe_hash: str, sampled_root: Path, embeddings_root: Path
+) -> dict | None:
+    """The mixing spec a recipe hash identifies, or None if it is nowhere on disk.
+
+    ``01_datasets`` is the authoritative home: a recipe hash names a dataset, and the
+    dataset's own directory is where its definition belongs.  The dataset-embedding
+    cache is consulted second only because it writes its own copy, so a recipe that
+    was embedded without ever going through the sample cache still resolves.  Before
+    ``01_datasets`` existed the embedding cache was the *only* source, which meant any
+    recipe sampled but never embedded could not be resolved at all — that is the
+    defect this ordering fixes, not a layout fallback.
+    """
+    recipe = _read_json(sampled_root / recipe_hash / "recipe.json")
+    if recipe is not None:
+        return recipe
+    return _read_json(embeddings_root / recipe_hash / "recipe.json")
 
 
 def _read_json(path: Path) -> dict | None:

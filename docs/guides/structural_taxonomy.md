@@ -133,7 +133,7 @@ Locally trained adapters (produced by `scripts/finetune_lora.py`) are written to
 `LoRACache` stores extracted representations alongside a `config.json` under a parallel hierarchy:
 
 ```
-cache_root/adapters/
+cache_root/03_adapters/
   meta-llama--Llama-3.1-8B/            ← base model (/ replaced with --)
     some-org--my-adapter/               ← adapter (/ replaced with --)
       config.json
@@ -320,7 +320,7 @@ builders in `src.notebook.structure` work entirely in rank space, and
 from src.notebook.lora_weights import load_lora_weights
 from src.analysis import lora_distance_matrix, fit_geometry
 
-weights = load_lora_weights(adapter_names, adapter_root="results/shared_cache/adapters",
+weights = load_lora_weights(adapter_names, adapter_root="results/shared_cache/03_adapters",
                             layer_indices=list(range(28)), projections=["k", "q", "v", "o"])
 
 dm = lora_distance_matrix(weights, kind="cosine")     # or "frobenius", "bures_wasserstein", "cka"

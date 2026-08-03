@@ -56,7 +56,6 @@ def extract_representations(cfg: dict, only_taxonomies: list[str] | None = None)
             print(f"    {mid}")
 
     cache_dir = get_cache_dir(cfg)
-    cache = make_repr_cache(cache_dir)
 
     # Only load queries when functional or behavioral extraction is actually enabled —
     # dataset_embedding does not use queries.
@@ -78,7 +77,9 @@ def extract_representations(cfg: dict, only_taxonomies: list[str] | None = None)
     if fcfg.get("enabled", True) and (enabled is None or "functional" in enabled):
         print(f"\n  [functional]  layers={fcfg.get('layer_indices', [-1, -4, -8])}"
               f"  mode={fcfg.get('activation_mode', 'input')}")
-        taxonomy = make_functional_taxonomy(cfg, queries, cache=cache)
+        taxonomy = make_functional_taxonomy(
+            cfg, queries, cache=make_repr_cache(cache_dir, "functional")
+        )
         for model_id in tqdm(model_ids, desc="functional", unit="model"):
             rep = taxonomy.extract(model_id)
             tqdm.write(f"    {model_id}  shape={rep.matrix.shape}  key={rep.cache_key}")
@@ -86,7 +87,9 @@ def extract_representations(cfg: dict, only_taxonomies: list[str] | None = None)
     # ── Behavioral taxonomy ────────────────────────────────────────────────────
     if bcfg.get("enabled", True) and (enabled is None or "behavioral" in enabled):
         print(f"\n  [behavioral]  max_new_tokens={bcfg.get('max_new_tokens', 64)}")
-        taxonomy = make_behavioral_taxonomy(cfg, queries, cache=cache)
+        taxonomy = make_behavioral_taxonomy(
+            cfg, queries, cache=make_repr_cache(cache_dir, "behavioral")
+        )
         for model_id in tqdm(model_ids, desc="behavioral", unit="model"):
             rep = taxonomy.extract(model_id)
             tqdm.write(f"    {model_id}  shape={rep.matrix.shape}  key={rep.cache_key}")

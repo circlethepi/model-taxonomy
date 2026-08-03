@@ -94,7 +94,7 @@ def scan_yahoo_cache(cache_root: Path | str) -> dict[str, dict[str, list]]:
             ...
         }
     """
-    emb_dir = Path(cache_root) / "dataset_embeddings"
+    emb_dir = Path(cache_root) / "02_dataset_embeddings"
     groups: dict[str, dict[str, set]] = defaultdict(
         lambda: {"n_values": set(), "seeds": set()}
     )
@@ -133,7 +133,7 @@ def scan_yahoo_cache_detailed(
             ...
         }
     """
-    emb_dir = Path(cache_root) / "dataset_embeddings"
+    emb_dir = Path(cache_root) / "02_dataset_embeddings"
     groups: dict[str, dict[int, set[int]]] = defaultdict(lambda: defaultdict(set))
 
     for recipe_json in emb_dir.glob("*/recipe.json"):

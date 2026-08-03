@@ -23,7 +23,7 @@ class LoRACache:
 
     Directory layout::
 
-        cache_root/adapters/{base_model_slug}/{adapter_slug}/
+        cache_root/03_adapters/{base_model_slug}/{adapter_slug}/
             adapter_model.safetensors   ← raw PEFT weights (untouched)
             adapter_config.json         ← raw PEFT config (untouched)
             {config_hash}/
@@ -40,7 +40,7 @@ class LoRACache:
 
     def __init__(self, cache_root: Path | str) -> None:
         self.root = Path(cache_root)
-        self._loras_dir = self.root / "adapters"
+        self._loras_dir = self.root / "03_adapters"
 
     # ------------------------------------------------------------------
     # Private helpers

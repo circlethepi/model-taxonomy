@@ -132,7 +132,7 @@ writing **after** the cache renumbering (`cache_layout_migration.md`), since the
 ## Smaller items noticed in passing
 
 - **`functional` and `behavioral` have no cached representations at all** —
-  `results/shared_cache/representations/` is empty, so `build_taxonomy_artifacts`
+  neither `results/shared_cache/04_activations/` nor `05_generated/` exists, so `build_taxonomy_artifacts`
   raises `NotImplementedError` with a pointer to `extract_reprs.py` for those two
   levels. Only structural and dataset_embedding are comparable today.
 - **`src/metrics/vector.py` carries a TODO** (also in

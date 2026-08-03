@@ -71,7 +71,7 @@ def build_datasets(cfg: dict, validate: bool = False) -> dict:
                 tqdm.write(f"    Validating: loading {n_samples} samples...")
                 mixed = make_mixed_dataset(
                     recipe, total_samples=n_samples,
-                    seed=ds_cfg.get("seed", 42), hf_token=token,
+                    seed=ds_cfg.get("seed", 42), hf_token=token, name=name,
                 )
                 queries = mixed.to_queries()
                 tqdm.write(f"    OK  (got {len(queries)} queries, first: {queries[0][:60]!r})")

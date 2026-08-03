@@ -182,7 +182,7 @@ class LoRAWeightCollection:
 
 def load_lora_weights(
     model_names: str | list[str],
-    adapter_root: str | Path = "results/shared_cache/peft_adapters",
+    adapter_root: str | Path = "results/shared_cache/03_adapters",
     layer_indices: int | list[int] | Literal["last"] = "last",
     projections: str | list[str] = "o",
     matrices: MatrixChoice = "both",
@@ -221,7 +221,11 @@ def load_lora_weights(
     loaded: dict[str, AdapterWeights] = {}
     for name in names:
         st_path = _find_safetensors(adapter_root, name)
-        with safe_open(str(st_path), framework="pt") as f:
+        # framework="numpy" keeps torch off the distance-computation import path
+        # entirely — measured ~587 MB of import overhead against ~190 MB.  Safe
+        # because PEFT adapter factors are float32, which numpy has; a bfloat16
+        # adapter would need framework="pt" and a .float() before .numpy().
+        with safe_open(str(st_path), framework="numpy") as f:
             all_keys = list(f.keys())
             n_layers = _max_layer(all_keys) + 1
             indices  = _resolve_layer_indices(layer_indices, n_layers)
@@ -243,7 +247,7 @@ def load_lora_weights(
                 cell_key = (layer_idx, proj_short)
                 if cell_key not in data:
                     data[cell_key] = LayerMatrices(layer_idx, proj_short, None, None)
-                arr = f.get_tensor(key).numpy()
+                arr = f.get_tensor(key)
                 if ab == "A":
                     data[cell_key].A = arr
                 else:

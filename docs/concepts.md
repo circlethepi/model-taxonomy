@@ -133,6 +133,60 @@ profile.save("./results/full_profile")
 
 Three cache classes cover different storage needs. All tensor data is stored in **safetensors** format — memory-mappable, pickle-free, and fast to load.
 
+### The shared cache layout
+
+Experiments that set the same `cache_dir` share one cache tree. Its directories carry
+numeric prefixes so a directory listing reads in pipeline order:
+
+```
+results/shared_cache/
+    01_datasets/                 {recipe_hash}/recipe.json + names.json + n{n}_s{seed}.json
+    02_dataset_embeddings/       {recipe_hash}/{embedder_hash}/
+    03_adapters/                 raw PEFT weights + extracted structural representations
+    03A_adapter_alignments/      pairwise Procrustes alignments
+    04_activations/              functional representations
+    05_generated/                behavioral representations
+    06_collections/              distance matrices, geometries, index.json
+```
+
+Directories sharing a number sit at the same stage. A **letter suffix means analysis
+*of* the objects at that stage** — `03A_adapter_alignments` holds things computed from
+what is in `03_adapters`, not a stage of its own.
+
+Three things about this layout are worth stating rather than leaving to be discovered:
+
+- **Structural representations live inside `03_adapters/{adapter}/{config_hash}/`**,
+  beside the weights they were derived from, while functional and behavioral
+  representations get their own stage directories. That asymmetry is deliberate — a
+  LoRA representation is a transformation of that adapter's own weights and nothing
+  else — but it is not obvious from the numbering. `StructuralTaxonomy` therefore has
+  exactly one caching protocol, `LoRACache`; without one it recomputes every call.
+- **`01_datasets/{recipe_hash}/recipe.json` is the authoritative home for recipes.**
+  `DatasetEmbeddingCache` also writes a copy under `02_` so the embedding cache stays
+  self-describing on its own, but resolution goes through `01_`. Before this existed
+  the embedding cache was the only hash-indexed source, so a recipe that was sampled
+  but never embedded could not be resolved at all.
+- **`recipe_hash` is content-addressed: one mixture, one directory.** It is a SHA-256
+  of `{recipe_type, datasets}` — the *name is not hashed*. n and seed live in the draw
+  filename, not the identity, so a mixture swept over 19 sizes and 10 seeds is one
+  recipe with ~190 draws beside it rather than 190 near-duplicate recipes. Two
+  consequences worth knowing: `names.json` accumulates every config-block name that
+  resolved to the hash, because several legitimately do; and `seed` had to join
+  `DatasetEmbeddingCache.embedder_hash`, since the recipe hash no longer separates
+  seeds and without it a seed sweep would silently collapse onto one embedding.
+- **Draws store source indices, not rows.** `n{n}_s{seed}.json` records which rows of
+  which upstream split were drawn, in order, with the Hub revision pinned and a
+  `rows_sha256` over the result — not the row text, which is already sitting in the
+  HuggingFace cache. That is ~85× smaller (2.07 GiB → 40 MiB across 564 draws) and
+  rehydrates faster, at the cost of a dependency on the upstream dataset that
+  `scripts/verify_sampled_cache.py` exists to audit.
+- **The numbering applies to the shared cache only.** `{output_dir}/adapters/` — the
+  fallback when no `cache_dir` is configured — stays unnumbered, because an experiment
+  output directory has no pipeline ordering to describe. Legacy per-experiment cache
+  trees at `results/<experiment>/cache/` still use the old flat names and are **not**
+  readable by current code; they are superseded work, left in place deliberately
+  rather than migrated.
+
 ### `DiskCache` — flat hash-keyed cache
 
 The general-purpose cache for `ModelRepresentation` objects. Keyed by a SHA-256 hash of the model ID plus all extraction parameters.
@@ -157,7 +211,7 @@ from src.cache import LoRACache
 lora_cache = LoRACache("./cache")
 
 # Directory structure:
-# ./cache/adapters/meta-llama--Llama-3.1-8B/some-org--my-adapter/
+# ./cache/03_adapters/meta-llama--Llama-3.1-8B/some-org--my-adapter/
 #     adapter_model.safetensors       ← raw PEFT weights (untouched)
 #     adapter_config.json
 #     {config_hash}/                  ← one dir per extraction configuration

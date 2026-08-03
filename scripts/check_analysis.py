@@ -40,7 +40,7 @@ from src.analysis import (
 from src.core.geometry import GeometryResult
 
 REPO = Path(__file__).parent.parent
-ADAPTER_ROOT = REPO / "results/shared_cache/adapters"
+ADAPTER_ROOT = REPO / "results/shared_cache/03_adapters"
 BASE_MODEL = "meta-llama/Llama-3.2-3B"
 YAHOO_ADAPTERS = [
     "yahoo_100t0_000t1_n1000_s00_r16_i00",
@@ -69,6 +69,7 @@ def check(name: str):
                 _RESULTS.append(("FAIL", name, f"{type(e).__name__}: {e}"))
                 traceback.print_exc()
         wrapped.__name__ = fn.__name__
+        wrapped.check_name = name  # so --list and -k can match on the description
         return wrapped
     return deco
 
@@ -960,8 +961,8 @@ def t_scan_cache():
     from src.analysis import scan_cache
 
     root = REPO / "results/shared_cache"
-    if not (root / "adapters").exists():
-        raise _Skip(f"{root}/adapters not present")
+    if not (root / "03_adapters").exists():
+        raise _Skip(f"{root}/03_adapters not present")
 
     index = scan_cache(root)
     if not len(index):
@@ -1006,8 +1007,8 @@ def t_comparison_end_to_end():
     from src.analysis import build_taxonomy_artifacts, compare_taxonomies, scan_cache
 
     root = REPO / "results/shared_cache"
-    if not (root / "adapters").exists():
-        raise _Skip(f"{root}/adapters not present")
+    if not (root / "03_adapters").exists():
+        raise _Skip(f"{root}/03_adapters not present")
 
     index = scan_cache(root).with_available("structural_weights", "dataset_embedding")
     slices = index.slices(("n_samples", "seed"))
@@ -1113,6 +1114,135 @@ def t_relabel_collision():
     return "collision rejected; mapping form is partial and non-mutating"
 
 
+@check("recipe identity: content-addressed, name-independent, type-separated")
+def t_recipe_identity():
+    from src.datasets.class_recipe import ClassAwareDatasetRecipe, ClassDatasetEntry
+    from src.datasets.recipe import DatasetEntry, DatasetRecipe
+
+    entries = [DatasetEntry("imdb", text_field="text", weight=1.0)]
+    a = DatasetRecipe(name="mix", datasets=entries)
+    b = DatasetRecipe(name="mix_n1000_s07", datasets=list(entries))
+    assert a.recipe_hash() == b.recipe_hash(), (
+        "the name is still in the hash — every n and seed would be its own recipe"
+    )
+
+    # Content still matters.
+    other = DatasetRecipe(name="mix", datasets=[DatasetEntry("imdb", text_field="other")])
+    assert a.recipe_hash() != other.recipe_hash(), "different entries must differ"
+
+    # recipe_type is the only thing separating the two classes once names are gone.
+    class_aware = ClassAwareDatasetRecipe(
+        name="mix", datasets=[ClassDatasetEntry("imdb", text_field="text", class_field="label")]
+    )
+    assert a.recipe_hash() != class_aware.recipe_hash(), (
+        "simple and class-aware recipes collide"
+    )
+
+    # The stored hash must be self-consistent, which is what CacheIndex asserts.
+    assert a.to_dict()["recipe_hash"] == a.recipe_hash()
+    assert a.to_dict()["schema_version"] == "2", "schema bump missing"
+    return "name excluded, entries and recipe_type included, schema_version=2"
+
+
+@check("embedder hash: seed separates draws of one content-addressed recipe")
+def t_embedder_hash_seed():
+    from src.cache.dataset_embedding_cache import DatasetEmbeddingCache
+
+    cfg, rep, n = {"embedder_class": "X", "model_name": "m"}, "mean", 1000
+    h0 = DatasetEmbeddingCache.embedder_hash(cfg, rep, n, 0)
+    h1 = DatasetEmbeddingCache.embedder_hash(cfg, rep, n, 1)
+    assert h0 != h1, (
+        "seeds collide — every seed of a mixture would share one embedding entry, "
+        "silently collapsing a seed sweep to a single point"
+    )
+    assert h0 != DatasetEmbeddingCache.embedder_hash(cfg, rep, 2000, 0), "n must still count"
+    return "distinct per seed and per n_samples"
+
+
+@check("draw manifest: v1 rows and v2 indices round-trip to the same rows")
+def t_draw_schema_roundtrip():
+    import json as _json
+    import tempfile
+
+    from src.cache.sampled_dataset_cache import SampledDatasetCache, rows_checksum
+
+    rows = [{"id": 1, "text": "a"}, {"id": 2, "text": "b"}]
+    with tempfile.TemporaryDirectory() as td:
+        cache = SampledDatasetCache(td)
+        # A v1 draw is a bare list; it must stay readable for pre-migration files.
+        path = cache._path("deadbeef", 2, 0)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(_json.dumps(rows))
+        assert cache.get("deadbeef", 2, 0) == rows, "v1 rows no longer readable"
+
+        # A source that cannot be indexed must be refused, not silently stored as v1.
+        try:
+            cache.put("cafe", 2, 0, rows=rows, indices=None, sources=None)
+        except ValueError as e:
+            assert "source indices" in str(e), str(e)
+        else:
+            raise AssertionError("un-indexable source was accepted")
+
+    assert rows_checksum(rows) == rows_checksum(list(rows)), "checksum is not stable"
+    return "v1 readable, un-indexable writes refused, checksum stable"
+
+
+@check("names.json: merges rather than overwriting, order-independent")
+def t_names_merge():
+    import tempfile
+
+    from src.cache.sampled_dataset_cache import SampledDatasetCache
+
+    with tempfile.TemporaryDirectory() as td:
+        cache = SampledDatasetCache(td)
+        for name in ["yahoo_x_n100_s00", "yahoo_x_n1000_s03", "yahoo_x_n100_s00"]:
+            cache.add_name("abcd", name)
+        first = cache.get_names("abcd")
+
+        cache2 = SampledDatasetCache(td + "/other")
+        for name in ["yahoo_x_n1000_s03", "yahoo_x_n100_s00"]:
+            cache2.add_name("abcd", name)
+        second = cache2.get_names("abcd")
+
+    assert first == sorted({"yahoo_x_n100_s00", "yahoo_x_n1000_s03"}), first
+    assert first == second, f"order-dependent: {first} vs {second}"
+    return f"{len(first)} names merged, insertion order irrelevant"
+
+
+@check("[data] cache: every recipe is schema 2 and every draw is index-backed")
+def t_cache_fully_migrated():
+    import json as _json
+
+    root = REPO / "results/shared_cache/01_datasets"
+    if not root.exists():
+        raise _Skip(f"{root} not present")
+
+    recipes = sorted(root.glob("*/recipe.json"))
+    if not recipes:
+        raise _Skip("no recipes in the dataset cache")
+
+    legacy_recipes, legacy_draws, draws = [], [], 0
+    for recipe_path in recipes:
+        payload = _json.loads(recipe_path.read_text())
+        if payload.get("schema_version") != "2":
+            legacy_recipes.append(recipe_path.parent.name)
+        # A stale hash means the directory was not re-keyed.
+        assert payload.get("recipe_hash") == recipe_path.parent.name, recipe_path
+        for draw_path in recipe_path.parent.glob("n*_s*.json"):
+            draws += 1
+            if isinstance(_json.loads(draw_path.read_text()), list):
+                legacy_draws.append(f"{recipe_path.parent.name}/{draw_path.name}")
+
+    assert not legacy_recipes, f"{len(legacy_recipes)} schema-1 recipe(s): {legacy_recipes[:3]}"
+    # Old-style {n}_{seed:010d}.json files left behind mean --prune never ran.
+    stale = [p.name for p in root.glob("*/*.json")
+             if p.name != "recipe.json" and p.name != "names.json"
+             and not p.name.startswith("n")]
+    assert not stale, f"{len(stale)} pre-migration draw file(s) remain: {stale[:3]}"
+    return (f"{len(recipes)} recipe(s), {draws} draw(s), "
+            f"{len(legacy_draws)} still storing rows")
+
+
 # ── entry point ───────────────────────────────────────────────────────────────
 
 SYNTHETIC = [
@@ -1126,25 +1256,57 @@ SYNTHETIC = [
     t_mixture_weights, t_split_and_whole_rejected, t_simplex_geometry,
     t_simplex_dimension_requirement, t_projection_dimension_matters,
     t_procrustes_transform, t_collection_multidim, t_analysis_geometries,
+    # content-addressed recipe identity, and the draw storage it enables
+    t_recipe_identity, t_embedder_hash_seed, t_draw_schema_roundtrip, t_names_merge,
 ]
 DATA_BACKED = [
     t_cosine_real_adapters, t_recovery, t_collection_roundtrip, t_cross_taxonomy,
     t_recipe_relabelling, t_scan_cache, t_comparison_end_to_end,
+    t_cache_fully_migrated,
 ]
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--synthetic-only", action="store_true",
-                        help="Skip checks that read from results/.")
+                        help="Skip checks that read from results/. Keeps the run in-memory "
+                             "and avoids touching the cache at all.")
+    parser.add_argument("--data-only", action="store_true",
+                        help="Run only the checks that read the real cache — the ones that "
+                             "catch a broken path after a cache migration.")
+    parser.add_argument("-k", metavar="PATTERN",
+                        help="Run only checks whose description contains PATTERN "
+                             "(case-insensitive substring, e.g. -k 'cache').")
+    parser.add_argument("--list", action="store_true",
+                        help="Print the check names and exit without running anything.")
     args = parser.parse_args()
+
+    if args.synthetic_only and args.data_only:
+        parser.error("--synthetic-only and --data-only are mutually exclusive")
+
+    if args.data_only:
+        checks = list(DATA_BACKED)
+    elif args.synthetic_only:
+        checks = list(SYNTHETIC)
+    else:
+        checks = SYNTHETIC + DATA_BACKED
+
+    if args.k:
+        pattern = args.k.lower()
+        checks = [fn for fn in checks if pattern in fn.check_name.lower()]
+        if not checks:
+            parser.error(f"no check matches {args.k!r}; use --list to see the names")
+
+    if args.list:
+        for fn in checks:
+            print(f"  {fn.check_name}")
+        print(f"\n{len(checks)} check(s)")
+        return 0
 
     try:
         from threadpoolctl import threadpool_limits
     except ImportError:
         threadpool_limits = None
-
-    checks = SYNTHETIC + ([] if args.synthetic_only else DATA_BACKED)
 
     print("=== src/analysis checks ===\n")
     ctx = threadpool_limits(1) if threadpool_limits is not None else None

@@ -300,6 +300,15 @@ class BehavioralTaxonomy(Taxonomy):
             metadata={
                 "n_queries": len(self.queries),
                 "generated_texts": all_generated_texts,
+                # Provenance, deliberately outside config_dict() so it does not
+                # fragment the cache: greedy decoding is not reproducible across GPU
+                # architectures — different fp16 kernels flip the argmax on near-ties
+                # — so knowing which device produced a generation is the difference
+                # between "the code changed" and "it ran on a different node".
+                "device_name": (
+                    torch.cuda.get_device_name(0) if torch.cuda.is_available() else "cpu"
+                ),
+                "batch_size": self.batch_size,
             },
         )
 

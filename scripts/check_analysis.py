@@ -1549,6 +1549,18 @@ def t_behavioral_batch_invariance():
     fp16 reductions vary with tensor shape and demanding bitwise equality there
     would be wrong.
 
+    **Both arms are generated here, in this process, on this GPU.**  An earlier
+    version compared a fresh ``batch_size=1`` run against the *cached* generations,
+    which conflated three variables — batch size, hardware and time — and duly
+    failed the moment the two ran on different nodes: the same config passed on an
+    A100 and failed on an L40S with 2/8 texts differing.  That is greedy decoding
+    flipping on near-ties under different fp16 kernels, not a padding bug, but the
+    check could not tell the difference.  Generating both arms together isolates
+    batch size as the only variable, which is what the name promises.
+
+    The cache is still used, but only for *inputs* — which model, which queries,
+    which generation settings — never as an expected output.
+
     Kept out of DATA_BACKED because it loads a multi-GB model — this tier only
     runs under --include-gpu, which the SLURM job passes while the GPU is still
     allocated.
@@ -1575,52 +1587,56 @@ def t_behavioral_batch_invariance():
 
     path = cache._config_dir(chash) / "embeddings" / f"{slugs[0]}.safetensors"
     tensors = load_file(str(path))
-    cached_matrix = tensors["matrix"]
     model_id = _json.loads(tensors["_meta_json"].tobytes().decode("utf-8"))["model_id"]
     if not Path(model_id).exists():
         raise _Skip(f"adapter directory {model_id} is no longer on disk")
 
-    n = min(8, len(queries), cached_matrix.shape[0])
-    cached_texts = cache.load_generations(chash, model_id)[:n]
+    n = min(8, len(queries))
 
     from src.embedders.sentence_transformer import SentenceTransformerEmbedder
     from src.taxonomy.behavioral import BehavioralTaxonomy
 
     ecfg = dict(config.get("embedder", {}))
-    embedder = SentenceTransformerEmbedder(
-        model_name=ecfg.get("model_name", "sentence-transformers/all-MiniLM-L6-v2"),
-        device="cuda",
-        use_generated_text=True,
-        normalize_embeddings=ecfg.get("normalize_embeddings", True),
-        trust_remote_code=ecfg.get("trust_remote_code", False),
-        prompt_name=ecfg.get("prompt_name"),
-    )
     dtype = torch.float16 if "float16" in str(config.get("torch_dtype", "")) else torch.float32
 
-    # cache=None bypasses storage entirely.  batch_size is not part of
-    # config_dict(), so a cached re-extraction would hit the same key and end up
-    # comparing the matrix with itself.
-    tax = BehavioralTaxonomy(
-        queries=queries[:n], embedder=embedder, query_key=config.get("query_key"),
-        cache=None, batch_size=1,
-        max_new_tokens=config.get("max_new_tokens", 64), torch_dtype=dtype,
-    )
-    try:
-        rep = tax.extract(model_id)
-    finally:
-        tax.close()
+    def _run(batch_size: int):
+        # cache=None bypasses storage entirely: batch_size is not part of
+        # config_dict(), so a cached run would hit the same key and compare a
+        # matrix with itself.
+        embedder = SentenceTransformerEmbedder(
+            model_name=ecfg.get("model_name", "sentence-transformers/all-MiniLM-L6-v2"),
+            device="cuda",
+            use_generated_text=True,
+            normalize_embeddings=ecfg.get("normalize_embeddings", True),
+            trust_remote_code=ecfg.get("trust_remote_code", False),
+            prompt_name=ecfg.get("prompt_name"),
+        )
+        tax = BehavioralTaxonomy(
+            queries=queries[:n], embedder=embedder, query_key=config.get("query_key"),
+            cache=None, batch_size=batch_size,
+            max_new_tokens=config.get("max_new_tokens", 64), torch_dtype=dtype,
+        )
+        try:
+            return tax.extract(model_id)
+        finally:
+            tax.close()
 
-    fresh_texts = rep.metadata["generated_texts"]
-    mismatched = [i for i in range(n) if fresh_texts[i] != cached_texts[i]]
+    single = _run(1)
+    batched = _run(n)          # one batch, so padding is maximally exercised
+
+    a, b = single.metadata["generated_texts"], batched.metadata["generated_texts"]
+    mismatched = [i for i in range(n) if a[i] != b[i]]
     assert not mismatched, (
-        f"{len(mismatched)}/{n} generations differ between batch_size=1 and the cached "
-        f"run (first at index {mismatched[0]}). Suspect padding side before trusting "
-        f"any distance from this run."
+        f"{len(mismatched)}/{n} generations differ between batch_size=1 and "
+        f"batch_size={n} on the same GPU in the same process (first at index "
+        f"{mismatched[0]}). Batch size is the only variable here, so suspect the "
+        f"padding side before trusting any distance from this run."
     )
 
-    delta = float(np.abs(rep.matrix[:n] - cached_matrix[:n]).max())
+    delta = float(np.abs(single.matrix - batched.matrix).max())
     assert delta < 1e-2, f"embeddings diverge far beyond fp16 noise: max|delta|={delta:.2e}"
-    return (f"{n} queries on {Path(model_id).name}: texts identical, "
+    return (f"{n} queries on {Path(model_id).name}, batch 1 vs {n} on "
+            f"{torch.cuda.get_device_name(0)}: texts identical, "
             f"max|delta| embeddings = {delta:.2e}")
 
 

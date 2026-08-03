@@ -1,0 +1,134 @@
+# Behavioral taxonomy: how much does the query text_field move the result?
+#
+# Identical to yahoo_behavioral_smoke.yaml in every respect except the query set,
+# which draws `best_answer` prose instead of `question_title`. Exactly one variable
+# changes, so any movement in the distance matrix is attributable to the field.
+#
+# Why: finetune_lora.py hands `text_field` to SFTTrainer as `dataset_text_field`, and
+# every training mixture sets `best_answer` — so the adapters were fit as a plain
+# causal LM on bare answer prose, no question and no template. The baseline query set
+# prompts them with a question title instead, a shape that never appeared in training.
+# This run measures what that mismatch is worth. See TODO item 11.
+#
+# The baseline is not disturbed: a different query_key gives a different behavioral
+# config_hash, so this lands in its own directory under 05_generated/ and the
+# question_title run (5191ad734b81daff) stays readable for side-by-side comparison.
+#
+# output_dir points at the existing yahoo_topics_mean_cosine experiment because that
+# is where the query recipe lives (make_queries reads
+# {output_dir}/datasets/{queries_dataset}.recipe.json). Nothing is written there —
+# every artifact from this run lands in the shared cache.
+
+name: yahoo_behavioral_answerfield
+output_dir: results/yahoo_topics_mean_cosine
+cache_dir: results/shared_cache
+
+slurm:
+  # Starting guess only. Re-check what is actually free immediately before
+  # generating the sbatch script — a queue snapshot written into a config is stale
+  # by the time it runs.
+  partition: l40s
+  gpus_per_node: 1
+  mem_gb: 48
+  # Padded well past the ~25 min this should take. A job killed at the wall wastes
+  # both the allocation and the queue wait, whereas an over-requested 1-GPU job
+  # still backfills readily.
+  time: "01:00:00"
+  cpus_per_task: 8
+  conda_env: taxonomy-env
+  modules: []
+  account: null
+
+# The query set — the only thing that differs from yahoo_behavioral_smoke.yaml.
+#
+# This is the *training* recipe, not a separate query recipe: it hashes to
+# 89bbaff3b7a4e6cb, verified identical to the recipe_hash recorded in the 50/50
+# adapter's own experiment_meta.json. So the prompts come from precisely the
+# distribution the adapters were fit on. The 50/50 mixture keeps the probe unbiased
+# between the two topics, matching the neutral choice the baseline query set makes.
+#
+# seed 7, because training used (n=1000, seed=0) — read from the adapter metadata,
+# not assumed. Both draw from the same ~560k-row pool, so expected overlap is
+# 64 x 1000/560000 ~ 0.11 rows; it is verified rather than trusted before the run.
+# The point is to change the *field*, not to accidentally test memorisation.
+#
+# The draw is requested at exactly n_queries because n enters the sampler — a 64-row
+# draw is not the first 64 rows of a larger one. First run samples it fresh and writes
+# 01_datasets/89bbaff3b7a4e6cb/n64_s7.json.
+datasets:
+  - name: yahoo_50t0_50t1
+    recipe_type: class_aware
+    n_samples: 64
+    seed: 7
+    entries:
+      - dataset_id: yahoo_answers_topics
+        split: train
+        weight: 1.0
+        text_field: best_answer         # THE variable under test: training prose, not question titles
+        class_field: topic
+        class_filter: [0, 1]
+        class_weights: {0: 1.0, 1: 1.0}
+
+base_models:
+  - meta-llama/Llama-3.2-3B
+
+fine_tuning:
+  enabled: false
+
+extraction:
+  # One adapter per mixture, spanning both pure simplex anchors. Rank (r16), sample
+  # count (n1000), data seed (s00) and init seed (i00) are all held constant, so the
+  # only thing varying across the five is the training mixture — which is exactly the
+  # axis the behavioral distances are supposed to recover.
+  #
+  # Holding _i00 fixed also keeps the default id_scheme usable: comparison._resolve_ids
+  # raises when two adapters collapse to the same recipe_id, which is what happens if
+  # a collection mixes init seeds.
+  models:
+    - results/shared_cache/03_adapters/meta-llama--Llama-3.2-3B/yahoo_100t0_000t1_n1000_s00_r16_i00
+    - results/shared_cache/03_adapters/meta-llama--Llama-3.2-3B/yahoo_075t0_025t1_n1000_s00_r16_i00
+    - results/shared_cache/03_adapters/meta-llama--Llama-3.2-3B/yahoo_050t0_050t1_n1000_s00_r16_i00
+    - results/shared_cache/03_adapters/meta-llama--Llama-3.2-3B/yahoo_025t0_075t1_n1000_s00_r16_i00
+    - results/shared_cache/03_adapters/meta-llama--Llama-3.2-3B/yahoo_000t0_100t1_n1000_s00_r16_i00
+
+  queries_dataset: yahoo_50t0_50t1
+  n_queries: 64
+  device: cuda
+  # KV-cache growth scales with batch x (prompt + max_new_tokens). 16 should fit
+  # comfortably on a 48 GB L40S alongside a 3B fp16 model and the embedder, but
+  # verify rather than assume: on CUDA OOM drop to 8, then 4. The resulting matrix is
+  # batch-size-independent in principle (the [gpu] batch-invariance check proves it),
+  # so this is purely a throughput knob.
+  batch_size: 16
+  torch_dtype: float16
+
+  taxonomies:
+    # Both of these are set explicitly rather than omitted. extract_reprs.py defaults
+    # functional and behavioral to enabled: true when the key is absent, while
+    # dataset_embedding defaults to false — so omitting the functional block would
+    # silently start a functional extraction that this work has not prepared.
+    functional:
+      enabled: false
+    dataset_embedding:
+      enabled: false
+
+    behavioral:
+      enabled: true
+      max_new_tokens: 128
+      embedder:
+        # Matching the embedder that produced 02_dataset_embeddings is what makes the
+        # two levels comparable; prompt_name is inside the embedder cache key, so a
+        # different value would put the levels in differently-keyed spaces.
+        model_name: nomic-ai/nomic-embed-text-v1.5
+        normalize_embeddings: true
+        trust_remote_code: true
+        prompt_name: document
+        # device: cuda    # per-embedder override; falls back to extraction.device,
+        #                 # then to auto-detect. See _utils.resolve_device.
+
+taxonomy:
+  models: [fine_tuned]
+  taxonomies: [behavioral]
+  metrics:
+    behavioral: cosine
+  geometry: [mds]

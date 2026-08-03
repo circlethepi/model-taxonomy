@@ -233,12 +233,13 @@ Generated texts are stored in `ModelRepresentation.metadata["generated_texts"]` 
 ### `FunctionalTaxonomy`
 
 ```python
-class FunctionalTaxonomy(Taxonomy):
+class FunctionalTaxonomy(HFInferenceTaxonomy, Taxonomy):
     def __init__(
         self,
         queries: Sequence[str],
-        layer_indices: list[int],
-        cache: DiskCache | None = None,
+        layer_indices: list[int] | None = None,
+        query_key: dict | None = None,
+        cache: ActivationCache | None = None,
         device: str = "cuda",
         batch_size: int = 8,
         torch_dtype: torch.dtype = torch.float16,
@@ -247,35 +248,43 @@ class FunctionalTaxonomy(Taxonomy):
         normalize_activations: bool = True,
         activation_mode: Literal["input", "generation", "both"] = "input",
         max_new_tokens: int = 32,
-        representation: Literal["gram", "matrix"] = "gram",
+        view: Literal["concat", "gram"] = "concat",
+        source_indices: list | None = None,
     )
     taxonomy_name = "functional"
 ```
 
 | Parameter | Description |
 |---|---|
-| `layer_indices` | Indices into `hidden_states`; `-1` = last transformer block, `0` = embedding layer |
-| `pooling` | How to pool the `(seq_len, d)` hidden state to a single vector per probe |
-| `normalize_activations` | L2-normalize activation vectors before computing Gram matrix; makes `G[i,i]=1` |
-| `activation_mode` | `"input"`: forward-pass activations on the prompt. `"generation"`: activations during decoding, mean-pooled over steps. `"both"`: both phases stacked. |
+| `query_key` | **Required.** The `{recipe_hash, n_samples, seed}` triple identifying the draw in `01_datasets`. Keys the cache; the query strings are never hashed. |
+| `layer_indices` | Indices into `hidden_states`; `0` = embedding layer, `-1` = last block. **`None` (default) stores every layer.** Negative indices are resolved to absolute positions before anything touches disk. |
+| `cache` | **Required.** Per-layer activations are the stored artefact; there is no in-memory-only path. |
+| `pooling` | How to pool `(seq_len, d)` to one vector per query. **Mask-aware**: padded positions are excluded, so a vector depends only on its own query. |
+| `normalize_activations` | L2-normalize rows. Applies at **read** time — it is part of a surrogate's identity, not of the stored activations. |
+| `activation_mode` | `"input"`: forward pass on the prompt. `"generation"`: decoding-step activations, mean-pooled. `"both"`: both stored separately, combined at read time. |
 | `max_new_tokens` | Tokens to generate per query; used when `activation_mode` is `"generation"` or `"both"`. Ignored for `"input"`. |
-| `representation` | `"gram"` (default): upper-triangle of per-layer Gram matrices, shape `(N_layers, N_queries*(N_queries+1)//2)`. `"matrix"`: raw activations concatenated per query, shape `(N_queries, N_layers*d)`. |
+| `view` | Which view `extract()` returns. See below. |
 
-**Representation shape (`representation="gram"`, the default):**
+**Views** (assembled at read time from stored per-layer activations, then cached
+under `surrogates/`):
 
-| `activation_mode` | Shape |
-|---|---|
-| `"input"` or `"generation"` | `(N_layers, N_queries*(N_queries+1)//2)` |
-| `"both"` | `(2*N_layers, N_queries*(N_queries+1)//2)` |
+| `view` | Shape | Rows are |
+|---|---|---|
+| `"concat"` (default) | `(n_queries, L·d)` | queries |
+| `"gram"` | `(n_queries, n_queries)` | queries |
 
-**Representation shape (`representation="matrix"`):**
+In `"both"` mode the input and generation halves are concatenated along the
+feature axis, so a row stays one query and `L·d` doubles.
 
-| `activation_mode` | Shape |
-|---|---|
-| `"input"` or `"generation"` | `(N_queries, N_layers * hidden_dim)` |
-| `"both"` | `(N_queries, 2*N_layers * hidden_dim)` |
+**Note on `gram`:** it is a *kernel*, not a feature matrix. `CKADistanceMetric`
+forms `K = X Xᵀ` itself, so passing a stored Gram computes `(H Hᵀ)²`. The cache
+tags such representations with `metadata["is_kernel"]` and the metric raises on
+them. Use `"concat"` with CKA.
 
-**Note on CKA:** `CKADistanceMetric(unbiased=True)` requires the matrix row count to be ≥ 4. For `gram` mode, rows = `N_layers` (or `2*N_layers` in `"both"`). For `matrix` mode, rows = `N_queries`. Use `unbiased=False` for smaller configurations.
+**Note on CKA:** `CKADistanceMetric(unbiased=True)` requires ≥ 4 rows and raises
+below that rather than returning NaN — the estimator divides by `n(n-3)`. Rows
+here are queries, so any realistic query set clears this. Use `unbiased=False`
+otherwise. See [`notes/gram_and_cka.md`](notes/gram_and_cka.md).
 
 ---
 

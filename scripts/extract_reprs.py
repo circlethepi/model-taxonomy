@@ -29,7 +29,7 @@ from scripts._utils import (
     hf_token,
     get_cache_dir,
     resolve_model_ids,
-    make_repr_cache,
+    make_activation_cache,
     make_generated_text_cache,
     make_queries,
     make_functional_taxonomy,
@@ -77,14 +77,20 @@ def extract_representations(cfg: dict, only_taxonomies: list[str] | None = None)
 
     # ── Functional taxonomy ────────────────────────────────────────────────────
     if fcfg.get("enabled", True) and (enabled is None or "functional" in enabled):
-        print(f"\n  [functional]  layers={fcfg.get('layer_indices', [-1, -4, -8])}"
-              f"  mode={fcfg.get('activation_mode', 'input')}")
+        print(f"\n  [functional]  layers={fcfg.get('layer_indices') or 'all'}"
+              f"  mode={fcfg.get('activation_mode', 'input')}"
+              f"  pooling={fcfg.get('pooling', 'mean')}")
         taxonomy = make_functional_taxonomy(
-            cfg, queries, cache=make_repr_cache(cache_dir, "functional")
+            cfg, queries, query_key, cache=make_activation_cache(cache_dir)
         )
-        for model_id in tqdm(model_ids, desc="functional", unit="model"):
-            rep = taxonomy.extract(model_id)
-            tqdm.write(f"    {model_id}  shape={rep.matrix.shape}  key={rep.cache_key}")
+        try:
+            for model_id in tqdm(model_ids, desc="functional", unit="model"):
+                rep = taxonomy.extract(model_id)
+                tqdm.write(f"    {model_id}  shape={rep.matrix.shape}  key={rep.cache_key}")
+        finally:
+            # The base model is held across extractions and freed once, here — see
+            # HFInferenceTaxonomy.close.
+            taxonomy.close()
 
     # ── Behavioral taxonomy ────────────────────────────────────────────────────
     if bcfg.get("enabled", True) and (enabled is None or "behavioral" in enabled):

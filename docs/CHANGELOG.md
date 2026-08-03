@@ -4,6 +4,52 @@
 
 ## Unreleased
 
+### Functional taxonomy: `ActivationCache`, read-time views, and a redefined `gram`
+
+The functional level was the last one still writing through the flat `DiskCache`,
+whose key hashes every query string into one opaque filename. It now has its own
+cache, a comparison-layer path, a discovery token, and checks at all three tiers.
+
+**`src/cache/activation_cache.py` (new)** — `ActivationCache`, keyed **model-wise
+then draw-wise** (`04_activations/{base}/{adapter}/{recipe_hash}/n{n}_s{seed}/`),
+following `LoRACache` rather than `GeneratedTextCache`. One forward pass produces
+every hidden state, so extraction stores all of them — one file per
+`(mode, pooling, layer)` — and *which layers you compare* becomes a read-time
+choice rather than a reason to re-run inference. Writes are additive: adding a
+mode or a layer never rewrites an existing file. Views are computed lazily and
+written back under `surrogates/{hash}/`. `queries.json` stores source row indices,
+not text, since `01_datasets` is canonical.
+
+**`src/taxonomy/_hf_inference.py` (new)** — `HFInferenceTaxonomy`, the base-model
+reuse and adapter-swapping machinery extracted from `BehavioralTaxonomy` without
+behavioural change. Both inference levels now inherit it, so the left-padding pin
+cannot be set for one and forgotten for the other.
+
+**⚠️ Breaking: `gram` has been redefined.** It is now `G = H Hᵀ` of the
+concatenated feature matrix — `(n_queries, n_queries)`, **rows are queries**. It
+used to be stacked upper triangles of per-layer Gram matrices, `(n_layers,
+n_queries(n_queries+1)/2)`, **rows were layers**. These are different objects; the
+old form is gone rather than kept as an option. Nothing needs migrating only
+because the functional level had never been run. The `representation:` config key
+is replaced by `view: concat | gram`. See `docs/notes/gram_and_cka.md`.
+
+**Mask-aware pooling.** `FunctionalTaxonomy._pool` now takes the `attention_mask`
+and pools only over real positions. Previously it averaged over the padded length,
+which made a pooled vector depend on which other queries shared its batch — and
+the cache could not notice, since `batch_size` is not part of the key.
+
+**`CKADistanceMetric` raises instead of returning NaN.** The unbiased HSIC
+estimator divides by `n(n-3)`; below 4 rows it now raises and names
+`unbiased=False`. It also refuses representations tagged `metadata["is_kernel"]`,
+which is what stops a stored Gram from silently being turned into `(H Hᵀ)²`.
+
+**Also:** `_functional_matrix` + `functional_selector` in
+`src/analysis/comparison.py`; a `functional_repr` availability token (flag letter
+`F`, header now `WRDSBF`) and `functional_draw` in `scan_cache`;
+`make_activation_cache` in `scripts/_utils.py`, with `REPR_CACHE_DIRS` and
+`make_repr_cache` removed as dead; `experiments/yahoo_functional_smoke.yaml`;
+and six synthetic, one `[data]` and one `[gpu]` check.
+
 ### New package `src/analysis` — analysis over distance matrices and geometries
 
 Until now the repo produced distance matrices in two places that could not talk to

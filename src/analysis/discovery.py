@@ -53,6 +53,7 @@ _TAXONOMY_AVAILABILITY = (
     "dataset_embedding",
     "sampled_rows",
     "behavioral_repr",
+    "functional_repr",
 )
 
 #: Flag letter per token, for the compact availability column in summary().
@@ -67,6 +68,7 @@ _AVAILABILITY_LETTERS = {
     "dataset_embedding": "D",
     "sampled_rows": "S",
     "behavioral_repr": "B",
+    "functional_repr": "F",
 }
 _AVAILABILITY_HEADER = "".join(_AVAILABILITY_LETTERS[n] for n in _TAXONOMY_AVAILABILITY)
 
@@ -293,6 +295,7 @@ def scan_cache(
     resolve_recipes: bool = True,
     scan_all_recipes: bool = False,
     behavioral_config_hash: str | None = None,
+    functional_draw: dict | None = None,
 ) -> CacheIndex:
     """Walk the shared cache and join adapters to the recipes they were trained on.
 
@@ -321,6 +324,14 @@ def scan_cache(
         representation generated from different queries or a different embedder is
         not interchangeable with the one a caller probably wants.  Pass the hash
         whenever the answer will be used to select models for a comparison.
+    functional_draw:
+        Which query draw the ``functional_repr`` token should report on, as a
+        ``{recipe_hash, n_samples, seed}`` dict.  Carries the **same caveat** as
+        ``behavioral_config_hash``: given a draw the token is exact, and without
+        one it degrades to "some activations exist for this model, under some
+        draw" — weaker than it looks, since activations from a different query
+        set are not interchangeable.  Pass it whenever the answer will select
+        models for a comparison.
     """
     root = Path(cache_root)
     adapters_root = root / "03_adapters"
@@ -330,6 +341,7 @@ def scan_cache(
     if not adapters_root.exists():
         return CacheIndex([], root)
 
+    from src.cache.activation_cache import ActivationCache
     from src.cache.dataset_embedding_cache import DatasetEmbeddingCache
     from src.cache.generated_text_cache import GeneratedTextCache
     from src.cache.lora_cache import LoRACache
@@ -337,6 +349,7 @@ def scan_cache(
     lora_cache = LoRACache(root)
     de_cache = DatasetEmbeddingCache(root)
     gen_cache = GeneratedTextCache(root)
+    act_cache = ActivationCache(root)
     behavioral_hashes = (
         [behavioral_config_hash] if behavioral_config_hash else gen_cache.list_configs()
     )
@@ -395,6 +408,9 @@ def scan_cache(
                 # path here — see _sampled_rows_exist below for why that matters.
                 "behavioral_repr": any(
                     gen_cache.exists(h, entry.model_id) for h in behavioral_hashes
+                ),
+                "functional_repr": _functional_repr_exists(
+                    act_cache, entry.base_model_id, entry.model_id, functional_draw
                 ),
             }
             entries.append(entry)
@@ -476,6 +492,24 @@ def _sampled_rows_exist(
     return (sampled_root / recipe_hash / f"n{n_samples}_s{seed}.json").exists()
 
 
+def _functional_repr_exists(
+    act_cache, base_model_id: str | None, model_id: str, draw: dict | None
+) -> bool:
+    """Whether this model has stored activations — exactly, or coarsely.
+
+    Both branches ask :class:`ActivationCache` where its own files live rather
+    than rebuilding the path.  ``_sampled_rows_exist`` above is the counterexample
+    already in this codebase: it hardcodes ``SampledDatasetCache``'s layout, so
+    the two are free to drift and the failure mode is silent — every write
+    succeeds while the cache reads as empty.
+    """
+    if not base_model_id:
+        return False
+    if draw is None:
+        return act_cache.has_any(base_model_id, model_id)
+    return act_cache.has_draw(base_model_id, model_id, draw)
+
+
 def _attach_unreferenced_recipes(
     entries: list[CacheEntry], de_cache, sampled_root: Path, embeddings_root: Path
 ) -> None:
@@ -517,8 +551,10 @@ def _attach_unreferenced_recipes(
                         "dataset_embedding": True,
                         "sampled_rows": True,
                         # These entries are recipes, not models — there is no adapter
-                        # to generate from, so behavioral can never be available.
+                        # to run inference on, so neither inference-based level can
+                        # ever be available for them.
                         "behavioral_repr": False,
+                        "functional_repr": False,
                     },
                 )
             )

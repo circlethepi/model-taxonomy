@@ -1814,7 +1814,12 @@ def t_activation_surrogate_writeback():
         # property of a surrogate rather than of the extraction.
         cache.load(_BASE, _ADAPTER, _QK, normalize=False)
         assert len(list(sdir.glob("*/surrogate.safetensors"))) == 3
-    return "computed once, read back on the second call; view and normalize keyed separately"
+
+        # ...and the two normalization *modes* are keyed apart from each other,
+        # not just from "off".
+        cache.load(_BASE, _ADAPTER, _QK, normalize="global")
+        assert len(list(sdir.glob("*/surrogate.safetensors"))) == 4
+    return "computed once, read back on the second call; view and each normalize mode keyed separately"
 
 
 @check("functional: concat and gram views agree with the stored layers")
@@ -1837,25 +1842,107 @@ def t_activation_view_equivalence():
         )
 
         raw = cache.load_layers(_BASE, _ADAPTER, _QK, "input", "mean")
-        H = np.concatenate([raw[ell].astype(np.float64) for ell in sorted(raw)], axis=1)
-        norms = np.linalg.norm(H, axis=1, keepdims=True)
-        Hn = H / np.where(norms < 1e-12, 1.0, norms)
+        blocks = [raw[ell].astype(np.float64) for ell in sorted(raw)]
+        H = np.concatenate(blocks, axis=1)
+
+        def rn(m):
+            n = np.linalg.norm(m, axis=1, keepdims=True)
+            return m / np.where(n < 1e-12, 1.0, n)
+
+        # The default is layerwise: normalize each layer, concatenate, renormalize.
+        Hl = rn(np.concatenate([rn(b) for b in blocks], axis=1))
 
         concat = cache.load(_BASE, _ADAPTER, _QK).matrix
         assert concat.shape == (6, 12), concat.shape
-        assert np.allclose(concat, Hn, atol=1e-6), "concat view is not the normalized concatenation"
+        assert np.allclose(concat, Hl, atol=1e-6), "default concat view is not the layerwise concatenation"
+
+        # global stays reachable and unchanged: concatenate first, normalize once.
+        glob = cache.load(_BASE, _ADAPTER, _QK, normalize="global").matrix
+        assert np.allclose(glob, rn(H), atol=1e-6), "global view is not the normalized concatenation"
 
         gram = cache.load(_BASE, _ADAPTER, _QK, view="gram").matrix
         assert gram.shape == (6, 6), f"gram must be (n_queries, n_queries), got {gram.shape}"
-        assert np.allclose(gram, Hn @ Hn.T, atol=1e-5), "gram is not H Hᵀ of the concatenation"
+        assert np.allclose(gram, Hl @ Hl.T, atol=1e-5), "gram is not H Hᵀ of the concatenation"
+        # The final row renorm is what buys this, under either mode.
+        assert np.allclose(np.diag(gram), 1.0, atol=1e-5), np.diag(gram)
 
         # A layer subset is a read-time choice and must not need a new run.
         sub = cache.load(_BASE, _ADAPTER, _QK, layers=[0, 2]).matrix
         assert sub.shape == (6, 8), sub.shape
 
-        raw_unnorm = cache.load(_BASE, _ADAPTER, _QK, normalize=False).matrix
+        raw_unnorm = cache.load(_BASE, _ADAPTER, _QK, normalize="none").matrix
         assert np.allclose(raw_unnorm, H, atol=1e-5), "unnormalized view is not the raw concatenation"
-    return "concat=(6,12) equals the stored layers; gram=(6,6) equals H Hᵀ; subsets read-time"
+    return "concat=(6,12) is the layerwise concatenation; global unchanged; gram=(6,6) with unit diagonal"
+
+
+@check("functional: layerwise normalization equalizes each layer's contribution")
+def t_activation_layerwise_normalization():
+    """The point of ``layer`` is that no layer can dominate the dot product.
+
+    Asserted through the property that distinguishes the two modes — how much of
+    a row's squared norm each layer block owns — rather than by reimplementing
+    the formula, which would only restate the code.
+
+    The setup is the real failure case in miniature: residual-stream norms grow
+    with depth, so in a 29-layer concatenation the last layers own nearly all of
+    each row and ``concat`` silently stops being a measurement of all of them.
+    """
+    import tempfile
+    from src.cache.activation_cache import ActivationCache
+
+    d = 4
+    layers = _seeded_layers(n_queries=5, d=d, layers=(0, 1, 2))
+    layers[2] = layers[2] * 100.0          # one layer 100x the scale of the others
+
+    def shares(M):
+        """Fraction of each row's squared norm owned by each layer block."""
+        sq = np.stack([(M[:, i * d:(i + 1) * d] ** 2).sum(axis=1) for i in range(3)], axis=1)
+        return sq / sq.sum(axis=1, keepdims=True)
+
+    with tempfile.TemporaryDirectory() as td:
+        cache = ActivationCache(td)
+        cache.save_activations(
+            _BASE, _ADAPTER, _QK, "input", "mean", layers,
+            config={"taxonomy": "functional"}, run_metadata={"n_hidden_states": 3},
+        )
+
+        g = cache.load(_BASE, _ADAPTER, _QK, normalize="global").matrix
+        gs = shares(g)
+        assert gs[:, 2].min() > 0.99, (
+            f"global should let the 100x layer dominate; its smallest share is {gs[:, 2].min():.4f}"
+        )
+
+        lay = cache.load(_BASE, _ADAPTER, _QK, normalize="layer").matrix
+        ls = shares(lay)
+        assert np.allclose(ls, 1 / 3, atol=1e-6), f"layerwise shares are not equal:\n{ls}"
+
+        # Rows stay unit-norm under both, which is what keeps gram's diagonal 1.
+        for name, M in (("global", g), ("layer", lay)):
+            assert np.allclose(np.linalg.norm(M, axis=1), 1.0, atol=1e-6), name
+
+        none = cache.load(_BASE, _ADAPTER, _QK, normalize="none").matrix
+        raw = cache.load_layers(_BASE, _ADAPTER, _QK, "input", "mean")
+        H = np.concatenate([raw[i] for i in sorted(raw)], axis=1)
+        assert np.allclose(none, H, atol=1e-5), "none is not the raw concatenation"
+
+        # True and "layer" are one request spelled two ways: same array, and one
+        # surrogate between them rather than two identical files on disk.
+        sdir = cache.draw_dir(_BASE, _ADAPTER, _QK) / "surrogates"
+        before = len(list(sdir.glob("*/surrogate.safetensors")))
+        boolean = cache.load(_BASE, _ADAPTER, _QK, normalize=True)
+        assert np.array_equal(boolean.matrix, lay), "normalize=True differs from 'layer'"
+        assert boolean.metadata["normalize"] == "layer", boolean.metadata["normalize"]
+        assert len(list(sdir.glob("*/surrogate.safetensors"))) == before, (
+            "normalize=True stored a second copy of the layer surrogate"
+        )
+
+        try:
+            cache.load(_BASE, _ADAPTER, _QK, normalize="layerwise")
+        except ValueError as exc:
+            assert "layerwise" in str(exc), str(exc)
+        else:
+            raise AssertionError("an unknown normalize mode was accepted")
+    return "global gives the 100x layer >0.99 of each row; layer gives every layer exactly 1/3"
 
 
 @check("functional: the taxonomy pins left padding")
@@ -2177,7 +2264,8 @@ SYNTHETIC = [
     # functional taxonomy: its cache, the views read off it, and the two
     # properties a distance built from it depends on
     t_activation_cache_roundtrip, t_activation_surrogate_writeback,
-    t_activation_view_equivalence, t_functional_padding_side,
+    t_activation_view_equivalence, t_activation_layerwise_normalization,
+    t_functional_padding_side,
     t_functional_mask_pooling, t_cka_row_guard,
 ]
 DATA_BACKED = [

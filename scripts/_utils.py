@@ -560,7 +560,8 @@ def make_functional_taxonomy(cfg: dict, queries: list[str], query_key: dict | No
         torch_dtype=parse_dtype(ext_cfg.get("torch_dtype", "float16")),
         hf_token=hf_token(cfg),
         pooling=fcfg.get("pooling", "mean"),
-        normalize_activations=fcfg.get("normalize_activations", True),
+        # layer | global | none; bools still accepted (True → layer).
+        normalize_activations=fcfg.get("normalize_activations", "layer"),
         activation_mode=fcfg.get("activation_mode", "input"),
         max_new_tokens=fcfg.get("max_new_tokens", 32),
         view=fcfg.get("view", "concat"),

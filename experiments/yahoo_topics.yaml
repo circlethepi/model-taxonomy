@@ -138,7 +138,7 @@ extraction:
       layer_indices: [-1, -4, -8, -16]
       activation_mode: input
       pooling: mean
-      normalize_activations: true
+      normalize_activations: layer   # layer | global | none
     behavioral:
       enabled: true
       max_new_tokens: 64

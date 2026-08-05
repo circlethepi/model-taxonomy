@@ -245,7 +245,7 @@ class FunctionalTaxonomy(HFInferenceTaxonomy, Taxonomy):
         torch_dtype: torch.dtype = torch.float16,
         hf_token: str | None = None,
         pooling: Literal["mean", "last_token", "cls"] = "mean",
-        normalize_activations: bool = True,
+        normalize_activations: str | bool = "layer",
         activation_mode: Literal["input", "generation", "both"] = "input",
         max_new_tokens: int = 32,
         view: Literal["concat", "gram"] = "concat",
@@ -260,7 +260,7 @@ class FunctionalTaxonomy(HFInferenceTaxonomy, Taxonomy):
 | `layer_indices` | Indices into `hidden_states`; `0` = embedding layer, `-1` = last block. **`None` (default) stores every layer.** Negative indices are resolved to absolute positions before anything touches disk. |
 | `cache` | **Required.** Per-layer activations are the stored artefact; there is no in-memory-only path. |
 | `pooling` | How to pool `(seq_len, d)` to one vector per query. **Mask-aware**: padded positions are excluded, so a vector depends only on its own query. |
-| `normalize_activations` | L2-normalize rows. Applies at **read** time — it is part of a surrogate's identity, not of the stored activations. |
+| `normalize_activations` | `"layer"` (default) row-normalizes each layer before concatenating, so every layer weighs the same; `"global"` normalizes only the finished row, letting each layer count in proportion to its own scale; `"none"` leaves it raw. Bools are accepted (`True → "layer"`, `False → "none"`) and canonicalized before hashing. Applies at **read** time — it is part of a surrogate's identity, not of the stored activations. |
 | `activation_mode` | `"input"`: forward pass on the prompt. `"generation"`: decoding-step activations, mean-pooled. `"both"`: both stored separately, combined at read time. |
 | `max_new_tokens` | Tokens to generate per query; used when `activation_mode` is `"generation"` or `"both"`. Ignored for `"input"`. |
 | `view` | Which view `extract()` returns. See below. |

@@ -61,6 +61,12 @@ class FunctionalTaxonomy(HFInferenceTaxonomy, Taxonomy):
         resolved against the model's actual hidden-state count before anything
         touches disk.
     normalize_activations:
+        ``"layer"`` (default), ``"global"`` or ``"none"``; bools are accepted as
+        ``True → "layer"``, ``False → "none"``.  ``layer`` row-normalizes each
+        layer before concatenating, so a layer's weight in the comparison is a
+        choice rather than an accident of its activation scale.  See
+        :class:`ActivationCache` for the measured per-layer norms.
+
         Applies at *read* time, not extraction: raw activations are stored, and
         normalization is part of a surrogate's identity.  Kept here as the
         default passed to :meth:`ActivationCache.load`.
@@ -77,7 +83,7 @@ class FunctionalTaxonomy(HFInferenceTaxonomy, Taxonomy):
         torch_dtype: torch.dtype = torch.float16,
         hf_token: str | None = None,
         pooling: Literal["mean", "last_token", "cls"] = "mean",
-        normalize_activations: bool = True,
+        normalize_activations: str | bool = "layer",
         activation_mode: Literal["input", "generation", "both"] = "input",
         max_new_tokens: int = 32,
         view: Literal["concat", "gram"] = "concat",
@@ -101,7 +107,9 @@ class FunctionalTaxonomy(HFInferenceTaxonomy, Taxonomy):
         self.query_key = dict(query_key or {})
         self.cache = cache
         self.pooling = pooling
-        self.normalize_activations = normalize_activations
+        # Canonicalized here so a typo fails at construction rather than after
+        # the inference it would have wasted.
+        self.normalize_activations = ActivationCache.canon_normalize(normalize_activations)
         self.activation_mode = activation_mode
         self.max_new_tokens = max_new_tokens
         self.view = view

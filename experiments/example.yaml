@@ -89,8 +89,13 @@ extraction:
                                     # generation → activations on generated tokens
                                     # both       → both stored, combined at read time
       pooling: mean                 # mean | last_token | cls; all mask-aware
-      normalize_activations: true   # L2-normalise; applied when a view is assembled,
-                                    # not when activations are stored
+      normalize_activations: layer  # layer  → normalise each layer, then the row, so
+                                    #          every layer weighs the same (default)
+                                    # global → normalise the finished row only; layers
+                                    #          count in proportion to their own scale
+                                    # none   → raw concatenation
+                                    # Applied when a view is assembled, not when
+                                    # activations are stored.
       max_new_tokens: 32            # tokens to generate (ignored when mode=input)
       view: concat                  # concat → (N_queries, L*hidden_dim); rows are
                                     #          queries. Use with cka or frobenius.

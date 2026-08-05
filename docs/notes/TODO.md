@@ -33,6 +33,8 @@ Dependencies are called out in the State column.
 
 | 13 | **The two inference caches diverge on three axes** | this row; see also 9 | `GeneratedTextCache` (`05_generated`) and `ActivationCache` (`04_activations`) store the same *kind* of thing — a per-model representation over a shared query draw — with three different conventions. Recorded now, while the reason for each is still known. **(a) Top-level key:** behavioral is run-wise (`{config_hash}/`), functional is model-wise (`{base}/{adapter}/{recipe_hash}/n{n}_s{seed}/`). Functional needs model-wise because one forward pass yields every layer, making layer choice a read-time decision; behavioral has no such axis, so run-wise costs it nothing. Not obviously worth unifying. **(b) Model key — this is the one with a real failure mode.** `generated_text_cache.model_slug` hashes the **full absolute path** of the adapter directory, so a behavioral entry is keyed to *where the adapter happened to live on disk*: **moving the cache root silently orphans every behavioral representation** — every write still succeeds, and the cache reads as empty. `ActivationCache` follows the `LoRACache` convention (`_slug(base_model_id) / adapter dir name`) and does not have this property. Fixing behavioral means a migration, since the slug is a directory name. **(c) Query record:** behavioral duplicates the full query **text** into `queries.json`; functional stores the `query_key` plus source row **indices**, since `01_datasets` is canonical and `(recipe_hash, n_samples, seed)` determines the text completely. Functional's is the better convention and behavioral's is redundant, but the redundancy is harmless. **Decide:** whether (b) is worth a migration on its own — it is the only one of the three that can lose data. |
 
+| 14 | **`CollectionCache.collection_hash()` ignores the taxonomy selector** | this row; see also 9, 13 | `collection_hash(model_ids, taxonomy, metric)` is the whole key, so everything that actually determines a functional matrix — draw, layers, view, **normalization** — is invisible to it, and the same for `behavioral_config_hash`. A cached collection is therefore returned for a selector it was not built with, silently. This was latent while there was one way to build each matrix; it stopped being latent when `normalize` gained modes and the default moved to `layer`, since every collection stored before that keeps serving `global` numbers. `build_taxonomy_artifacts` documents the hazard but cannot avoid it. **Fix:** fold the resolved selector into the hash. **Cost:** invalidates every stored collection, which is why it was not done alongside the normalization change — it is a separate decision about throwing away cached work. **Workaround today:** call `_compute_distance_matrix` directly, as `docs/notes/TODO.md`'s re-measurement did. |
+
 ## Small wins
 
 Recorded so they survive; each is cheap and independent.
@@ -111,7 +113,7 @@ Recorded so they survive; each is cheap and independent.
 ## Verification
 
 `python scripts/check_analysis.py` is the sharpest instrument in the repo and the
-only test harness — there is no pytest. It registers 53 checks (43 synthetic, 10 that
+only test harness — there is no pytest. It registers 54 checks (44 synthetic, 10 that
 read the real cache); the data-backed ones report `SKIP` when a path is missing
 rather than passing vacuously, so they fail loudly on a missed migration. Run it
 before and after any of the items above and compare the pass/skip profile.
@@ -136,11 +138,11 @@ narrow it further when you want a fast loop:
 
 Run it in the project conda environment (`conda activate taxonomy-env`, the same one
 the SLURM scripts activate) — `numpy` is not installed in the base env, so the
-checks fail at import there. Baseline as of 2026-08-03, after the functional work:
-**53 passed, 0 failed, 0 skipped** across 53 registered checks (43 synthetic,
+checks fail at import there. Baseline as of 2026-08-05, after the layerwise-normalization work:
+**54 passed, 0 failed, 0 skipped** across 54 registered checks (44 synthetic,
 10 `[data]`), plus 2 `[gpu]` checks behind `--include-gpu`. Both inference levels are
 now populated, so nothing skips; the `[data]` checks for each must **skip**, never
-pass, whenever their stage directory is absent. Earlier baselines: 45/0/1 after the
+pass, whenever their stage directory is absent. Earlier baselines: 53/0/0 after the functional work, 45/0/1 after the
 behavioral work (the one skip being functional's absent `04_activations/`), and
 40/0/0 before either. `t_scan_cache` reports 25 adapters,
 **25 with recipes, 25 usable**, and `verify_sampled_cache --fast` reports **523** draws
@@ -172,6 +174,50 @@ Procrustes 0.2399 (p = 0.015) — better than structural (0.4500) and worse than
 dataset_embedding (0.0041). Functional↔behavioral correlate at **0.382**;
 functional↔structural at **−0.006**.
 
+**These numbers are all `normalize="global"`**, which was the only mode when the
+job ran. See the re-measurement below.
+
+### Re-measured under layerwise normalization (no GPU; read-time rebuild)
+
+`normalize="layer"` is now the default. Same stored activations, same draw, same
+metric — only the surrogate was rebuilt.
+
+| | `global` (as run) | `layer` (new default) |
+|---|---|---|
+| off-diagonal min / max | 0.00113 / 0.01068 | 0.00110 / 0.01120 |
+| spread | 0.00955 | 0.01010 |
+| monotone in mixing proportion | yes | yes |
+| Pearson r vs mixing gap | 0.803 (p = 0.005) | **0.823** (p = 0.004) |
+| Spearman ρ vs mixing gap | 0.833 (p = 0.003) | **0.788** (p = 0.007) |
+
+The two matrices correlate at **r = 0.993**. Layerwise separates the adapters
+very slightly more and moves Pearson up and Spearman down — one rank swap. On
+this evidence the choice of normalization is **not** what is limiting the signal;
+the tiny absolute distances above still are.
+
+**The premise behind layerwise turned out to be only half right, so record what
+was actually measured.** The expectation was that deep layers dominate a
+`global`-normalized concatenation. On Llama-3.2-3B, mean-pooled over these 64
+queries, they do not: transformer-block row norms run 56 → 71, within ~1.6× of
+each other, and the effective number of contributing layers is 26.4 of 29. What
+*is* lopsided is the bottom: the **embedding layer and layer 1 have row norms
+0.36 and 2.41**, giving them 0.00% and 0.01% of a row's squared norm. Under
+`global` those two are effectively absent from a comparison labelled "all
+layers"; under `layer` they count as much as any other. That — not depth — is
+what the new default changes here, and it cuts both ways, since it also amplifies
+a near-zero-norm layer and whatever noise it carries up to parity.
+
+⚠️ **`CollectionCache` does not see the selector.** `collection_hash()` keys on
+`(model_ids, taxonomy, metric)`, so the draw, layers, view and normalization are
+not in it: a collection built before this change keeps returning its `global`
+matrix whatever selector is passed. The figures above were produced by going
+through `_compute_distance_matrix` directly. The `[data]` check's cross-taxonomy
+table still prints the cached 0.382 for the same reason. `build_taxonomy_artifacts`
+already documents this caveat for `behavioral_config_hash`; it now bites harder,
+since the *default* changed underneath the cached entries. **Worth fixing** —
+folding the selector into `collection_hash` is the obvious move, and it is not
+done here because it invalidates every stored collection.
+
 **The caveat worth carrying forward: the absolute distances are tiny.** A CKA
 distance of 0.011 is a CKA *similarity* of 0.989 — all five models are nearly
 identical in activation space, which is what you would expect from rank-16 LoRAs
@@ -192,6 +238,24 @@ activations (29 × 64 × 3072 × 4 B ≈ 22.8 MB per model) but not the **writte
 surrogate**, which is the same size again because the default `concat` view over all
 layers is exactly as large as the layers it concatenates. Still cheap, but a
 surrogate is not free the way a small derived view would be.
+
+**And each normalization mode costs another full-size copy.** After the layerwise
+change, `04_activations/` holds three surrogates per model — the orphaned
+`{"normalize": true}` one from the smoke run, plus `global` and `layer` from the
+re-measurement — 327 MB in total against 114 MB of actual activations. **109 MB of
+that is the orphan**, unreachable because `true` now canonicalizes to `"layer"`
+and hashes differently. It was deliberately **not** deleted: dropping cache entries
+as a side effect of a code change is the wrong default. To reclaim it:
+
+```bash
+# inspect first, then remove
+grep -l '"normalize": true' results/shared_cache/04_activations/*/*/*/*/surrogates/*/config.json \
+  | xargs -n1 dirname
+```
+
+The general lesson for `n_queries=64`: a `concat` surrogate over all layers is
+~23 MB per model per mode, so surrogates dominate this stage's footprint and will
+keep growing one copy at a time as views and normalizations are explored.
 
 The jump from 20 usable to 25 is task 2's doing, not a change in the data: the five
 oldest adapters were trained under the pre-rename naming (`yahoo_25t0_75t1`) and used to

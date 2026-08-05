@@ -144,6 +144,20 @@ same pooling, or the same activation mode. Matching row counts is not matching
 semantics, and two 64-row matrices from different draws will compare happily and
 mean nothing.
 
+**Normalization is on that list too.** A `layer`-normalized and a
+`global`-normalized view of the same draw, the same layers and the same pooling
+have identical shapes and will compare without complaint, but they weight the
+layers differently and the number means nothing. The surrogate hash keeps the two
+apart *on disk*; nothing stops a caller loading one of each.
+
 Guard this at the level above: `_functional_matrix` resolves one draw for the
 whole collection and refuses when several are present, and the `functional_repr`
 availability token is only exact when `scan_cache` is given a draw.
+
+One gap remains, and it is worth knowing about because it is silent:
+`CollectionCache.collection_hash()` keys on `(model_ids, taxonomy, metric)` only.
+The functional selector — draw, layers, view, **normalization** — is not in it,
+so a collection built before this change still returns its `global` matrix from
+cache no matter what selector you pass. `build_taxonomy_artifacts`' docstring
+flags the same caveat for `behavioral_config_hash`. To re-measure under a
+different normalization, bypass the collection cache or clear the entry.

@@ -43,12 +43,35 @@ estimator divides by `n(n-3)`; below 4 rows it now raises and names
 `unbiased=False`. It also refuses representations tagged `metadata["is_kernel"]`,
 which is what stops a stored Gram from silently being turned into `(H Hᵀ)²`.
 
+**Layerwise normalization, and it is the new default.**
+`normalize_activations` / `ActivationCache.load(normalize=)` widen from a bool to
+`"layer" | "global" | "none"`; bools still work (`True → "layer"`,
+`False → "none"`) and are canonicalized before hashing so one request cannot
+become two surrogates. `"layer"` row-normalizes each `(mode, layer)` block before
+concatenating, then normalizes the row, so rows stay unit-norm and `gram`'s
+diagonal stays 1. `"global"` — concatenate, then normalize once — is the previous
+behaviour, unchanged and still reachable by name.
+
+⚠️ **This changes the numbers.** Any `concat` or `gram` view is a different
+matrix under the new default, and `{"normalize": true}` no longer hashes to the
+same surrogate as `{"normalize": "layer"}`, so surrogates written before this
+change are orphaned and rebuilt on next read (cheap — a concat over stored
+activations, no model). Stored per-layer activations are untouched.
+
+Measured on Llama-3.2-3B, mean-pooled: the transformer blocks' row norms sit
+within ~1.6× of each other, but the **embedding layer and layer 1 are two orders
+of magnitude smaller** (0.36 and 2.41 against 56–71), so under `global` they
+carry 0.00% and 0.01% of a row and are effectively absent from a comparison
+labelled "all layers". Under `layer` all 29 count equally. On the smoke run the
+two modes correlate at r = 0.993 — a change in emphasis, not a different
+measurement.
+
 **Also:** `_functional_matrix` + `functional_selector` in
 `src/analysis/comparison.py`; a `functional_repr` availability token (flag letter
 `F`, header now `WRDSBF`) and `functional_draw` in `scan_cache`;
 `make_activation_cache` in `scripts/_utils.py`, with `REPR_CACHE_DIRS` and
 `make_repr_cache` removed as dead; `experiments/yahoo_functional_smoke.yaml`;
-and six synthetic, one `[data]` and one `[gpu]` check.
+and seven synthetic, one `[data]` and one `[gpu]` check.
 
 ### New package `src/analysis` — analysis over distance matrices and geometries
 

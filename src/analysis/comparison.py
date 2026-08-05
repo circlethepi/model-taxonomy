@@ -466,7 +466,7 @@ def _functional_matrix(
 
         {"draw": {"recipe_hash": ..., "n_samples": 64, "seed": 0},
          "mode": "input", "pooling": "mean", "layers": None,
-         "view": "concat", "normalize": True}
+         "view": "concat", "normalize": "layer"}   # layer | global | none
 
     Every field has a default, and ``draw=None`` resolves to the one draw present
     when there is exactly one — with the same "several exist, name one" error
@@ -484,7 +484,7 @@ def _functional_matrix(
     mode = sel.get("mode", "input")
     pooling = sel.get("pooling", "mean")
     view = sel.get("view", "concat")
-    normalize = sel.get("normalize", True)
+    normalize = sel.get("normalize", "layer")
     layers = sel.get("layers")
     max_new_tokens = sel.get("max_new_tokens")
 

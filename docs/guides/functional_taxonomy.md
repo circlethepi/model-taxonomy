@@ -79,12 +79,46 @@ all) against one full batch (maximum padding).
 
 `normalize_activations` applies when a view is assembled, not when activations
 are stored. Raw activations go to disk; normalization is part of a surrogate's
-identity. A normalized and an unnormalized view of the same run coexist without
-re-running inference.
+identity. Differently normalized views of the same run coexist without re-running
+inference.
 
-When on (the default), each row of the concatenation is divided by its L2 norm,
-which makes `G[i,i] = 1` in the `gram` view and makes distances depend on the
-direction of activations rather than their magnitude.
+| Mode | What it does |
+|---|---|
+| `"layer"` **(default)** | Row-normalize each `(mode, layer)` block, concatenate, normalize the row again. Every layer contributes equally. |
+| `"global"` | Concatenate first, normalize the row once. Layers contribute in proportion to their own activation scale. |
+| `"none"` | The raw concatenation. |
+
+Bools still work: `true → "layer"`, `false → "none"`. They are canonicalized
+before the surrogate hash, so `true` and `"layer"` are one entry, not two.
+
+Rows are unit-norm under both `layer` and `global`, so `G[i,i] = 1` in the `gram`
+view either way and distances depend on direction rather than magnitude.
+
+### Why `layer` is the default
+
+Under `global`, how much a layer counts is an accident of its activation scale.
+Measured on Llama-3.2-3B, mean-pooled over 64 queries, that is less dramatic than
+the usual "deep layers dominate" story but not harmless:
+
+```
+mean row norm     layer  0:   0.36     share of squared norm: 0.0000
+                  layer  1:   2.41                            0.0001
+                  layer  2:  56.13                            0.0322
+                  ...
+                  layer 27:  70.64                            0.0511
+                  layer 28:  59.65                            0.0364
+```
+
+The transformer blocks sit within ~1.6× of each other, so they are not badly
+skewed. **The embedding layer and layer 1 are two orders of magnitude smaller**,
+and under `global` they contribute essentially nothing — the concatenation is
+labelled "all layers" but measures 27 of them. Under `layer` all 29 count equally.
+
+Read that as a trade rather than a free win: `layer` restores information `global`
+drops, and it also amplifies a near-zero-norm layer, and whatever noise it
+carries, up to parity. On the five-adapter smoke run the two modes' distance
+matrices correlate at **r = 0.993**, so this is a change in emphasis, not a
+different measurement.
 
 ## `layer_indices`
 
@@ -111,7 +145,8 @@ taxonomy = FunctionalTaxonomy(
     batch_size=16,
     torch_dtype=torch.float16,
     pooling="mean",
-    normalize_activations=True,           # read-time; part of the surrogate key
+    normalize_activations="layer",        # layer | global | none; read-time,
+                                          # and part of the surrogate key
     activation_mode="input",
     max_new_tokens=32,                    # used when mode != "input"
     view="concat",

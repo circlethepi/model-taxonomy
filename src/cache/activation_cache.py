@@ -73,8 +73,39 @@ class ActivationCache:
     Everything that changes the stored numbers — mode, pooling, and the token
     budget for generation — is in the filename.  Normalization is *not*: raw
     activations are stored and normalization is a property of a surrogate, so
-    normalized and unnormalized views coexist without re-running inference.
+    differently normalized views coexist without re-running inference.
+
+    Normalization has two modes, both applied to *rows* (a row is a query):
+
+    ``layer`` (the default)
+        Normalize each ``(mode, layer)`` block's rows, concatenate, then
+        normalize the row again.  Every layer contributes equally to a dot
+        product.
+    ``global``
+        Concatenate first, normalize the row once.  Layers then contribute in
+        proportion to their own scale.
+
+    ``layer`` is the default because under ``global`` a layer's weight in the
+    comparison is an accident of its activation scale rather than a choice.
+    **Measured** on Llama-3.2-3B, mean-pooled over 64 queries: the transformer
+    blocks are within ~1.6x of each other (row norms 56 → 71, rising with depth),
+    so mid-and-late layers are *not* badly skewed — but the **embedding layer and
+    layer 1 are two orders of magnitude smaller** (0.36 and 2.41), giving them
+    shares of 0.00% and 0.01% of a row's squared norm.  Under ``global`` those
+    two layers are effectively absent from the comparison; under ``layer`` they
+    are full members at 1/29 each.
+
+    That cuts both ways, so it is worth knowing which you asked for: ``layer``
+    includes information ``global`` silently drops, and equally it amplifies a
+    near-zero-norm layer — and whatever noise it carries — up to parity.
+
+    ``none`` stores the raw concatenation.  See ``docs/notes/gram_and_cka.md``.
     """
+
+    #: Accepted normalization modes.  Bools are accepted too and canonicalized
+    #: by :meth:`_canon_normalize`, so ``True`` and ``"layer"`` cannot produce
+    #: two surrogates for one request.
+    NORM_MODES = frozenset({"layer", "global", "none"})
 
     #: Views that are kernel matrices rather than feature matrices.  Handing one
     #: to a metric that forms its own kernel computes a different quantity
@@ -150,6 +181,25 @@ class ActivationCache:
         """16-char SHA-256 prefix identifying a config dict."""
         payload = json.dumps(config, sort_keys=True, default=str).encode()
         return hashlib.sha256(payload).hexdigest()[:16]
+
+    @classmethod
+    def canon_normalize(cls, normalize: str | bool) -> str:
+        """One spelling per normalization request.
+
+        ``normalize=True`` and ``normalize="layer"`` are the same thing asked
+        two ways.  They must reach the surrogate spec identically or they hash
+        differently and the same view is computed and stored twice.
+        """
+        if normalize is True:
+            return "layer"
+        if normalize is False:
+            return "none"
+        if normalize in cls.NORM_MODES:
+            return str(normalize)
+        raise ValueError(
+            f"unknown normalize {normalize!r}; expected one of "
+            f"{sorted(cls.NORM_MODES)}, or a bool (True→'layer', False→'none')"
+        )
 
     # ------------------------------------------------------------------
     # Existence
@@ -385,19 +435,22 @@ class ActivationCache:
         pooling: str = "mean",
         layers: list[int] | None = None,
         view: str = "concat",
-        normalize: bool = True,
+        normalize: str | bool = "layer",
         max_new_tokens: int | None = None,
     ) -> ModelRepresentation:
         """A model's functional representation, defaulting to the concatenated view.
 
         With no arguments beyond the model key and draw this returns the
         concatenation across **all stored layers** of ``input``-mode mean-pooled
-        activations — ``(n_queries, L·d)``, row *i* being query *i*.
+        activations — ``(n_queries, L·d)``, row *i* being query *i* —
+        layer-normalized, so every layer weighs the same.
 
         Views are resolved through ``surrogates/`` first and computed only on a
         miss, then written back, so a given ``(draw, mode, pooling, layers, view,
         normalize)`` is computed at most once.
         """
+        normalize = self.canon_normalize(normalize)
+
         if mode == "both":
             stored_modes = ["input", "generation"]
         else:
@@ -464,26 +517,35 @@ class ActivationCache:
         resolved: dict[str, list[int]],
         pooling: str,
         view: str,
-        normalize: bool,
+        normalize: str,
         max_new_tokens: int | None,
     ) -> np.ndarray:
         """Concatenate the requested layers, then apply the view.
 
         ``both`` concatenates the input and generation halves along the feature
         axis, so a row stays one query.
+
+        Under ``normalize="layer"`` each block is row-normalized *before* the
+        concatenation, which is what equalizes the layers; the row is then
+        normalized again so the result is unit-norm either way, and ``gram``'s
+        diagonal is 1 under both modes.  Blocks are per ``(mode, layer)``, so an
+        input-mode and a generation-mode block of the same layer are scaled
+        independently — they have no reason to share a scale.
         """
         blocks: list[np.ndarray] = []
         for m, lays in resolved.items():
             per_layer = self.load_layers(
                 base_model_id, adapter_id, query_key, m, pooling, lays, max_new_tokens
             )
-            blocks.extend(per_layer[ell] for ell in sorted(per_layer))
+            blocks.extend(per_layer[ell].astype(np.float64) for ell in sorted(per_layer))
 
-        H = np.concatenate([b.astype(np.float64) for b in blocks], axis=1)
+        if normalize == "layer":
+            blocks = [_row_normalize(b) for b in blocks]
 
-        if normalize:
-            norms = np.linalg.norm(H, axis=1, keepdims=True)
-            H = H / np.where(norms < 1e-12, 1.0, norms)
+        H = np.concatenate(blocks, axis=1)
+
+        if normalize in ("layer", "global"):
+            H = _row_normalize(H)
 
         if view == "concat":
             return H.astype(np.float32)
@@ -562,6 +624,16 @@ class ActivationCache:
         if not adapter_dir.exists():
             return False
         return any(adapter_dir.glob("*/*/activations/*.safetensors"))
+
+
+def _row_normalize(m: np.ndarray) -> np.ndarray:
+    """L2-normalize each row, leaving zero rows at zero rather than NaN.
+
+    Applied at two scales — per layer block and to the whole concatenation — so
+    it is a helper rather than an inline expression.
+    """
+    norms = np.linalg.norm(m, axis=1, keepdims=True)
+    return m / np.where(norms < 1e-12, 1.0, norms)
 
 
 def _atomic_write_json(path: Path, payload: dict) -> None:

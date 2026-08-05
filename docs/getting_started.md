@@ -26,7 +26,7 @@ pip install submitit
 
 ## Minimal example
 
-The following runs a full functional analysis on three small public models using activation Gram matrices, CKA distances, and MDS coordinates. No GPU is required for tiny models.
+The following runs a full functional analysis on three small public models using pooled layer activations, CKA distances, and MDS coordinates. No GPU is required for tiny models.
 
 ```python
 from src import (

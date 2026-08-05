@@ -27,7 +27,7 @@ from scripts._utils import (
     get_cache_dir,
     hf_token,
     resolve_model_ids,
-    make_repr_cache,
+    make_activation_cache,
     make_generated_text_cache,
     make_queries,
     make_functional_taxonomy,
@@ -109,23 +109,28 @@ def run_taxonomy(cfg: dict, only_taxonomies: list[str] | None = None) -> ModelTa
     # ── Functional ─────────────────────────────────────────────────────────────
     if "functional" in configured_taxonomies:
         print("\n  [functional]")
-        queries, _ = make_queries(cfg)
+        queries, query_key = make_queries(cfg)
         taxonomy = make_functional_taxonomy(
-            cfg, queries, cache=make_repr_cache(cache_dir, "functional")
+            cfg, queries, query_key, cache=make_activation_cache(cache_dir)
         )
         metric_names = _to_list(metrics_cfg.get("functional", "cka"))
 
-        for metric_name in metric_names:
-            metric = make_metric(metric_name)
-            analyzer = TaxonomyAnalyzer(taxonomy, metric, backend)
-            analysis = analyzer.fit(model_ids)
+        try:
+            for metric_name in metric_names:
+                metric = make_metric(metric_name)
+                analyzer = TaxonomyAnalyzer(taxonomy, metric, backend)
+                analysis = analyzer.fit(model_ids)
 
-            _add_geometries(analysis, geometry_names, dims, metric_name)
+                _add_geometries(analysis, geometry_names, dims, metric_name)
 
-            if len(metric_names) > 1:
-                analysis.taxonomy_name = f"functional_{metric_name}"
+                if len(metric_names) > 1:
+                    analysis.taxonomy_name = f"functional_{metric_name}"
 
-            profile.add(analysis)
+                profile.add(analysis)
+        finally:
+            # Base model held across extractions, freed once — see
+            # HFInferenceTaxonomy.close.
+            taxonomy.close()
 
     # ── Behavioral ─────────────────────────────────────────────────────────────
     if "behavioral" in configured_taxonomies:

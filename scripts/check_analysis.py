@@ -1031,6 +1031,16 @@ def t_comparison_end_to_end():
             tokens.append("behavioral_repr")
             taxonomies.append("behavioral")
 
+    # Functional joins on the same terms, and for the same reason: a slice with a
+    # gap would build a matrix and then fail on it, reporting FAIL where the
+    # honest answer is "that model was never extracted".
+    if (root / "04_activations").exists():
+        candidate = index.with_available(*tokens, "functional_repr")
+        cand_slices = candidate.slices(("n_samples", "seed"))
+        if cand_slices and len(cand_slices[max(cand_slices)]) >= 3:
+            tokens.append("functional_repr")
+            taxonomies.append("functional")
+
     index = index.with_available(*tokens)
     slices = index.slices(("n_samples", "seed"))
     if not slices:
@@ -1684,6 +1694,554 @@ def t_behavioral_batch_invariance():
     )
 
 
+# ── functional taxonomy ───────────────────────────────────────────────────────
+
+_QK = {"recipe_hash": "04a65e58df502e45", "n_samples": 6, "seed": 0}
+_BASE = "meta-llama/Llama-3.2-3B"
+_ADAPTER = "/cache/03_adapters/meta-llama--Llama-3.2-3B/yahoo_050t0_050t1_n1000_s00_r16_i00"
+
+
+def _seeded_layers(n_queries=6, d=4, layers=(0, 1, 2), seed=7):
+    rng = np.random.default_rng(seed)
+    return {ell: rng.normal(size=(n_queries, d)).astype(np.float32) for ell in layers}
+
+
+@check("functional: ActivationCache round-trips per-layer tensors and is additive")
+def t_activation_cache_roundtrip():
+    """Storing one file per (mode, pooling, layer) is what makes writes additive.
+
+    A later run that adds a mode, or adds layers, must never rewrite what is
+    already there — that is the property the model-wise layout exists for.
+    """
+    import tempfile
+    from src.cache.activation_cache import ActivationCache
+
+    layers = _seeded_layers()
+    with tempfile.TemporaryDirectory() as td:
+        cache = ActivationCache(td)
+        cfg = {"taxonomy": "functional", "query_key": _QK, "pooling": "mean"}
+        cache.save_activations(
+            _BASE, _ADAPTER, _QK, "input", "mean", layers,
+            config=cfg, run_metadata={"n_hidden_states": 3, "batch_size": 2},
+            source_indices=[[0, i] for i in range(6)],
+        )
+
+        assert cache.list_layers(_BASE, _ADAPTER, _QK, "input", "mean") == [0, 1, 2]
+        got = cache.load_layers(_BASE, _ADAPTER, _QK, "input", "mean")
+        for ell, arr in layers.items():
+            assert np.array_equal(got[ell], arr), f"layer {ell} changed across the round trip"
+            assert got[ell].dtype == np.float32, got[ell].dtype
+
+        # queries.json records indices, not text: 01_datasets is canonical and
+        # (recipe_hash, n, seed) already determines the strings.
+        q = cache.load_queries(_BASE, _ADAPTER, _QK)
+        assert "queries" not in q, "query text is duplicated into the activation cache"
+        assert len(q["source_indices"]) == 6, q
+        assert q["query_key"]["recipe_hash"] == _QK["recipe_hash"]
+
+        runs = cache.list_runs(_BASE, _ADAPTER, _QK)
+        assert len(runs) == 1, runs
+        rec = cache.load_config(_BASE, _ADAPTER, _QK, runs[0])
+        assert rec["resolved_layers"] == [0, 1, 2], rec
+        # batch_size is provenance, deliberately outside config_dict so it does
+        # not fragment the cache — but it must still be recorded.
+        assert rec["batch_size"] == 2 and rec["n_hidden_states"] == 3, rec
+
+        # Additive: a second mode lands beside the first, touching nothing.
+        cache.save_activations(
+            _BASE, _ADAPTER, _QK, "generation", "mean", _seeded_layers(seed=8),
+            max_new_tokens=32, config=dict(cfg, activation_mode="generation"),
+        )
+        assert cache.list_layers(_BASE, _ADAPTER, _QK, "input", "mean") == [0, 1, 2]
+        assert cache.list_layers(
+            _BASE, _ADAPTER, _QK, "generation", "mean", 32
+        ) == [0, 1, 2]
+        after = cache.load_layers(_BASE, _ADAPTER, _QK, "input", "mean")
+        assert np.array_equal(after[0], layers[0]), "adding a mode rewrote input activations"
+
+        # Generation carries its token budget in the name: 32 and 128 tokens are
+        # different vectors and must not overwrite each other.
+        assert cache.list_layers(_BASE, _ADAPTER, _QK, "generation", "mean", 128) == []
+
+        # Negative indices must never reach disk, or -1 and 28 become two files.
+        try:
+            cache.activation_path(_BASE, _ADAPTER, _QK, "input", "mean", -1)
+        except ValueError as e:
+            assert "negative" in str(e), e
+        else:
+            raise AssertionError("a negative layer index was accepted as a filename")
+
+        assert cache.has_draw(_BASE, _ADAPTER, _QK) and cache.has_any(_BASE, _ADAPTER)
+    return "per-(mode,pooling,layer) round trip, additive writes, indices not text"
+
+
+@check("functional: views are computed once and written back")
+def t_activation_surrogate_writeback():
+    """A view is derived, but deriving it twice is waste, so it is cached.
+
+    Asserted on disk and through the ``surrogate_cached`` flag rather than by
+    timing, which would be flaky.
+    """
+    import tempfile
+    from src.cache.activation_cache import ActivationCache
+
+    layers = _seeded_layers()
+    with tempfile.TemporaryDirectory() as td:
+        cache = ActivationCache(td)
+        cache.save_activations(
+            _BASE, _ADAPTER, _QK, "input", "mean", layers,
+            config={"taxonomy": "functional"}, run_metadata={"n_hidden_states": 3},
+        )
+
+        first = cache.load(_BASE, _ADAPTER, _QK)
+        assert first.metadata["surrogate_cached"] is False, "reported a hit on a cold cache"
+
+        sdir = cache.draw_dir(_BASE, _ADAPTER, _QK) / "surrogates"
+        stored = list(sdir.glob("*/surrogate.safetensors"))
+        assert len(stored) == 1, f"expected one surrogate on disk, found {len(stored)}"
+
+        second = cache.load(_BASE, _ADAPTER, _QK)
+        assert second.metadata["surrogate_cached"] is True, "recomputed instead of reading back"
+        assert np.array_equal(first.matrix, second.matrix), "cached view differs from computed"
+
+        # A different view is a different surrogate, not an overwrite.
+        gram = cache.load(_BASE, _ADAPTER, _QK, view="gram")
+        assert len(list(sdir.glob("*/surrogate.safetensors"))) == 2
+        assert gram.metadata["is_kernel"] is True, gram.metadata
+        assert first.metadata["is_kernel"] is False, first.metadata
+
+        # So is a different normalize setting — which is why normalization is a
+        # property of a surrogate rather than of the extraction.
+        cache.load(_BASE, _ADAPTER, _QK, normalize=False)
+        assert len(list(sdir.glob("*/surrogate.safetensors"))) == 3
+
+        # ...and the two normalization *modes* are keyed apart from each other,
+        # not just from "off".
+        cache.load(_BASE, _ADAPTER, _QK, normalize="global")
+        assert len(list(sdir.glob("*/surrogate.safetensors"))) == 4
+    return "computed once, read back on the second call; view and each normalize mode keyed separately"
+
+
+@check("functional: concat and gram views agree with the stored layers")
+def t_activation_view_equivalence():
+    """The default view must be exactly the concatenation, and gram its Gram.
+
+    Rows are **queries** in both.  An older form stacked per-layer Gram triangles,
+    making a row a *layer*; that is a different object and is not what CKA on a
+    query set means.
+    """
+    import tempfile
+    from src.cache.activation_cache import ActivationCache
+
+    layers = _seeded_layers(n_queries=6, d=4, layers=(0, 1, 2))
+    with tempfile.TemporaryDirectory() as td:
+        cache = ActivationCache(td)
+        cache.save_activations(
+            _BASE, _ADAPTER, _QK, "input", "mean", layers,
+            config={"taxonomy": "functional"}, run_metadata={"n_hidden_states": 3},
+        )
+
+        raw = cache.load_layers(_BASE, _ADAPTER, _QK, "input", "mean")
+        blocks = [raw[ell].astype(np.float64) for ell in sorted(raw)]
+        H = np.concatenate(blocks, axis=1)
+
+        def rn(m):
+            n = np.linalg.norm(m, axis=1, keepdims=True)
+            return m / np.where(n < 1e-12, 1.0, n)
+
+        # The default is layerwise: normalize each layer, concatenate, renormalize.
+        Hl = rn(np.concatenate([rn(b) for b in blocks], axis=1))
+
+        concat = cache.load(_BASE, _ADAPTER, _QK).matrix
+        assert concat.shape == (6, 12), concat.shape
+        assert np.allclose(concat, Hl, atol=1e-6), "default concat view is not the layerwise concatenation"
+
+        # global stays reachable and unchanged: concatenate first, normalize once.
+        glob = cache.load(_BASE, _ADAPTER, _QK, normalize="global").matrix
+        assert np.allclose(glob, rn(H), atol=1e-6), "global view is not the normalized concatenation"
+
+        gram = cache.load(_BASE, _ADAPTER, _QK, view="gram").matrix
+        assert gram.shape == (6, 6), f"gram must be (n_queries, n_queries), got {gram.shape}"
+        assert np.allclose(gram, Hl @ Hl.T, atol=1e-5), "gram is not H Hᵀ of the concatenation"
+        # The final row renorm is what buys this, under either mode.
+        assert np.allclose(np.diag(gram), 1.0, atol=1e-5), np.diag(gram)
+
+        # A layer subset is a read-time choice and must not need a new run.
+        sub = cache.load(_BASE, _ADAPTER, _QK, layers=[0, 2]).matrix
+        assert sub.shape == (6, 8), sub.shape
+
+        raw_unnorm = cache.load(_BASE, _ADAPTER, _QK, normalize="none").matrix
+        assert np.allclose(raw_unnorm, H, atol=1e-5), "unnormalized view is not the raw concatenation"
+    return "concat=(6,12) is the layerwise concatenation; global unchanged; gram=(6,6) with unit diagonal"
+
+
+@check("functional: layerwise normalization equalizes each layer's contribution")
+def t_activation_layerwise_normalization():
+    """The point of ``layer`` is that no layer can dominate the dot product.
+
+    Asserted through the property that distinguishes the two modes — how much of
+    a row's squared norm each layer block owns — rather than by reimplementing
+    the formula, which would only restate the code.
+
+    The setup is the real failure case in miniature: residual-stream norms grow
+    with depth, so in a 29-layer concatenation the last layers own nearly all of
+    each row and ``concat`` silently stops being a measurement of all of them.
+    """
+    import tempfile
+    from src.cache.activation_cache import ActivationCache
+
+    d = 4
+    layers = _seeded_layers(n_queries=5, d=d, layers=(0, 1, 2))
+    layers[2] = layers[2] * 100.0          # one layer 100x the scale of the others
+
+    def shares(M):
+        """Fraction of each row's squared norm owned by each layer block."""
+        sq = np.stack([(M[:, i * d:(i + 1) * d] ** 2).sum(axis=1) for i in range(3)], axis=1)
+        return sq / sq.sum(axis=1, keepdims=True)
+
+    with tempfile.TemporaryDirectory() as td:
+        cache = ActivationCache(td)
+        cache.save_activations(
+            _BASE, _ADAPTER, _QK, "input", "mean", layers,
+            config={"taxonomy": "functional"}, run_metadata={"n_hidden_states": 3},
+        )
+
+        g = cache.load(_BASE, _ADAPTER, _QK, normalize="global").matrix
+        gs = shares(g)
+        assert gs[:, 2].min() > 0.99, (
+            f"global should let the 100x layer dominate; its smallest share is {gs[:, 2].min():.4f}"
+        )
+
+        lay = cache.load(_BASE, _ADAPTER, _QK, normalize="layer").matrix
+        ls = shares(lay)
+        assert np.allclose(ls, 1 / 3, atol=1e-6), f"layerwise shares are not equal:\n{ls}"
+
+        # Rows stay unit-norm under both, which is what keeps gram's diagonal 1.
+        for name, M in (("global", g), ("layer", lay)):
+            assert np.allclose(np.linalg.norm(M, axis=1), 1.0, atol=1e-6), name
+
+        none = cache.load(_BASE, _ADAPTER, _QK, normalize="none").matrix
+        raw = cache.load_layers(_BASE, _ADAPTER, _QK, "input", "mean")
+        H = np.concatenate([raw[i] for i in sorted(raw)], axis=1)
+        assert np.allclose(none, H, atol=1e-5), "none is not the raw concatenation"
+
+        # True and "layer" are one request spelled two ways: same array, and one
+        # surrogate between them rather than two identical files on disk.
+        sdir = cache.draw_dir(_BASE, _ADAPTER, _QK) / "surrogates"
+        before = len(list(sdir.glob("*/surrogate.safetensors")))
+        boolean = cache.load(_BASE, _ADAPTER, _QK, normalize=True)
+        assert np.array_equal(boolean.matrix, lay), "normalize=True differs from 'layer'"
+        assert boolean.metadata["normalize"] == "layer", boolean.metadata["normalize"]
+        assert len(list(sdir.glob("*/surrogate.safetensors"))) == before, (
+            "normalize=True stored a second copy of the layer surrogate"
+        )
+
+        try:
+            cache.load(_BASE, _ADAPTER, _QK, normalize="layerwise")
+        except ValueError as exc:
+            assert "layerwise" in str(exc), str(exc)
+        else:
+            raise AssertionError("an unknown normalize mode was accepted")
+    return "global gives the 100x layer >0.99 of each row; layer gives every layer exactly 1/3"
+
+
+@check("functional: the taxonomy pins left padding")
+def t_functional_padding_side():
+    """Shared with behavioral, but load-bearing here for a different reason.
+
+    With left padding the last real token sits at index -1, so ``last_token``
+    pooling needs no mask arithmetic to find it.  The pin now lives on the shared
+    base class, so this also catches the extraction going wrong.
+    """
+    import inspect
+    from src.taxonomy.functional import FunctionalTaxonomy
+
+    src = inspect.getsource(FunctionalTaxonomy._load_tokenizer)
+    assert 'padding_side = "left"' in src, "FunctionalTaxonomy no longer pins padding_side"
+    return "padding_side='left' pinned via HFInferenceTaxonomy"
+
+
+@check("functional: pooling ignores padding, so a vector depends only on its query")
+def t_functional_mask_pooling():
+    """The property that makes a representation reproducible.
+
+    ``padding=True`` pads each batch to *its own* longest sequence, so an unmasked
+    mean averages in pad-position hidden states — which are not zero, since the
+    model computes a residual-stream vector at every position — and how many a
+    query gets depends on which other queries share its batch.  Pooling would then
+    shift with ``batch_size`` or query order, and the cache could not notice,
+    because neither is part of the key.
+
+    Runs on hand-built tensors: no model, no GPU, milliseconds.
+    """
+    import torch
+    from src.taxonomy.functional import FunctionalTaxonomy
+
+    tax = FunctionalTaxonomy(queries=["a"], query_key=_QK, cache=object())
+
+    # One real token then padding, versus the same real token alone.  Left padding
+    # in production; both orders checked so the masking is not accidentally
+    # position-specific.
+    real = torch.tensor([[1.0, 2.0], [3.0, 4.0]])          # 2 real positions
+    junk = torch.tensor([[99.0, -99.0], [50.0, -50.0]])    # pad-position states
+
+    padded = torch.cat([junk, real], dim=0).unsqueeze(0)   # (1, 4, 2), left-padded
+    mask = torch.tensor([[0, 0, 1, 1]])
+    unpadded = real.unsqueeze(0)
+    full_mask = torch.tensor([[1, 1]])
+
+    for pooling in ("mean", "last_token", "cls"):
+        tax.pooling = pooling
+        a = tax._pool(padded, mask)
+        b = tax._pool(unpadded, full_mask)
+        assert torch.allclose(a, b), (
+            f"{pooling}: padded {a.tolist()} != unpadded {b.tolist()} — pooling is "
+            "reading pad positions, so the vector depends on batch composition"
+        )
+
+    # And confirm the unmasked mean really would differ, so this check has teeth.
+    naive = padded.mean(dim=1)
+    assert not torch.allclose(naive, real.mean(dim=0, keepdim=True)), (
+        "the fixture has no padding contamination to detect; the check proves nothing"
+    )
+
+    # Batch with mixed lengths: row 0 padded, row 1 full.
+    batch = torch.stack([torch.cat([junk[:1], real], dim=0),
+                         torch.cat([real, junk[:1]], dim=0)])
+    bmask = torch.tensor([[0, 1, 1], [1, 1, 0]])
+    tax.pooling = "mean"
+    pooled = tax._pool(batch, bmask)
+    assert torch.allclose(pooled[0], real.mean(dim=0)), pooled[0]
+    assert torch.allclose(pooled[1], real.mean(dim=0)), pooled[1]
+    return "mean/last_token/cls all mask-aware; unmasked mean provably differs"
+
+
+@check("functional: CKA refuses row counts its estimator cannot support")
+def t_cka_row_guard():
+    """The unbiased HSIC estimator divides by n(n-3).
+
+    Measured before the guard: 3 rows → **NaN**, 4 → 1.0, 8 → 0.985.  A NaN
+    returned here flows into a distance matrix and then into an MDS fit, where it
+    is much harder to trace back.  Raising names the cause at the point it occurs.
+    """
+    from src.core.representation import ModelRepresentation
+    from src.metrics.cka import CKADistanceMetric
+
+    rng = np.random.default_rng(0)
+
+    def rep(n, name="a", **meta):
+        return ModelRepresentation(
+            model_id=name, taxonomy="functional",
+            matrix=rng.normal(size=(n, 5)).astype(np.float32), metadata=meta,
+        )
+
+    try:
+        CKADistanceMetric().compute(rep(3, "a"), rep(3, "b"))
+    except ValueError as e:
+        assert "4" in str(e) and "unbiased" in str(e), e
+    else:
+        raise AssertionError("3 rows accepted; this returns NaN into a distance matrix")
+
+    vals = {}
+    for n in (4, 8):
+        v = CKADistanceMetric().compute(rep(n, "a"), rep(n, "b"))
+        assert np.isfinite(v) and 0.0 <= v <= 2.0, f"n={n}: {v}"
+        vals[n] = v
+
+    # The escape hatch the error message advertises has to actually work.
+    small = CKADistanceMetric(unbiased=False).compute(rep(3, "a"), rep(3, "b"))
+    assert np.isfinite(small), f"unbiased=False still degenerate at n=3: {small}"
+
+    # The guard must not have changed the metric itself.
+    same = rep(8, "a")
+    assert abs(CKADistanceMetric().compute(same, same)) < 1e-9
+
+    # A stored Gram is a kernel; CKA forms its own, so passing one computes
+    # (H Hᵀ)² silently.  Refuse instead.
+    try:
+        CKADistanceMetric().compute(rep(8, "a", is_kernel=True, view="gram"), rep(8, "b"))
+    except ValueError as e:
+        assert "kernel" in str(e), e
+    else:
+        raise AssertionError("a kernel matrix was accepted as a feature matrix")
+    return f"n=3 raises, n=4 → {vals[4]:.3f}, n=8 → {vals[8]:.3f}, unbiased=False works, gram refused"
+
+
+def _activation_cache_or_skip():
+    from src.cache.activation_cache import ActivationCache
+
+    root = REPO / "results/shared_cache"
+    if not (root / "04_activations").exists():
+        raise _Skip(f"{root / '04_activations'} not present — functional has not been run")
+    cache = ActivationCache(root)
+    models = cache.list_models()
+    if not models:
+        raise _Skip("04_activations exists but holds no models")
+    return cache, models
+
+
+@check("[data] functional: cached representations are well formed")
+def t_functional_reps_well_formed():
+    cache, models = _activation_cache_or_skip()
+
+    checked, shapes, draws_seen = 0, set(), set()
+    for base_slug, adapter in models:
+        base_id = base_slug.replace("--", "/")
+        for draw in cache.list_draws(base_id, adapter):
+            draws_seen.add((draw["recipe_hash"], draw["n_samples"], draw["seed"]))
+            stored = cache.list_layers(base_id, adapter, draw, "input", "mean")
+            if not stored:
+                continue
+            per_layer = cache.load_layers(base_id, adapter, draw, "input", "mean")
+            for ell, arr in per_layer.items():
+                assert arr.dtype == np.float32, f"{adapter} L{ell}: dtype {arr.dtype}"
+                assert arr.ndim == 2, f"{adapter} L{ell}: shape {arr.shape}"
+                assert arr.shape[0] == draw["n_samples"], (
+                    f"{adapter} L{ell}: {arr.shape[0]} rows for an n={draw['n_samples']} draw"
+                )
+                assert np.isfinite(arr).all(), f"{adapter} L{ell}: non-finite values"
+                shapes.add(arr.shape)
+
+            # Layers must be stored under resolved absolute indices.
+            assert all(ell >= 0 for ell in stored), stored
+            runs = cache.list_runs(base_id, adapter, draw)
+            assert runs, f"{adapter}: activations with no run record"
+            rec = cache.load_config(base_id, adapter, draw, runs[0])
+            assert rec["config"]["taxonomy"] == "functional", rec["config"]
+            assert rec["config"]["query_key"]["recipe_hash"] == draw["recipe_hash"]
+            n_hidden = rec.get("n_hidden_states")
+            assert n_hidden and max(stored) < n_hidden, (stored, n_hidden)
+
+            # The default view must assemble and be usable as a feature matrix.
+            rep = cache.load(base_id, adapter, draw)
+            assert rep.matrix.shape[0] == draw["n_samples"], rep.matrix.shape
+            assert rep.matrix.shape[1] == sum(
+                per_layer[ell].shape[1] for ell in sorted(per_layer)
+            ), rep.matrix.shape
+            assert np.isfinite(rep.matrix).all()
+            assert rep.metadata["is_kernel"] is False
+            checked += 1
+
+    if not checked:
+        raise _Skip("04_activations holds no readable draws")
+    return (
+        f"{checked} model-draw(s), {len(draws_seen)} draw(s), per-layer shapes "
+        f"{sorted(shapes)[:3]}"
+    )
+
+
+@check("[gpu] functional: input-mode activations are invariant to batch size")
+def t_functional_batch_invariance():
+    """The measurement `docs/notes/functional_behavioral.md` asks for.
+
+    Unlike the behavioral equivalent this can be tight.  ``input`` mode runs no
+    ``generate`` call, so there is no greedy argmax to flip on a near-tie; the
+    only source of disagreement is fp16 matmul tiling. What batching *would*
+    change, if pooling read pad positions, is the pooled vector itself — and by a
+    lot, since pad-position hidden states are not small.
+
+    So: batch 1 (no padding at all) versus one full batch (maximum padding).  A
+    per-row cosine below 0.999 means pooling is contaminated by padding, not that
+    fp16 is noisy.  **This is expected to fail without mask-aware pooling**, which
+    is why the fix and this check landed together.
+    """
+    import torch
+
+    if not torch.cuda.is_available():
+        raise _Skip("no CUDA device available")
+
+    cache, models = _activation_cache_or_skip()
+    base_slug, adapter = models[0]
+    base_id = base_slug.replace("--", "/")
+    draws = cache.list_draws(base_id, adapter)
+    if not draws:
+        raise _Skip(f"{adapter} has no stored draws")
+    draw = draws[0]
+
+    runs = cache.list_runs(base_id, adapter, draw)
+    if not runs:
+        raise _Skip(f"{adapter} has no run record to replay")
+    rec = cache.load_config(base_id, adapter, draw, runs[0])
+    model_id = rec["config"].get("_model_id") or _model_id_for(base_id, adapter)
+    if model_id is None or not Path(model_id).exists():
+        raise _Skip(f"adapter directory for {adapter} is no longer on disk")
+
+    queries = _replay_queries(draw, limit=8)
+    if not queries:
+        raise _Skip("could not rehydrate the query draw to replay it")
+
+    from src.taxonomy.functional import FunctionalTaxonomy
+
+    dtype = torch.float16 if "float16" in str(rec["config"].get("torch_dtype", "")) else torch.float32
+    stored_layers = cache.list_layers(base_id, adapter, draw, "input", "mean")
+    probe = sorted(stored_layers)[-1:]  # last layer is the one comparisons read
+
+    def _run(batch_size: int):
+        tax = FunctionalTaxonomy(
+            queries=queries, layer_indices=probe, query_key=draw, cache=None,
+            batch_size=batch_size, torch_dtype=dtype, pooling="mean",
+        )
+        tax.cache = None
+        try:
+            model, shared = tax._get_model(model_id)
+            tok = tax._load_tokenizer(model_id, tax._resolve_base_model_id(model_id))
+            n_hidden = int(model.config.num_hidden_layers) + 1
+            layers = tax._resolve_layers(n_hidden)
+            out = []
+            for i in range(0, len(queries), batch_size):
+                got = tax._process_batch(model, tok, queries[i : i + batch_size], layers)
+                out.append(got["input"][layers[0]])
+            return np.concatenate(out, axis=0)
+        finally:
+            tax.close()
+
+    single = _run(1)                 # no padding at all
+    batched = _run(len(queries))     # one batch, maximum padding
+
+    num = (single * batched).sum(axis=1)
+    den = np.linalg.norm(single, axis=1) * np.linalg.norm(batched, axis=1)
+    cos = num / np.where(den < 1e-12, 1.0, den)
+    worst = float(cos.min())
+    delta = float(np.abs(single - batched).max())
+
+    assert worst > 0.999, (
+        f"per-row cosine drops to {worst:.5f} between batch 1 and batch "
+        f"{len(queries)}. fp16 tiling alone does not do that — pooling is almost "
+        "certainly averaging over pad positions, which makes a vector depend on "
+        "which queries shared its batch. Check FunctionalTaxonomy._pool."
+    )
+    return (
+        f"{len(queries)} queries on {torch.cuda.get_device_name(0)}: min per-row "
+        f"cosine {worst:.6f}, max|delta| {delta:.2e} (batch 1 vs {len(queries)})"
+    )
+
+
+def _model_id_for(base_id: str, adapter_slug_name: str) -> str | None:
+    """Locate the adapter directory an activation entry came from."""
+    d = REPO / "results/shared_cache/03_adapters" / base_id.replace("/", "--") / adapter_slug_name
+    return str(d) if d.exists() else None
+
+
+def _replay_queries(draw: dict, limit: int = 8) -> list[str]:
+    """Rehydrate a query draw from 01_datasets, or return [] if it cannot be."""
+    try:
+        from src.cache.sampled_dataset_cache import SampledDatasetCache
+
+        cache = SampledDatasetCache(REPO / "results/shared_cache")
+        rows = cache.get(draw["recipe_hash"], draw["n_samples"], draw["seed"])
+    except Exception:
+        return []
+    if not rows:
+        return []
+    out = []
+    for row in rows[:limit]:
+        for field in ("text", "question_title", "content", "question_content"):
+            if isinstance(row, dict) and row.get(field):
+                out.append(str(row[field]))
+                break
+    return out
+
+
 # ── entry point ───────────────────────────────────────────────────────────────
 
 SYNTHETIC = [
@@ -1703,17 +2261,25 @@ SYNTHETIC = [
     t_generated_cache_roundtrip, t_generated_cache_hash_stable, t_behavioral_padding_side,
     # embedder task prefixes: the model is misused without them, and the failure is silent
     t_embedder_prefix_resolved, t_embedder_prefix_in_cache_key,
+    # functional taxonomy: its cache, the views read off it, and the two
+    # properties a distance built from it depends on
+    t_activation_cache_roundtrip, t_activation_surrogate_writeback,
+    t_activation_view_equivalence, t_activation_layerwise_normalization,
+    t_functional_padding_side,
+    t_functional_mask_pooling, t_cka_row_guard,
 ]
 DATA_BACKED = [
     t_cosine_real_adapters, t_recovery, t_collection_roundtrip, t_cross_taxonomy,
     t_recipe_relabelling, t_scan_cache, t_comparison_end_to_end,
     t_cache_fully_migrated, t_behavioral_reps_well_formed,
+    t_functional_reps_well_formed,
 ]
 #: A third tier: real checks that need a GPU and a multi-GB model load, so they are
 #: too slow for a harness meant to run in seconds around every edit.  Off unless
 #: --include-gpu is passed, which the SLURM job does while the GPU is allocated.
 GPU_BACKED = [
     t_behavioral_batch_invariance,
+    t_functional_batch_invariance,
 ]
 
 

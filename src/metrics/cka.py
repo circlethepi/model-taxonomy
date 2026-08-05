@@ -43,6 +43,32 @@ class CKADistanceMetric(DistanceMetric):
                 f"Query count mismatch: {a.n_queries} vs {b.n_queries}. "
                 "Both representations must use the same query set."
             )
+        for rep in (a, b):
+            # A stored Gram matrix is a kernel, not a feature matrix.  This
+            # method forms K = X Xᵀ itself, so a Gram passed in here silently
+            # computes (H Hᵀ)² — a different quantity that still returns a
+            # plausible-looking number.  Linear CKA already forms exactly this
+            # Gram internally, so the feature matrix is what you want.
+            if rep.metadata.get("is_kernel"):
+                raise ValueError(
+                    f"{rep.model_id} is a kernel matrix "
+                    f"(view={rep.metadata.get('view')!r}), not a feature matrix. "
+                    "CKA forms its own kernel, so passing this computes (H Hᵀ)². "
+                    "Use view='concat'."
+                )
+
+        n = a.n_queries
+        if self.unbiased and n < 4:
+            # The unbiased HSIC estimator divides by n(n-3): n=3 is a division by
+            # zero (NaN, which would flow into a distance matrix unnoticed) and
+            # n=4 is degenerate.  Measured: 3 → nan, 4 → 1.0, 8 → 0.985.
+            raise ValueError(
+                f"CKA with the unbiased HSIC estimator needs at least 4 rows, got {n}. "
+                "The estimator divides by n(n-3), so n=3 is NaN and n=4 is degenerate. "
+                "Pass unbiased=False for small row counts, or compare a "
+                "representation whose rows are queries rather than layers."
+            )
+
         X = a.matrix.astype(np.float64)
         Y = b.matrix.astype(np.float64)
 

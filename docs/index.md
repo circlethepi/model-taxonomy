@@ -35,7 +35,7 @@ Collection of models
 | Taxonomy | What is compared | Status |
 |---|---|---|
 | **Behavioral** | Mean-embedded outputs over probe inputs | Implemented |
-| **Functional** | Gram matrices of internal activations per layer | Implemented |
+| **Functional** | Pooled internal activations per layer, over a shared query set | Implemented |
 | **Structural** | Weight matrices / LoRA adapter matrices | Implemented |
 | **Dataset Embedding** | Fine-tuning dataset text distribution | Implemented |
 | **Training Data** | Fine-tuning dataset distribution | Planned |
@@ -47,7 +47,8 @@ Collection of models
 | [Getting Started](getting_started.md) | Installation and a complete end-to-end example |
 | [Core Concepts](concepts.md) | Data model, pipeline, cache hierarchy, and design rationale |
 | [Behavioral Taxonomy](guides/behavioral_taxonomy.md) | Generated-output comparison, embedder strategies, probe design |
-| [Functional Taxonomy](guides/functional_taxonomy.md) | Activation modes (input / generation / both), Gram matrices, layer selection |
+| [Functional Taxonomy](guides/functional_taxonomy.md) | Activation modes (input / generation / both), read-time views, layer selection |
+| [Gram matrices and CKA](notes/gram_and_cka.md) | What a row means at each level, the two CKA implementations, and the kernel trap |
 | [Structural Taxonomy](guides/structural_taxonomy.md) | LoRA adapter cache, config.json schema, layer selection |
 | [Compute Backends](guides/compute_backends.md) | Local execution and SLURM cluster setup |
 | [Geometry Methods](guides/geometry_methods.md) | MDS, PCA, UMAP — when to use each |

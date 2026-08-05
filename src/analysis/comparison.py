@@ -101,6 +101,7 @@ def build_taxonomy_artifacts(
     projections: str | list[str] | None = None,
     embedder_hash: str | None = None,
     behavioral_config_hash: str | None = None,
+    functional_selector: dict | None = None,
     id_scheme: str = "recipe_id",
     mds_kwargs: Mapping[str, Any] | None = None,
 ) -> tuple[DistanceMatrix, dict[str, GeometryResult]]:
@@ -118,7 +119,7 @@ def build_taxonomy_artifacts(
     ==================  ==========================================  ==========================
     structural          LoRA A/B factors from the adapter files     low-rank builders
     dataset_embedding   ``DatasetEmbeddingCache``                   ``src.metrics`` pairwise
-    functional          ``DiskCache``                               ``src.metrics`` pairwise
+    functional          ``ActivationCache``                         ``src.metrics`` pairwise
     behavioral          ``GeneratedTextCache``                      ``src.metrics`` pairwise
     ==================  ==========================================  ==========================
 
@@ -142,6 +143,14 @@ def build_taxonomy_artifacts(
         keys on ``(ids, taxonomy, metric)`` only — as it already does for
         ``embedder_hash`` — so switching runs at one metric wants a fresh
         ``cache_root`` or a cleared entry.
+    functional_selector:
+        Which cached activations to read and how to view them:
+        ``{"draw", "mode", "pooling", "layers", "view", "normalize"}``, all
+        optional.  Functional is keyed by model rather than by run, so this is a
+        dict where behavioral takes a single hash.  ``layers`` is a read-time
+        choice — a run stores every layer — so changing it costs a surrogate
+        build, not a GPU pass.  The same collection-cache caveat as
+        ``behavioral_config_hash`` applies.
     id_scheme:
         ``"recipe_id"`` (default) keys the result by training recipe, which is the
         namespace every taxonomy shares.  Use ``"model_id"`` when a collection
@@ -168,6 +177,7 @@ def build_taxonomy_artifacts(
             index, taxonomy, metric, ids,
             layers=layers, projections=projections, embedder_hash=embedder_hash,
             behavioral_config_hash=behavioral_config_hash,
+            functional_selector=functional_selector,
         )
         if cache is not None:
             chash = cache.save_distance_matrix(
@@ -286,6 +296,7 @@ def _compute_distance_matrix(
     projections=None,
     embedder_hash: str | None = None,
     behavioral_config_hash: str | None = None,
+    functional_selector: dict | None = None,
 ) -> DistanceMatrix:
     if taxonomy == "structural":
         return _structural_matrix(index, metric, ids, layers, projections)
@@ -294,11 +305,7 @@ def _compute_distance_matrix(
     if taxonomy == "behavioral":
         return _behavioral_matrix(index, metric, ids, behavioral_config_hash)
     if taxonomy == "functional":
-        raise NotImplementedError(
-            f"the {taxonomy!r} taxonomy has no cached representations to read. "
-            "Run scripts/extract_reprs.py for it first, then re-run this "
-            "comparison; the other taxonomy levels are unaffected."
-        )
+        return _functional_matrix(index, metric, ids, functional_selector)
     raise ValueError(
         f"unknown taxonomy {taxonomy!r}. Choose from structural, "
         "dataset_embedding, functional, behavioral."
@@ -447,6 +454,107 @@ def _behavioral_matrix(
         metric=metric_obj.metric_name,
         taxonomy="behavioral",
     )
+
+
+def _functional_matrix(
+    index: CacheIndex, metric: Any, ids: Sequence[ModelID], selector: dict | None
+) -> DistanceMatrix:
+    """Pairwise distances over cached activations.
+
+    Unlike behavioral, functional is keyed by *model* rather than by run, so the
+    choice is not a single config hash.  A selector names the draw and the view::
+
+        {"draw": {"recipe_hash": ..., "n_samples": 64, "seed": 0},
+         "mode": "input", "pooling": "mean", "layers": None,
+         "view": "concat", "normalize": "layer"}   # layer | global | none
+
+    Every field has a default, and ``draw=None`` resolves to the one draw present
+    when there is exactly one — with the same "several exist, name one" error
+    behavioral raises, since two draws are different query sets and comparing
+    across them is meaningless rather than merely imprecise.
+    """
+    from src.cache.activation_cache import ActivationCache
+
+    root = index.cache_root
+    if root is None:
+        raise ValueError("index has no cache_root; cannot locate activations")
+
+    cache = ActivationCache(root)
+    sel = dict(selector or {})
+    mode = sel.get("mode", "input")
+    pooling = sel.get("pooling", "mean")
+    view = sel.get("view", "concat")
+    normalize = sel.get("normalize", "layer")
+    layers = sel.get("layers")
+    max_new_tokens = sel.get("max_new_tokens")
+
+    draw = sel.get("draw")
+    if draw is None:
+        draw = _functional_draw_choice(cache, index)
+
+    reps = []
+    for entry in index.entries:
+        base_id = entry.base_model_id
+        if not base_id:
+            raise ValueError(
+                f"{entry.adapter_name} has no base_model_id; activations are keyed "
+                "by (base model, adapter) and cannot be located without it"
+            )
+        try:
+            reps.append(
+                cache.load(
+                    base_id, entry.model_id, draw,
+                    mode=mode, pooling=pooling, layers=layers,
+                    view=view, normalize=normalize, max_new_tokens=max_new_tokens,
+                )
+            )
+        except FileNotFoundError as e:
+            raise ValueError(
+                f"no functional representation for {entry.adapter_name!r} under draw "
+                f"{ActivationCache.draw_name(draw)} ({mode}/{pooling}): {e}. "
+                "Filter with index.with_available('functional_repr')."
+            ) from None
+
+    metric_obj = _resolve_metric(metric)
+    n = len(reps)
+    arr = np.zeros((n, n), dtype=np.float64)
+    for i in range(n):
+        for j in range(i + 1, n):
+            arr[i, j] = arr[j, i] = metric_obj.compute(reps[i], reps[j])
+
+    return DistanceMatrix(
+        matrix=arr,
+        model_ids=list(ids),
+        metric=metric_obj.metric_name,
+        taxonomy="functional",
+    )
+
+
+def _functional_draw_choice(cache, index: CacheIndex) -> dict:
+    """The single draw every entry has activations under, or an error naming the options."""
+    per_entry = []
+    for entry in index.entries:
+        if not entry.base_model_id:
+            continue
+        draws = cache.list_draws(entry.base_model_id, entry.model_id)
+        per_entry.append({(d["recipe_hash"], d["n_samples"], d["seed"]) for d in draws})
+
+    shared = set.intersection(*per_entry) if per_entry else set()
+    if not shared:
+        raise ValueError(
+            "no single query draw has activations for every model in this "
+            "collection. Run scripts/extract_reprs.py --taxonomy functional, or "
+            "pass functional_selector={'draw': {...}} to name one."
+        )
+    if len(shared) > 1:
+        listed = sorted(f"{r}/n{n}_s{s:02d}" for r, n, s in shared)
+        raise ValueError(
+            f"{len(listed)} query draws are cached for every model: {listed}. "
+            "Different draws are different query sets and are not comparable, so "
+            "pass functional_selector={'draw': {...}} to choose one."
+        )
+    recipe_hash, n_samples, seed = next(iter(shared))
+    return {"recipe_hash": recipe_hash, "n_samples": n_samples, "seed": seed}
 
 
 def _draw_key(entry) -> tuple:

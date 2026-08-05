@@ -1,8 +1,30 @@
 # Functional and behavioral taxonomies: details still to work out
 
-**Status:** both levels are fully implemented and fully wired into the scripts, and
-neither has ever been run. Nothing below is a bug report — these are the details to
-settle and the things to look at when the first extraction happens.
+> **Status update (2026-08-03) — most of this note is now historical.**
+>
+> Both levels have run. Behavioral landed first (`05_generated/`,
+> `GeneratedTextCache`, `behavioral_repr`, `_behavioral_matrix`); functional
+> followed (`04_activations/`, `ActivationCache`, `functional_repr`,
+> `_functional_matrix`).
+>
+> **Open questions 1, 2 and 3 are closed** — see the resolution box at the head of
+> each. **Question 4 is still open** and is item 8 in [TODO.md](TODO.md).
+>
+> Of "things to check": item 1 (embedders pinned to CPU) was fixed; item 2
+> (functional does not pin padding side) is fixed — the pin now lives on the
+> shared `HFInferenceTaxonomy` base class; item 3 (pooling over padded positions)
+> is fixed and **measured** rather than assumed.
+>
+> The `gram` representation was **redefined** as part of this work: rows are
+> queries, not layers. That is documented in [gram_and_cka.md](gram_and_cka.md),
+> which is the note to read on Gram matrices and CKA.
+>
+> The original text is kept below because the reasoning behind each decision is
+> still the record of *why* things are the way they are.
+
+**Original status:** both levels are fully implemented and fully wired into the
+scripts, and neither has ever been run. Nothing below is a bug report — these are
+the details to settle and the things to look at when the first extraction happens.
 
 This note is written to be readable without the code open. Components are named and
 described where they first come up.
@@ -138,6 +160,24 @@ for some time after the cache migration added five.)
 
 ### 1. How should cache discovery report availability for a config-keyed cache?
 
+> **CLOSED.** The premise dissolved rather than the question being answered:
+> neither level uses `DiskCache` any more, so neither is config-keyed in the way
+> described below. Behavioral moved to `GeneratedTextCache`
+> (`05_generated/{config_hash}/…`) and functional to `ActivationCache`
+> (`04_activations/{base}/{adapter}/{recipe_hash}/n{n}_s{seed}/…`). Both make
+> availability a **file-existence test** again — option (a)'s uniformity without
+> its walk-and-read cost.
+>
+> Both tokens carry the **same honesty caveat**, documented on the `scan_cache`
+> arguments: given `behavioral_config_hash` / `functional_draw` the token is
+> exact; without one it degrades to "some representation exists, under some
+> config/draw", which is weaker than it looks, because a representation from a
+> different query set is not interchangeable. Pass the selector whenever the
+> answer will choose models for a comparison.
+>
+> Both checks ask the cache where its own files live rather than rebuilding the
+> path — `_sampled_rows_exist` is the counterexample still in the tree.
+
 The four existing availability tokens are answerable from the filesystem alone. For
 example `structural_weights` is just a file-existence test
 (`src/analysis/discovery.py:347`):
@@ -178,6 +218,32 @@ than it does for the other four tokens.
 
 ### 2. Which functional representation mode feeds the comparison, and how is it reduced?
 
+> **CLOSED — and the `gram` option below was redefined, not merely chosen between.**
+>
+> The `representation` parameter is gone. Extraction now stores **pooled per-layer
+> activations**, one `(n_queries, d)` file per `(mode, pooling, layer)`, and the
+> matrix handed to the comparison layer is a **view** assembled at read time. That
+> removes the "which mode do we extract in?" question entirely: both views come
+> from one run, and switching costs a surrogate build rather than a GPU pass.
+>
+> | view | shape | rows are |
+> |---|---|---|
+> | `concat` (**default**, feeds the metrics) | `(n_queries, L·d)` | queries |
+> | `gram` | `(n_queries, n_queries)` | queries |
+>
+> The old `gram` — stacked per-layer triangles, rows = **layers** — was dropped
+> rather than kept as a second option. Two objects sharing a name with different
+> row semantics is precisely the confusion worth not shipping, and nothing had
+> been computed with it. `gram` now means `G = H Hᵀ` of the concatenation.
+>
+> The observation below that the two modes are "not interchangeable" was right,
+> and is why the redefinition matters: rows must be **queries** for a
+> query-set CKA to mean anything.
+>
+> One trap this creates: a stored Gram is a *kernel*, and `CKADistanceMetric`
+> forms its own, so passing one computes `(H Hᵀ)²` silently. The cache tags kernel
+> views and the metric refuses them. See [gram_and_cka.md](gram_and_cka.md).
+
 `FunctionalTaxonomy` has a `representation` setting with two options that produce
 differently-shaped matrices, and — importantly — differently-*meaning* rows
 (`src/taxonomy/functional.py:143-161`):
@@ -197,6 +263,23 @@ modes are **not interchangeable** and a single reduction cannot serve both. This
 needs a deliberate decision, not a default.
 
 ### 3. How do layer indices line up across taxonomy levels?
+
+> **PARTLY CLOSED — half of this is fixed, and the half that remains is the
+> interesting half.**
+>
+> **Fixed:** functional no longer stores anything under a configured (possibly
+> negative) index. `_resolve_layers` resolves against the model's actual
+> `n_hidden_states` at extraction, and `ActivationCache.activation_path` **raises**
+> on a negative index. `-1` and `28` can no longer become two files that drift
+> apart, and `runs/{hash}.json` records both the resolved layers and
+> `n_hidden_states`, so the numbering used is always recoverable from disk.
+>
+> **Still open:** the structural↔functional mapping. Functional indexes
+> `hidden_states` (length `n_layers + 1`, index 0 = embedding output); structural
+> uses absolute adapter layer numbers. The offset is knowable — functional index
+> `k+1` is the output of transformer block `k` — but nothing in the code states
+> it, so a cross-level claim of "the same layer in both" is still unverified.
+> Cheap to add once someone wants to make that claim.
 
 Two levels both talk about "layers" and mean different numbering:
 
@@ -262,6 +345,16 @@ together, since fixing only the behavioral one leaves the asymmetry in place.
 
 ### 2. Functional does not pin the tokenizer's padding side; behavioral does
 
+> **FIXED.** The pin now lives on `HFInferenceTaxonomy`, a base class both levels
+> inherit, so it cannot be set for one and forgotten for the other — which is the
+> shape of bug this item actually was. `scripts/check_analysis.py` asserts the pin
+> is present in the source for **both** taxonomies, via `inspect.getsource`, so it
+> fails the moment the line is removed.
+>
+> The docstring records the reason it matters for functional specifically, which
+> is different from behavioral's: with left padding the last real token is always
+> at index `-1`, so `last_token` pooling finds it without mask arithmetic.
+
 **The mechanism.** `tokenizer(..., padding=True)` pads every sequence in a batch out
 to the length of the longest one in that batch. `tokenizer.padding_side` decides
 whether those pad tokens are appended *after* the real tokens (`"right"`) or
@@ -315,6 +408,35 @@ obvious candidate, but confirm it rather than assume it — the default
 question (next item).
 
 ### 3. Pooling averages over padded positions — noted, magnitude unclear
+
+> **FIXED, and the magnitude is now measured rather than assumed.**
+>
+> `_pool` takes the `attention_mask` and pools only over real positions:
+> `mean` divides by the unpadded length, `last_token` indexes the last unmasked
+> position, `cls` the first. The property this buys is that **a pooled vector is a
+> function of its query alone** — it no longer depends on which other queries
+> shared its batch, which matters because `batch_size` is deliberately not part of
+> the cache key, so two runs at different batch sizes share an entry.
+>
+> Two checks pin it, at different costs:
+> - *synthetic* — hand-built tensors with known padding; asserts padded and
+>   unpadded pooling agree for all three modes, **and** that the unmasked mean
+>   provably differs, so the check cannot pass vacuously. No GPU, milliseconds.
+> - *`[gpu]`* — `batch_size=1` (no padding at all) against one full batch (maximum
+>   padding), asserting per-row cosine > 0.999. This is the measurement this item
+>   asked for: the gap between the two arms *is* the padding contribution. It can
+>   be much tighter than the behavioral equivalent because `input` mode runs no
+>   `generate` call, so there is no greedy argmax to flip on a near-tie — the only
+>   residual is fp16 matmul tiling.
+>
+> **Measured** (job 1999300, L40S, 8 queries, batch 1 vs batch 8): **min per-row
+> cosine 0.999999**, max|Δ| 7.81e-03. After mask-aware pooling the padding
+> contribution is zero to six decimal places, and what remains is fp16 matmul
+> tiling. This item is closed with a number rather than a judgement.
+>
+> See the "Verification" section of [TODO.md](TODO.md) for the full smoke-run
+> results, including the caveat that the absolute functional distances are very
+> small (CKA similarity 0.989–0.999 across all five adapters).
 
 In `activation_mode="input"`, `_extract_input_activations` slices one query's hidden
 states and hands them to `_pool` (`src/taxonomy/functional.py:217`):

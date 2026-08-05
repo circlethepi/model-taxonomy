@@ -1,0 +1,118 @@
+# Functional taxonomy smoke run.
+#
+# The smallest run that answers "does the functional level carry signal at all?".
+# Five adapters spanning the full mixing range, 64 queries, forward passes only.
+# Cheaper than the behavioral smoke run it mirrors: no generation, so the cost is
+# one prompt-length forward pass per query rather than 128 decoding steps.
+#
+# The datasets: block below is byte-identical to yahoo_behavioral_smoke.yaml on
+# purpose. That makes both levels read the same draw — recipe 04a65e58df502e45,
+# n=64, seed=0, already materialised in 01_datasets — which is what puts the two
+# on the same footing rather than merely on the same topic.
+#
+# output_dir points at the existing yahoo_topics_mean_cosine experiment because
+# that is where the query recipe lives (make_queries reads
+# {output_dir}/datasets/{queries_dataset}.recipe.json). Nothing is written there —
+# every artifact from this run lands in the shared cache under 04_activations.
+
+name: yahoo_functional_smoke
+output_dir: results/yahoo_topics_mean_cosine
+cache_dir: results/shared_cache
+
+slurm:
+  # Starting guess only. Re-check what is actually free immediately before
+  # generating the sbatch script — a queue snapshot written into a config is stale
+  # by the time it runs.
+  partition: l40s
+  gpus_per_node: 1
+  mem_gb: 48
+  # Generous for what this is: five adapters x 64 forward passes with the base
+  # model loaded once. An over-requested 1-GPU job still backfills readily,
+  # whereas a job killed at the wall wastes both the allocation and the queue wait.
+  time: "01:00:00"
+  cpus_per_task: 8
+  conda_env: taxonomy-env
+  modules: []
+  account: null
+
+# The query set. Identical to the block in yahoo_behavioral_smoke.yaml — do not
+# edit one without the other, or the two levels stop being comparable. n_samples
+# is the draw size because n enters the sampler: a 64-row draw is not the first
+# 64 rows of a 128-row one.
+datasets:
+  - name: yahoo_queries
+    recipe_type: class_aware
+    n_samples: 64
+    seed: 0
+    entries:
+      - dataset_id: yahoo_answers_topics
+        split: train
+        weight: 1.0
+        text_field: question_title      # prompts to read activations over
+        class_field: topic
+        class_filter: [0, 1]
+        class_weights: {0: 1.0, 1: 1.0}
+
+base_models:
+  - meta-llama/Llama-3.2-3B
+
+fine_tuning:
+  enabled: false
+
+extraction:
+  # One adapter per mixture, spanning both pure simplex anchors. Rank (r16), sample
+  # count (n1000), data seed (s00) and init seed (i00) are all held constant, so the
+  # only thing varying across the five is the training mixture — which is exactly the
+  # axis the functional distances are supposed to recover.
+  #
+  # Holding _i00 fixed also keeps the default id_scheme usable: comparison._resolve_ids
+  # raises when two adapters collapse to the same recipe_id, which is what happens if
+  # a collection mixes init seeds.
+  models:
+    - results/shared_cache/03_adapters/meta-llama--Llama-3.2-3B/yahoo_100t0_000t1_n1000_s00_r16_i00
+    - results/shared_cache/03_adapters/meta-llama--Llama-3.2-3B/yahoo_075t0_025t1_n1000_s00_r16_i00
+    - results/shared_cache/03_adapters/meta-llama--Llama-3.2-3B/yahoo_050t0_050t1_n1000_s00_r16_i00
+    - results/shared_cache/03_adapters/meta-llama--Llama-3.2-3B/yahoo_025t0_075t1_n1000_s00_r16_i00
+    - results/shared_cache/03_adapters/meta-llama--Llama-3.2-3B/yahoo_000t0_100t1_n1000_s00_r16_i00
+
+  queries_dataset: yahoo_queries
+  n_queries: 64
+  device: cuda
+  # No KV cache to grow here — input mode is a single forward pass per batch — so
+  # this is bounded by activations rather than by decoding. 16 is comfortable on a
+  # 48 GB L40S alongside a 3B fp16 model; on CUDA OOM drop to 8. The stored vectors
+  # are batch-size-independent because pooling is mask-aware, which the [gpu]
+  # batch-invariance check measures rather than assumes.
+  batch_size: 16
+  torch_dtype: float16
+
+  taxonomies:
+    # Set explicitly rather than omitted: extract_reprs.py defaults functional and
+    # behavioral to enabled: true when the key is absent, so omitting the
+    # behavioral block would silently start a generation run.
+    behavioral:
+      enabled: false
+    dataset_embedding:
+      enabled: false
+
+    functional:
+      enabled: true
+      # layer_indices omitted on purpose: the default stores *every* hidden state.
+      # One forward pass produces them all, so restricting here would buy no GPU
+      # time and only remove layers a later comparison might want. ~23 MB per
+      # model at 64 queries, ~114 MB for the five.
+      activation_mode: input
+      pooling: mean
+      # Applies when a view is assembled, not when activations are stored, so a
+      # normalized and an unnormalized view can coexist without re-running.
+      normalize_activations: true
+
+taxonomy:
+  models: [fine_tuned]
+  taxonomies: [functional]
+  metrics:
+    # Linear CKA forms its own Gram from the concatenated feature matrix, which is
+    # why the default view is concat rather than gram — passing a stored Gram here
+    # would compute (H Hᵀ)² silently. See docs/notes/gram_and_cka.md.
+    functional: cka
+  geometry: [mds]

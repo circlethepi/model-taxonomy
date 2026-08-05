@@ -80,15 +80,29 @@ extraction:
     # -- Functional: compare internal activations across layers ----------------
     functional:
       enabled: true
-      layer_indices: [-1, -4, -8]   # layers to extract; negative = from the end
-      activation_mode: input        # input     → activations on the prompt tokens only
+      # layer_indices: [-1, -4, -8] # omit to store EVERY layer (recommended). One
+                                    # forward pass produces them all, so restricting
+                                    # buys no GPU time and only removes layers a
+                                    # later comparison might want; layer choice is a
+                                    # read-time decision. Negative = from the end.
+      activation_mode: input        # input      → activations on the prompt tokens only
                                     # generation → activations on generated tokens
-                                    # both      → concatenate prompt + generation
-      pooling: mean                 # mean | last_token | cls
-      normalize_activations: true   # L2-normalise each activation vector
+                                    # both       → both stored, combined at read time
+      pooling: mean                 # mean | last_token | cls; all mask-aware
+      normalize_activations: layer  # layer  → normalise each layer, then the row, so
+                                    #          every layer weighs the same (default)
+                                    # global → normalise the finished row only; layers
+                                    #          count in proportion to their own scale
+                                    # none   → raw concatenation
+                                    # Applied when a view is assembled, not when
+                                    # activations are stored.
       max_new_tokens: 32            # tokens to generate (ignored when mode=input)
-      representation: gram          # gram   → (N_layers, triu_features), best with cka
-                                    # matrix → (N_queries, N_layers*hidden_dim), best with frobenius
+      view: concat                  # concat → (N_queries, L*hidden_dim); rows are
+                                    #          queries. Use with cka or frobenius.
+                                    # gram   → (N_queries, N_queries) = H @ H.T.
+                                    #          A KERNEL, not a feature matrix — cka
+                                    #          forms its own and will refuse this.
+                                    #          See docs/notes/gram_and_cka.md
 
     # -- Behavioral: compare model outputs via a sentence embedder -------------
     behavioral:

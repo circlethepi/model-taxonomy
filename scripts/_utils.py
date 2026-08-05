@@ -432,35 +432,18 @@ def parse_dtype(name: str) -> torch.dtype:
 
 # ── Cache factories ───────────────────────────────────────────────────────────
 
-#: Where each taxonomy's representations live under the shared cache.  Structural is
-#: absent on purpose: its representations are written by LoRACache, beside the adapter
-#: weights they were derived from, rather than into a stage directory of their own.
-#: behavioral is absent: it outgrew DiskCache and has its own GeneratedTextCache,
-#: which owns ``05_generated`` and lays it out differently.  Leaving the entry here
-#: would let make_repr_cache hand back a DiskCache pointed at the same directory,
-#: giving that tree two writers with incompatible layouts.
-REPR_CACHE_DIRS = {
-    "functional": "04_activations",
-}
+# REPR_CACHE_DIRS / make_repr_cache used to live here, handing out a flat DiskCache
+# per taxonomy.  Every level has now outgrown it: structural writes through LoRACache,
+# dataset_embedding through DatasetEmbeddingCache, behavioral through
+# GeneratedTextCache and functional through ActivationCache.  Each owns its stage
+# directory and lays it out differently, so a DiskCache pointed at the same tree would
+# give it a second writer with an incompatible layout.  DiskCache itself remains for
+# ad-hoc use; nothing in the pipeline routes through it.
 
 
-def make_repr_cache(cache_dir: Path, taxonomy: str):
-    """DiskCache for one taxonomy's representations.
-
-    Functional's provisional home: when that level is built out it is expected to
-    grow its own cache class the way structural has LoRACache and behavioral now
-    has GeneratedTextCache.
-    """
-    from src.cache.disk import DiskCache
-
-    try:
-        subdir = REPR_CACHE_DIRS[taxonomy]
-    except KeyError:
-        raise ValueError(
-            f"no representation cache directory for taxonomy {taxonomy!r}; "
-            f"choose from {sorted(REPR_CACHE_DIRS)}"
-        ) from None
-    return DiskCache(cache_dir / subdir)
+def make_activation_cache(cache_dir: Path):
+    from src.cache.activation_cache import ActivationCache
+    return ActivationCache(cache_dir)
 
 
 def make_dataset_embedding_cache(cache_dir: Path):
@@ -558,7 +541,7 @@ def make_queries(cfg: dict) -> tuple[list[str], dict]:
     return mixed.to_queries(n=n_queries), query_key
 
 
-def make_functional_taxonomy(cfg: dict, queries: list[str], cache=None):
+def make_functional_taxonomy(cfg: dict, queries: list[str], query_key: dict | None = None, cache=None):
     from src.taxonomy.functional import FunctionalTaxonomy
 
     ext_cfg = cfg.get("extraction", {})
@@ -566,17 +549,22 @@ def make_functional_taxonomy(cfg: dict, queries: list[str], cache=None):
 
     return FunctionalTaxonomy(
         queries=queries,
-        layer_indices=fcfg.get("layer_indices", [-1, -4, -8]),
+        # Default None = store every hidden state.  One forward pass produces
+        # them all, so restricting here buys no GPU time and only removes
+        # layers you might later want to read.
+        layer_indices=fcfg.get("layer_indices"),
+        query_key=query_key,
         cache=cache,
         device=ext_cfg.get("device", "cuda"),
         batch_size=ext_cfg.get("batch_size", 8),
         torch_dtype=parse_dtype(ext_cfg.get("torch_dtype", "float16")),
         hf_token=hf_token(cfg),
         pooling=fcfg.get("pooling", "mean"),
-        normalize_activations=fcfg.get("normalize_activations", True),
+        # layer | global | none; bools still accepted (True → layer).
+        normalize_activations=fcfg.get("normalize_activations", "layer"),
         activation_mode=fcfg.get("activation_mode", "input"),
         max_new_tokens=fcfg.get("max_new_tokens", 32),
-        representation=fcfg.get("representation", "gram"),
+        view=fcfg.get("view", "concat"),
     )
 
 

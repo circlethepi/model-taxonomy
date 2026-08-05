@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import gc
-import os
 from typing import Any, Literal, Sequence
 
 import numpy as np
@@ -9,178 +8,315 @@ import torch
 
 from src.core.protocols import Taxonomy, ModelID
 from src.core.representation import ModelRepresentation
-from src.cache.disk import DiskCache
+from src.cache.activation_cache import ActivationCache
+from src.taxonomy._hf_inference import HFInferenceTaxonomy
 
 
-class FunctionalTaxonomy(Taxonomy):
-    """Compares models via the covariance structure of their internal activations.
+class FunctionalTaxonomy(HFInferenceTaxonomy, Taxonomy):
+    """Compares models via their internal activations on a shared query set.
 
-    For each query input and each specified layer, the model's hidden states are
-    pooled to a single vector.
+    For each query and each layer, the model's hidden states are pooled to a
+    single vector.  The pooled ``(n_queries, d)`` matrix for each layer is stored
+    **separately** by :class:`~src.cache.activation_cache.ActivationCache`, and
+    the representation handed to the comparison layer is a *view* assembled at
+    read time.
 
-    Representation modes
-    --------------------
-    ``"gram"`` (default)
-        The (N_queries, hidden_dim) activation matrix H is used to compute a
-        Gram matrix G = H @ H.T.  The representation is the stacked upper
-        triangles of per-layer Gram matrices:
-        shape ``(N_layers, N_queries*(N_queries+1)//2)``.  Rows = layers.
-        Best paired with CKA metric.
-    ``"matrix"``
-        The raw activation vectors are concatenated across layers per query,
-        yielding shape ``(N_queries, N_layers * hidden_dim)``.  Rows = queries.
-        Compatible with both Frobenius and CKA metrics (standard query-CKA).
+    That split is the point.  One forward pass produces every layer at once, so
+    "which layers am I comparing?" is a question about reading, not about running
+    a model.  By default extraction stores all of them (~23 MB for a 3B model at
+    64 queries) and ``load`` concatenates across them.
+
+    Views
+    -----
+    ``"concat"`` (default)
+        Activations concatenated across the selected layers, ``(n_queries,
+        L·d)``.  Row *i* is query *i*.  This is what feeds the distance metrics.
+    ``"gram"``
+        ``G = H Hᵀ`` of that concatenation, ``(n_queries, n_queries)``.  Rows are
+        still queries.  This is a **kernel**, not a feature matrix: handing it to
+        a metric that forms its own kernel computes ``(H Hᵀ)²``.  Representations
+        built from it are tagged ``metadata["is_kernel"]`` so metrics can refuse.
 
     Activation modes
     ----------------
     ``"input"`` (default)
-        Activations from the forward pass on the input prompt only.
+        Forward pass on the prompt only.
     ``"generation"``
-        Activations collected during auto-regressive generation.  At each
-        decoding step the last-token hidden state is extracted per layer; these
-        are mean-pooled across all generated steps to yield one vector per
-        (query, layer).  Requires ``max_new_tokens > 0``.
+        Activations collected during decoding; at each step the last-token hidden
+        state is taken per layer and mean-pooled across steps.
     ``"both"``
-        Runs both input and generation passes and stacks their layer slots,
-        producing ``2*N_layers`` layer-vector slots per query.  The first
-        N_layers slots correspond to input activations; the next N_layers to
-        generation activations.
+        Runs both passes and stores them as separate files, combined at read
+        time.  Because the two are stored separately, a draw that already has
+        ``input`` can gain ``generation`` later without recomputing either.
+
+    Parameters
+    ----------
+    query_key:
+        The ``{recipe_hash, n_samples, seed}`` triple identifying the query draw
+        in ``01_datasets``.  This — not the query strings — is what goes into
+        :meth:`config_dict` and what keys the cache.
+    layer_indices:
+        Layers to store.  ``None`` (the default) stores every hidden state, which
+        is what makes layer choice a read-time decision.  Negative indices are
+        resolved against the model's actual hidden-state count before anything
+        touches disk.
+    normalize_activations:
+        ``"layer"`` (default), ``"global"`` or ``"none"``; bools are accepted as
+        ``True → "layer"``, ``False → "none"``.  ``layer`` row-normalizes each
+        layer before concatenating, so a layer's weight in the comparison is a
+        choice rather than an accident of its activation scale.  See
+        :class:`ActivationCache` for the measured per-layer norms.
+
+        Applies at *read* time, not extraction: raw activations are stored, and
+        normalization is part of a surrogate's identity.  Kept here as the
+        default passed to :meth:`ActivationCache.load`.
     """
 
     def __init__(
         self,
         queries: Sequence[str],
-        layer_indices: list[int],
-        cache: DiskCache | None = None,
+        layer_indices: list[int] | None = None,
+        query_key: dict | None = None,
+        cache: ActivationCache | None = None,
         device: str = "cuda",
         batch_size: int = 8,
         torch_dtype: torch.dtype = torch.float16,
         hf_token: str | None = None,
         pooling: Literal["mean", "last_token", "cls"] = "mean",
-        normalize_activations: bool = True,
+        normalize_activations: str | bool = "layer",
         activation_mode: Literal["input", "generation", "both"] = "input",
         max_new_tokens: int = 32,
-        representation: Literal["gram", "matrix"] = "gram",
+        view: Literal["concat", "gram"] = "concat",
+        source_indices: list | None = None,
     ) -> None:
+        if activation_mode not in ("input", "generation", "both"):
+            raise ValueError(f"Unknown activation_mode: {activation_mode!r}")
+        if activation_mode in ("generation", "both") and max_new_tokens <= 0:
+            raise ValueError(
+                f"activation_mode={activation_mode!r} requires max_new_tokens > 0."
+            )
+
+        super().__init__(
+            device=device,
+            batch_size=batch_size,
+            torch_dtype=torch_dtype,
+            hf_token=hf_token,
+        )
         self.queries = list(queries)
-        self.layer_indices = list(layer_indices)
+        self.layer_indices = list(layer_indices) if layer_indices is not None else None
+        self.query_key = dict(query_key or {})
         self.cache = cache
-        self.device = device
-        self.batch_size = batch_size
-        self.torch_dtype = torch_dtype
-        self.hf_token = hf_token or os.environ.get("HF_TOKEN")
         self.pooling = pooling
-        self.normalize_activations = normalize_activations
+        # Canonicalized here so a typo fails at construction rather than after
+        # the inference it would have wasted.
+        self.normalize_activations = ActivationCache.canon_normalize(normalize_activations)
         self.activation_mode = activation_mode
         self.max_new_tokens = max_new_tokens
-        self.representation = representation
+        self.view = view
+        self.source_indices = source_indices
 
     @property
     def taxonomy_name(self) -> str:
         return "functional"
 
     def config_dict(self) -> dict[str, Any]:
+        # "taxonomy" keeps a functional config from ever hashing equal to a
+        # behavioral one and makes the run record self-describing.  The query
+        # *key* rather than the strings: hashing the strings would make every
+        # entry sensitive to any upstream change that shifts the draw, with no
+        # way to tell from a key which draw it belonged to.
         return {
             "taxonomy": "functional",
-            "queries": self.queries,
+            "query_key": self.query_key,
+            "n_queries": len(self.queries),
             "layer_indices": self.layer_indices,
             "pooling": self.pooling,
-            "normalize_activations": self.normalize_activations,
-            "torch_dtype": str(self.torch_dtype),
             "activation_mode": self.activation_mode,
-            "max_new_tokens": self.max_new_tokens,
-            "representation": self.representation,
+            "max_new_tokens": self.max_new_tokens if self.activation_mode != "input" else None,
+            "torch_dtype": str(self.torch_dtype),
         }
 
+    # ------------------------------------------------------------------
+    # Cache coordinates
+    # ------------------------------------------------------------------
+
+    def _model_key(self, model_id: ModelID) -> tuple[str, str]:
+        """``(base_model_id, adapter_id)`` for cache addressing.
+
+        A plain HuggingFace model has no adapter and lands under ``_base``.
+        """
+        base = self._resolve_base_model_id(model_id)
+        if base is None:
+            return str(model_id), "_base"
+        return base, str(model_id)
+
+    @property
+    def _stored_modes(self) -> list[str]:
+        return ["input", "generation"] if self.activation_mode == "both" else [self.activation_mode]
+
+    def _mnt(self, mode: str) -> int | None:
+        return None if mode == "input" else self.max_new_tokens
+
+    # ------------------------------------------------------------------
+    # Extraction
+    # ------------------------------------------------------------------
+
     def extract(self, model_id: ModelID) -> ModelRepresentation:
-        cache_key = DiskCache.key_for(model_id, self.config_dict()) if self.cache else ""
+        if self.cache is None:
+            raise ValueError(
+                "FunctionalTaxonomy requires an ActivationCache. Per-layer "
+                "activations are the stored artefact and views are assembled "
+                "from them; there is no in-memory-only path."
+            )
+        if not self.query_key:
+            raise ValueError(
+                "FunctionalTaxonomy requires query_key — the "
+                "{recipe_hash, n_samples, seed} triple identifying the draw. It "
+                "is what keys the cache."
+            )
 
-        if self.cache is not None and self.cache.exists(cache_key):
-            return self.cache.load(cache_key)
+        base_id, adapter_id = self._model_key(model_id)
 
-        rep = self._extract_fresh(model_id, cache_key)
+        if not self._all_on_disk(base_id, adapter_id):
+            self._extract_fresh(model_id, base_id, adapter_id)
 
-        if self.cache is not None:
-            self.cache.save(cache_key, rep)
-
-        return rep
-
-    def _extract_fresh(self, model_id: ModelID, cache_key: str) -> ModelRepresentation:
-        from transformers import AutoModelForCausalLM, AutoTokenizer
-
-        tokenizer = AutoTokenizer.from_pretrained(
-            model_id, token=self.hf_token, trust_remote_code=True
+        return self.cache.load(
+            base_id,
+            adapter_id,
+            self.query_key,
+            mode=self.activation_mode,
+            pooling=self.pooling,
+            layers=None if self.layer_indices is None else self._stored_selection(base_id, adapter_id),
+            view=self.view,
+            normalize=self.normalize_activations,
+            max_new_tokens=self._mnt(self.activation_mode),
         )
-        if tokenizer.pad_token is None:
-            tokenizer.pad_token = tokenizer.eos_token
 
-        model = AutoModelForCausalLM.from_pretrained(
-            model_id,
-            torch_dtype=self.torch_dtype,
-            device_map="auto",
-            token=self.hf_token,
-            trust_remote_code=True,
-        )
-        model.eval()
+    def _stored_n_hidden_states(self, base_id: str, adapter_id: str) -> int | None:
+        """Hidden-state count recorded by an earlier run on this draw, if any.
 
-        # Number of layer-vector slots per query depends on activation_mode
-        n_layer_vecs = (2 if self.activation_mode == "both" else 1) * len(self.layer_indices)
-        per_layer_vecs: list[list[np.ndarray]] = [[] for _ in range(n_layer_vecs)]
+        Lets a negative ``layer_indices`` be resolved — and therefore a cache hit
+        be detected — without loading the model.
+        """
+        for run_hash in self.cache.list_runs(base_id, adapter_id, self.query_key):
+            rec = self.cache.load_config(base_id, adapter_id, self.query_key, run_hash)
+            if rec.get("n_hidden_states"):
+                return int(rec["n_hidden_states"])
+        return None
+
+    def _resolve_layers(self, n_hidden_states: int) -> list[int]:
+        """Configured indices as absolute positions into ``hidden_states``.
+
+        ``-1`` and ``28`` name the same layer; storing files under the configured
+        index would write it twice under two names and let the copies drift.
+        """
+        if self.layer_indices is None:
+            return list(range(n_hidden_states))
+        out = []
+        for ell in self.layer_indices:
+            resolved = ell if ell >= 0 else n_hidden_states + ell
+            if not 0 <= resolved < n_hidden_states:
+                raise IndexError(
+                    f"layer index {ell} resolves to {resolved}, outside the "
+                    f"{n_hidden_states} hidden states this model produces."
+                )
+            out.append(resolved)
+        return sorted(set(out))
+
+    def _stored_selection(self, base_id: str, adapter_id: str) -> list[int] | None:
+        n = self._stored_n_hidden_states(base_id, adapter_id)
+        return self._resolve_layers(n) if n is not None else None
+
+    def _all_on_disk(self, base_id: str, adapter_id: str) -> bool:
+        """True when every requested (mode, layer) is already stored.
+
+        A hit here means the model is never loaded — which is the whole reason
+        activations are keyed model-wise rather than run-wise.
+        """
+        n = self._stored_n_hidden_states(base_id, adapter_id)
+        for mode in self._stored_modes:
+            stored = self.cache.list_layers(
+                base_id, adapter_id, self.query_key, mode, self.pooling, self._mnt(mode)
+            )
+            if not stored:
+                return False
+            if self.layer_indices is None:
+                # "All layers" is only satisfied by a run that stored all of
+                # them; without a recorded count we cannot tell, so re-extract.
+                if n is None or sorted(stored) != list(range(n)):
+                    return False
+            else:
+                if n is None or not set(self._resolve_layers(n)).issubset(stored):
+                    return False
+        return True
+
+    def _extract_fresh(self, model_id: ModelID, base_id: str, adapter_id: str) -> None:
+        model, shared = self._get_model(model_id)
+        tokenizer = self._load_tokenizer(model_id, self._resolve_base_model_id(model_id))
 
         try:
+            n_hidden = int(model.config.num_hidden_layers) + 1
+            layers = self._resolve_layers(n_hidden)
+
+            # {mode: {layer: [ (batch, d) arrays ]}}
+            acc: dict[str, dict[int, list[np.ndarray]]] = {
+                mode: {ell: [] for ell in layers} for mode in self._stored_modes
+            }
+
             for i in range(0, len(self.queries), self.batch_size):
-                batch_queries = self.queries[i : i + self.batch_size]
-                batch_vecs = self._process_batch(model, tokenizer, batch_queries)
-                for query_vecs in batch_vecs:
-                    for k, vec in enumerate(query_vecs):
-                        per_layer_vecs[k].append(vec)
+                batch = self.queries[i : i + self.batch_size]
+                for mode, per_layer in self._process_batch(model, tokenizer, batch, layers).items():
+                    for ell, arr in per_layer.items():
+                        acc[mode][ell].append(arr)
         finally:
-            del model
-            gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+            if not shared:
+                del model
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
 
-        if self.representation == "gram":
-            triu_idx = np.triu_indices(len(self.queries))
-            rows: list[np.ndarray] = []
-            for vecs in per_layer_vecs:
-                H = np.stack(vecs, axis=0).astype(np.float64)  # (N_queries, d)
-                if self.normalize_activations:
-                    norms = np.linalg.norm(H, axis=1, keepdims=True)
-                    H = H / np.where(norms < 1e-12, 1.0, norms)
-                rows.append((H @ H.T)[triu_idx].astype(np.float32))
-            matrix = np.stack(rows, axis=0)  # (n_layer_vecs, N_queries*(N_queries+1)//2)
-        else:  # "matrix"
-            query_mats: list[np.ndarray] = []
-            for q_idx in range(len(self.queries)):
-                vecs_for_query = [per_layer_vecs[k][q_idx] for k in range(n_layer_vecs)]
-                query_mats.append(np.concatenate(vecs_for_query).astype(np.float32))
-            matrix = np.stack(query_mats, axis=0)  # (N_queries, n_layer_vecs * hidden_dim)
-            if self.normalize_activations:
-                norms = np.linalg.norm(matrix, axis=1, keepdims=True)
-                matrix = matrix / np.where(norms < 1e-12, 1.0, norms)
+        config = self.config_dict()
+        run_metadata = {
+            "n_hidden_states": n_hidden,
+            # Provenance, deliberately outside config_dict() so it does not
+            # fragment the cache.  batch_size in particular must not key the
+            # cache — with mask-aware pooling it does not change the numbers,
+            # and recording it is how a regression there would be traceable.
+            "batch_size": self.batch_size,
+            "device_name": (
+                torch.cuda.get_device_name(0) if torch.cuda.is_available() else "cpu"
+            ),
+        }
 
-        return ModelRepresentation.create(
-            model_id=model_id,
-            taxonomy=self.taxonomy_name,
-            matrix=matrix,
-            config=self.config_dict(),
-            metadata={
-                "n_queries": len(self.queries),
-                "n_layers": n_layer_vecs,
-                "layer_indices": self.layer_indices,
-                "activation_mode": self.activation_mode,
-                "representation": self.representation,
-            },
-        )
+        for mode in self._stored_modes:
+            stacked = {
+                ell: np.concatenate(chunks, axis=0) for ell, chunks in acc[mode].items()
+            }
+            self.cache.save_activations(
+                base_id,
+                adapter_id,
+                self.query_key,
+                mode,
+                self.pooling,
+                stacked,
+                max_new_tokens=self._mnt(mode),
+                config=config,
+                run_metadata=run_metadata,
+                source_indices=self.source_indices,
+            )
+
+    # ------------------------------------------------------------------
+    # Forward passes
+    # ------------------------------------------------------------------
 
     def _process_batch(
         self,
         model: Any,
         tokenizer: Any,
         queries: list[str],
-    ) -> list[list[np.ndarray]]:
-        """Return one list per query, each containing n_layer_vecs activation vectors."""
+        layers: list[int],
+    ) -> dict[str, dict[int, np.ndarray]]:
+        """``{mode: {layer: (batch, d) array}}`` for one batch of queries."""
         inputs = tokenizer(
             queries,
             return_tensors="pt",
@@ -189,57 +325,36 @@ class FunctionalTaxonomy(Taxonomy):
             max_length=512,
         )
         inputs = {k: v.to(model.device) for k, v in inputs.items()}
+        mask = inputs["attention_mask"]
 
+        out: dict[str, dict[int, np.ndarray]] = {}
         with torch.no_grad():
-            if self.activation_mode == "input":
-                return self._extract_input_activations(model, inputs, len(queries))
-            elif self.activation_mode == "generation":
-                return self._extract_generation_activations(
-                    model, tokenizer, inputs, len(queries)
+            if "input" in self._stored_modes:
+                out["input"] = self._input_activations(model, inputs, mask, layers)
+            if "generation" in self._stored_modes:
+                out["generation"] = self._generation_activations(
+                    model, tokenizer, inputs, layers
                 )
-            elif self.activation_mode == "both":
-                input_vecs = self._extract_input_activations(model, inputs, len(queries))
-                gen_vecs = self._extract_generation_activations(
-                    model, tokenizer, inputs, len(queries)
-                )
-                # Concatenate per-query: [input_layers..., gen_layers...]
-                return [iv + gv for iv, gv in zip(input_vecs, gen_vecs)]
-            else:
-                raise ValueError(f"Unknown activation_mode: {self.activation_mode!r}")
+        return out
 
-    def _extract_input_activations(
-        self,
-        model: Any,
-        inputs: dict,
-        n_queries: int,
-    ) -> list[list[np.ndarray]]:
-        """Forward pass on the input prompt; return one vector per (query, layer)."""
-        out = model(**inputs, output_hidden_states=True)
-        batch_results: list[list[np.ndarray]] = []
-        for query_idx in range(n_queries):
-            query_layer_vecs: list[np.ndarray] = []
-            for layer_idx in self.layer_indices:
-                h = out.hidden_states[layer_idx][query_idx]  # (seq_len, d)
-                vec = self._pool(h).float().cpu().numpy()
-                query_layer_vecs.append(vec)
-            batch_results.append(query_layer_vecs)
-        return batch_results
+    def _input_activations(
+        self, model: Any, inputs: dict, mask: torch.Tensor, layers: list[int]
+    ) -> dict[int, np.ndarray]:
+        hs = model(**inputs, output_hidden_states=True).hidden_states
+        return {ell: self._pool(hs[ell], mask).float().cpu().numpy() for ell in layers}
 
-    def _extract_generation_activations(
-        self,
-        model: Any,
-        tokenizer: Any,
-        inputs: dict,
-        n_queries: int,
-    ) -> list[list[np.ndarray]]:
+    def _generation_activations(
+        self, model: Any, tokenizer: Any, inputs: dict, layers: list[int]
+    ) -> dict[int, np.ndarray]:
         """Generation-phase activations, mean-pooled across decoding steps.
 
-        At each step the last-token hidden state is extracted for each selected
-        layer (shape: batch × d) and accumulated.  After all steps the per-step
-        tensors are stacked and averaged, yielding one (d,) vector per
-        (query, layer).
+        At each step the last-token hidden state is taken per layer and
+        accumulated; the per-step tensors are then averaged.  Every step's last
+        position is a real generated token, so no masking applies here — but note
+        greedy decoding runs to ``max_new_tokens`` for every query regardless of
+        EOS, so a query that finished early contributes post-EOS states.
         """
-        gen_out = model.generate(
+        gen = model.generate(
             **inputs,
             max_new_tokens=self.max_new_tokens,
             do_sample=False,
@@ -247,31 +362,36 @@ class FunctionalTaxonomy(Taxonomy):
             return_dict_in_generate=True,
             output_hidden_states=True,
         )
-        # gen_out.hidden_states: tuple[step] of tuple[layer] of (batch, seq_at_step, d)
-        # For step 0: seq_at_step == input_len + 1.  For steps 1+: seq_at_step == 1.
-        # Taking [:, -1, :] always selects the most-recently generated token.
+        sums: dict[int, np.ndarray] = {}
+        n_steps = 0
+        for step_hs in gen.hidden_states:
+            n_steps += 1
+            for ell in layers:
+                h = step_hs[ell][:, -1, :].float().cpu().numpy()
+                sums[ell] = h if ell not in sums else sums[ell] + h
+        return {ell: v / max(n_steps, 1) for ell, v in sums.items()}
 
-        per_layer_per_step: list[list[np.ndarray]] = [[] for _ in self.layer_indices]
-        for step_hs in gen_out.hidden_states:
-            for k, layer_idx in enumerate(self.layer_indices):
-                h = step_hs[layer_idx][:, -1, :]   # (batch, d)
-                per_layer_per_step[k].append(h.float().cpu().numpy())
+    def _pool(self, h: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        """Pool ``(batch, seq, d)`` to ``(batch, d)``, ignoring padding.
 
-        batch_results: list[list[np.ndarray]] = [[] for _ in range(n_queries)]
-        for k in range(len(self.layer_indices)):
-            stacked = np.stack(per_layer_per_step[k], axis=0)  # (n_steps, batch, d)
-            mean_over_steps = stacked.mean(axis=0)              # (batch, d)
-            for query_idx in range(n_queries):
-                batch_results[query_idx].append(mean_over_steps[query_idx])
-
-        return batch_results
-
-    def _pool(self, h: torch.Tensor) -> torch.Tensor:
+        Masking is what makes a pooled vector a function of its query alone.
+        ``padding=True`` pads each batch to its own longest sequence, so an
+        unmasked mean would average in pad-position hidden states — which are not
+        zero, since the model computes a residual-stream vector at every position
+        even though nothing attends to them — and how many of those a query gets
+        would depend on which other queries shared its batch.  Reordering the
+        queries or changing ``batch_size`` would then shift every vector, and the
+        cache could not notice because neither is part of the key.
+        """
+        m = mask.unsqueeze(-1).to(h.dtype)
         if self.pooling == "mean":
-            return h.mean(dim=0)
-        elif self.pooling == "last_token":
-            return h[-1]
-        elif self.pooling == "cls":
-            return h[0]
-        else:
-            raise ValueError(f"Unknown pooling: {self.pooling!r}")
+            return (h * m).sum(dim=1) / m.sum(dim=1).clamp(min=1)
+        if self.pooling == "last_token":
+            # Left padding puts the last real token at -1, but index it from the
+            # mask anyway so this stays correct if padding_side ever changes.
+            idx = mask.shape[1] - 1 - mask.flip(dims=[1]).argmax(dim=1)
+            return h[torch.arange(h.shape[0], device=h.device), idx]
+        if self.pooling == "cls":
+            idx = mask.argmax(dim=1)  # first unmasked position
+            return h[torch.arange(h.shape[0], device=h.device), idx]
+        raise ValueError(f"Unknown pooling: {self.pooling!r}")

@@ -3,8 +3,10 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
+import math
 
 import matplotlib.pyplot as plt
+from mpl_toolkits.axes_grid1 import make_axes_locatable
 import numpy as np
 import seaborn as sns
 
@@ -82,6 +84,80 @@ def _get_fig_ax(ax: plt.Axes | None, figsize=None) -> tuple[plt.Figure, plt.Axes
     return plt.subplots(figsize=figsize)
 
 
+# ─── Detail Helpers ───────────────────────────────────────────────────────────────
+
+def nice_number(value, round_val=False):
+    """Find a 'nice' number approximately equal to value"""
+    exponent = math.floor(math.log10(value))
+    fraction = value / (10 ** exponent)
+    
+    if round_val:
+        if fraction < 1.5:
+            nice_fraction = 1
+        elif fraction < 3:
+            nice_fraction = 2
+        elif fraction < 7:
+            nice_fraction = 5
+        else:
+            nice_fraction = 10
+    else:
+        if fraction <= 1:
+            nice_fraction = 1
+        elif fraction <= 2:
+            nice_fraction = 2
+        elif fraction <= 5:
+            nice_fraction = 5
+        else:
+            nice_fraction = 10
+    
+    return nice_fraction * (10 ** exponent)
+
+
+def nice_ticks(min_val, max_val, num_ticks=5):
+    """Generate nice tick marks for a range"""
+    range_val = nice_number(max_val - min_val, False)
+    tick_spacing = nice_number(range_val / (num_ticks - 1), True)
+    
+    nice_min = math.floor(min_val / tick_spacing) * tick_spacing
+    nice_max = math.ceil(max_val / tick_spacing) * tick_spacing
+    
+    ticks = []
+    t = nice_min
+    while t <= nice_max + tick_spacing * 0.5:
+        ticks.append(round(t, 10))  # avoid float precision issues
+        t += tick_spacing
+    return ticks
+
+
+def _add_colorbar(
+    ax: plt.Axes,
+    colormap: Union[str, plt.cm.Colormap],
+    label: str | None = None,
+    norm: plt.Normalize | None = None,
+    ticks: list | None = None,
+    ticklabels: list[str] | Callable | None = None,
+) -> tuple[plt.Figure, plt.Axes]:
+    """Add a colorbar to an axis"""
+    fig = ax.get_figure()
+
+    sm = plt.cm.ScalarMappable(cmap=colormap, norm=norm)
+    sm.set_array([])  # Required for ScalarMappable to work properly
+    cbar = plt.colorbar(sm, ax=ax)
+    cbar.set_label(label)
+
+    if ticks is not None:
+        ticks = sorted(set(ticks))  # Ensure ticks are unique and sorted
+        cbar.set_ticks(ticks)
+    if ticklabels is not None:
+        if ticklabels is not None and callable(ticklabels):
+            ticklabels = [ticklabels(tick) for tick in ticks]
+        cbar.set_ticklabels(ticklabels)
+
+    return fig, ax
+
+
+
+
 # ── plot_lines ────────────────────────────────────────────────────────────────
 
 def plot_lines(
@@ -140,6 +216,7 @@ def plot_lines(
 def plot_scatter(
     geometry,
     color_by: list | np.ndarray | None = None,
+    colormap: str | plt.cm.Colormap = "plasma",
     labels: list[str] | None = None,
     series: list[PlotSeries] | None = None,
     ax: plt.Axes | None = None,
@@ -147,6 +224,7 @@ def plot_scatter(
     marker_size: int = 100,
     title: str | None = None,
     savepath=None,
+    savefig=True
 ) -> tuple[plt.Figure, plt.Axes]:
     """Scatter plot of a GeometryResult (2D MDS/UMAP/PCA coordinates).
 
@@ -179,7 +257,7 @@ def plot_scatter(
                                      marker="o", s=marker_size, zorder=3)
             else:
                 scatter = ax.scatter(coords[:, 0], coords[:, 1], c=color_arr,
-                                     cmap="viridis", marker="o", s=marker_size, zorder=3)
+                                     cmap=colormap, marker="o", s=marker_size, zorder=3)
         else:
             ax.scatter(coords[:, 0], coords[:, 1], color=PALETTE[0],
                        marker="o", s=marker_size, zorder=3)
@@ -196,7 +274,8 @@ def plot_scatter(
     ax.set_xlabel("dim 1")
     ax.set_ylabel("dim 2")
 
-    _save(fig, _resolve_savepath(savepath, title or _title))
+    if savefig:
+        _save(fig, _resolve_savepath(savepath, title or _title))
     return fig, ax
 
 
@@ -208,7 +287,7 @@ def plot_distance_heatmap(
     label_fn: Callable[[str], str] | None = None,
     title: str | None = None,
     fmt: str = ".2f",
-    cmap: str = "viridis_r",
+    cmap: str = "copper_r",
     annot: bool = True,
     colorbar: bool = True,
     cbar_ticks: list | None = None,
@@ -216,6 +295,7 @@ def plot_distance_heatmap(
     vmax: float | None = None,
     tick_rotation: int = 0,
     savepath=None,
+    savefig=True,
 ) -> tuple[plt.Figure, plt.Axes]:
     """Heatmap of a DistanceMatrix.
 
@@ -242,17 +322,22 @@ def plot_distance_heatmap(
         cmap=cmap,
         vmin=vmin,
         vmax=vmax,
-        cbar=colorbar,
+        cbar=False,
         square=True,
     )
 
-    if colorbar and cbar_ticks is not None:
-        ax.collections[0].colorbar.set_ticks(cbar_ticks)
-
     if colorbar:
-        cbar = ax.collections[0].colorbar
-        tick_fs = plt.rcParams.get("xtick.labelsize", plt.rcParams["font.size"])
-        cbar.ax.tick_params(labelsize=tick_fs)
+        norm = plt.Normalize(vmin=np.min(dm.matrix) if vmin is None else vmin,
+                             vmax=np.max(dm.matrix) if vmax is None else vmax)
+        fig, ax =_add_colorbar(ax, colormap=cmap, label="distance", norm=norm,
+                      ticks=cbar_ticks)
+    # if colorbar and cbar_ticks is not None:
+    #     ax.collections[0].colorbar.set_ticks(cbar_ticks)
+
+    # if colorbar:
+    #     cbar = ax.collections[0].colorbar
+        # tick_fs = plt.rcParams.get("xtick.labelsize", plt.rcParams["font.size"])
+        # cax.tick_params(labelsize=tick_fs)
 
     ax.set_xticklabels(ax.get_xticklabels(), rotation=tick_rotation)
     ax.set_yticklabels(ax.get_yticklabels(), rotation=0)
@@ -260,5 +345,7 @@ def plot_distance_heatmap(
     _title = title or f"{dm.taxonomy} | {dm.metric}"
     ax.set_title(_title)
 
-    _save(fig, _resolve_savepath(savepath, title or _title))
+    if savefig:
+        _save(fig, _resolve_savepath(savepath, title or _title))
     return fig, ax
+

@@ -6,4 +6,6 @@ from .figures import (
     plot_lines,
     plot_scatter,
     save_figure,
+    
+    _add_colorbar
 )

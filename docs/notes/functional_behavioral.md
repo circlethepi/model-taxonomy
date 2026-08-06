@@ -162,18 +162,25 @@ for some time after the cache migration added five.)
 
 > **CLOSED.** The premise dissolved rather than the question being answered:
 > neither level uses `DiskCache` any more, so neither is config-keyed in the way
-> described below. Behavioral moved to `GeneratedTextCache`
-> (`05_generated/{config_hash}/…`) and functional to `ActivationCache`
-> (`04_activations/{base}/{adapter}/{recipe_hash}/n{n}_s{seed}/…`). Both make
-> availability a **file-existence test** again — option (a)'s uniformity without
-> its walk-and-read cost.
+> described below. Both now use the **same** key —
+> `{base}/{adapter}/{recipe_hash}/n{n}_s{seed}/` — from the shared
+> `DrawKeyedCache`: functional in `04_activations`, behavioral in
+> `05_generated`. Both make availability a **file-existence test** again —
+> option (a)'s uniformity without its walk-and-read cost.
+>
+> **Behavioral was run-keyed (`05_generated/{config_hash}/…`) until TODO item 13,
+> and that was not merely an inconsistency — it was broken.** The per-model
+> filename hashed the adapter's full path, and the stored paths were relative, so
+> the entries were reachable only from the directory the writer ran in. Measured
+> before the fix: `behavioral_repr` was **0 across all 25 adapters × 2 configs**
+> with 10 representations readable on disk.
 >
 > Both tokens carry the **same honesty caveat**, documented on the `scan_cache`
-> arguments: given `behavioral_config_hash` / `functional_draw` the token is
-> exact; without one it degrades to "some representation exists, under some
-> config/draw", which is weaker than it looks, because a representation from a
-> different query set is not interchangeable. Pass the selector whenever the
-> answer will choose models for a comparison.
+> arguments: given `behavioral_draw` / `functional_draw` the token is exact;
+> without one it degrades to "some representation exists, under some draw", which
+> is weaker than it looks, because a representation from a different query set is
+> not interchangeable. Pass the selector whenever the answer will choose models
+> for a comparison.
 >
 > Both checks ask the cache where its own files live rather than rebuilding the
 > path — `_sampled_rows_exist` is the counterexample still in the tree.

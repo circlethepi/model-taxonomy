@@ -10,9 +10,11 @@
 # prompts them with a question title instead, a shape that never appeared in training.
 # This run measures what that mismatch is worth. See TODO item 11.
 #
-# The baseline is not disturbed: a different query_key gives a different behavioral
-# config_hash, so this lands in its own directory under 05_generated/ and the
-# question_title run (5191ad734b81daff) stays readable for side-by-side comparison.
+# The baseline is not disturbed: a different query_key means a different recipe_hash,
+# so this lands under its own {recipe_hash}/n{n}_s{seed}/ in 05_generated/ and the
+# question_title run stays readable for side-by-side comparison. (The mechanism changed
+# with TODO item 13 — 05_generated is keyed by model and draw, not by a run hash — but
+# the conclusion is the same, and is now the *same* separation functional gets.)
 #
 # output_dir points at the existing yahoo_topics_mean_cosine experiment because that
 # is where the query recipe lives (make_queries reads

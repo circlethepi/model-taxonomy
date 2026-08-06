@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hashlib
 import json
 import os
 from datetime import datetime, timezone
@@ -9,6 +8,8 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 
+from src.cache._draw import draw_name, parse_draw_name
+from src.cache._draw_keyed import DrawKeyedCache
 from src.core.representation import ModelRepresentation
 
 if TYPE_CHECKING:
@@ -22,13 +23,40 @@ class DatasetEmbeddingCache:
     Directory layout::
 
         cache_root/02_dataset_embeddings/{recipe_hash}/
-            recipe.json                ← human-readable recipe (plain-text)
-            {embedder_hash}/
-                config.json            ← embedder config + representation + n_samples
-                embeddings.safetensors ← (N, d) or (1, gram_features) float32
+            recipe.json                     ← human-readable recipe (plain-text)
+            n{n}_s{seed}/
+                {embedder_hash}/
+                    config.json             ← the embedder config
+                    surrogates/{surrogate_hash}/
+                        config.json         ← {"representation": ...}
+                        surrogate.safetensors
 
     The recipe is always written as a standalone human-readable file so recipes
-    can be inspected or reconstructed without loading the tensor data.
+    can be inspected or reconstructed without loading the tensor data.  It sits
+    at the **recipe** level because it describes the mixture — which is exactly
+    what ``recipe_hash`` identifies — and is shared across every draw of it.
+
+    **The draw is a path component, not part of a hash.**  It briefly was part of
+    one: when ``recipe_hash`` became content-addressed over
+    ``{recipe_type, datasets}``, ``_s{seed}`` left the recipe *name*, and seed had
+    to go somewhere or every seed of a mixture would collapse onto one entry and
+    a seed sweep would silently read one draw for all seeds.  Folding it into
+    ``embedder_hash`` fixed that, but it left this the only stage where "which
+    draws are embedded?" could not be answered by looking — 520 opaque directory
+    names encoding what ``01``, ``04`` and ``05`` all write in plain text.  The
+    guarantee is unchanged; only its location is.
+
+    **A surrogate here is authored, not derived — and that differs from
+    ``04``/``05``.**  In the inference caches a surrogate is a read-time *view* of
+    a stored base artifact: the raw activations are on disk, so a new view is a
+    recomputation that costs nothing but CPU.  This stage has no base artifact.
+    ``representation`` is chosen *before* embedding and only its result is
+    stored, because the true base — the full ``(N, 768)`` per-element embeddings —
+    would cost 6.1 GB across the stored cache and a GPU re-embed of ~2M texts,
+    and ``mean`` is not invertible.  So the directory shape matches ``04``/``05``
+    exactly while the guarantee behind it is weaker: **adding a representation
+    here means re-embedding, not a read-time rebuild.**  Do not write code that
+    assumes a missing surrogate can be reconstructed from a sibling.
     """
 
     def __init__(self, cache_root: Path | str) -> None:
@@ -42,48 +70,80 @@ class DatasetEmbeddingCache:
     def _recipe_dir(self, recipe_hash: str) -> Path:
         return self._base / recipe_hash
 
-    def _entry_dir(self, recipe_hash: str, embedder_hash: str) -> Path:
-        return self._base / recipe_hash / embedder_hash
+    def draw_dir(self, recipe_hash: str, n_samples: int, seed: int) -> Path:
+        return self._recipe_dir(recipe_hash) / draw_name(n_samples, seed)
+
+    def entry_dir(
+        self, recipe_hash: str, n_samples: int, seed: int, embedder_hash: str
+    ) -> Path:
+        return self.draw_dir(recipe_hash, n_samples, seed) / embedder_hash
+
+    def surrogate_dir(
+        self,
+        recipe_hash: str,
+        n_samples: int,
+        seed: int,
+        embedder_hash: str,
+        spec: dict,
+    ) -> Path:
+        return (
+            self.entry_dir(recipe_hash, n_samples, seed, embedder_hash)
+            / "surrogates"
+            / self.surrogate_hash(spec)
+        )
 
     # ------------------------------------------------------------------
     # Hash helpers
     # ------------------------------------------------------------------
 
     @staticmethod
-    def embedder_hash(
-        embedder_config: dict,
-        representation: str,
-        n_samples: int,
-        seed: int | None = None,
-    ) -> str:
-        """16-char SHA-256 prefix identifying an (embedder, mode, n_samples, seed) key.
+    def embedder_hash(embedder_config: dict) -> str:
+        """16-char SHA-256 prefix identifying an embedder configuration.
 
-        *seed* is part of the key because the recipe hash no longer distinguishes draws.
-        It once did — the recipe name carried ``_s{seed}``, so two seeds of one mixture
-        were two recipes and landed in two directories.  Now that the hash is
-        content-addressed they share a recipe directory, and seed is the only thing left
-        separating their embeddings.  Without it all seeds of a mixture would collapse
-        onto one entry and the seed sweep would silently read one draw's embedding for
-        every seed.
+        **Only the embedder**, which is what the name has always claimed.  It
+        used to carry ``representation``, ``n_samples`` and ``seed`` as well —
+        and since the embedder axis never actually varied in the stored cache,
+        that made a directory named ``embedder_hash`` in practice a draw hash.
+        The draw is now a path component and the representation is the surrogate
+        spec, so this key finally means what it says.
+
+        Every field of the embedder config counts, including ``prompt_prefix``:
+        bare and correctly-prefixed embeddings live on different scales, so a key
+        that could not tell them apart would let the cache hand back one where
+        the other was asked for.
         """
-        payload = json.dumps(
-            {
-                "embedder_config": embedder_config,
-                "representation": representation,
-                "n_samples": n_samples,
-                "seed": seed,
-            },
-            sort_keys=True,
-        ).encode()
-        return hashlib.sha256(payload).hexdigest()[:16]
+        return DrawKeyedCache.config_hash(embedder_config)
+
+    @staticmethod
+    def surrogate_hash(spec: dict) -> str:
+        """16-char SHA-256 prefix identifying a representation spec.
+
+        Deliberately :meth:`DrawKeyedCache.config_hash`, not a private peer, so a
+        spec dict hashes identically here and at ``04``/``05``.  Two hashing
+        schemes for one concept is how the draw token drifted; do not start a
+        second one.
+        """
+        return DrawKeyedCache.config_hash(spec)
+
+    @staticmethod
+    def spec_for(representation: str) -> dict:
+        """The surrogate spec naming one representation mode."""
+        return {"representation": representation}
 
     # ------------------------------------------------------------------
     # Existence checks
     # ------------------------------------------------------------------
 
-    def exists(self, recipe_hash: str, embedder_hash: str) -> bool:
-        d = self._entry_dir(recipe_hash, embedder_hash)
-        return (d / "config.json").exists() and (d / "embeddings.safetensors").exists()
+    def exists(
+        self,
+        recipe_hash: str,
+        n_samples: int,
+        seed: int,
+        embedder_hash: str,
+        spec: dict,
+    ) -> bool:
+        d = self.surrogate_dir(recipe_hash, n_samples, seed, embedder_hash, spec)
+        return (d / "config.json").exists() and (d / "surrogate.safetensors").exists()
 
     # ------------------------------------------------------------------
     # Write
@@ -96,52 +156,62 @@ class DatasetEmbeddingCache:
         embedder_config: dict,
         representation: str,
         n_samples: int,
-        seed: int | None = None,
+        seed: int,
     ) -> None:
-        """Atomically write recipe.json, config.json, and embeddings.safetensors.
+        """Atomically write recipe.json, the entry config, and the surrogate.
 
-        Idempotent: returns immediately if the entry already exists.
+        Idempotent: returns immediately if the surrogate already exists.
         Thread-safe via FileLock (safe on shared network filesystems).
+
+        ``seed`` is required.  It was optional while it lived inside a hash,
+        where ``None`` was merely one more value to digest; now that it names a
+        directory, ``None`` would render as the literal ``sNone`` — a path that
+        describes no draw and silently pools everything seedless into one entry.
         """
         from filelock import FileLock
         from safetensors.numpy import save_file
 
         recipe_hash = recipe.recipe_hash()
-        emb_hash = self.embedder_hash(embedder_config, representation, n_samples, seed)
+        emb_hash = self.embedder_hash(embedder_config)
+        spec = self.spec_for(representation)
 
-        entry_dir = self._entry_dir(recipe_hash, emb_hash)
-        entry_dir.mkdir(parents=True, exist_ok=True)
+        entry_dir = self.entry_dir(recipe_hash, n_samples, seed, emb_hash)
+        surr_dir = self.surrogate_dir(recipe_hash, n_samples, seed, emb_hash, spec)
+        surr_dir.mkdir(parents=True, exist_ok=True)
 
         lock_path = self._recipe_dir(recipe_hash) / ".lock"
         with FileLock(str(lock_path)):
-            if self.exists(recipe_hash, emb_hash):
+            if self.exists(recipe_hash, n_samples, seed, emb_hash, spec):
                 return
 
-            # Write recipe.json (human-readable, shared across embedder configs)
+            # recipe.json — human-readable, shared across draws and embedders
             recipe_path = self._recipe_dir(recipe_hash) / "recipe.json"
             if not recipe_path.exists():
                 tmp = recipe_path.with_suffix(".tmp")
                 tmp.write_text(json.dumps(recipe.to_dict(), indent=2))
                 os.replace(tmp, recipe_path)
 
-            # Write config.json
+            # The entry config describes the embedder and the draw it ran over.
+            # n_samples and seed are recorded even though the path already says
+            # them: a file that cannot be interpreted without its own path is a
+            # file that cannot survive being moved, and this stage has now been
+            # moved twice.
             config = {
-                "schema_version": "2",
+                "schema_version": "3",
                 "recipe_hash": recipe_hash,
                 "embedder_config": embedder_config,
-                "representation": representation,
                 "n_samples": n_samples,
                 "seed": seed,
                 "embedded_at": datetime.now(timezone.utc).isoformat(),
             }
-            config_path = entry_dir / "config.json"
-            tmp_cfg = entry_dir / "config.json.tmp"
-            tmp_cfg.write_text(json.dumps(config, indent=2))
-            os.replace(tmp_cfg, config_path)
+            _atomic_write_json(entry_dir / "config.json", config)
 
-            # Write embeddings.safetensors
-            st_path = entry_dir / "embeddings.safetensors"
-            tmp_st = entry_dir / "embeddings.safetensors.tmp"
+            _atomic_write_json(
+                surr_dir / "config.json", {"schema_version": "1", **spec}
+            )
+
+            st_path = surr_dir / "surrogate.safetensors"
+            tmp_st = surr_dir / "surrogate.safetensors.tmp"
             meta_bytes = np.frombuffer(
                 json.dumps(
                     {
@@ -165,12 +235,19 @@ class DatasetEmbeddingCache:
     # Read
     # ------------------------------------------------------------------
 
-    def load(self, recipe_hash: str, embedder_hash: str) -> ModelRepresentation:
-        """Reconstruct a ModelRepresentation from cached embeddings."""
+    def load(
+        self,
+        recipe_hash: str,
+        n_samples: int,
+        seed: int,
+        embedder_hash: str,
+        spec: dict,
+    ) -> ModelRepresentation:
+        """Reconstruct a ModelRepresentation from a cached surrogate."""
         from safetensors.numpy import load_file
 
-        entry_dir = self._entry_dir(recipe_hash, embedder_hash)
-        tensors = load_file(str(entry_dir / "embeddings.safetensors"))
+        d = self.surrogate_dir(recipe_hash, n_samples, seed, embedder_hash, spec)
+        tensors = load_file(str(d / "surrogate.safetensors"))
         matrix = tensors["matrix"]
         meta = json.loads(tensors["_meta_json"].tobytes().decode("utf-8"))
         return ModelRepresentation(
@@ -186,9 +263,11 @@ class DatasetEmbeddingCache:
         path = self._recipe_dir(recipe_hash) / "recipe.json"
         return json.loads(path.read_text())
 
-    def load_config(self, recipe_hash: str, embedder_hash: str) -> dict:
-        """Return the config.json dict for a specific embedding entry."""
-        path = self._entry_dir(recipe_hash, embedder_hash) / "config.json"
+    def load_config(
+        self, recipe_hash: str, n_samples: int, seed: int, embedder_hash: str
+    ) -> dict:
+        """Return the config.json dict for one embedder entry."""
+        path = self.entry_dir(recipe_hash, n_samples, seed, embedder_hash) / "config.json"
         return json.loads(path.read_text())
 
     # ------------------------------------------------------------------
@@ -205,32 +284,80 @@ class DatasetEmbeddingCache:
             if d.is_dir() and (d / "recipe.json").exists()
         ]
 
-    def list_embedder_configs(self, recipe_hash: str) -> list[dict]:
-        """Return all stored embedder configs for a given recipe_hash."""
-        recipe_dir = self._recipe_dir(recipe_hash)
-        if not recipe_dir.exists():
-            return []
-        configs = []
-        for d in sorted(recipe_dir.iterdir()):
-            cfg_path = d / "config.json"
-            if d.is_dir() and cfg_path.exists():
-                configs.append(json.loads(cfg_path.read_text()))
-        return configs
+    def list_draws(self, recipe_hash: str) -> list[tuple[int, int]]:
+        """The ``(n_samples, seed)`` draws embedded under a recipe hash.
 
-    def list_embedder_hashes(self, recipe_hash: str) -> list[str]:
-        """Return the embedder hashes stored for a recipe, without reading configs.
-
-        The hash is what :meth:`load` needs, and it is simply the subdirectory
-        name — so this answers "does this recipe have embeddings, and under which
-        keys?" with a directory listing rather than one JSON parse per entry.
-        That matters when scanning a cache holding a four-figure number of
-        recipes.
+        The point of the whole relayout: this used to require opening one JSON
+        per entry, because the answer was inside a hash rather than in the tree.
+        It is now a directory listing, which is how ``01`` and ``04`` have always
+        answered the same question.
         """
         recipe_dir = self._recipe_dir(recipe_hash)
         if not recipe_dir.exists():
             return []
+        draws = []
+        for d in sorted(recipe_dir.iterdir()):
+            parsed = parse_draw_name(d.name) if d.is_dir() else None
+            if parsed:
+                draws.append(parsed)
+        return draws
+
+    def list_embedder_hashes(
+        self, recipe_hash: str, n_samples: int, seed: int
+    ) -> list[str]:
+        """The embedder hashes stored for one draw, without reading configs."""
+        d = self.draw_dir(recipe_hash, n_samples, seed)
+        if not d.exists():
+            return []
         return [
-            d.name
-            for d in sorted(recipe_dir.iterdir())
-            if d.is_dir() and (d / "config.json").exists()
+            e.name for e in sorted(d.iterdir())
+            if e.is_dir() and (e / "config.json").exists()
         ]
+
+    def list_surrogates(
+        self, recipe_hash: str, n_samples: int, seed: int, embedder_hash: str
+    ) -> list[dict]:
+        """The stored representation specs for one embedder entry."""
+        d = self.entry_dir(recipe_hash, n_samples, seed, embedder_hash) / "surrogates"
+        if not d.exists():
+            return []
+        specs = []
+        for s in sorted(d.iterdir()):
+            cfg = s / "config.json"
+            if s.is_dir() and cfg.exists():
+                specs.append(json.loads(cfg.read_text()))
+        return specs
+
+    def list_embedder_configs(
+        self,
+        recipe_hash: str,
+        n_samples: int | None = None,
+        seed: int | None = None,
+    ) -> list[dict]:
+        """Stored embedder configs, for one draw or across all of them.
+
+        Each returned config carries its own ``n_samples`` and ``seed``, so a
+        caller sweeping every draw of a recipe can still tell them apart.
+        """
+        if n_samples is not None and seed is not None:
+            draws = [(n_samples, seed)]
+        else:
+            draws = self.list_draws(recipe_hash)
+
+        configs = []
+        for n, s in draws:
+            d = self.draw_dir(recipe_hash, n, s)
+            if not d.exists():
+                continue
+            for e in sorted(d.iterdir()):
+                cfg = e / "config.json"
+                if e.is_dir() and cfg.exists():
+                    configs.append(json.loads(cfg.read_text()))
+        return configs
+
+
+def _atomic_write_json(path: Path, payload: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(payload, indent=2))
+    os.replace(tmp, path)

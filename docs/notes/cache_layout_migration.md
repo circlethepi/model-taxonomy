@@ -41,7 +41,7 @@ directories may share a number when they sit at the same stage.
 | new name | old name | holds | stage |
 |---|---|---|---|
 | `01_datasets/` | `sampled_datasets/` | sampled rows, `{recipe_hash}/{n}_{seed:010d}.json`; **plus** a mirrored `recipe.json` per hash (see below) | create datasets, and the common test set |
-| `02_dataset_embeddings/` | `dataset_embeddings/` | `{recipe_hash}/recipe.json` + `{embedder_hash}/{config.json, embeddings.safetensors}` | dataset taxonomy representations |
+| `02_dataset_embeddings/` | `dataset_embeddings/` | `{recipe_hash}/recipe.json` + `n{n}_s{seed}/{embedder_hash}/config.json` + `surrogates/{hash}/{config.json, surrogate.safetensors}` (draw and surrogate levels added by item 15) | dataset taxonomy representations |
 | `03_adapters/` | `adapters/` | raw PEFT weights **and** extracted structural reps under `{adapter}/{config_hash}/` | fine-tuning output |
 | `03_adapter_alignments/` | `adapter_alignments/` | pairwise Procrustes alignment matrices, `{layer}/{proj}/` | structural taxonomy artifacts (was unnumbered in the original sketch) |
 | `04_activations/` | part of `representations/` | functional taxonomy reps + `queries.json` | functional extraction |

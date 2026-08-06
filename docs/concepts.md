@@ -141,7 +141,7 @@ numeric prefixes so a directory listing reads in pipeline order:
 ```
 results/shared_cache/
     01_datasets/                 {recipe_hash}/recipe.json + names.json + n{n}_s{seed}.json
-    02_dataset_embeddings/       {recipe_hash}/{embedder_hash}/
+    02_dataset_embeddings/       {recipe_hash}/n{n}_s{seed}/{embedder_hash}/surrogates/{hash}/
     03_adapters/                 raw PEFT weights + extracted structural representations
     03A_adapter_alignments/      pairwise Procrustes alignments
     04_activations/              {base}/{adapter}/{recipe_hash}/n{n}_s{seed}/
@@ -177,9 +177,23 @@ Three things about this layout are worth stating rather than leaving to be disco
   filename, not the identity, so a mixture swept over 19 sizes and 10 seeds is one
   recipe with ~190 draws beside it rather than 190 near-duplicate recipes. Two
   consequences worth knowing: `names.json` accumulates every config-block name that
-  resolved to the hash, because several legitimately do; and `seed` had to join
-  `DatasetEmbeddingCache.embedder_hash`, since the recipe hash no longer separates
-  seeds and without it a seed sweep would silently collapse onto one embedding.
+  resolved to the hash, because several legitimately do; and something had to keep
+  separating seeds once the recipe hash stopped doing it, or a seed sweep would
+  silently collapse onto one embedding. That was `DatasetEmbeddingCache.embedder_hash`
+  until item 15 moved it into the path, where `01`, `04` and `05` had always kept it.
+- **Every stage spells a draw the same way, and `src/cache/_draw.py` owns the
+  spelling.** `n{n}_s{seed:02d}`, zero-padded. It has not always been so: `01` wrote
+  an unpadded seed while `04`/`05` padded theirs, and `02` wrote no draw at all — so
+  the same coordinate had three spellings and nothing compared them. Writing is
+  narrow and reading is wide: `draw_name` always pads, `parse_draw_name` accepts
+  both, so pre-migration names still read.
+- **A `02` surrogate is authored, not derived — unlike `04`/`05`.** The inference
+  stages store a base artifact and compute views from it at read time, so a new view
+  costs only CPU. `02` stores no base: `representation` is chosen before embedding,
+  and keeping the full `(N, 768)` would cost 6.1 GB plus a GPU re-embed of ~2M texts.
+  The directory shape matches; the guarantee does not. Adding a representation here
+  means re-embedding, so do not write code that reconstructs one surrogate from a
+  sibling.
 - **Draws store source indices, not rows.** `n{n}_s{seed}.json` records which rows of
   which upstream split were drawn, in order, with the Hub revision pinned and a
   `rows_sha256` over the result — not the row text, which is already sitting in the

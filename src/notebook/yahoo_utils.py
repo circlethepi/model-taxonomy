@@ -83,6 +83,77 @@ def filter_yahoo_recipes(
     return [r for r in model_ids if matches(r) == keep]
 
 
+def _class_weights(recipe: dict) -> dict[str, float] | None:
+    """A recipe's normalized class weights, or None if it has none.
+
+    Read from the recipe body rather than parsed out of its *name*.  The name
+    cannot be trusted: ``recipe_hash`` is content-addressed over
+    ``{recipe_type, datasets}``, so one directory serves every draw of a mixture
+    and its ``recipe.json`` keeps whichever name happened to write it first.  The
+    class weights are part of what the hash is actually over.
+    """
+    datasets = recipe.get("datasets") or []
+    if not datasets:
+        return None
+    weights = datasets[0].get("normalized_class_weights") or {}
+    return {str(k): float(v) for k, v in weights.items()} or None
+
+
+def _proportion_label(weights: dict[str, float], classes: list[str]) -> str:
+    """``"075t0_025t1"`` over a fixed class universe.
+
+    *classes* is passed in rather than taken from *weights* because a pure
+    recipe filters to a single class and so records only that one — labelling it
+    from its own keys alone would produce ``"100t0"`` where every other recipe
+    produces ``"100t0_000t1"``, and the two would not sort or group together.
+    """
+    return "_".join(
+        f"{round(weights.get(c, 0.0) * 100):03d}t{c}" for c in classes
+    )
+
+
+def _scan_yahoo_draws(cache_root: Path | str) -> list[tuple[str, int, int]]:
+    """``[(proportion, n_samples, seed), ...]`` for every embedded Yahoo draw.
+
+    Lists the ``n{n}_s{seed}`` directories that item 15 put in the path.  Before
+    that the draw was inside ``embedder_hash`` and this had to be reconstructed
+    from the recipe name, which reported **one** draw per proportion instead of
+    the 103-135 actually stored — and dropped any proportion whose stored name
+    predated the ``_n{n}_s{seed}`` convention entirely.
+    """
+    from src.cache._draw import parse_draw_name
+
+    emb_dir = Path(cache_root) / "02_dataset_embeddings"
+    if not emb_dir.is_dir():
+        return []
+
+    # Pass 1: which recipes carry class weights, and what is the class universe?
+    found: list[tuple[Path, dict[str, float]]] = []
+    classes: set[str] = set()
+    for recipe_json in sorted(emb_dir.glob("*/recipe.json")):
+        try:
+            recipe = json.loads(recipe_json.read_text())
+        except Exception:
+            continue
+        weights = _class_weights(recipe)
+        if weights is None:
+            continue
+        found.append((recipe_json.parent, weights))
+        classes.update(weights)
+
+    ordered = sorted(classes, key=int)
+
+    # Pass 2: list the draws each one has.
+    out: list[tuple[str, int, int]] = []
+    for recipe_dir, weights in found:
+        proportion = _proportion_label(weights, ordered)
+        for draw_dir in sorted(recipe_dir.iterdir()):
+            parsed = parse_draw_name(draw_dir.name) if draw_dir.is_dir() else None
+            if parsed:
+                out.append((proportion, parsed[0], parsed[1]))
+    return out
+
+
 def scan_yahoo_cache(cache_root: Path | str) -> dict[str, dict[str, list]]:
     """Scan the dataset_embeddings cache for Yahoo recipes.
 
@@ -94,20 +165,10 @@ def scan_yahoo_cache(cache_root: Path | str) -> dict[str, dict[str, list]]:
             ...
         }
     """
-    emb_dir = Path(cache_root) / "02_dataset_embeddings"
     groups: dict[str, dict[str, set]] = defaultdict(
         lambda: {"n_values": set(), "seeds": set()}
     )
-
-    for recipe_json in emb_dir.glob("*/recipe.json"):
-        try:
-            name = json.loads(recipe_json.read_text()).get("name", "")
-        except Exception:
-            continue
-        m = YAHOO_RECIPE_RE.match(name)
-        if not m:
-            continue
-        proportion, n, seed = m.group(1), int(m.group(2)), int(m.group(3))
+    for proportion, n, seed in _scan_yahoo_draws(cache_root):
         groups[proportion]["n_values"].add(n)
         groups[proportion]["seeds"].add(seed)
 
@@ -133,18 +194,8 @@ def scan_yahoo_cache_detailed(
             ...
         }
     """
-    emb_dir = Path(cache_root) / "02_dataset_embeddings"
     groups: dict[str, dict[int, set[int]]] = defaultdict(lambda: defaultdict(set))
-
-    for recipe_json in emb_dir.glob("*/recipe.json"):
-        try:
-            name = json.loads(recipe_json.read_text()).get("name", "")
-        except Exception:
-            continue
-        m = YAHOO_RECIPE_RE.match(name)
-        if not m:
-            continue
-        proportion, n, seed = m.group(1), int(m.group(2)), int(m.group(3))
+    for proportion, n, seed in _scan_yahoo_draws(cache_root):
         groups[proportion][n].add(seed)
 
     return {

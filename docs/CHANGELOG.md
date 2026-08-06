@@ -4,6 +4,73 @@
 
 ## Unreleased
 
+### Every stage now spells a draw the same way, and `02` finally says which one
+
+**`src/cache/_draw.py` owns the draw token.** `n{n}_s{seed:02d}`, zero-padded.
+Three stages had three spellings for one coordinate: `01_datasets` wrote
+`n100000_s0.json`, `04`/`05` wrote `n64_s00`, and `02_dataset_embeddings` wrote
+no draw at all. Nothing detected the drift because each stage only read its own
+names — `DrawKeyedCache.draw_name` even documented its token as matching
+`01_datasets` while `01` wrote something else. Writing is narrow and reading is
+wide: `draw_name` always pads, `parse_draw_name` accepts both widths, so
+pre-migration names still read.
+
+**`02_dataset_embeddings` gains a draw level and a surrogate level**, matching
+`04`/`05`:
+
+    before: {recipe_hash}/{embedder_hash}/{config.json, embeddings.safetensors}
+    after:  {recipe_hash}/n{n}_s{seed:02d}/{embedder_hash}/
+                config.json
+                surrogates/{surrogate_hash}/{config.json, surrogate.safetensors}
+
+`embedder_hash` now keys `{embedder_config}` alone and `representation` moved
+into the surrogate spec. Folding the draw into that hash was a real fix once —
+when `recipe_hash` became content-addressed, something had to stop two seeds of
+one mixture sharing an entry — but it left `02` the only stage where "which draws
+are embedded?" needed one JSON parse per entry. **The guarantee moved into the
+path; it did not go away.** All 520 stored entries had a constant
+`representation`, `model_name` and `prompt_prefix`, so the directory was in
+practice a draw hash.
+
+**`dataset_selector`** joins `behavioral_selector` and `functional_selector`,
+since `representation` left the hash and `embedder_hash=` alone can no longer
+express which representation to read. It is one more axis
+`CollectionCache.collection_hash()` cannot see — that is TODO item 14.
+
+**`_embedder_choice` collapsed from ~50 lines to a set intersection.** It only
+did signature bookkeeping because the hash bundled `n_samples`, which meant one
+shared hash implied one shared sample count and ruled out the pooled comparison
+across the size sweep.
+
+**A `02` surrogate is authored, not derived**, and this differs from `04`/`05`.
+Those store a base artifact and compute views from it at read time; `02` stores
+no base, because the full `(N, 768)` embeddings would cost 6.1 GB and a GPU
+re-embed of ~2M texts, and `mean` is not invertible. Adding a representation here
+means re-embedding. Recorded in the class docstring.
+
+**Migration** (`scripts/migrate_dataset_embedding_layout.py`, additive with a
+separate `--prune`): 523 draws renamed and 520 entries relayed out, all verified
+byte-identical then pruned. No GPU, no recomputation, no distance changed.
+`verify_sampled_cache --full` rehydrated all 1046 draws (both spellings) against
+their recorded checksums between apply and prune: 0 failed.
+
+**Also fixed:** `scan_yahoo_cache` / `scan_yahoo_cache_detailed` reported **1
+draw per proportion instead of 94–135**, and dropped one proportion entirely.
+They regexed the recipe *name*, which content-addressing had reduced to one
+arbitrary stale label per directory; they now list draw directories and derive
+the proportion from `normalized_class_weights`. Two stale docstrings in
+`DatasetEmbeddingTaxonomy` were corrected — `representation` has three modes, not
+two, and `gram` no longer mirrors `FunctionalTaxonomy`.
+
+`scripts/migrate_recipe_identity.py` now computes the old four-field embedder
+digest itself. A completed migration is a record of a transition that already
+happened; it must not change meaning when the live signature does.
+
+`check_analysis.py`: 60 passed, 2 failed, 1 skipped across 63 checks. Both
+failures pre-date this work — `migrate_behavioral_layout.py --apply` has never
+been run against the shared cache, so the old run-wise `05_generated` directories
+survive.
+
 ### The behavioral cache was orphaned, and is now keyed like the functional one
 
 `05_generated` was keyed `{config_hash}/` with per-model filenames hashing the

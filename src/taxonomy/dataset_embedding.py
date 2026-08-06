@@ -29,7 +29,7 @@ class DatasetEmbeddingTaxonomy(Taxonomy):
     ``MixedDataset`` / ``ClassMixedDataset``, embeds every text element, and
     returns a ``ModelRepresentation`` whose ``model_id`` is the recipe hash.
 
-    Two representation modes are available:
+    Three representation modes are available:
 
     ``"matrix"``
         Raw ``(N_samples, d)`` embedding matrix.  Compatible with both
@@ -37,9 +37,19 @@ class DatasetEmbeddingTaxonomy(Taxonomy):
 
     ``"gram"``
         Gram matrix ``E @ E.T`` upper-triangle, stored as
-        ``(1, N_samples*(N_samples+1)//2)``.  Mirrors what
-        ``FunctionalTaxonomy`` does per layer.  Use with
+        ``(1, N_samples*(N_samples+1)//2)``.  Use with
         ``FrobeniusDistanceMetric``.
+
+        This used to be documented as mirroring what ``FunctionalTaxonomy``
+        does per layer.  It no longer mirrors anything: that per-layer form was
+        removed when functional's ``gram`` was redefined so its rows are
+        *queries* rather than layers — see ``docs/notes/gram_and_cka.md`` §3.
+
+    ``"mean"``
+        Centroid of the embeddings, ``(1, d)``.  Undocumented until now despite
+        being the mode every stored entry in ``02_dataset_embeddings`` uses, and
+        the one that makes a dataset directly comparable to a pooled behavioral
+        vector.
 
     Because this class implements the ``Taxonomy`` protocol, it plugs directly
     into ``TaxonomyAnalyzer`` alongside ``BehavioralTaxonomy``,
@@ -159,11 +169,10 @@ class DatasetEmbeddingTaxonomy(Taxonomy):
         if self.cache is not None:
             from src.cache.dataset_embedding_cache import DatasetEmbeddingCache
 
-            emb_hash = DatasetEmbeddingCache.embedder_hash(
-                self.embedder.config_dict(), self.representation, n_samples, seed
-            )
-            if self.cache.exists(recipe_hash, emb_hash):
-                return self.cache.load(recipe_hash, emb_hash)
+            emb_hash = DatasetEmbeddingCache.embedder_hash(self.embedder.config_dict())
+            spec = DatasetEmbeddingCache.spec_for(self.representation)
+            if self.cache.exists(recipe_hash, n_samples, seed, emb_hash, spec):
+                return self.cache.load(recipe_hash, n_samples, seed, emb_hash, spec)
 
         # Sample cache lookup / population
         mixed: MixedDataset | ClassMixedDataset | CachedMixedDataset

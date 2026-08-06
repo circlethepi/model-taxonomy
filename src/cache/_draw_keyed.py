@@ -36,11 +36,13 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-import re
 from datetime import datetime, timezone
 from pathlib import Path
 
 import numpy as np
+
+from src.cache._draw import DRAW_RE
+from src.cache._draw import draw_name as _draw_name
 
 
 def _slug(model_id: str) -> str:
@@ -72,7 +74,9 @@ def adapter_slug(model_id: str) -> str:
 
 
 #: ``n{n}_s{seed}`` directories, parsed when enumerating what a model has.
-_DRAW_RE = re.compile(r"^n(\d+)_s(\d+)$")
+#: Re-exported from :mod:`src.cache._draw`, which owns the spelling for every
+#: stage; the alias is kept so existing references here keep reading.
+_DRAW_RE = DRAW_RE
 
 
 class DrawKeyedCache:
@@ -122,8 +126,17 @@ class DrawKeyedCache:
 
     @staticmethod
     def draw_name(query_key: dict) -> str:
-        """``n{n}_s{seed}``, matching the draw filenames in ``01_datasets``."""
-        return f"n{query_key['n_samples']}_s{int(query_key['seed']):02d}"
+        """``n{n}_s{seed}`` for a query key, via :func:`src.cache._draw.draw_name`.
+
+        Takes the whole query key rather than two ints because every caller here
+        already holds one.  The spelling itself is not decided in this class —
+        :mod:`src.cache._draw` owns it, so ``01``, ``02`` and the inference
+        stages cannot drift apart again.  They *had* drifted: this token was
+        documented as "matching the draw filenames in ``01_datasets``" while
+        ``01`` was in fact writing an unpadded seed.  Item 15 moved ``01`` onto
+        this spelling and made the claim true.
+        """
+        return _draw_name(query_key["n_samples"], query_key["seed"])
 
     def draw_dir(self, base_model_id: str, adapter_id: str, query_key: dict) -> Path:
         return (

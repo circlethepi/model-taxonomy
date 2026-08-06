@@ -100,6 +100,7 @@ def build_taxonomy_artifacts(
     layers: int | list[int] | None = None,
     projections: str | list[str] | None = None,
     embedder_hash: str | None = None,
+    dataset_selector: dict | None = None,
     behavioral_selector: dict | None = None,
     functional_selector: dict | None = None,
     id_scheme: str = "recipe_id",
@@ -206,6 +207,7 @@ def build_taxonomy_artifacts(
         dm = _compute_distance_matrix(
             index, taxonomy, metric, ids,
             layers=layers, projections=projections, embedder_hash=embedder_hash,
+            dataset_selector=dataset_selector,
             behavioral_selector=behavioral_selector,
             functional_selector=functional_selector,
         )
@@ -325,13 +327,16 @@ def _compute_distance_matrix(
     layers=None,
     projections=None,
     embedder_hash: str | None = None,
+    dataset_selector: dict | None = None,
     behavioral_selector: dict | None = None,
     functional_selector: dict | None = None,
 ) -> DistanceMatrix:
     if taxonomy == "structural":
         return _structural_matrix(index, metric, ids, layers, projections)
     if taxonomy == "dataset_embedding":
-        return _dataset_embedding_matrix(index, metric, ids, embedder_hash)
+        return _dataset_embedding_matrix(
+            index, metric, ids, embedder_hash, dataset_selector
+        )
     if taxonomy == "behavioral":
         return _behavioral_matrix(index, metric, ids, behavioral_selector)
     if taxonomy == "functional":
@@ -382,7 +387,11 @@ def _structural_matrix(
 
 
 def _dataset_embedding_matrix(
-    index: CacheIndex, metric: Any, ids: Sequence[ModelID], embedder_hash: str | None
+    index: CacheIndex,
+    metric: Any,
+    ids: Sequence[ModelID],
+    embedder_hash: str | None,
+    dataset_selector: dict | None = None,
 ) -> DistanceMatrix:
     """Pairwise distances over cached dataset embeddings."""
     from src.cache.dataset_embedding_cache import DatasetEmbeddingCache
@@ -392,24 +401,33 @@ def _dataset_embedding_matrix(
         raise ValueError("index has no cache_root; cannot locate dataset embeddings")
 
     cache = DatasetEmbeddingCache(root)
-    chosen = (
-        {_draw_key(e): embedder_hash for e in index.entries}
-        if embedder_hash
-        else _embedder_choice(cache, index)
-    )
+    sel = dict(dataset_selector or {})
+    if embedder_hash and not sel.get("embedder_hash"):
+        sel["embedder_hash"] = embedder_hash
+
+    # One embedder hash now serves every draw, because the hash no longer bundles
+    # n_samples: agreeing on it is agreeing on the embedder, not on a sample
+    # count.  Only the representation still has to be chosen.
+    chosen = sel.get("embedder_hash") or _embedder_choice(cache, index)
+    spec = DatasetEmbeddingCache.spec_for(sel.get("representation", "mean"))
 
     reps = []
     for entry in index.entries:
         if not entry.recipe_hash:
             raise ValueError(f"{entry.adapter_name} has no recipe_hash to look up")
-        emb = chosen[_draw_key(entry)]
-        if not cache.exists(entry.recipe_hash, emb):
+        if not cache.exists(
+            entry.recipe_hash, entry.n_samples, entry.seed, chosen, spec
+        ):
             raise ValueError(
-                f"no dataset embedding for recipe {entry.recipe_id!r} under "
-                f"embedder {emb}. Available for it: "
-                f"{cache.list_embedder_hashes(entry.recipe_hash)}"
+                f"no dataset embedding for recipe {entry.recipe_id!r} at draw "
+                f"n{entry.n_samples}_s{entry.seed} under embedder {chosen} and "
+                f"representation {spec['representation']!r}. Embedders stored for "
+                f"that draw: "
+                f"{cache.list_embedder_hashes(entry.recipe_hash, entry.n_samples, entry.seed)}"
             )
-        reps.append(cache.load(entry.recipe_hash, emb))
+        reps.append(
+            cache.load(entry.recipe_hash, entry.n_samples, entry.seed, chosen, spec)
+        )
 
     metric_obj = _resolve_metric(metric)
     n = len(reps)
@@ -754,63 +772,54 @@ def _draw_key(entry) -> tuple:
     return (entry.recipe_hash, entry.n_samples, entry.seed)
 
 
-def _embedder_choice(cache, index: CacheIndex) -> dict[tuple, str]:
-    """Pick one embedding per draw: ``{(recipe_hash, n_samples, seed): embedder_hash}``.
+def _embedder_choice(cache, index: CacheIndex) -> str:
+    """The one embedder hash every entry in this collection has, as a string.
 
-    The embedder hash bundles ``(embedder_config, representation, n_samples)``, so
-    requiring one shared *hash* across a collection would also require one shared
-    sample count — which rules out exactly the pooled comparison that spans the
-    sample-size sweep, even though every dataset there was embedded by the same
-    model in the same mode.
+    This used to return a hash *per draw* and take fifty lines to do it, because
+    ``embedder_hash`` bundled ``n_samples`` and ``seed``: requiring one shared
+    hash would have required one shared sample count, which rules out exactly the
+    pooled comparison that spans the sample-size sweep.  The workaround was to
+    agree on an ``(embedder_config, representation)`` signature instead and let
+    each recipe contribute its own hash.
 
-    So the agreement demanded is on ``(embedder_config, representation)`` alone,
-    and each recipe then contributes its own sample count.  That keeps the axis
-    meaningful — no dataset is embedded by a different model than its neighbours —
-    while letting ``n_samples`` be the thing that varies.
+    Item 15 removed the reason.  The hash now keys the embedder alone, so one
+    hash genuinely is common to every draw and the signature bookkeeping
+    collapses into a set intersection over hashes.
+
+    The two errors below are kept.  They stop firing for the sweep case they were
+    written to work around, but they remain reachable — and necessary — the
+    moment a second embedder exists in the cache.
     """
-    signatures: list[dict[str, str]] = []
+    available: list[set[str]] = []
     for entry in index.entries:
         if not entry.recipe_hash:
             raise ValueError(f"{entry.adapter_name} has no recipe_hash to look up")
-        by_signature: dict[str, str] = {}
-        for cfg in cache.list_embedder_configs(entry.recipe_hash):
-            signature = json.dumps(
-                [cfg.get("embedder_config"), cfg.get("representation")], sort_keys=True
+        hashes = set(
+            cache.list_embedder_hashes(
+                entry.recipe_hash, entry.n_samples, entry.seed
             )
-            emb_hash = cache.embedder_hash(
-                cfg["embedder_config"], cfg["representation"],
-                cfg["n_samples"], cfg.get("seed"),
-            )
-            # Prefer the embedding of the exact draw the model was trained on; anything
-            # else is a different dataset.  Seed counts as much as n_samples here, since
-            # the two are what distinguish draws of one content-addressed recipe.
-            exact = cfg["n_samples"] == entry.n_samples and cfg.get("seed") == entry.seed
-            if signature not in by_signature or exact:
-                by_signature[signature] = emb_hash
-        if not by_signature:
+        )
+        if not hashes:
             raise ValueError(
-                f"no cached dataset embedding for recipe {entry.recipe_id!r}"
+                f"no cached dataset embedding for recipe {entry.recipe_id!r} at "
+                f"draw n{entry.n_samples}_s{entry.seed}"
             )
-        signatures.append(by_signature)
+        available.append(hashes)
 
-    common = set.intersection(*(set(s) for s in signatures))
+    common = set.intersection(*available)
     if not common:
         raise ValueError(
-            "the models in this collection share no (embedder, representation) "
-            "configuration, so their dataset embeddings cannot be compared on one "
-            "axis. Embed them all with the same embedder first."
+            "the models in this collection share no embedder configuration, so "
+            "their dataset embeddings cannot be compared on one axis. Embed them "
+            "all with the same embedder first."
         )
     if len(common) > 1:
-        readable = [json.loads(s) for s in sorted(common)]
         raise ValueError(
-            f"{len(common)} (embedder, representation) configurations are "
-            f"available for every model: {readable}. Pass embedder_hash= to choose."
+            f"{len(common)} embedder configurations are available for every "
+            f"model: {sorted(common)}. Pass dataset_selector={{'embedder_hash': ...}} "
+            "to choose."
         )
-
-    signature = next(iter(common))
-    return {
-        _draw_key(e): s[signature] for e, s in zip(index.entries, signatures)
-    }
+    return next(iter(common))
 
 
 # ── stage 2: the comparison ────────────────────────────────────────────────────

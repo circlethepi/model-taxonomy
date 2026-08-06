@@ -31,6 +31,7 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Iterator, Sequence
 
+from src.cache._draw import draw_name, parse_draw_name
 from src.core.protocols import ModelID
 
 __all__ = ["CacheEntry", "CacheIndex", "scan_cache"]
@@ -389,8 +390,13 @@ def scan_cache(
                     )
                 entry.recipe = recipe_cache[entry.recipe_hash]
 
-            if entry.recipe_hash:
-                entry.embedder_hashes = de_cache.list_embedder_hashes(entry.recipe_hash)
+            # Per draw, not per recipe.  A recipe hash is content-addressed, so
+            # asking it alone answers "was this mixture ever embedded, at any n
+            # and seed?" — which is not what the availability flag below means.
+            if entry.recipe_hash and entry.n_samples is not None and entry.seed is not None:
+                entry.embedder_hashes = de_cache.list_embedder_hashes(
+                    entry.recipe_hash, entry.n_samples, entry.seed
+                )
 
             entry.available = {
                 "structural_weights": (adapter_dir / "adapter_model.safetensors").exists(),
@@ -485,8 +491,12 @@ def _sampled_rows_exist(
 ) -> bool:
     if not recipe_hash or n_samples is None or seed is None:
         return False
-    # SampledDatasetCache._path: {recipe_hash}/n{n_samples}_s{seed}.json
-    return (sampled_root / recipe_hash / f"n{n_samples}_s{seed}.json").exists()
+    # Still rebuilds SampledDatasetCache's layout rather than asking it — but the
+    # part that actually drifted, the draw token, now comes from the one function
+    # that owns it.  Constructing the cache instead would be better still, except
+    # that its __init__ mkdirs the root, and a predicate used by a read-only scan
+    # must not create directories as a side effect.
+    return (sampled_root / recipe_hash / f"{draw_name(n_samples, seed)}.json").exists()
 
 
 def _draw_keyed_repr_exists(
@@ -548,7 +558,9 @@ def _attach_unreferenced_recipes(
                     mixture=mixture,
                     n_samples=n_samples,
                     seed=seed,
-                    embedder_hashes=de_cache.list_embedder_hashes(recipe_hash),
+                    embedder_hashes=de_cache.list_embedder_hashes(
+                        recipe_hash, n_samples, seed
+                    ),
                     available={
                         "structural_weights": False,
                         "structural_repr": False,
@@ -564,9 +576,6 @@ def _attach_unreferenced_recipes(
             )
 
 
-_DRAW_FILE_RE = re.compile(r"^n(?P<n>\d+)_s(?P<seed>\d+)$")
-
-
 def _draws_for(sampled_root: Path, recipe_hash: str) -> list[tuple[int, int]]:
     """The ``(n_samples, seed)`` draws cached under a recipe hash."""
     directory = sampled_root / recipe_hash
@@ -574,9 +583,9 @@ def _draws_for(sampled_root: Path, recipe_hash: str) -> list[tuple[int, int]]:
         return []
     draws = []
     for path in directory.glob("n*_s*.json"):
-        m = _DRAW_FILE_RE.match(path.stem)
-        if m:
-            draws.append((int(m.group("n")), int(m.group("seed"))))
+        parsed = parse_draw_name(path.stem)
+        if parsed:
+            draws.append(parsed)
     return draws
 
 

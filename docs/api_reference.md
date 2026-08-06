@@ -686,7 +686,8 @@ from src import DatasetEmbeddingCache
 class DatasetEmbeddingCache:
     def __init__(self, cache_root: Path | str)
 
-    def exists(self, recipe_hash: str, embedder_hash: str) -> bool
+    def exists(self, recipe_hash: str, n_samples: int, seed: int,
+               embedder_hash: str, spec: dict) -> bool
     def save(
         self,
         recipe: DatasetRecipe | ClassAwareDatasetRecipe,
@@ -694,22 +695,44 @@ class DatasetEmbeddingCache:
         embedder_config: dict,
         representation: str,
         n_samples: int,
-        seed: int | None = None,
+        seed: int,
     ) -> None
-    def load(self, recipe_hash: str, embedder_hash: str) -> ModelRepresentation
+    def load(self, recipe_hash: str, n_samples: int, seed: int,
+             embedder_hash: str, spec: dict) -> ModelRepresentation
+
+    def list_draws(self, recipe_hash: str) -> list[tuple[int, int]]
+    def list_embedder_hashes(self, recipe_hash: str, n_samples: int, seed: int) -> list[str]
+    def list_surrogates(self, recipe_hash: str, n_samples: int, seed: int,
+                        embedder_hash: str) -> list[dict]
 
     @staticmethod
-    def embedder_hash(
-        embedder_config: dict,
-        representation: str,
-        n_samples: int,
-        seed: int | None = None,
-    ) -> str
+    def embedder_hash(embedder_config: dict) -> str
+    @staticmethod
+    def surrogate_hash(spec: dict) -> str
+    @staticmethod
+    def spec_for(representation: str) -> dict
 ```
 
-Hierarchical cache for `DatasetEmbeddingTaxonomy` representations. Stores data under `cache_root/02_dataset_embeddings/{recipe_hash}/{embedder_hash}/`. Each entry contains a human-readable `recipe.json`, a `config.json` with embedder settings, and an `embeddings.safetensors` file. Pass a `DatasetEmbeddingCache` instance to `DatasetEmbeddingTaxonomy(cache=...)` to enable persistence.
+Hierarchical cache for `DatasetEmbeddingTaxonomy` representations, stored under
+`cache_root/02_dataset_embeddings/{recipe_hash}/n{n}_s{seed}/{embedder_hash}/`, with
+a human-readable `recipe.json` at the recipe level, a `config.json` naming the
+embedder at the entry level, and the tensor under
+`surrogates/{surrogate_hash}/surrogate.safetensors`. Pass an instance to
+`DatasetEmbeddingTaxonomy(cache=...)` to enable persistence.
 
-`embedder_hash` identifies an `(embedder_config, representation, n_samples, seed)` key and is used as the second-level directory key. `seed` is part of it because `recipe_hash` is content-addressed and therefore shared by every draw of a mixture — without the seed, all seeds would resolve to one entry.
+`embedder_hash` identifies the embedder configuration and nothing else. It used to
+carry `representation`, `n_samples` and `seed` as well; the draw is now a path
+component and the representation is the surrogate spec, so the key finally means
+what its name says. `seed` is required by `save` — it names a directory, and `None`
+would render as the literal `sNone`.
+
+`surrogate_hash` is deliberately `DrawKeyedCache.config_hash`, so a spec dict hashes
+identically here and at `04`/`05`.
+
+**A surrogate here is authored, not derived.** At `04`/`05` a surrogate is a
+read-time view of a stored base artifact; this stage stores no base, because the
+full `(N, 768)` embeddings would cost 6.1 GB and a GPU re-embed. Adding a
+representation means re-embedding, not a read-time rebuild.
 
 ---
 

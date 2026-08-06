@@ -35,6 +35,8 @@ Dependencies are called out in the State column.
 
 | 14 | **`CollectionCache.collection_hash()` ignores the taxonomy selector** | this row; see also 9, 13 | `collection_hash(model_ids, taxonomy, metric)` is the whole key, so everything that actually determines a functional matrix — draw, layers, view, **normalization** — is invisible to it, and the same for `behavioral_selector` (which since item 13 is a full selector rather than one config hash, so there are now *more* ways for two collections to differ invisibly). A cached collection is therefore returned for a selector it was not built with, silently. **Quantified** while verifying item 13: rebuilding the single stored functional collection reproduces it to **4.09e-10** under `normalize="global"` and differs by **1.13e-03** under today's `layer` default — so the stored entry is intact and this hash blind spot is the whole of the discrepancy. This was latent while there was one way to build each matrix; it stopped being latent when `normalize` gained modes and the default moved to `layer`, since every collection stored before that keeps serving `global` numbers. `build_taxonomy_artifacts` documents the hazard but cannot avoid it. **Fix:** fold the resolved selector into the hash. **Cost:** invalidates every stored collection, which is why it was not done alongside the normalization change — it is a separate decision about throwing away cached work. **Workaround today:** call `_compute_distance_matrix` directly, as `docs/notes/TODO.md`'s re-measurement did. |
 
+| ~~15~~ | ~~`02_dataset_embeddings` hides the draw in a hash~~ | [dataset_embedding_layout.md](dataset_embedding_layout.md) | **Done.** `02` is now `{recipe_hash}/n{n}_s{seed:02d}/{embedder_hash}/surrogates/{hash}/`, matching `04`/`05`; `embedder_hash` keys `embedder_config` alone and `representation` moved into the surrogate spec. **The draw token was unified across three stages, not two** — `01` wrote an unpadded seed while `04`/`05` padded theirs, so `src/cache/_draw.py` now owns the spelling and `01`'s 523 draws were renamed to match. Migration was content-preserving: 523 + 520 verified byte-identical, then pruned; no GPU, no distance changed. Also fixed in passing: `scan_yahoo_cache` reported 1 draw per proportion instead of 94–135 and dropped one proportion entirely. Adds `dataset_selector`, which is one more axis item 14 cannot see.
+
 ## First end-to-end measurement of the behavioral level (2026-08-05)
 
 Item 13 made this possible: behavioral had **never** joined a cross-taxonomy
@@ -144,7 +146,7 @@ Recorded so they survive; each is cheap and independent.
 ## Verification
 
 `python scripts/check_analysis.py` is the sharpest instrument in the repo and the
-only test harness — there is no pytest. It registers 60 checks (48 synthetic, 12 that
+only test harness — there is no pytest. It registers 63 checks (51 synthetic, 12 that
 read the real cache); the data-backed ones report `SKIP` when a path is missing
 rather than passing vacuously, so they fail loudly on a missed migration. Run it
 before and after any of the items above and compare the pass/skip profile.
@@ -167,7 +169,7 @@ narrow it further when you want a fast loop:
 
     --list              print the check names, run nothing
     -k PATTERN          only checks whose description contains PATTERN
-    --data-only         only the 10 that read the real cache — what catches a
+    --data-only         only the 12 that read the real cache — what catches a
                         broken path after a migration
     --synthetic-only    skip the cache entirely
     --include-gpu       additionally run the [gpu] tier, which loads a real model
@@ -176,9 +178,15 @@ narrow it further when you want a fast loop:
 
 Run it in the project conda environment (`conda activate taxonomy-env`, the same one
 the SLURM scripts activate) — `numpy` is not installed in the base env, so the
-checks fail at import there. Baseline as of 2026-08-05, after the item-13 re-key:
-**60 passed, 0 failed, 0 skipped** across 60 registered checks (48 synthetic,
-12 `[data]`), plus 2 `[gpu]` checks behind `--include-gpu`. Both inference levels are
+checks fail at import there. Baseline as of 2026-08-06, after item 15:
+**60 passed, 2 failed, 1 skipped** across 63 registered checks (51 synthetic,
+12 `[data]`), plus 2 `[gpu]` checks behind `--include-gpu`. ⚠️ **The 2 failures are
+not item 15's** and were present before it: PR #7's behavioral migration has been
+merged as *code* but `scripts/migrate_behavioral_layout.py --apply` has never been
+run against the shared cache, so the old run-wise `05_generated/{config_hash}/`
+directories survive and no model-draw exists at both inference levels. Run that
+migration to clear both. The previous line here read 60/0/0 after the item-13
+re-key, which was true of the branch but not of this cache. Both inference levels are
 now populated, so nothing skips; the `[data]` checks for each must **skip**, never
 pass, whenever their stage directory is absent — verified by hiding `05_generated`,
 which turns exactly 3 `[data]` checks to SKIP and fails none. Earlier baselines:

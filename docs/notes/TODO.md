@@ -31,9 +31,40 @@ Dependencies are called out in the State column.
 | 10 | Generalize CKA to multi-layer / multi-projection sweeps | [cka_notes.md](cka_notes.md) | Parked on a genuine modeling choice, not on effort. Needs a decision in conversation before any code. The other three distance builders were already generalized — see [frobenius_bw_generalization.md](frobenius_bw_generalization.md) for those proofs. |
 | 12 | **Behavioral representations have no `representation:` knob, unlike the dataset level** | this row; see also 8 | **What is on disk today** (verified against `05_generated/5191ad734b81daff/`): `embeddings/{slug}.safetensors` holds `matrix` as **`(n_queries, 768)` float32** — one row per query, each row L2-normalized, no pooling across queries — plus a `_meta_json` blob carrying `model_id`, `taxonomy` and `metadata`. The generated **text is not in the tensor file**: it lives beside it in `generations/{slug}.json`, and `GeneratedTextCache.load()` folds it back into `metadata["generated_texts"]` so callers see the original object. At `n_queries=64` that is ~192 KB of tensor + ~33 KB of text per model, growing linearly in `n_queries`. **The asymmetry:** `DatasetEmbeddingTaxonomy` takes `representation: mean\|matrix` and the populated `02_dataset_embeddings` all use `mean` (a `(1, d)` centroid), but `BehavioralTaxonomy` has no such parameter — it always stores the full matrix. **Why that matters less than it looks:** `CosineDistanceMetric` flattens both matrices before comparing, and because row *i* is query *i* for every model and every row is unit-norm, the flattened cosine reduces exactly to the **mean per-query cosine similarity** — `cos(A_flat, B_flat) = (1/n)·Σᵢ⟨aᵢ,bᵢ⟩`. So the metric already averages over queries; keeping the full matrix costs disk but is what makes per-query analysis (centering, subsetting, per-query variance) possible at all — and those are the levers if the signal stays weak. **Decide:** whether behavioral gains a `representation:` option for symmetry, and whether a pooled `(1, 768)` variant is stored alongside so behavioral and dataset centroids are directly comparable. Note a pooled behavioral vector is **not** the same as the flattened cosine — averaging vectors then comparing differs from comparing then averaging. |
 
-| 13 | **The two inference caches diverge on three axes** | this row; see also 9 | `GeneratedTextCache` (`05_generated`) and `ActivationCache` (`04_activations`) store the same *kind* of thing — a per-model representation over a shared query draw — with three different conventions. Recorded now, while the reason for each is still known. **(a) Top-level key:** behavioral is run-wise (`{config_hash}/`), functional is model-wise (`{base}/{adapter}/{recipe_hash}/n{n}_s{seed}/`). Functional needs model-wise because one forward pass yields every layer, making layer choice a read-time decision; behavioral has no such axis, so run-wise costs it nothing. Not obviously worth unifying. **(b) Model key — this is the one with a real failure mode.** `generated_text_cache.model_slug` hashes the **full absolute path** of the adapter directory, so a behavioral entry is keyed to *where the adapter happened to live on disk*: **moving the cache root silently orphans every behavioral representation** — every write still succeeds, and the cache reads as empty. `ActivationCache` follows the `LoRACache` convention (`_slug(base_model_id) / adapter dir name`) and does not have this property. Fixing behavioral means a migration, since the slug is a directory name. **(c) Query record:** behavioral duplicates the full query **text** into `queries.json`; functional stores the `query_key` plus source row **indices**, since `01_datasets` is canonical and `(recipe_hash, n_samples, seed)` determines the text completely. Functional's is the better convention and behavioral's is redundant, but the redundancy is harmless. **Decide:** whether (b) is worth a migration on its own — it is the only one of the three that can lose data. |
+| ~~13~~ | ~~The two inference caches diverge on three axes~~ | this row; see also 9, 14 | **Done — all three axes, and (b) was worse than this row claimed.** **(a)** unified: `05_generated` is now model-wise, sharing `{base}/{adapter}/{recipe_hash}/n{n}_s{seed}/` with `04_activations` via a new `src/cache/_draw_keyed.py::DrawKeyedCache`. The row said this was "not obviously worth unifying"; it was, because fixing (b) *is* a migration of the model key and doing it twice would have cost the same twice. **(b)** fixed. The row said moving the cache root would orphan the entries — in fact **they were already orphaned**: the stored `model_id`s were *relative* paths, so `behavioral_repr` resolved to **0 hits across all 25 adapters × 2 configs** while 10 representations sat readable on disk. It went unnoticed because both checks touching behavioral bypassed the broken path — one read by config hash, the other excluded behavioral unless exactly one config existed, and there were two — so the level had **never** been exercised end to end. It now is, and `behavioral_repr` resolves to 5 from any cwd and from a relative root. **(c)** kept **as this row wrote it**: no query text is stored. A draft of the fix proposed inverting it, on the grounds that `text_field` is a read-time projection outside `recipe_hash`. That is false — `ClassDatasetEntry.to_dict()` includes `text_field`, `_canonical()` hashes the entries, so `(recipe_hash, n_samples, seed)` *does* determine the text. `_replay_queries` guessing the column was a bug in `_replay_queries`, now reading `text_field` from `recipe.json`. **Do not re-propose storing query text.** Also: `model_slug` is gone (its one live use was an in-memory PEFT adapter name, now `_hf_inference._adapter_name`), `source_indices` is populated rather than always empty, and `compare_all_slices` finally forwards the selectors it never had. Migrated by `scripts/migrate_behavioral_layout.py` (`--dry-run`/`--apply`/`--revert`): 10 entries byte-identical, 5 sharing coordinates with `04_activations`, 128 stored query strings dropped as redundant. |
 
-| 14 | **`CollectionCache.collection_hash()` ignores the taxonomy selector** | this row; see also 9, 13 | `collection_hash(model_ids, taxonomy, metric)` is the whole key, so everything that actually determines a functional matrix — draw, layers, view, **normalization** — is invisible to it, and the same for `behavioral_config_hash`. A cached collection is therefore returned for a selector it was not built with, silently. This was latent while there was one way to build each matrix; it stopped being latent when `normalize` gained modes and the default moved to `layer`, since every collection stored before that keeps serving `global` numbers. `build_taxonomy_artifacts` documents the hazard but cannot avoid it. **Fix:** fold the resolved selector into the hash. **Cost:** invalidates every stored collection, which is why it was not done alongside the normalization change — it is a separate decision about throwing away cached work. **Workaround today:** call `_compute_distance_matrix` directly, as `docs/notes/TODO.md`'s re-measurement did. |
+| 14 | **`CollectionCache.collection_hash()` ignores the taxonomy selector** | this row; see also 9, 13 | `collection_hash(model_ids, taxonomy, metric)` is the whole key, so everything that actually determines a functional matrix — draw, layers, view, **normalization** — is invisible to it, and the same for `behavioral_selector` (which since item 13 is a full selector rather than one config hash, so there are now *more* ways for two collections to differ invisibly). A cached collection is therefore returned for a selector it was not built with, silently. **Quantified** while verifying item 13: rebuilding the single stored functional collection reproduces it to **4.09e-10** under `normalize="global"` and differs by **1.13e-03** under today's `layer` default — so the stored entry is intact and this hash blind spot is the whole of the discrepancy. This was latent while there was one way to build each matrix; it stopped being latent when `normalize` gained modes and the default moved to `layer`, since every collection stored before that keeps serving `global` numbers. `build_taxonomy_artifacts` documents the hazard but cannot avoid it. **Fix:** fold the resolved selector into the hash. **Cost:** invalidates every stored collection, which is why it was not done alongside the normalization change — it is a separate decision about throwing away cached work. **Workaround today:** call `_compute_distance_matrix` directly, as `docs/notes/TODO.md`'s re-measurement did. |
+
+## First end-to-end measurement of the behavioral level (2026-08-05)
+
+Item 13 made this possible: behavioral had **never** joined a cross-taxonomy
+comparison, because the check that would have run it required exactly one cached
+config and there were two. It now joins, and the first numbers are bad in a
+specific and interpretable way.
+
+Same slice as the functional smoke run — 5 adapters, `n_samples=1000, seed=0`,
+64 queries, draw `04a65e58df502e45/n64_s00`, cosine:
+
+| taxonomy | stress | r | ρ | Procrustes | p |
+|---|---|---|---|---|---|
+| dataset_embedding | 0.2879 | 1.0000 | 1.0000 | 0.0041 | 0.005 |
+| functional | 0.0193 | 1.0000 | 1.0000 | 0.2487 | 0.015 |
+| structural | 0.0534 | 0.9937 | 1.0000 | 0.4500 | 0.015 |
+| **behavioral** | 0.2156 | **−0.9995** | **−1.0000** | **0.9772** | **0.955** |
+
+**Behavioral recovers the mixing order exactly backwards**, and its Procrustes
+p-value is 0.955 — no better than chance. The other three levels are all
+positively ordered and significant.
+
+Do not read this as "behavioral does not work" yet. It is exactly the failure
+**item 11** predicts: the adapters were trained on bare `best_answer` prose with
+no question and no template, while the behavioral query set prompts them with a
+`question_title` to continue. The generations are therefore produced from an
+input shape that never appeared in training. A monotone-but-inverted ordering is
+more consistent with a systematic artefact than with noise, which would scatter.
+
+**Before treating this as a property of the level, fix item 11 and re-measure.**
+The re-measurement is cheap now that the level joins a comparison at all.
 
 ## Small wins
 
@@ -113,10 +144,17 @@ Recorded so they survive; each is cheap and independent.
 ## Verification
 
 `python scripts/check_analysis.py` is the sharpest instrument in the repo and the
-only test harness — there is no pytest. It registers 54 checks (44 synthetic, 10 that
+only test harness — there is no pytest. It registers 60 checks (48 synthetic, 12 that
 read the real cache); the data-backed ones report `SKIP` when a path is missing
 rather than passing vacuously, so they fail loudly on a missed migration. Run it
 before and after any of the items above and compare the pass/skip profile.
+
+**A green suite is not proof a level works.** Item 13 is the cautionary case: the
+behavioral cache was unreachable through discovery for its entire life while the
+suite read 54/0/0, because the only two checks touching it both went around the
+broken path. When adding a level, make sure at least one check exercises it the
+way a *caller* would — through `scan_cache` and `build_taxonomy_artifacts` — not
+just by reading its files back directly.
 
 `python scripts/verify_sampled_cache.py --full` is the second instrument, and the one
 that matters for the dataset cache specifically: draws are stored as source indices, so
@@ -138,11 +176,13 @@ narrow it further when you want a fast loop:
 
 Run it in the project conda environment (`conda activate taxonomy-env`, the same one
 the SLURM scripts activate) — `numpy` is not installed in the base env, so the
-checks fail at import there. Baseline as of 2026-08-05, after the layerwise-normalization work:
-**54 passed, 0 failed, 0 skipped** across 54 registered checks (44 synthetic,
-10 `[data]`), plus 2 `[gpu]` checks behind `--include-gpu`. Both inference levels are
+checks fail at import there. Baseline as of 2026-08-05, after the item-13 re-key:
+**60 passed, 0 failed, 0 skipped** across 60 registered checks (48 synthetic,
+12 `[data]`), plus 2 `[gpu]` checks behind `--include-gpu`. Both inference levels are
 now populated, so nothing skips; the `[data]` checks for each must **skip**, never
-pass, whenever their stage directory is absent. Earlier baselines: 53/0/0 after the functional work, 45/0/1 after the
+pass, whenever their stage directory is absent — verified by hiding `05_generated`,
+which turns exactly 3 `[data]` checks to SKIP and fails none. Earlier baselines:
+54/0/0 after layerwise normalization, 53/0/0 after the functional work, 45/0/1 after the
 behavioral work (the one skip being functional's absent `04_activations/`), and
 40/0/0 before either. `t_scan_cache` reports 25 adapters,
 **25 with recipes, 25 usable**, and `verify_sampled_cache --fast` reports **523** draws

@@ -4,6 +4,57 @@
 
 ## Unreleased
 
+### The behavioral cache was orphaned, and is now keyed like the functional one
+
+`05_generated` was keyed `{config_hash}/` with per-model filenames hashing the
+adapter's **full path**. The stored paths were *relative*, so the key depended on
+the working directory the extraction ran in. This was not a latent hazard:
+measured before the change, `behavioral_repr` resolved to **0 hits across all 25
+adapters × 2 configs** while 10 representations sat readable on disk. Every write
+had succeeded; the cache read as empty.
+
+It went unnoticed because both checks touching behavioral bypassed the broken
+path — one read by config hash directly, the other excluded behavioral unless
+exactly one config existed, and there were two. **The level had never been
+exercised end to end.** It now is, and immediately produced its first
+cross-taxonomy numbers (see `docs/notes/TODO.md` — they are inverted, which is
+what TODO item 11 predicts).
+
+**`src/cache/_draw_keyed.py` (new)** — `DrawKeyedCache`, the addressing half both
+inference caches now share: `{base}/{adapter}/{recipe_hash}/n{n}_s{seed}/`,
+`draw_name`/`draw_dir`/`mode_token`/`config_hash`, the surrogate mechanism, and
+the enumeration API. Extracted as a pure move first, gated on an unchanged
+suite. `t_draw_keyed_shared_key` asserts the two caches share these by
+**identity**, so a future override cannot silently re-diverge them.
+
+**`src/cache/generated_text_cache.py`** — rebased onto it. Variants live in the
+filename (`generation{max_new_tokens}_{embedder_hash}`), so `ls embeddings/`
+answers "which embedders ran over this draw?" and re-embedding existing text
+costs no GPU pass. `model_slug` is deleted; its one live use was an in-memory
+PEFT adapter name, now `_hf_inference._adapter_name`, where hashing a path is
+harmless because the name never outlives the process.
+
+**No query text is stored at either level.** `(recipe_hash, n_samples, seed)`
+determines it, because `text_field` is part of the recipe and so part of
+`recipe_hash`. `_replay_queries` stopped guessing the column from a candidate
+list — first-match-wins silently took `text` over `question_title` on rows
+carrying both — and reads `text_field` from `recipe.json`. `source_indices` is
+now populated rather than always empty.
+
+**Consumers** — `scan_cache` takes `behavioral_draw` (the old keyword is removed,
+not aliased, so a stale call fails loudly); `_functional_repr_exists` collapses
+into `_draw_keyed_repr_exists`; `_behavioral_matrix` mirrors `_functional_matrix`
+behind `behavioral_selector`; `compare_all_slices` forwards the selectors it
+never had.
+
+**Migration** — `scripts/migrate_behavioral_layout.py`, with
+`--dry-run`/`--apply`/`--revert`. All 10 entries round-tripped byte-identical;
+the payoff check reports 5 model-draws sharing coordinates with `04_activations`
+and 0 for the other draw, as predicted. 128 stored query strings were dropped as
+redundant; generated text is preserved in full.
+
+Checks **54 → 60 passed, 0 failed, 0 skipped**.
+
 ### Functional taxonomy: `ActivationCache`, read-time views, and a redefined `gram`
 
 The functional level was the last one still writing through the flat `DiskCache`,

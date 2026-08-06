@@ -11,6 +11,8 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import json
+import re
 import sys
 import traceback
 from functools import lru_cache
@@ -994,6 +996,48 @@ def t_scan_cache():
     )
 
 
+def _draws_shared_by_all(root: Path, stage: str) -> set:
+    """``{(recipe_hash, n_samples, seed)}`` every model in *stage* has.
+
+    Works for either inference stage, because since the re-key they enumerate
+    identically.
+    """
+    from src.cache.activation_cache import ActivationCache
+    from src.cache.generated_text_cache import GeneratedTextCache
+
+    if not (root / stage).exists():
+        return set()
+    cache = (GeneratedTextCache if stage == "05_generated" else ActivationCache)(root)
+    per_model = []
+    for base_slug, adapter_slug in cache.list_models():
+        draws = cache.list_draws(base_slug.replace("--", "/"), adapter_slug)
+        per_model.append({(d["recipe_hash"], d["n_samples"], d["seed"]) for d in draws})
+    return set.intersection(*per_model) if per_model else set()
+
+
+def _shared_inference_draw(root: Path, stage: str) -> dict | None:
+    """One draw for *stage*, preferring one the other inference stage also has.
+
+    Several draws are several query sets, so picking arbitrarily would compare
+    models across different questions.  But when both levels hold the same draw,
+    that one is unambiguously the right choice — and preferring it is what makes
+    a cross-level comparison read the *same* queries at both levels, which is the
+    property the re-key exists to provide.  Returns None when the choice is still
+    ambiguous, so the caller can drop the level rather than guess.
+    """
+    mine = _draws_shared_by_all(root, stage)
+    if not mine:
+        return None
+    if len(mine) > 1:
+        other = "04_activations" if stage == "05_generated" else "05_generated"
+        overlap = mine & _draws_shared_by_all(root, other)
+        if len(overlap) != 1:
+            return None
+        mine = overlap
+    recipe_hash, n_samples, seed = next(iter(mine))
+    return {"recipe_hash": recipe_hash, "n_samples": n_samples, "seed": seed}
+
+
 @check("[data] comparison: end-to-end on one slice, reported not asserted")
 def t_comparison_end_to_end():
     """Full chain on real adapters: cache -> distances -> MDS -> simplex -> truth.
@@ -1011,20 +1055,21 @@ def t_comparison_end_to_end():
         raise _Skip(f"{root}/03_adapters not present")
 
     # Behavioral joins only when every model in the slice has a representation
-    # under one config.  "05_generated exists" is not enough: a slice missing one
+    # under one draw.  "05_generated exists" is not enough: a slice missing one
     # adapter would build a matrix and then fail on it, reporting FAIL where the
     # honest answer is "that model was never extracted".
-    from src.cache.generated_text_cache import GeneratedTextCache
+    #
+    # This used to require *exactly one* config to exist, and there were two — so
+    # behavioral was silently dropped from this check for its whole life, which
+    # is why the cache being unreachable through discovery never showed up here.
+    # A draw is the right unit: two draws are two query sets, but two embedders
+    # over one draw are still the same comparison.
+    behavioral_draw = _shared_inference_draw(root, "05_generated")
 
-    behavioral_hash = None
-    gen_configs = GeneratedTextCache(root).list_configs()
-    if len(gen_configs) == 1:
-        behavioral_hash = gen_configs[0]
-
-    index = scan_cache(root, behavioral_config_hash=behavioral_hash)
+    index = scan_cache(root, behavioral_draw=behavioral_draw)
     tokens = ["structural_weights", "dataset_embedding"]
     taxonomies = ["structural", "dataset_embedding"]
-    if behavioral_hash is not None:
+    if behavioral_draw is not None:
         candidate = index.with_available(*tokens, "behavioral_repr")
         cand_slices = candidate.slices(("n_samples", "seed"))
         if cand_slices and len(cand_slices[max(cand_slices)]) >= 3:
@@ -1058,7 +1103,7 @@ def t_comparison_end_to_end():
             matrices[tax], _ = build_taxonomy_artifacts(
                 sub, tax, "cosine", cache_root=td, n_components=(2,),
                 layers=[27], projections="o",
-                behavioral_config_hash=behavioral_hash,
+                behavioral_selector={"draw": behavioral_draw} if behavioral_draw else None,
             )
         result = compare_taxonomies(
             matrices, sub.recipes(), n_permutations=199,
@@ -1367,18 +1412,22 @@ def t_embedder_prefix_in_cache_key():
 
 # ── behavioral taxonomy ───────────────────────────────────────────────────────
 
-def _behavioral_config_hashes() -> tuple:
-    """``(GeneratedTextCache, [config_hash, ...])`` for the real cache."""
+def _generated_cache_or_skip() -> tuple:
+    """``(GeneratedTextCache, [(base_slug, adapter_slug), ...])`` for the real cache.
+
+    Twin of :func:`_activation_cache_or_skip`, which is the point: since the
+    re-key the two inference stages are enumerated the same way.
+    """
     from src.cache.generated_text_cache import GeneratedTextCache
 
     root = REPO / "results/shared_cache"
     if not (root / "05_generated").exists():
         raise _Skip(f"{root}/05_generated not present — behavioral has not been run")
     cache = GeneratedTextCache(root)
-    hashes = cache.list_configs()
-    if not hashes:
-        raise _Skip("05_generated exists but holds no complete config")
-    return cache, hashes
+    models = cache.list_models()
+    if not models:
+        raise _Skip("05_generated exists but holds no model")
+    return cache, models
 
 
 @check("behavioral: GeneratedTextCache round-trips matrix, metadata and generations")
@@ -1388,57 +1437,75 @@ def t_generated_cache_roundtrip():
     from src.cache.generated_text_cache import GeneratedTextCache
     from src.core.representation import ModelRepresentation
 
+    base = "meta-llama/Llama-3.2-3B"
+    adapter = "/some/abs/path/yahoo_050t0_050t1_n1000_s00_r16_i00"
+    draw = {"recipe_hash": "abc", "n_samples": 4, "seed": 0}
     config = {"taxonomy": "behavioral", "max_new_tokens": 16,
-              "embedder": {"model_name": "stub"}}
-    chash = GeneratedTextCache.config_hash(config)
-    model_id = "/some/abs/path/yahoo_050t0_050t1_n1000_s00_r16_i00"
+              "query_key": draw, "embedder": {"model_name": "stub"}}
+    ehash = GeneratedTextCache.embedder_hash(config["embedder"])
     texts = ["first continuation", "second", "third", "fourth"]
     matrix = np.arange(12, dtype=np.float32).reshape(4, 3)
 
     with tempfile.TemporaryDirectory() as td:
         cache = GeneratedTextCache(td)
-        assert not cache.exists(chash, model_id), "empty cache reports a hit"
+        assert not cache.exists(base, adapter, draw, 16, ehash), "empty cache reports a hit"
 
         rep = ModelRepresentation.create(
-            model_id=model_id, taxonomy="behavioral", matrix=matrix, config=config,
+            model_id=adapter, taxonomy="behavioral", matrix=matrix, config=config,
             metadata={"n_queries": 4, "generated_texts": texts},
         )
-        cache.save(chash, rep, config=config, queries=["q0", "q1", "q2", "q3"],
-                   query_key={"recipe_hash": "abc", "n_samples": 4, "seed": 0})
-        assert cache.exists(chash, model_id)
+        cache.save(base, adapter, draw, rep, max_new_tokens=16, embedder_hash=ehash,
+                   config=config, source_indices=[[0, i] for i in range(4)])
+        assert cache.exists(base, adapter, draw, 16, ehash)
 
-        got = cache.load(chash, model_id)
+        got = cache.load(base, adapter, draw, 16, ehash)
         assert np.array_equal(got.matrix, matrix), "matrix changed across the round trip"
         assert got.matrix.dtype == np.float32, got.matrix.dtype
-        assert got.model_id == model_id and got.taxonomy == "behavioral"
+        assert got.model_id == adapter and got.taxonomy == "behavioral"
         # generated_texts lives in generations/, not in the tensor file; load() has
         # to fold it back in or every consumer of metadata breaks.
         assert got.metadata["generated_texts"] == texts, got.metadata
-        assert got.metadata["n_queries"] == 4
 
         # Reading text must not require touching the tensors.
-        assert cache.load_generations(chash, model_id) == texts
-        assert cache.load_config(chash)["query_key"]["recipe_hash"] == "abc"
-        assert cache.list_configs() == [chash]
-        assert len(cache.list_models(chash)) == 1
+        assert cache.load_generations(base, adapter, draw, 16) == texts
+
+        # The draw record is a pointer, not a copy: query_key and indices, no text.
+        q = cache.load_queries(base, adapter, draw)
+        assert q["query_key"]["recipe_hash"] == "abc", q
+        assert len(q["source_indices"]) == 4, q
+        assert "queries" not in q, (
+            "queries.json is storing query text again; 01_datasets is canonical and "
+            "recipe_hash already determines the text via text_field"
+        )
+
+        assert cache.list_variants(base, adapter, draw) == [(f"generation16", ehash)]
+        assert cache.list_draws(base, adapter) == [draw]
+        assert cache.has_draw(base, adapter, draw)
+
+        # A plain HF model has no adapter and lands under _base — the branch the
+        # behavioral level had never exercised.
+        cache.save(base, "_base", draw, rep, max_new_tokens=16, embedder_hash=ehash,
+                   config=config)
+        assert cache.exists(base, "_base", draw, 16, ehash), "_base branch is unreachable"
 
         # Idempotent: a second save of different data is a no-op, because there is
-        # no invalidation path — a changed config yields a new hash instead.
+        # no invalidation path — a changed embedder yields a new filename instead.
         rep2 = ModelRepresentation.create(
-            model_id=model_id, taxonomy="behavioral",
+            model_id=adapter, taxonomy="behavioral",
             matrix=np.zeros((4, 3), dtype=np.float32), config=config,
             metadata={"generated_texts": ["x"] * 4},
         )
-        cache.save(chash, rep2, config=config)
-        assert np.array_equal(cache.load(chash, model_id).matrix, matrix), (
+        cache.save(base, adapter, draw, rep2, max_new_tokens=16, embedder_hash=ehash,
+                   config=config)
+        assert np.array_equal(cache.load(base, adapter, draw, 16, ehash).matrix, matrix), (
             "save overwrote an existing entry"
         )
-    return f"round-tripped (4, 3) + 4 generations under {chash}"
+    return f"round-tripped (4, 3) + 4 generations at generation16_{ehash[:8]}"
 
 
 @check("behavioral: config_hash is stable under dict key reordering")
 def t_generated_cache_hash_stable():
-    from src.cache.generated_text_cache import GeneratedTextCache, model_slug
+    from src.cache.generated_text_cache import GeneratedTextCache
 
     a = {"taxonomy": "behavioral", "max_new_tokens": 128,
          "embedder": {"model_name": "nomic", "normalize_embeddings": True},
@@ -1454,13 +1521,16 @@ def t_generated_cache_hash_stable():
         "config_hash ignores max_new_tokens"
     )
 
-    # Adapter dirs share basenames across base models, so the slug must not
-    # collapse two different absolute paths onto one filename.
-    s1 = model_slug("/cache/03_adapters/meta-llama--Llama-3.2-3B/yahoo_050t0_050t1_n1000_s00_r16_i00")
-    s2 = model_slug("/cache/03_adapters/meta-llama--Llama-3.1-8B/yahoo_050t0_050t1_n1000_s00_r16_i00")
-    assert s1 != s2, f"slug collision between different base models: {s1}"
-    assert "/" not in s1, s1
-    return f"hash stable under reordering; slugs distinct ({s1[-8:]} vs {s2[-8:]})"
+    # embedder_hash is what separates two embedders over one draw, so it must
+    # move when the embedder does -- otherwise re-embedding silently no-ops
+    # against the first embedder's file.
+    e1 = GeneratedTextCache.embedder_hash({"model_name": "nomic", "normalize_embeddings": True})
+    e2 = GeneratedTextCache.embedder_hash({"model_name": "minilm", "normalize_embeddings": True})
+    e3 = GeneratedTextCache.embedder_hash({"normalize_embeddings": True, "model_name": "nomic"})
+    assert e1 != e2, "embedder_hash ignores model_name; two embedders would collide"
+    assert e1 == e3, "embedder_hash depends on dict ordering"
+    assert len(e1) == 16 and all(c in "0123456789abcdef" for c in e1), e1
+    return f"hash stable under reordering; embedder hashes distinct ({e1[:8]} vs {e2[:8]})"
 
 
 @check("behavioral: the taxonomy pins left padding")
@@ -1511,42 +1581,44 @@ def t_behavioral_padding_side():
 
 @check("[data] behavioral: cached representations are well formed")
 def t_behavioral_reps_well_formed():
-    cache, hashes = _behavioral_config_hashes()
+    cache, models = _generated_cache_or_skip()
 
-    checked, shapes = 0, set()
-    for chash in hashes:
-        queries = cache.load_queries(chash).get("queries", [])
-        n_queries = len(queries)
-        for slug in cache.list_models(chash):
-            path = cache._config_dir(chash) / "embeddings" / f"{slug}.safetensors"
-            from safetensors.numpy import load_file
-            import json as _json
-            tensors = load_file(str(path))
-            matrix = tensors["matrix"]
-            meta = _json.loads(tensors["_meta_json"].tobytes().decode("utf-8"))
-            model_id = meta["model_id"]
+    checked, shapes, draws = 0, set(), set()
+    for base_slug, adapter_slug in models:
+        base_id = base_slug.replace("--", "/")
+        for draw in cache.list_draws(base_id, adapter_slug):
+            draws.add((draw["recipe_hash"], draw["n_samples"], draw["seed"]))
+            n_queries = int(draw["n_samples"])
 
-            assert matrix.dtype == np.float32, f"{slug}: dtype {matrix.dtype}"
-            assert matrix.ndim == 2, f"{slug}: shape {matrix.shape}"
-            if n_queries:
+            for mode_token, ehash in cache.list_variants(base_id, adapter_slug, draw):
+                mnt = int(mode_token[len("generation"):])
+                # Through the public API — no reaching into cache._config_dir.
+                # Rebuilding a private path in a check is how a reader and a
+                # writer drift apart, which is the failure this stage just had.
+                rep = cache.load(base_id, adapter_slug, draw, mnt, ehash)
+                matrix, name = rep.matrix, f"{adapter_slug}/{mode_token}"
+
+                assert matrix.dtype == np.float32, f"{name}: dtype {matrix.dtype}"
+                assert matrix.ndim == 2, f"{name}: shape {matrix.shape}"
                 assert matrix.shape[0] == n_queries, (
-                    f"{slug}: {matrix.shape[0]} rows for {n_queries} queries"
+                    f"{name}: {matrix.shape[0]} rows for a draw of {n_queries}"
                 )
-            assert np.isfinite(matrix).all(), f"{slug}: non-finite values"
+                assert np.isfinite(matrix).all(), f"{name}: non-finite values"
 
-            texts = cache.load_generations(chash, model_id)
-            assert len(texts) == matrix.shape[0], (
-                f"{slug}: {len(texts)} generations for {matrix.shape[0]} rows"
-            )
-            empty = [i for i, t in enumerate(texts) if not t.strip()]
-            assert not empty, f"{slug}: {len(empty)} empty generation(s) at {empty[:3]}"
+                texts = rep.metadata["generated_texts"]
+                assert len(texts) == matrix.shape[0], (
+                    f"{name}: {len(texts)} generations for {matrix.shape[0]} rows"
+                )
+                empty = [i for i, t in enumerate(texts) if not t.strip()]
+                assert not empty, f"{name}: {len(empty)} empty generation(s) at {empty[:3]}"
 
-            shapes.add(matrix.shape)
-            checked += 1
+                shapes.add(matrix.shape)
+                checked += 1
 
     if not checked:
-        raise _Skip("no behavioral representations stored under any config")
-    return f"{checked} representation(s) across {len(hashes)} config(s), shapes {sorted(shapes)}"
+        raise _Skip("no behavioral representations stored under any draw")
+    return (f"{checked} representation(s) across {len(models)} model(s) and "
+            f"{len(draws)} draw(s), shapes {sorted(shapes)}")
 
 
 @check("[gpu] behavioral: generation is invariant to batch size")
@@ -1595,28 +1667,37 @@ def t_behavioral_batch_invariance():
     if not torch.cuda.is_available():
         raise _Skip("no CUDA device available")
 
-    cache, hashes = _behavioral_config_hashes()
-    chash = hashes[0]
-    slugs = cache.list_models(chash)
-    if not slugs:
-        raise _Skip(f"config {chash} has no stored models")
+    cache, models = _generated_cache_or_skip()
+    base_slug, adapter_slug = models[0]
+    base_id = base_slug.replace("--", "/")
+    draws = cache.list_draws(base_id, adapter_slug)
+    if not draws:
+        raise _Skip(f"{adapter_slug} has no stored draw")
+    draw = draws[0]
 
-    stored = cache.load_queries(chash)
-    queries = stored.get("queries", [])
+    variants = cache.list_variants(base_id, adapter_slug, draw)
+    if not variants:
+        raise _Skip(f"{adapter_slug} has no stored variant under {cache.draw_name(draw)}")
+    mode_token, ehash = variants[0]
+
+    runs = cache.list_runs(base_id, adapter_slug, draw)
+    if not runs:
+        raise _Skip(f"{adapter_slug} has no runs/ record to read settings from")
+    run = cache.load_config(base_id, adapter_slug, draw, runs[0])
+    config = run["config"]
+
+    # Rehydrated from 01_datasets rather than read back from this stage: the
+    # draw key determines the text, so there is nothing to store here and
+    # nothing to trust here either.
+    queries = _replay_queries(draw, limit=8)
     if not queries:
-        raise _Skip(f"config {chash} has no queries.json to replay")
+        raise _Skip(f"could not rehydrate draw {cache.draw_name(draw)} to replay it")
 
-    config = cache.load_config(chash)
-    import json as _json
-    from safetensors.numpy import load_file
-
-    path = cache._config_dir(chash) / "embeddings" / f"{slugs[0]}.safetensors"
-    tensors = load_file(str(path))
-    model_id = _json.loads(tensors["_meta_json"].tobytes().decode("utf-8"))["model_id"]
-    if not Path(model_id).exists():
+    model_id = run.get("model_id")
+    if not model_id or not Path(model_id).exists():
         raise _Skip(f"adapter directory {model_id} is no longer on disk")
 
-    n = min(8, len(queries))
+    n = len(queries)
 
     from src.embedders.sentence_transformer import SentenceTransformerEmbedder
     from src.taxonomy.behavioral import BehavioralTaxonomy
@@ -2233,16 +2314,272 @@ def _replay_queries(draw: dict, limit: int = 8) -> list[str]:
         return []
     if not rows:
         return []
+    field = _recipe_text_field(draw["recipe_hash"])
     out = []
     for row in rows[:limit]:
-        for field in ("text", "question_title", "content", "question_content"):
-            if isinstance(row, dict) and row.get(field):
-                out.append(str(row[field]))
-                break
+        if isinstance(row, dict) and row.get(field):
+            out.append(str(row[field]))
     return out
 
 
+def _recipe_text_field(recipe_hash: str) -> str:
+    """Which column of a source row became the query text, per the recipe.
+
+    This used to be a guess — first match over ``("text", "question_title",
+    "content", "question_content")`` — which silently picked ``text`` on a row
+    carrying both it and ``question_title``, and reported nothing.
+
+    It never had to be a guess.  ``text_field`` is part of ``ClassDatasetEntry``,
+    ``_canonical()`` hashes the entries, and ``recipe_hash`` is a SHA-256 of that
+    string — so the recipe *determines* the column, and the recipe is named by
+    the draw.  This is also why neither inference cache stores query text: the
+    draw key already fixes it.
+    """
+    path = REPO / "results/shared_cache/01_datasets" / recipe_hash / "recipe.json"
+    recipe = json.loads(path.read_text())
+    datasets = recipe.get("datasets") or []
+    if not datasets:
+        raise AssertionError(f"{path} has no datasets entry to read text_field from")
+    return datasets[0].get("text_field", "text")
+
+
 # ── entry point ───────────────────────────────────────────────────────────────
+
+# ── the two inference caches share one addressing scheme ──────────────────────
+
+@check("inference caches: behavioral and functional share the addressing code")
+def t_draw_keyed_shared_key():
+    """Identity, not equality — the two must be the *same* function object.
+
+    Equality would pass if someone reimplemented ``draw_dir`` identically on one
+    subclass, and the two copies would then be free to drift.  Drift is exactly
+    what put the behavioral cache at coordinates no reader could compute: every
+    write succeeded and the cache read as empty.  Asserting identity means a
+    future override has to delete this check to land, which is the point.
+    """
+    from src.cache._draw_keyed import DrawKeyedCache
+    from src.cache.activation_cache import ActivationCache
+    from src.cache.generated_text_cache import GeneratedTextCache
+
+    shared = ["draw_name", "draw_dir", "mode_token", "config_hash", "canon_normalize",
+              "surrogate_dir", "save_surrogate", "load_surrogate", "list_draws",
+              "list_models", "list_base_models", "has_any"]
+    def _underlying(cls, name):
+        # A classmethod is re-bound on every attribute access, so compare the
+        # function it wraps rather than the bound object.
+        return getattr(getattr(cls, name), "__func__", getattr(cls, name))
+
+    for name in shared:
+        a = _underlying(ActivationCache, name)
+        b = _underlying(GeneratedTextCache, name)
+        base = _underlying(DrawKeyedCache, name)
+        assert a is b is base, (
+            f"{name} is not shared between the two inference caches; they can now "
+            "drift apart, which is how the behavioral cache was orphaned"
+        )
+
+    # And the coordinates really do coincide for one model under one draw.
+    draw = {"recipe_hash": "abc", "n_samples": 64, "seed": 0}
+    base_id, adapter = "meta-llama/Llama-3.2-3B", "/some/path/yahoo_050t0_050t1"
+    act = ActivationCache("/root").draw_dir(base_id, adapter, draw)
+    gen = GeneratedTextCache("/root").draw_dir(base_id, adapter, draw)
+    assert act.relative_to("/root/04_activations") == gen.relative_to("/root/05_generated"), (
+        f"stage-relative coordinates differ: {act} vs {gen}"
+    )
+    return f"{len(shared)} shared members, suffix {act.relative_to('/root/04_activations')}"
+
+
+@check("behavioral: a non-default view is computed once and written back")
+def t_generated_surrogate_writeback():
+    import tempfile
+
+    from src.cache.generated_text_cache import GeneratedTextCache
+    from src.core.representation import ModelRepresentation
+
+    draw = {"recipe_hash": "abc", "n_samples": 4, "seed": 0}
+    base, adapter = "meta-llama/Llama-3.2-3B", "/p/yahoo_050t0_050t1"
+    ehash = GeneratedTextCache.embedder_hash({"model_name": "stub"})
+    matrix = np.arange(12, dtype=np.float32).reshape(4, 3)
+
+    with tempfile.TemporaryDirectory() as td:
+        cache = GeneratedTextCache(td)
+        rep = ModelRepresentation.create(
+            model_id=adapter, taxonomy="behavioral", matrix=matrix, config={},
+            metadata={"generated_texts": ["a", "b", "c", "d"]},
+        )
+        cache.save(base, adapter, draw, rep, max_new_tokens=16, embedder_hash=ehash)
+
+        # The default view is the stored matrix and must NOT be written back --
+        # a byte-copy beside the original would double this stage for nothing.
+        plain = cache.load(base, adapter, draw, 16, ehash)
+        assert np.array_equal(plain.matrix, matrix)
+        assert "surrogate_cached" not in plain.metadata, (
+            "the identity view was routed through surrogates/"
+        )
+        sur_dir = cache.draw_dir(base, adapter, draw) / "surrogates"
+        assert not sur_dir.exists(), "identity view wrote a surrogate"
+
+        first = cache.load(base, adapter, draw, 16, ehash, view="gram", normalize="layer")
+        assert first.metadata["surrogate_cached"] is False, first.metadata
+        assert first.matrix.shape == (4, 4), first.matrix.shape
+        assert first.metadata["is_kernel"] is True
+        second = cache.load(base, adapter, draw, 16, ehash, view="gram", normalize="layer")
+        assert second.metadata["surrogate_cached"] is True, "surrogate was not written back"
+        assert np.array_equal(first.matrix, second.matrix)
+
+        # Rows are unit-norm after row normalization, so the gram diagonal is 1 --
+        # the same property the functional gram has, over the same draw.
+        assert np.allclose(np.diag(second.matrix), 1.0), np.diag(second.matrix)
+    return "identity view unstored; gram computed once, written back, diag=1"
+
+
+@check("inference: the PEFT adapter name separates identical basenames")
+def t_adapter_name_unique():
+    """Re-homed from the cache layer, and now about the right thing.
+
+    This property used to guard a *filename*, where hashing the full path made
+    an entry unreachable from any other working directory.  The name is now
+    in-memory only — PEFT's adapter registry — so hashing the path is fine and
+    the uniqueness is what matters: a mixed-base session loads both of these
+    into one PeftModel, and a collision would silently apply the wrong weights.
+    """
+    from src.cache._draw_keyed import adapter_slug
+    from src.taxonomy._hf_inference import _adapter_name
+
+    p1 = "/cache/03_adapters/meta-llama--Llama-3.2-3B/yahoo_050t0_050t1_n1000_s00_r16_i00"
+    p2 = "/cache/03_adapters/meta-llama--Llama-3.1-8B/yahoo_050t0_050t1_n1000_s00_r16_i00"
+    assert _adapter_name(p1) != _adapter_name(p2), "PEFT adapter names collide across bases"
+    assert "/" not in _adapter_name(p1)
+
+    # And the reason the *cache* does not need this: the base model is its own
+    # path component there, so the bare basename is unambiguous.
+    assert adapter_slug(p1) == adapter_slug(p2), (
+        "adapter_slug is no longer the basename; the cache relies on the base "
+        "model being a separate path component to disambiguate"
+    )
+    return f"{_adapter_name(p1)[-8:]} vs {_adapter_name(p2)[-8:]}; slugs equal by design"
+
+
+@check("draws: the query column comes from the recipe, not a guess")
+def t_replay_queries_uses_recipe_text_field():
+    """A row carrying several candidate columns must resolve by ``text_field``.
+
+    ``_replay_queries`` used to take the first of ``("text", "question_title",
+    "content", "question_content")`` present in the row, so a row with both
+    ``text`` and ``question_title`` silently yielded the wrong one — with no
+    error and no way to tell from the output.  The recipe records ``text_field``
+    and ``recipe_hash`` covers it, so the answer was always available.
+
+    This is also the check that keeps the inference caches free of stored query
+    text: if the draw key determines the column, the text needs no second home.
+    """
+    import tempfile
+
+    row = {"text": "WRONG - generic column",
+           "question_title": "RIGHT - what the recipe asked for",
+           "content": "also wrong"}
+
+    with tempfile.TemporaryDirectory() as td:
+        rh = "deadbeefdeadbeef"
+        d = Path(td) / "results/shared_cache/01_datasets" / rh
+        d.mkdir(parents=True)
+        (d / "recipe.json").write_text(json.dumps({
+            "schema_version": "2", "recipe_type": "class_aware", "recipe_hash": rh,
+            "datasets": [{"dataset_id": "yahoo", "text_field": "question_title"}],
+        }))
+
+        import scripts.check_analysis as mod
+        original = mod.REPO
+        try:
+            mod.REPO = Path(td)
+            field = mod._recipe_text_field(rh)
+        finally:
+            mod.REPO = original
+
+    assert field == "question_title", f"resolved {field!r}, not the recipe's text_field"
+    assert row[field].startswith("RIGHT"), row[field]
+    return "text_field read from recipe.json; the ambiguous row resolves correctly"
+
+
+@check("[data] behavioral: nothing of the old run-wise layout survives")
+def t_behavioral_layout_migrated():
+    """The analogue of :func:`t_cache_fully_migrated`, for ``05_generated``."""
+    from src.cache._draw_keyed import _DRAW_RE
+    from src.cache.generated_text_cache import _GEN_RE
+
+    root = REPO / "results/shared_cache"
+    base = root / "05_generated"
+    if not base.exists():
+        raise _Skip(f"{base} not present — behavioral has not been run")
+
+    old = [d.name for d in base.iterdir()
+           if d.is_dir() and (d / "config.json").exists()]
+    assert not old, f"old run-wise config directories survive: {sorted(old)}"
+
+    # The old filenames ended in __<8 hex>, the path-hash that caused the bug.
+    # Nothing anywhere may carry that shape again.
+    offenders = [str(p.relative_to(base)) for p in base.rglob("*")
+                 if re.search(r"__[0-9a-f]{8}$", p.stem)]
+    assert not offenders, f"path-hashed slugs survive: {offenders[:3]}"
+
+    draws, variants = 0, 0
+    for emb in base.glob("*/*/*/*/embeddings/*.safetensors"):
+        draw_dir = emb.parent.parent
+        assert _DRAW_RE.match(draw_dir.name), f"{draw_dir} is not an n{{n}}_s{{seed}} directory"
+        assert _GEN_RE.match(emb.stem), f"{emb.name} does not parse as {{mode}}_{{embedder}}"
+        variants += 1
+        q = json.loads((draw_dir / "queries.json").read_text())
+        assert "queries" not in q, f"{draw_dir}/queries.json still stores query text"
+        assert q["query_key"]["recipe_hash"] == draw_dir.parent.name, (
+            f"{draw_dir}: queries.json disagrees with its own path"
+        )
+    draws = len({p.parent.parent for p in base.glob("*/*/*/*/embeddings/*.safetensors")})
+
+    if not variants:
+        raise _Skip("05_generated exists but holds no embedding")
+    return f"{variants} variant(s) across {draws} model-draw(s), no legacy artefacts"
+
+
+@check("[data] inference: behavioral and functional land on the same coordinates")
+def t_cross_taxonomy_coordinates():
+    """The payoff of the re-key, asserted rather than assumed.
+
+    Must find **at least one** shared ``(base, adapter, draw)``, or it would pass
+    vacuously on an empty intersection — which is precisely what a migration
+    landing in the wrong place looks like.
+    """
+    from src.cache.activation_cache import ActivationCache
+    from src.cache.generated_text_cache import GeneratedTextCache
+
+    root = REPO / "results/shared_cache"
+    for stage in ("04_activations", "05_generated"):
+        if not (root / stage).exists():
+            raise _Skip(f"{root}/{stage} not present")
+
+    act, gen = ActivationCache(root), GeneratedTextCache(root)
+    shared = 0
+    for base_slug, adapter_slug in gen.list_models():
+        base_id = base_slug.replace("--", "/")
+        beh_draws = {(d["recipe_hash"], d["n_samples"], d["seed"])
+                     for d in gen.list_draws(base_id, adapter_slug)}
+        fun_draws = {(d["recipe_hash"], d["n_samples"], d["seed"])
+                     for d in act.list_draws(base_id, adapter_slug)}
+        for rh, n, s in beh_draws & fun_draws:
+            draw = {"recipe_hash": rh, "n_samples": n, "seed": s}
+            b = gen.draw_dir(base_id, adapter_slug, draw).relative_to(root / "05_generated")
+            f = act.draw_dir(base_id, adapter_slug, draw).relative_to(root / "04_activations")
+            assert b == f, f"coordinates differ for {adapter_slug}: {b} vs {f}"
+            assert gen.has_draw(base_id, adapter_slug, draw)
+            assert act.has_draw(base_id, adapter_slug, draw)
+            shared += 1
+
+    assert shared > 0, (
+        "no model-draw is present at both inference levels, so this check proves "
+        "nothing. Either the migration landed somewhere unexpected, or the two "
+        "levels were never run over the same draw."
+    )
+    return f"{shared} model-draw(s) at identical coordinates in both stages"
+
 
 SYNTHETIC = [
     t_anchor_fixed, t_similarity_invariance, t_affine_invariance_in_hull,
@@ -2267,12 +2604,17 @@ SYNTHETIC = [
     t_activation_view_equivalence, t_activation_layerwise_normalization,
     t_functional_padding_side,
     t_functional_mask_pooling, t_cka_row_guard,
+    # the two inference caches are addressed by one piece of code, and the
+    # things that used to be spelled twice
+    t_draw_keyed_shared_key, t_generated_surrogate_writeback, t_adapter_name_unique,
+    t_replay_queries_uses_recipe_text_field,
 ]
 DATA_BACKED = [
     t_cosine_real_adapters, t_recovery, t_collection_roundtrip, t_cross_taxonomy,
     t_recipe_relabelling, t_scan_cache, t_comparison_end_to_end,
     t_cache_fully_migrated, t_behavioral_reps_well_formed,
     t_functional_reps_well_formed,
+    t_behavioral_layout_migrated, t_cross_taxonomy_coordinates,
 ]
 #: A third tier: real checks that need a GPU and a multi-GB model load, so they are
 #: too slow for a harness meant to run in seconds around every edit.  Off unless

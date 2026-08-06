@@ -65,6 +65,7 @@ class BehavioralTaxonomy(HFInferenceTaxonomy, Taxonomy):
         max_new_tokens: int = 64,
         torch_dtype: torch.dtype = torch.float16,
         hf_token: str | None = None,
+        source_indices: list | None = None,
     ) -> None:
         if max_new_tokens <= 0:
             raise ValueError(
@@ -83,6 +84,10 @@ class BehavioralTaxonomy(HFInferenceTaxonomy, Taxonomy):
         self.query_key = dict(query_key or {})
         self.cache = cache
         self.max_new_tokens = max_new_tokens
+        # Which source row of 01_datasets is query i.  A denormalized convenience
+        # -- the draw file holds the same list -- and deliberately outside
+        # config_dict(), so supplying it does not fragment the cache.
+        self.source_indices = source_indices
 
     @property
     def taxonomy_name(self) -> str:
@@ -105,19 +110,42 @@ class BehavioralTaxonomy(HFInferenceTaxonomy, Taxonomy):
         config = self.config_dict()
         config_hash = GeneratedTextCache.config_hash(config) if self.cache else ""
 
-        if self.cache is not None and self.cache.exists(config_hash, model_id):
-            return self.cache.load(config_hash, model_id)
+        if self.cache is None:
+            return self._extract_fresh(model_id, config_hash)
+
+        # (base, adapter) comes from the shared HFInferenceTaxonomy helper, so a
+        # behavioral entry lands at the same coordinates as the functional entry
+        # for the same model — that is the whole point of TODO item 13.
+        base_model_id, adapter_id = self._model_key(model_id)
+        embedder_hash = GeneratedTextCache.embedder_hash(self.embedder.config_dict())
+
+        if self.cache.exists(
+            base_model_id,
+            adapter_id,
+            self.query_key,
+            self.max_new_tokens,
+            embedder_hash,
+        ):
+            return self.cache.load(
+                base_model_id,
+                adapter_id,
+                self.query_key,
+                self.max_new_tokens,
+                embedder_hash,
+            )
 
         rep = self._extract_fresh(model_id, config_hash)
 
-        if self.cache is not None:
-            self.cache.save(
-                config_hash,
-                rep,
-                config=config,
-                queries=self.queries,
-                query_key=self.query_key,
-            )
+        self.cache.save(
+            base_model_id,
+            adapter_id,
+            self.query_key,
+            rep,
+            max_new_tokens=self.max_new_tokens,
+            embedder_hash=embedder_hash,
+            config=config,
+            source_indices=self.source_indices,
+        )
 
         return rep
 

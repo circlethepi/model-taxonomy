@@ -159,5 +159,12 @@ One gap remains, and it is worth knowing about because it is silent:
 The functional selector — draw, layers, view, **normalization** — is not in it,
 so a collection built before this change still returns its `global` matrix from
 cache no matter what selector you pass. `build_taxonomy_artifacts`' docstring
-flags the same caveat for `behavioral_config_hash`. To re-measure under a
+flags the same caveat for `behavioral_selector`. To re-measure under a
 different normalization, bypass the collection cache or clear the entry.
+
+Measured after the item-13 re-key, and worth recording because it separates the
+two hazards: rebuilding the one stored functional collection reproduces it to
+**4.09e-10** under `normalize="global"` — float reassociation, nothing more — and
+differs by **1.13e-03** under the current `layer` default. So the stored entry is
+intact and was built under `global`; the visible gap is entirely this
+`collection_hash` blind spot (TODO item 14), not drift in the activations.

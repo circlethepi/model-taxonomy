@@ -100,7 +100,7 @@ def build_taxonomy_artifacts(
     layers: int | list[int] | None = None,
     projections: str | list[str] | None = None,
     embedder_hash: str | None = None,
-    behavioral_config_hash: str | None = None,
+    behavioral_selector: dict | None = None,
     functional_selector: dict | None = None,
     id_scheme: str = "recipe_id",
     mds_kwargs: Mapping[str, Any] | None = None,
@@ -136,21 +136,30 @@ def build_taxonomy_artifacts(
     n_components:
         Dimensions to embed at.  A simplex projection needs ``k-1``; a plot needs
         2.  Both are usually wanted, and the cache now keeps them apart.
-    behavioral_config_hash:
-        Which cached behavioral run to read.  Optional while only one exists; once
-        there are several they differ in queries, embedder or generation settings
-        and are not comparable, so one must be named.  Note the collection cache
-        keys on ``(ids, taxonomy, metric)`` only — as it already does for
-        ``embedder_hash`` — so switching runs at one metric wants a fresh
-        ``cache_root`` or a cleared entry.
+    behavioral_selector:
+        Which cached behavioral representations to read and how to view them:
+        ``{"draw", "max_new_tokens", "embedder_hash", "view", "normalize"}``, all
+        optional.  ``draw`` resolves to the one every model shares and the
+        variant to the one present within it; several of either is an error
+        naming the options, since two draws are different query sets and two
+        embedders are different vector spaces.
     functional_selector:
-        Which cached activations to read and how to view them:
-        ``{"draw", "mode", "pooling", "layers", "view", "normalize"}``, all
-        optional.  Functional is keyed by model rather than by run, so this is a
-        dict where behavioral takes a single hash.  ``layers`` is a read-time
-        choice — a run stores every layer — so changing it costs a surrogate
-        build, not a GPU pass.  The same collection-cache caveat as
-        ``behavioral_config_hash`` applies.
+        The same shape, for activations:
+        ``{"draw", "mode", "pooling", "layers", "view", "normalize"}``.
+        ``layers`` is a read-time choice — a run stores every layer — so changing
+        it costs a surrogate build, not a GPU pass.
+
+    .. warning::
+       **The collection cache does not see either selector.**
+       ``CollectionCache.collection_hash`` keys on ``(ids, taxonomy, metric)``
+       alone, so a collection built under one draw, view or normalization is
+       returned unchanged for a different one — silently.  This predates the
+       selectors and applies equally to ``embedder_hash``; it is
+       ``docs/notes/TODO.md`` item 14, deliberately not fixed here because the
+       fix invalidates every stored collection.  Until then, switching selectors
+       at one metric wants a fresh ``cache_root`` or a cleared entry.  Widening
+       ``behavioral_config_hash`` into a full selector makes this bite harder,
+       since there are now more ways for two collections to differ invisibly.
     id_scheme:
         ``"recipe_id"`` (default) keys the result by training recipe, which is the
         namespace every taxonomy shares.  Use ``"model_id"`` when a collection
@@ -176,7 +185,7 @@ def build_taxonomy_artifacts(
         dm = _compute_distance_matrix(
             index, taxonomy, metric, ids,
             layers=layers, projections=projections, embedder_hash=embedder_hash,
-            behavioral_config_hash=behavioral_config_hash,
+            behavioral_selector=behavioral_selector,
             functional_selector=functional_selector,
         )
         if cache is not None:
@@ -295,7 +304,7 @@ def _compute_distance_matrix(
     layers=None,
     projections=None,
     embedder_hash: str | None = None,
-    behavioral_config_hash: str | None = None,
+    behavioral_selector: dict | None = None,
     functional_selector: dict | None = None,
 ) -> DistanceMatrix:
     if taxonomy == "structural":
@@ -303,7 +312,7 @@ def _compute_distance_matrix(
     if taxonomy == "dataset_embedding":
         return _dataset_embedding_matrix(index, metric, ids, embedder_hash)
     if taxonomy == "behavioral":
-        return _behavioral_matrix(index, metric, ids, behavioral_config_hash)
+        return _behavioral_matrix(index, metric, ids, behavioral_selector)
     if taxonomy == "functional":
         return _functional_matrix(index, metric, ids, functional_selector)
     raise ValueError(
@@ -397,16 +406,27 @@ def _dataset_embedding_matrix(
 
 
 def _behavioral_matrix(
-    index: CacheIndex, metric: Any, ids: Sequence[ModelID], config_hash: str | None
+    index: CacheIndex, metric: Any, ids: Sequence[ModelID], selector: dict | None
 ) -> DistanceMatrix:
     """Pairwise distances over cached behavioral representations.
 
-    Simpler than :func:`_dataset_embedding_matrix` because there is nothing to
-    negotiate: that function needs ``_embedder_choice`` to find one
-    ``(embedder_config, representation)`` shared across recipes drawn at different
-    ``n_samples``, whereas one behavioral config hash already covers every model in
-    a run.  Picking the hash is therefore a choice between whole runs, not a
-    per-model reconciliation.
+    Mirrors :func:`_functional_matrix`, because since the re-key the two levels
+    are addressed identically.  A selector names the draw and the variant::
+
+        {"draw": {"recipe_hash": ..., "n_samples": 64, "seed": 0},
+         "max_new_tokens": 128, "embedder_hash": ...,
+         "view": "matrix", "normalize": "none"}   # matrix | gram
+
+    Every field has a default.  ``draw=None`` resolves to the one draw every
+    model shares, and ``embedder_hash=None`` to the one variant present within
+    it — both with a "several exist, name one" error rather than a silent pick,
+    since two draws are different query sets and two embedders are different
+    vector spaces.
+
+    **This replaced a single ``config_hash``**, which selected a whole run at
+    once.  The disambiguation did not disappear with it; it split in two — which
+    draw, and which variant within the draw — and gained the ability to say "the
+    same queries, re-embedded" instead of treating that as an unrelated run.
     """
     from src.cache.generated_text_cache import GeneratedTextCache
 
@@ -415,31 +435,44 @@ def _behavioral_matrix(
         raise ValueError("index has no cache_root; cannot locate behavioral representations")
 
     cache = GeneratedTextCache(root)
+    sel = dict(selector or {})
+    view = sel.get("view", "matrix")
+    normalize = sel.get("normalize", "none")
 
-    if config_hash is None:
-        available = cache.list_configs()
-        if not available:
-            raise ValueError(
-                "no behavioral representations have been extracted yet. Run "
-                "scripts/extract_reprs.py --taxonomy behavioral first."
-            )
-        if len(available) > 1:
-            raise ValueError(
-                f"{len(available)} behavioral runs are cached: {available}. They differ "
-                "in queries, embedder or generation settings and are not comparable, so "
-                "pass behavioral_config_hash= to choose one."
-            )
-        config_hash = available[0]
+    draw = sel.get("draw")
+    if draw is None:
+        draw = _draw_choice(cache, index, "behavioral", "behavioral")
+
+    max_new_tokens = sel.get("max_new_tokens")
+    embedder_hash = sel.get("embedder_hash")
+    if max_new_tokens is None or embedder_hash is None:
+        max_new_tokens, embedder_hash = _behavioral_variant_choice(
+            cache, index, draw, max_new_tokens, embedder_hash
+        )
 
     reps = []
     for entry in index.entries:
-        if not cache.exists(config_hash, entry.model_id):
+        base_id = entry.base_model_id
+        if not base_id:
             raise ValueError(
-                f"no behavioral representation for {entry.adapter_name!r} under config "
-                f"{config_hash}. Present under it: {cache.list_models(config_hash)}. "
-                "Filter with index.with_available('behavioral_repr')."
+                f"{entry.adapter_name} has no base_model_id; behavioral representations "
+                "are keyed by (base model, adapter) and cannot be located without it"
             )
-        reps.append(cache.load(config_hash, entry.model_id))
+        try:
+            reps.append(
+                cache.load(
+                    base_id, entry.model_id, draw,
+                    max_new_tokens=max_new_tokens, embedder_hash=embedder_hash,
+                    view=view, normalize=normalize,
+                )
+            )
+        except FileNotFoundError as e:
+            raise ValueError(
+                f"no behavioral representation for {entry.adapter_name!r} under draw "
+                f"{GeneratedTextCache.draw_name(draw)} "
+                f"(generation{max_new_tokens}, embedder {embedder_hash}): {e}. "
+                "Filter with index.with_available('behavioral_repr')."
+            ) from None
 
     metric_obj = _resolve_metric(metric)
     n = len(reps)
@@ -490,7 +523,7 @@ def _functional_matrix(
 
     draw = sel.get("draw")
     if draw is None:
-        draw = _functional_draw_choice(cache, index)
+        draw = _draw_choice(cache, index, "functional", "functional")
 
     reps = []
     for entry in index.entries:
@@ -530,8 +563,14 @@ def _functional_matrix(
     )
 
 
-def _functional_draw_choice(cache, index: CacheIndex) -> dict:
-    """The single draw every entry has activations under, or an error naming the options."""
+def _draw_choice(cache, index: CacheIndex, taxonomy: str, extract_flag: str) -> dict:
+    """The single draw every entry has a representation under, or an error naming the options.
+
+    Serves both inference levels: since ``05_generated`` was re-keyed to match
+    ``04_activations``, ``list_draws`` means the same thing on both caches, and
+    "which query draw do all these models share?" is one question asked of a
+    different tree.
+    """
     per_entry = []
     for entry in index.entries:
         if not entry.base_model_id:
@@ -542,19 +581,70 @@ def _functional_draw_choice(cache, index: CacheIndex) -> dict:
     shared = set.intersection(*per_entry) if per_entry else set()
     if not shared:
         raise ValueError(
-            "no single query draw has activations for every model in this "
-            "collection. Run scripts/extract_reprs.py --taxonomy functional, or "
-            "pass functional_selector={'draw': {...}} to name one."
+            f"no single query draw has {taxonomy} representations for every model in "
+            f"this collection. Run scripts/extract_reprs.py --taxonomy {extract_flag}, "
+            f"or pass {taxonomy}_selector={{'draw': {{...}}}} to name one."
         )
     if len(shared) > 1:
         listed = sorted(f"{r}/n{n}_s{s:02d}" for r, n, s in shared)
         raise ValueError(
             f"{len(listed)} query draws are cached for every model: {listed}. "
             "Different draws are different query sets and are not comparable, so "
-            "pass functional_selector={'draw': {...}} to choose one."
+            f"pass {taxonomy}_selector={{'draw': {{...}}}} to choose one."
         )
     recipe_hash, n_samples, seed = next(iter(shared))
     return {"recipe_hash": recipe_hash, "n_samples": n_samples, "seed": seed}
+
+
+def _behavioral_variant_choice(
+    cache, index: CacheIndex, draw: dict,
+    max_new_tokens: int | None, embedder_hash: str | None,
+) -> tuple[int, str]:
+    """The single ``(max_new_tokens, embedder_hash)`` every entry shares under *draw*.
+
+    Modelled on :func:`_embedder_choice`, and like it this is a **directory
+    listing, not a file open** — the variant is entirely in the filename, so
+    answering "what has been computed here?" costs one ``glob`` per model rather
+    than one safetensors load.
+
+    Partial selectors are honoured: naming only ``embedder_hash`` narrows the
+    candidates and then requires the rest to be unambiguous, which is what makes
+    "the same draw, re-embedded" expressible.
+    """
+    per_entry = []
+    for entry in index.entries:
+        if not entry.base_model_id:
+            continue
+        variants = set()
+        for mode_token, emb in cache.list_variants(entry.base_model_id, entry.model_id, draw):
+            if not mode_token.startswith("generation"):
+                continue
+            mnt = int(mode_token[len("generation"):])
+            if max_new_tokens is not None and mnt != max_new_tokens:
+                continue
+            if embedder_hash is not None and emb != embedder_hash:
+                continue
+            variants.add((mnt, emb))
+        per_entry.append(variants)
+
+    shared = set.intersection(*per_entry) if per_entry else set()
+    if not shared:
+        raise ValueError(
+            "no single (max_new_tokens, embedder) variant has behavioral "
+            "representations for every model under draw "
+            f"{cache.draw_name(draw)}. Run scripts/extract_reprs.py --taxonomy "
+            "behavioral, or name one with behavioral_selector="
+            "{'max_new_tokens': ..., 'embedder_hash': ...}."
+        )
+    if len(shared) > 1:
+        listed = sorted(f"generation{m}_{e}" for m, e in shared)
+        raise ValueError(
+            f"{len(listed)} behavioral variants are cached for every model: {listed}. "
+            "They differ in generation length or embedder and are not comparable, so "
+            "pass behavioral_selector={'max_new_tokens': ..., 'embedder_hash': ...} "
+            "to choose one."
+        )
+    return next(iter(shared))
 
 
 def _draw_key(entry) -> tuple:
@@ -1096,6 +1186,9 @@ def compare_all_slices(
     groupings: Sequence[Sequence[str]] = (("n_samples", "seed"), ("n_samples",), ("seed",), ()),
     n_components: Sequence[int] | None = None,
     min_models: int = 3,
+    embedder_hash: str | None = None,
+    behavioral_selector: dict | None = None,
+    functional_selector: dict | None = None,
     **compare_kwargs,
 ) -> dict[tuple[str, tuple], TaxonomyComparison]:
     """Compare every slice of a collection, and the pooled whole, writing reports.
@@ -1114,6 +1207,14 @@ def compare_all_slices(
     taxonomies:
         ``{taxonomy_name: metric}``, e.g. ``{"structural": "cosine",
         "dataset_embedding": "cosine"}``.
+    embedder_hash, behavioral_selector, functional_selector:
+        Forwarded to :func:`build_taxonomy_artifacts` for every slice.
+
+        These were **missing** before, which meant a sweep could not name the
+        draw, view or embedder it wanted: each slice silently took whatever the
+        auto-resolution picked, and a sweep spanning two draws failed on the
+        ambiguity instead of being told which to use.  They are per-collection
+        choices, not per-slice ones, so one value applies to the whole sweep.
     """
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -1151,6 +1252,9 @@ def compare_all_slices(
                         n_components=n_components or (2,),
                         label=f"{group_name}/{label}",
                         slice_key=slice_dict,
+                        embedder_hash=embedder_hash,
+                        behavioral_selector=behavioral_selector,
+                        functional_selector=functional_selector,
                     )
                     matrices[tax] = dm
 

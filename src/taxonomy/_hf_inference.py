@@ -14,6 +14,7 @@ it is and are the load-bearing part.
 from __future__ import annotations
 
 import gc
+import hashlib
 import json
 import os
 import warnings
@@ -23,7 +24,31 @@ from typing import Any
 import torch
 
 from src.core.protocols import ModelID
-from src.cache.generated_text_cache import model_slug
+
+
+def _adapter_name(model_id: ModelID) -> str:
+    """A name for one adapter inside PEFT's in-process adapter registry.
+
+    **This is an in-memory label, not a path, and nothing persists under it.**
+    It only has to be unique among the adapters loaded into a single
+    ``PeftModel`` during one process, which is why hashing the full ``model_id``
+    is fine here: the string's dependence on the caller's working directory
+    cannot outlive the process that computed it.
+
+    :func:`src.cache._draw_keyed.adapter_slug` is **not** a substitute. It takes
+    the directory basename, and adapter basenames collide across base models —
+    ``…/Llama-3.2-3B/yahoo_050t0_050t1_n1000_s00_r16_i00`` and the same leaf
+    under ``Llama-3.1-8B`` share it. On disk the base model is a separate path
+    component so the two stay apart; here there is no such component, so the
+    name must carry the distinction itself.
+
+    This function used to be ``generated_text_cache.model_slug`` and was used for
+    **both** jobs at once — this one and naming files on disk. That is what
+    keyed the behavioral cache to the writer's working directory. Keeping the
+    two apart is the fix; see ``docs/notes/TODO.md`` item 13.
+    """
+    digest = hashlib.sha256(str(model_id).encode()).hexdigest()[:8]
+    return f"{Path(str(model_id)).name}__{digest}"
 
 
 class HFInferenceTaxonomy:
@@ -55,6 +80,23 @@ class HFInferenceTaxonomy:
     # ------------------------------------------------------------------
     # Model loading — base held across calls, adapters swapped
     # ------------------------------------------------------------------
+
+    def _model_key(self, model_id: ModelID) -> tuple[str, str]:
+        """``(base_model_id, adapter_id)`` for cache addressing.
+
+        A plain HuggingFace model has no adapter and lands under ``_base``.
+
+        Lives here rather than on either subclass because both inference caches
+        are keyed the same way, so both taxonomies need the identical answer —
+        and "identical" is load-bearing: two implementations of this that
+        disagreed would put the functional and behavioral entries for one model
+        at different coordinates, which is the divergence item 13 exists to
+        remove.
+        """
+        base = self._resolve_base_model_id(model_id)
+        if base is None:
+            return str(model_id), "_base"
+        return base, str(model_id)
 
     @staticmethod
     def _resolve_base_model_id(model_id: ModelID) -> str | None:
@@ -169,7 +211,7 @@ class HFInferenceTaxonomy:
             )
             self._base_model_id = base_model_id
 
-        adapter_name = model_slug(str(model_id))
+        adapter_name = _adapter_name(model_id)
         if self._peft_model is None:
             self._peft_model = PeftModel.from_pretrained(
                 self._base_model, str(model_id), adapter_name=adapter_name

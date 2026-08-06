@@ -44,6 +44,7 @@ Usage::
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -269,6 +270,28 @@ def convert_draws(root: Path, mapping: dict[str, dict], dry_run: bool) -> dict:
 # ── Phase 3: dataset embeddings ───────────────────────────────────────────────
 
 
+def _legacy_embedder_hash(
+    embedder_config: dict, representation: str, n_samples: int, seed: int | None
+) -> str:
+    """``DatasetEmbeddingCache.embedder_hash`` as it stood when this script ran.
+
+    Frozen deliberately.  The live function now keys on ``embedder_config``
+    alone, so calling it here would silently rewrite what this migration is a
+    record of.  A migration script describes a transition that already happened;
+    it must keep computing the digests it actually wrote.
+    """
+    payload = json.dumps(
+        {
+            "embedder_config": embedder_config,
+            "representation": representation,
+            "n_samples": n_samples,
+            "seed": seed,
+        },
+        sort_keys=True,
+    ).encode()
+    return hashlib.sha256(payload).hexdigest()[:16]
+
+
 def migrate_embeddings(root: Path, mapping: dict[str, dict], dry_run: bool) -> dict:
     """Re-key ``02_dataset_embeddings`` on both levels.
 
@@ -276,9 +299,15 @@ def migrate_embeddings(root: Path, mapping: dict[str, dict], dry_run: bool) -> d
     without which every seed of a mixture would collide onto one entry.  The seed is
     read from the *old* recipe name, which still carries ``_s{seed}`` at this point;
     after the migration nothing else records it.
-    """
-    from src.cache.dataset_embedding_cache import DatasetEmbeddingCache
 
+    The embedder-hash signature described above is **this migration's**, not the
+    live one.  Item 15 later moved the draw into the path and the representation
+    into a surrogate spec, leaving ``DatasetEmbeddingCache.embedder_hash`` keyed
+    on ``embedder_config`` alone.  This script is a completed one-shot whose
+    record of what it did must not change meaning when the live signature does,
+    so it computes the old four-field digest itself — see
+    :func:`_legacy_embedder_hash` below.  Do not re-point it at the live one.
+    """
     embeddings_root = root / EMBEDDINGS_DIR
     stats = {"moved": 0, "skipped": 0, "collisions": 0, "duplicate": 0}
     if not embeddings_root.exists():
@@ -306,7 +335,7 @@ def migrate_embeddings(root: Path, mapping: dict[str, dict], dry_run: bool) -> d
             config_path = emb_dir / "config.json"
             if emb_dir.is_dir() and config_path.exists():
                 config = json.loads(config_path.read_text())
-                new_emb = DatasetEmbeddingCache.embedder_hash(
+                new_emb = _legacy_embedder_hash(
                     config["embedder_config"], config["representation"],
                     config["n_samples"], seed,
                 )

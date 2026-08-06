@@ -6,16 +6,32 @@ import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from src.datasets._text_projection import (
+    DEFAULT_SEPARATOR,
+    composition_dict,
+    read_composition,
+)
+
 
 @dataclass
 class DatasetEntry:
-    """One constituent dataset in a mixing recipe."""
+    """One constituent dataset in a mixing recipe.
+
+    ``text_fields`` composes several columns into the entry's text instead of
+    taking one, joined by ``text_separator``; see
+    :mod:`src.datasets._text_projection`.  Kept in step with
+    :class:`~src.datasets.class_recipe.ClassDatasetEntry`, which is where the
+    composition is actually used — the two are structural duplicates by design
+    and drift between them is the recurring hazard.
+    """
 
     dataset_id: str
     split: str = "train"
     weight: float = 1.0
     text_field: str = "text"
     subset: str | None = None
+    text_fields: list[str] | None = None
+    text_separator: str = DEFAULT_SEPARATOR
 
     def to_dict(self) -> dict:
         return {
@@ -24,16 +40,21 @@ class DatasetEntry:
             "weight": self.weight,
             "text_field": self.text_field,
             "subset": self.subset,
+            # Only when set — this dict is hashed into recipe_hash.
+            **composition_dict(self.text_fields, self.text_separator),
         }
 
     @classmethod
     def from_dict(cls, d: dict) -> DatasetEntry:
+        text_fields, text_separator = read_composition(d)
         return cls(
             dataset_id=d["dataset_id"],
             split=d.get("split", "train"),
             weight=d.get("weight", 1.0),
             text_field=d.get("text_field", "text"),
             subset=d.get("subset"),
+            text_fields=text_fields,
+            text_separator=text_separator,
         )
 
 

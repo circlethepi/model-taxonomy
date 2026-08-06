@@ -40,6 +40,7 @@ from src.analysis import (
     shepard,
 )
 from src.core.geometry import GeometryResult
+from src.datasets import _text_projection
 
 REPO = Path(__file__).parent.parent
 ADAPTER_ROOT = REPO / "results/shared_cache/03_adapters"
@@ -1609,31 +1610,44 @@ def t_generated_cache_roundtrip():
     config = {"taxonomy": "behavioral", "max_new_tokens": 16,
               "query_key": draw, "embedder": {"model_name": "stub"}}
     ehash = GeneratedTextCache.embedder_hash(config["embedder"])
-    texts = ["first continuation", "second", "third", "fourth"]
-    matrix = np.arange(12, dtype=np.float32).reshape(4, 3)
+    sampling = {"do_sample": True, "temperature": 1.0, "top_p": 1.0,
+                "top_k": None, "generation_seed": 0}
+    shash = GeneratedTextCache.sampling_hash(sampling)
+    R = 3
+    # texts[q][r]: three sampled continuations for each of four queries, and the
+    # matrix is one row per (query, replicate) in query-major order.
+    texts = [[f"q{q} continuation {r}" for r in range(R)] for q in range(4)]
+    matrix = np.arange(4 * R * 3, dtype=np.float32).reshape(4 * R, 3)
 
     with tempfile.TemporaryDirectory() as td:
         cache = GeneratedTextCache(td)
-        assert not cache.exists(base, adapter, draw, 16, ehash), "empty cache reports a hit"
+        assert not cache.exists(base, adapter, draw, 16, R, shash, ehash), (
+            "empty cache reports a hit"
+        )
 
         rep = ModelRepresentation.create(
             model_id=adapter, taxonomy="behavioral", matrix=matrix, config=config,
             metadata={"n_queries": 4, "generated_texts": texts},
         )
-        cache.save(base, adapter, draw, rep, max_new_tokens=16, embedder_hash=ehash,
+        cache.save(base, adapter, draw, rep, max_new_tokens=16, replicates=R,
+                   sampling=sampling, embedder_hash=ehash,
                    config=config, source_indices=[[0, i] for i in range(4)])
-        assert cache.exists(base, adapter, draw, 16, ehash)
+        assert cache.exists(base, adapter, draw, 16, R, shash, ehash)
 
-        got = cache.load(base, adapter, draw, 16, ehash)
+        got = cache.load(base, adapter, draw, 16, R, shash, ehash)
         assert np.array_equal(got.matrix, matrix), "matrix changed across the round trip"
         assert got.matrix.dtype == np.float32, got.matrix.dtype
         assert got.model_id == adapter and got.taxonomy == "behavioral"
         # generated_texts lives in generations/, not in the tensor file; load() has
         # to fold it back in or every consumer of metadata breaks.
         assert got.metadata["generated_texts"] == texts, got.metadata
+        assert got.metadata["n_rows"] == 4 * R, got.metadata
+        assert got.metadata["n_queries"] == 4, (
+            "n_queries counted rows; with replicates a row is one sample, not one query"
+        )
 
         # Reading text must not require touching the tensors.
-        assert cache.load_generations(base, adapter, draw, 16) == texts
+        assert cache.load_generations(base, adapter, draw, 16, R, shash) == texts
 
         # The draw record is a pointer, not a copy: query_key and indices, no text.
         q = cache.load_queries(base, adapter, draw)
@@ -1644,29 +1658,156 @@ def t_generated_cache_roundtrip():
             "recipe_hash already determines the text via text_field"
         )
 
-        assert cache.list_variants(base, adapter, draw) == [(f"generation16", ehash)]
+        assert cache.list_variants(base, adapter, draw) == [("generation16", R, shash, ehash)]
         assert cache.list_draws(base, adapter) == [draw]
         assert cache.has_draw(base, adapter, draw)
 
         # A plain HF model has no adapter and lands under _base — the branch the
         # behavioral level had never exercised.
-        cache.save(base, "_base", draw, rep, max_new_tokens=16, embedder_hash=ehash,
-                   config=config)
-        assert cache.exists(base, "_base", draw, 16, ehash), "_base branch is unreachable"
+        cache.save(base, "_base", draw, rep, max_new_tokens=16, replicates=R,
+                   sampling=sampling, embedder_hash=ehash, config=config)
+        assert cache.exists(base, "_base", draw, 16, R, shash, ehash), (
+            "_base branch is unreachable"
+        )
 
         # Idempotent: a second save of different data is a no-op, because there is
         # no invalidation path — a changed embedder yields a new filename instead.
         rep2 = ModelRepresentation.create(
             model_id=adapter, taxonomy="behavioral",
-            matrix=np.zeros((4, 3), dtype=np.float32), config=config,
-            metadata={"generated_texts": ["x"] * 4},
+            matrix=np.zeros((4 * R, 3), dtype=np.float32), config=config,
+            metadata={"generated_texts": [["x"] * R] * 4},
         )
-        cache.save(base, adapter, draw, rep2, max_new_tokens=16, embedder_hash=ehash,
-                   config=config)
-        assert np.array_equal(cache.load(base, adapter, draw, 16, ehash).matrix, matrix), (
-            "save overwrote an existing entry"
+        cache.save(base, adapter, draw, rep2, max_new_tokens=16, replicates=R,
+                   sampling=sampling, embedder_hash=ehash, config=config)
+        assert np.array_equal(
+            cache.load(base, adapter, draw, 16, R, shash, ehash).matrix, matrix
+        ), "save overwrote an existing entry"
+    return (
+        f"round-tripped ({4 * R}, 3) = 4 queries x {R} replicates + nested "
+        f"generations at generation16_{R}r_{shash}_{ehash[:8]}"
+    )
+
+
+@check("behavioral: replicates average back to one row per query")
+def t_generated_replicate_reduction():
+    """``replicate_reduction="mean"`` must equal an explicit per-query mean.
+
+    The stored layout is query-major — ``q0r0, q0r1, …, q1r0, …`` — so the
+    reduction is a reshape.  If the storage order were replicate-major instead,
+    the same reshape would silently average *across queries* and produce a
+    plausible-looking matrix of the right shape that means nothing, which is why
+    this asserts against an independently written mean rather than against
+    itself.
+    """
+    import tempfile
+
+    from src.cache.generated_text_cache import GeneratedTextCache
+    from src.core.representation import ModelRepresentation
+
+    base, adapter = "meta-llama/Llama-3.2-3B", "/abs/adapter"
+    draw = {"recipe_hash": "abc", "n_samples": 5, "seed": 0}
+    sampling = {"do_sample": True, "temperature": 0.8, "top_p": 0.95,
+                "top_k": None, "generation_seed": 7}
+    shash = GeneratedTextCache.sampling_hash(sampling)
+    ehash = GeneratedTextCache.embedder_hash({"model_name": "stub"})
+    n, R, d = 5, 4, 6
+    rng = np.random.default_rng(0)
+    matrix = rng.normal(size=(n * R, d)).astype(np.float32)
+
+    with tempfile.TemporaryDirectory() as td:
+        cache = GeneratedTextCache(td)
+        rep = ModelRepresentation.create(
+            model_id=adapter, taxonomy="behavioral", matrix=matrix, config={},
+            metadata={"generated_texts": [["t"] * R] * n},
         )
-    return f"round-tripped (4, 3) + 4 generations at generation16_{ehash[:8]}"
+        cache.save(base, adapter, draw, rep, max_new_tokens=32, replicates=R,
+                   sampling=sampling, embedder_hash=ehash, config={})
+
+        pooled = cache.load(base, adapter, draw, 32, R, shash, ehash,
+                            replicate_reduction="mean")
+        # Written out the long way on purpose: row q*R+r is replicate r of query q.
+        expected = np.stack([
+            matrix[q * R:(q + 1) * R].astype(np.float64).mean(axis=0) for q in range(n)
+        ]).astype(np.float32)
+        assert pooled.matrix.shape == (n, d), pooled.matrix.shape
+        assert np.allclose(pooled.matrix, expected, atol=1e-6), "mean is not the per-query mean"
+        assert pooled.metadata["n_queries"] == n, pooled.metadata
+        assert pooled.metadata["surrogate_cached"] is False, "first build reported as cached"
+
+        again = cache.load(base, adapter, draw, 32, R, shash, ehash,
+                           replicate_reduction="mean")
+        assert again.metadata["surrogate_cached"] is True, "reduction recomputed, not cached"
+        assert np.array_equal(again.matrix, pooled.matrix)
+
+        # The unreduced read is still the stored bytes and is not routed through a
+        # surrogate at all.
+        raw = cache.load(base, adapter, draw, 32, R, shash, ehash)
+        assert np.array_equal(raw.matrix, matrix)
+        assert "surrogate_cached" not in raw.metadata, raw.metadata
+
+    return f"({n * R}, {d}) -> ({n}, {d}); second read served from the surrogate"
+
+
+@check("behavioral: sampling settings separate two runs over one draw")
+def t_generated_sampling_hash_separates():
+    """Two temperatures over one draw must be two entries, not one reused.
+
+    ``save()`` is idempotent *on the filename*.  Before the sampling hash was in
+    the name, a second run at a different temperature would have found the first
+    run's file, returned early, and handed back the first run's numbers — no
+    error, no warning, and nothing on disk to show two runs had happened.  This
+    is the same failure mode the class documents for ``torch_dtype``, on an axis
+    that changes the result far more.
+    """
+    import tempfile
+
+    from src.cache.generated_text_cache import GeneratedTextCache
+    from src.core.representation import ModelRepresentation
+
+    base, adapter = "meta-llama/Llama-3.2-3B", "/abs/adapter"
+    draw = {"recipe_hash": "abc", "n_samples": 2, "seed": 0}
+    ehash = GeneratedTextCache.embedder_hash({"model_name": "stub"})
+    hot = {"do_sample": True, "temperature": 1.0, "top_p": 1.0,
+           "top_k": None, "generation_seed": 0}
+    cold = dict(hot, temperature=0.7)
+    greedy = dict(GeneratedTextCache.GREEDY_SAMPLING)
+
+    hashes = {k: GeneratedTextCache.sampling_hash(v)
+              for k, v in {"hot": hot, "cold": cold, "greedy": greedy}.items()}
+    assert len(set(hashes.values())) == 3, f"sampling hashes collide: {hashes}"
+
+    # Frozen: scripts/migrate_behavioral_replicates.py renamed every pre-sampling
+    # entry under this literal. If the canon changes, those files stop being
+    # reachable, so this is pinned rather than recomputed.
+    assert hashes["greedy"] == "6f000f01", (
+        f"greedy sampling now hashes to {hashes['greedy']}, not the 6f000f01 that "
+        "migrate_behavioral_replicates.py wrote into 10 filenames"
+    )
+
+    with tempfile.TemporaryDirectory() as td:
+        cache = GeneratedTextCache(td)
+        for name, sampling in (("hot", hot), ("cold", cold)):
+            matrix = np.full((2, 3), 1.0 if name == "hot" else 2.0, dtype=np.float32)
+            rep = ModelRepresentation.create(
+                model_id=adapter, taxonomy="behavioral", matrix=matrix, config={},
+                metadata={"generated_texts": [[name], [name]]},
+            )
+            cache.save(base, adapter, draw, rep, max_new_tokens=8, replicates=1,
+                       sampling=sampling, embedder_hash=ehash, config={})
+
+        variants = cache.list_variants(base, adapter, draw)
+        assert len(variants) == 2, f"expected two co-existing entries, got {variants}"
+
+        got_hot = cache.load(base, adapter, draw, 8, 1, hashes["hot"], ehash)
+        got_cold = cache.load(base, adapter, draw, 8, 1, hashes["cold"], ehash)
+        assert got_hot.matrix[0, 0] == 1.0 and got_cold.matrix[0, 0] == 2.0, (
+            "the second sampling config read back the first one's numbers"
+        )
+        # The settings, not just their digest, are stored — a hash alone cannot be
+        # read back into "what temperature was this?".
+        assert got_cold.metadata["sampling"]["temperature"] == 0.7, got_cold.metadata
+
+    return f"hot={hashes['hot']} cold={hashes['cold']} greedy={hashes['greedy']}, all distinct"
 
 
 @check("behavioral: config_hash is stable under dict key reordering")
@@ -1697,6 +1838,128 @@ def t_generated_cache_hash_stable():
     assert e1 == e3, "embedder_hash depends on dict ordering"
     assert len(e1) == 16 and all(c in "0123456789abcdef" for c in e1), e1
     return f"hash stable under reordering; embedder hashes distinct ({e1[:8]} vs {e2[:8]})"
+
+
+@check("behavioral: replicate rows stay attached to their own query")
+def t_behavioral_replicate_ordering():
+    """The whole replicate scheme rests on one unwritten assumption.
+
+    ``generate(num_return_sequences=R)`` returns ``n * R`` rows query-major, and
+    every layer downstream — the nested ``generated_texts``, the stored matrix,
+    ``replicate_reduction="mean"``'s reshape — assumes that without checking.  If
+    the order were replicate-major instead, nothing would raise: the shapes stay
+    right, the text stays fluent, the mean stays a mean, and every distance would
+    be computed from replicates attached to the wrong queries.  There is no
+    symptom to notice on real hardware, which is why it is asserted here against
+    stubs that can prove which prompt produced which row.
+
+    Batching is the part that actually breaks: ``_process_batch`` sees a *slice*
+    of the draw and must map row ``q*R + r`` back to the query's index within
+    that slice.  The stub tokenizer therefore encodes each query's **global**
+    index, so a batch-relative mistake fails rather than passing by coincidence.
+    """
+    import torch
+
+    from src.taxonomy.behavioral import BehavioralTaxonomy
+
+    class StubTok:
+        pad_token_id = 0
+
+        def __call__(self, queries, **kw):
+            ids = torch.tensor([[100 + int(q.split()[-1])] for q in queries])
+            return {"input_ids": ids, "attention_mask": torch.ones_like(ids)}
+
+        def batch_decode(self, ids, skip_special_tokens=True):
+            # ids are the generated tokens only — the taxonomy strips the prompt.
+            return [f"q{int(r[0]) - 100}:{'-'.join(str(int(x)) for x in r[1:])}"
+                    for r in ids]
+
+    class StubModel:
+        device = "cpu"
+
+        def generate(self, input_ids=None, attention_mask=None, max_new_tokens=4,
+                     num_return_sequences=1, pad_token_id=0, do_sample=True, **kw):
+            prompts = input_ids.repeat_interleave(num_return_sequences, dim=0)
+            if do_sample:
+                new = torch.randint(0, 1000,
+                                    (prompts.shape[0], max_new_tokens))
+            else:
+                new = torch.zeros((prompts.shape[0], max_new_tokens), dtype=torch.long)
+            # Echo the prompt id as the first generated token so the decoded text
+            # still names its query after the prompt is sliced off.
+            new[:, 0] = prompts[:, 0]
+            return torch.cat([prompts, new], dim=1)
+
+    class StubEmbedder:
+        def config_dict(self):
+            return {"model_name": "stub"}
+
+        def embed(self, out, query):
+            rng = np.random.default_rng(abs(hash(out.generated_text)) % 2**32)
+            return rng.normal(size=3).astype(np.float32)
+
+    class T(BehavioralTaxonomy):
+        def _get_model(self, model_id):
+            return StubModel(), True
+
+        def _load_tokenizer(self, model_id, base):
+            return StubTok()
+
+        @staticmethod
+        def _resolve_base_model_id(model_id):
+            return None
+
+    queries = [f"query {i}" for i in range(5)]
+    R, n = 3, 5
+
+    def build(seed=0, batch_size=2, replicates=R, do_sample=True):
+        return T(queries=queries, embedder=StubEmbedder(), cache=None, device="cpu",
+                 batch_size=batch_size, max_new_tokens=4, replicates=replicates,
+                 do_sample=do_sample, temperature=1.0, top_p=1.0,
+                 generation_seed=seed, torch_dtype=torch.float32)
+
+    # batch_size=2 over 5 queries: an uneven split, so the last batch is short and
+    # a row-index bug cannot hide behind a clean division.
+    rep = build().extract("m")
+    texts = rep.metadata["generated_texts"]
+
+    assert rep.matrix.shape == (n * R, 3), rep.matrix.shape
+    assert [len(t) for t in texts] == [R] * n, [len(t) for t in texts]
+
+    misplaced = [(q, r) for q, per in enumerate(texts)
+                 for r, t in enumerate(per) if not t.startswith(f"q{q}:")]
+    assert not misplaced, (
+        f"{len(misplaced)} generation(s) attached to the wrong query (first "
+        f"{misplaced[:3]}). Rows are not query-major, or the batch offset is wrong."
+    )
+
+    # And the matrix agrees with the text: row q*R+r must embed texts[q][r].
+    emb = StubEmbedder()
+    for q in range(n):
+        for r in range(R):
+            want = emb.embed(type("O", (), {"generated_text": texts[q][r]})(), queries[q])
+            assert np.allclose(rep.matrix[q * R + r], want), (
+                f"row {q * R + r} does not embed texts[{q}][{r}]"
+            )
+
+    a = build(seed=0).extract("m").metadata["generated_texts"]
+    b = build(seed=0).extract("m").metadata["generated_texts"]
+    c = build(seed=1).extract("m").metadata["generated_texts"]
+    assert a == b, "same generation_seed and batch_size produced different text"
+    assert a != c, "changing generation_seed changed nothing; the seed is not used"
+    assert any(len(set(t)) > 1 for t in texts), "every replicate is identical"
+
+    assert rep.metadata["effective_batch"] == 2 * R, rep.metadata
+
+    try:
+        build(replicates=2, do_sample=False)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("greedy decoding with replicates > 1 was accepted")
+
+    return (f"{n} queries x {R} replicates over uneven batches: rows query-major, "
+            f"text and matrix agree, seeding reproducible")
 
 
 @check("behavioral: the taxonomy pins left padding")
@@ -1756,26 +2019,37 @@ def t_behavioral_reps_well_formed():
             draws.add((draw["recipe_hash"], draw["n_samples"], draw["seed"]))
             n_queries = int(draw["n_samples"])
 
-            for mode_token, ehash in cache.list_variants(base_id, adapter_slug, draw):
+            for mode_token, reps, shash, ehash in cache.list_variants(
+                base_id, adapter_slug, draw
+            ):
                 mnt = int(mode_token[len("generation"):])
                 # Through the public API — no reaching into cache._config_dir.
                 # Rebuilding a private path in a check is how a reader and a
                 # writer drift apart, which is the failure this stage just had.
-                rep = cache.load(base_id, adapter_slug, draw, mnt, ehash)
-                matrix, name = rep.matrix, f"{adapter_slug}/{mode_token}"
+                rep = cache.load(base_id, adapter_slug, draw, mnt, reps, shash, ehash)
+                matrix = rep.matrix
+                name = f"{adapter_slug}/{mode_token}_{reps}r_{shash}"
 
                 assert matrix.dtype == np.float32, f"{name}: dtype {matrix.dtype}"
                 assert matrix.ndim == 2, f"{name}: shape {matrix.shape}"
-                assert matrix.shape[0] == n_queries, (
-                    f"{name}: {matrix.shape[0]} rows for a draw of {n_queries}"
+                # One row per (query, replicate), so the row count carries the
+                # replicate count too — a matrix whose rows do not factor that way
+                # means the filename and the tensor disagree.
+                assert matrix.shape[0] == n_queries * reps, (
+                    f"{name}: {matrix.shape[0]} rows for a draw of {n_queries} "
+                    f"at {reps} replicate(s)"
                 )
                 assert np.isfinite(matrix).all(), f"{name}: non-finite values"
 
                 texts = rep.metadata["generated_texts"]
-                assert len(texts) == matrix.shape[0], (
-                    f"{name}: {len(texts)} generations for {matrix.shape[0]} rows"
+                assert len(texts) == n_queries, (
+                    f"{name}: {len(texts)} query group(s) for a draw of {n_queries}"
                 )
-                empty = [i for i, t in enumerate(texts) if not t.strip()]
+                flat = [t for per_query in texts for t in per_query]
+                assert len(flat) == matrix.shape[0], (
+                    f"{name}: {len(flat)} generations for {matrix.shape[0]} rows"
+                )
+                empty = [i for i, t in enumerate(flat) if not t.strip()]
                 assert not empty, f"{name}: {len(empty)} empty generation(s) at {empty[:3]}"
 
                 shapes.add(matrix.shape)
@@ -1787,42 +2061,48 @@ def t_behavioral_reps_well_formed():
             f"{len(draws)} draw(s), shapes {sorted(shapes)}")
 
 
-@check("[gpu] behavioral: generation is invariant to batch size")
+@check("[gpu] behavioral: generation reproduces at a fixed batch size")
 def t_behavioral_batch_invariance():
-    """Re-generate a few queries at batch_size=1 and compare with the cached run.
+    """Generate the same queries twice and assert the property sampling leaves.
 
-    **Exact equality is not assertable, and demanding it was a mistake.** Two earlier
-    versions of this check asserted that batched greedy decoding reproduces
-    ``batch_size=1`` byte for byte. It does not, and cannot: batched matmuls tile
-    differently, so fp16 logits differ in their last bits, and greedy ``argmax``
-    flips wherever two tokens are near-tied. The sequences then diverge and never
-    reconverge. That is ordinary behaviour for batched transformer inference, not a
-    defect.
+    **What this check used to assert, and why it changed.** Under greedy decoding
+    the interesting question was whether batching changed the output. It did, a
+    little, and unavoidably: batched matmuls tile differently, fp16 logits differ
+    in their last bits, and ``argmax`` flips on near-ties. Measured on an L40S
+    (job 1987293), 8 queries, batch 1 vs batch 8: **6/8 byte-identical**, the two
+    divergent ones splitting ~10 % in after ~50 characters of shared coherent
+    prefix, with no correlation to padding amount. So the check asserted a
+    *signature* — a minority diverge, and only after a shared prefix — which
+    separated fp16 tie-flipping from broken left padding.
 
-    Measured on an L40S (job 1987293), 8 queries, batch 1 vs batch 8:
+    **That signature is gone, and not because anything broke.** Decoding now
+    samples, and one RNG stream serves a whole batch, so batch shape determines
+    which tokens are drawn. Two batch sizes now produce *unrelated* continuations
+    by design, and the old assertion would fail on correct code — worse, it would
+    fail in the same way a padding bug does, so keeping it would train the reader
+    to ignore it.
 
-    - 6/8 byte-identical — **including the shortest prompt**, which carries the most
-      left padding and would be the first casualty of a padding bug.
-    - The 2 divergent ones split ~10 % in, after ~50 characters of shared coherent
-      prefix, into two equally fluent continuations (``"…it is a device that "`` →
-      ``"is designed to protect you"`` vs ``"will cut off the current"``).
-    - No correlation with padding amount: the 3-word and 17-word prompts were both
-      identical; the divergent ones were 5 and 10 words.
+    What replaces it is the property that still holds and is still worth having:
 
-    So the property worth asserting is not equality but the **signature** that
-    separates tie-flipping from broken padding:
+    1. **Same batch size, same seed, same text.** This is the reproducibility the
+       cache's filenames promise. It exercises the per-batch seeding in
+       ``BehavioralTaxonomy._seed_for_batch``; without it, a re-extraction would
+       silently produce different numbers under the same filename.
+    2. **A different seed produces different text.** Otherwise the seeding is not
+       reaching ``generate`` at all and every "replicate" is one sample repeated
+       — which would look exactly like a working run until someone measured the
+       spread and found zero.
+    3. **Replicates within one query differ from each other.** The same failure
+       seen from the other side, and the one that matters for the measurement.
+    4. **Identical text yields identical embeddings**, catching nondeterminism in
+       the embedder rather than the decoder.
 
-    1. the majority survive batching unchanged — a padding bug corrupts most of a
-       batch, since most sequences carry padding;
-    2. any divergence happens *after* a shared prefix — a padding bug decodes from
-       the wrong position and so differs from the first token;
-    3. identical text yields identical embeddings — a separate property, catching
-       nondeterminism in the embedder rather than the decoder.
+    Cross-batch-size divergence is now *reported*, not asserted, so the number
+    stays visible without pretending it is a bug.
 
-    Both arms are generated here, in this process, on this GPU. An earlier version
-    compared against the *cached* generations, which conflated batch size, hardware
-    and time; the cache is now read only for *inputs* — which model, which queries,
-    which settings — never as an expected output.
+    Every arm is generated here, in this process, on this GPU. The cache is read
+    only for *inputs* — which model, which queries, which settings — never as an
+    expected output.
 
     Kept out of DATA_BACKED because it loads a multi-GB model — this tier only
     runs under --include-gpu, which the SLURM job passes while the GPU is still
@@ -1844,7 +2124,8 @@ def t_behavioral_batch_invariance():
     variants = cache.list_variants(base_id, adapter_slug, draw)
     if not variants:
         raise _Skip(f"{adapter_slug} has no stored variant under {cache.draw_name(draw)}")
-    mode_token, ehash = variants[0]
+    # The variant list is read to confirm this draw has been extracted at all; the
+    # settings themselves come from runs/, which records the whole config.
 
     runs = cache.list_runs(base_id, adapter_slug, draw)
     if not runs:
@@ -1871,7 +2152,9 @@ def t_behavioral_batch_invariance():
     ecfg = dict(config.get("embedder", {}))
     dtype = torch.float16 if "float16" in str(config.get("torch_dtype", "")) else torch.float32
 
-    def _run(batch_size: int):
+    R = 2
+
+    def _run(batch_size: int, seed: int):
         # cache=None bypasses storage entirely: batch_size is not part of
         # config_dict(), so a cached run would hit the same key and compare a
         # matrix with itself.
@@ -1886,58 +2169,65 @@ def t_behavioral_batch_invariance():
         tax = BehavioralTaxonomy(
             queries=queries[:n], embedder=embedder, query_key=config.get("query_key"),
             cache=None, batch_size=batch_size,
-            max_new_tokens=config.get("max_new_tokens", 64), torch_dtype=dtype,
+            max_new_tokens=config.get("max_new_tokens", 64),
+            replicates=R, do_sample=True, temperature=1.0, top_p=1.0,
+            generation_seed=seed,
+            torch_dtype=dtype,
         )
         try:
             return tax.extract(model_id)
         finally:
             tax.close()
 
-    single = _run(1)
-    batched = _run(n)          # one batch, so padding is maximally exercised
+    first = _run(n, seed=0)
+    repeat = _run(n, seed=0)     # same batch shape, same seed
+    reseeded = _run(n, seed=1)
+    single = _run(1, seed=0)     # different batch shape, so a different RNG stream
 
-    a, b = single.metadata["generated_texts"], batched.metadata["generated_texts"]
-    identical = [i for i in range(n) if a[i] == b[i]]
-    diverged = [i for i in range(n) if a[i] != b[i]]
+    a = first.metadata["generated_texts"]
+    b = repeat.metadata["generated_texts"]
+    c = reseeded.metadata["generated_texts"]
+    one = single.metadata["generated_texts"]
 
-    def _shared_prefix(x: str, y: str) -> int:
-        k = 0
-        while k < min(len(x), len(y)) and x[k] == y[k]:
-            k += 1
-        return k
-
-    # 1. A padding bug corrupts the *majority* of a batch, because most sequences
-    #    are shorter than the longest and so carry padding.  Tie-flipping touches a
-    #    minority.  Measured on a real L40S run: 6/8 identical.
-    assert len(identical) * 2 >= n, (
-        f"only {len(identical)}/{n} generations survive batching unchanged. That is "
-        f"too many to be greedy tie-flipping — suspect padding_side, which must be "
-        f"'left' for decoder-only generation."
+    # 1. The reproducibility the filenames promise. If this fails, two extractions
+    #    write different numbers under one name and the cache is lying about what
+    #    it holds.
+    mismatched = [(q, r) for q in range(n) for r in range(R) if a[q][r] != b[q][r]]
+    assert not mismatched, (
+        f"{len(mismatched)}/{n * R} generations differ between two runs at the same "
+        f"batch_size and generation_seed (first at {mismatched[:3]}). Sampling is not "
+        f"seeded reproducibly - check BehavioralTaxonomy._seed_for_batch."
+    )
+    assert np.allclose(first.matrix, repeat.matrix, atol=1e-5), (
+        "identical text produced different embeddings; the embedder is nondeterministic"
     )
 
-    # 2. A padding bug diverges from the *first* generated token, because the
-    #    sequence starts decoding from the wrong position.  Tie-flipping diverges
-    #    somewhere in the middle, after a shared, coherent prefix.
-    immediate = [i for i in diverged if _shared_prefix(a[i], b[i]) < 10]
-    assert not immediate, (
-        f"{len(immediate)}/{n} generations differ from the very first characters "
-        f"(indices {immediate[:3]}). That is the signature of a padding bug, not of "
-        f"fp16 tie-flipping — check padding_side before trusting any distance."
+    # 2 and 3. If the seed never reached generate(), every replicate would be one
+    #    sample repeated and every seed would give the same text - a run that looks
+    #    healthy until someone measures the spread and finds zero.
+    assert any(a[q][r] != c[q][r] for q in range(n) for r in range(R)), (
+        "a different generation_seed produced identical text; the seed is not "
+        "reaching generate(), so replicates are not sampling anything"
+    )
+    within = [q for q in range(n) if len(set(a[q])) > 1]
+    assert within, (
+        f"all {R} replicates are identical for every one of {n} queries. Either "
+        f"do_sample is not taking effect or num_return_sequences is being ignored."
     )
 
-    # 3. The embedder must be deterministic: identical text, identical vector.  This
-    #    is separate from the decoding question and would catch nondeterminism in the
-    #    sentence-transformer itself.
-    for i in identical:
-        d = float(np.abs(single.matrix[i] - batched.matrix[i]).max())
-        assert d < 1e-5, f"query {i}: same text, embeddings differ by {d:.2e}"
+    # 4. Reported, not asserted: under sampling one RNG stream serves the whole
+    #    batch, so a different batch shape draws different tokens. That is expected
+    #    now, and is why batch_size is recorded in metadata and in runs/ rather than
+    #    being asserted away here.
+    cross_identical = sum(
+        1 for q in range(n) for r in range(R) if a[q][r] == one[q][r]
+    )
 
-    prefixes = [_shared_prefix(a[i], b[i]) for i in diverged]
-    delta = float(np.abs(single.matrix - batched.matrix).max())
     return (
-        f"{len(identical)}/{n} identical on {torch.cuda.get_device_name(0)}; "
-        f"{len(diverged)} diverged after {prefixes} shared chars (fp16 tie-flips, "
-        f"not padding); max|delta| over all rows = {delta:.2e}"
+        f"{n} queries x {R} replicates on {torch.cuda.get_device_name(0)}: "
+        f"reproducible at fixed batch/seed; {len(within)}/{n} queries have distinct "
+        f"replicates; reseeding changed the text; batch 1 vs batch {n} shares "
+        f"{cross_identical}/{n * R} (expected low under sampling)"
     )
 
 
@@ -2480,33 +2770,48 @@ def _replay_queries(draw: dict, limit: int = 8) -> list[str]:
         return []
     if not rows:
         return []
-    field = _recipe_text_field(draw["recipe_hash"])
+    recipe = _recipe_for(draw["recipe_hash"])
     out = []
     for row in rows[:limit]:
-        if isinstance(row, dict) and row.get(field):
-            out.append(str(row[field]))
+        if not isinstance(row, dict):
+            continue
+        text = _text_projection.row_text(recipe, row)
+        if text:
+            out.append(text)
     return out
 
 
-def _recipe_text_field(recipe_hash: str) -> str:
-    """Which column of a source row became the query text, per the recipe.
+def _recipe_for(recipe_hash: str):
+    """The recipe a draw was sampled from, as objects rather than JSON.
 
-    This used to be a guess — first match over ``("text", "question_title",
-    "content", "question_content")`` — which silently picked ``text`` on a row
-    carrying both it and ``question_title``, and reported nothing.
+    Which column (or columns) of a source row became the query text used to be a
+    guess — first match over ``("text", "question_title", "content",
+    "question_content")`` — which silently picked ``text`` on a row carrying both
+    it and ``question_title``, and reported nothing.
 
-    It never had to be a guess.  ``text_field`` is part of ``ClassDatasetEntry``,
+    It never had to be a guess.  The projection is part of ``ClassDatasetEntry``,
     ``_canonical()`` hashes the entries, and ``recipe_hash`` is a SHA-256 of that
-    string — so the recipe *determines* the column, and the recipe is named by
-    the draw.  This is also why neither inference cache stores query text: the
-    draw key already fixes it.
+    string — so the recipe *determines* the text, and the recipe is named by the
+    draw.  This is also why neither inference cache stores query text: the draw
+    key already fixes it.  Loading the recipe rather than reading one key off it
+    is what keeps that true now that an entry may compose several columns.
     """
     path = REPO / "results/shared_cache/01_datasets" / recipe_hash / "recipe.json"
-    recipe = json.loads(path.read_text())
-    datasets = recipe.get("datasets") or []
-    if not datasets:
-        raise AssertionError(f"{path} has no datasets entry to read text_field from")
-    return datasets[0].get("text_field", "text")
+    data = json.loads(path.read_text())
+    if not (data.get("datasets") or []):
+        raise AssertionError(f"{path} has no datasets entry to read a projection from")
+
+    if data.get("recipe_type") == "class_aware":
+        from src.datasets.class_recipe import ClassAwareDatasetRecipe as Recipe
+        from src.datasets.class_recipe import ClassDatasetEntry as Entry
+    else:
+        from src.datasets.recipe import DatasetEntry as Entry
+        from src.datasets.recipe import DatasetRecipe as Recipe
+
+    return Recipe(
+        name=data.get("name", ""),
+        datasets=[Entry.from_dict(d) for d in data["datasets"]],
+    )
 
 
 # ── entry point ───────────────────────────────────────────────────────────────
@@ -2565,19 +2870,22 @@ def t_generated_surrogate_writeback():
     draw = {"recipe_hash": "abc", "n_samples": 4, "seed": 0}
     base, adapter = "meta-llama/Llama-3.2-3B", "/p/yahoo_050t0_050t1"
     ehash = GeneratedTextCache.embedder_hash({"model_name": "stub"})
+    sampling = dict(GeneratedTextCache.GREEDY_SAMPLING)
+    shash = GeneratedTextCache.sampling_hash(sampling)
     matrix = np.arange(12, dtype=np.float32).reshape(4, 3)
 
     with tempfile.TemporaryDirectory() as td:
         cache = GeneratedTextCache(td)
         rep = ModelRepresentation.create(
             model_id=adapter, taxonomy="behavioral", matrix=matrix, config={},
-            metadata={"generated_texts": ["a", "b", "c", "d"]},
+            metadata={"generated_texts": [["a"], ["b"], ["c"], ["d"]]},
         )
-        cache.save(base, adapter, draw, rep, max_new_tokens=16, embedder_hash=ehash)
+        cache.save(base, adapter, draw, rep, max_new_tokens=16, replicates=1,
+                   sampling=sampling, embedder_hash=ehash)
 
         # The default view is the stored matrix and must NOT be written back --
         # a byte-copy beside the original would double this stage for nothing.
-        plain = cache.load(base, adapter, draw, 16, ehash)
+        plain = cache.load(base, adapter, draw, 16, 1, shash, ehash)
         assert np.array_equal(plain.matrix, matrix)
         assert "surrogate_cached" not in plain.metadata, (
             "the identity view was routed through surrogates/"
@@ -2585,11 +2893,13 @@ def t_generated_surrogate_writeback():
         sur_dir = cache.draw_dir(base, adapter, draw) / "surrogates"
         assert not sur_dir.exists(), "identity view wrote a surrogate"
 
-        first = cache.load(base, adapter, draw, 16, ehash, view="gram", normalize="layer")
+        first = cache.load(base, adapter, draw, 16, 1, shash, ehash,
+                           view="gram", normalize="layer")
         assert first.metadata["surrogate_cached"] is False, first.metadata
         assert first.matrix.shape == (4, 4), first.matrix.shape
         assert first.metadata["is_kernel"] is True
-        second = cache.load(base, adapter, draw, 16, ehash, view="gram", normalize="layer")
+        second = cache.load(base, adapter, draw, 16, 1, shash, ehash,
+                            view="gram", normalize="layer")
         assert second.metadata["surrogate_cached"] is True, "surrogate was not written back"
         assert np.array_equal(first.matrix, second.matrix)
 
@@ -2626,45 +2936,58 @@ def t_adapter_name_unique():
     return f"{_adapter_name(p1)[-8:]} vs {_adapter_name(p2)[-8:]}; slugs equal by design"
 
 
-@check("draws: the query column comes from the recipe, not a guess")
+@check("draws: the query text comes from the recipe, not a guess")
 def t_replay_queries_uses_recipe_text_field():
-    """A row carrying several candidate columns must resolve by ``text_field``.
+    """A row carrying several candidate columns must resolve by the recipe.
 
     ``_replay_queries`` used to take the first of ``("text", "question_title",
     "content", "question_content")`` present in the row, so a row with both
     ``text`` and ``question_title`` silently yielded the wrong one — with no
-    error and no way to tell from the output.  The recipe records ``text_field``
+    error and no way to tell from the output.  The recipe records the projection
     and ``recipe_hash`` covers it, so the answer was always available.
 
+    Extended for composed entries: a recipe naming ``text_fields`` must replay as
+    the joined string, not as one of its parts.  That is the whole content of the
+    item 11 fix on the read side — if replay disagreed with what training saw,
+    every check that compares them would be comparing the wrong things.
+
     This is also the check that keeps the inference caches free of stored query
-    text: if the draw key determines the column, the text needs no second home.
+    text: if the draw key determines the text, it needs no second home.
     """
     import tempfile
 
     row = {"text": "WRONG - generic column",
            "question_title": "RIGHT - what the recipe asked for",
+           "best_answer": "AND the answer",
            "content": "also wrong"}
 
-    with tempfile.TemporaryDirectory() as td:
-        rh = "deadbeefdeadbeef"
-        d = Path(td) / "results/shared_cache/01_datasets" / rh
-        d.mkdir(parents=True)
-        (d / "recipe.json").write_text(json.dumps({
-            "schema_version": "2", "recipe_type": "class_aware", "recipe_hash": rh,
-            "datasets": [{"dataset_id": "yahoo", "text_field": "question_title"}],
-        }))
+    def _resolve(datasets):
+        with tempfile.TemporaryDirectory() as td:
+            rh = "deadbeefdeadbeef"
+            d = Path(td) / "results/shared_cache/01_datasets" / rh
+            d.mkdir(parents=True)
+            (d / "recipe.json").write_text(json.dumps({
+                "schema_version": "2", "recipe_type": "class_aware", "recipe_hash": rh,
+                "datasets": datasets,
+            }))
+            import scripts.check_analysis as mod
+            original = mod.REPO
+            try:
+                mod.REPO = Path(td)
+                return _text_projection.row_text(mod._recipe_for(rh), row)
+            finally:
+                mod.REPO = original
 
-        import scripts.check_analysis as mod
-        original = mod.REPO
-        try:
-            mod.REPO = Path(td)
-            field = mod._recipe_text_field(rh)
-        finally:
-            mod.REPO = original
+    single = _resolve([{"dataset_id": "yahoo", "text_field": "question_title"}])
+    assert single.startswith("RIGHT"), f"resolved {single!r}, not the recipe's text_field"
 
-    assert field == "question_title", f"resolved {field!r}, not the recipe's text_field"
-    assert row[field].startswith("RIGHT"), row[field]
-    return "text_field read from recipe.json; the ambiguous row resolves correctly"
+    composed = _resolve([{
+        "dataset_id": "yahoo", "text_field": "best_answer",
+        "text_fields": ["question_title", "best_answer"], "text_separator": "\n",
+    }])
+    assert composed == f"{row['question_title']}\n{row['best_answer']}", composed
+
+    return "single and composed projections both read from recipe.json"
 
 
 @check("[data] behavioral: nothing of the old run-wise layout survives")
@@ -2764,7 +3087,10 @@ SYNTHETIC = [
     t_draw_schema_roundtrip,
     t_names_merge,
     # behavioral taxonomy: its cache, and the padding property batch invariance needs
-    t_generated_cache_roundtrip, t_generated_cache_hash_stable, t_behavioral_padding_side,
+    t_generated_cache_roundtrip, t_generated_replicate_reduction,
+    t_generated_sampling_hash_separates,
+    t_generated_cache_hash_stable, t_behavioral_replicate_ordering,
+    t_behavioral_padding_side,
     # embedder task prefixes: the model is misused without them, and the failure is silent
     t_embedder_prefix_resolved, t_embedder_prefix_in_cache_key,
     # functional taxonomy: its cache, the views read off it, and the two

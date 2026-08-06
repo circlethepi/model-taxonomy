@@ -256,13 +256,18 @@ def write(entries: list[dict], root: Path, dry_run: bool) -> dict:
     from src.core.representation import ModelRepresentation
 
     cache = GeneratedTextCache(root)
+    # Everything this migration touches predates sampling, so it is greedy with
+    # one continuation per query by construction — the same values
+    # scripts/migrate_behavioral_replicates.py renames the survivors under.
+    greedy = dict(GeneratedTextCache.GREEDY_SAMPLING)
+    greedy_hash = GeneratedTextCache.sampling_hash(greedy)
     verb = "would write" if dry_run else "wrote"
     stats = {"written": 0, "queries_dropped": 0}
 
     for e in entries:
         dest = cache.embeddings_path(
             e["base_model_id"], e["adapter_id"], e["query_key"],
-            e["max_new_tokens"], e["embedder_hash"],
+            e["max_new_tokens"], 1, greedy_hash, e["embedder_hash"],
         )
         print(f"    {verb} {dest.relative_to(root)}")
         stats["queries_dropped"] += e["n_queries_stored"]
@@ -282,6 +287,8 @@ def write(entries: list[dict], root: Path, dry_run: bool) -> dict:
         cache.save(
             e["base_model_id"], e["adapter_id"], e["query_key"], rep,
             max_new_tokens=e["max_new_tokens"],
+            replicates=1,
+            sampling=greedy,
             embedder_hash=e["embedder_hash"],
             # The original config, so runs/ keeps its hash — the only link back
             # to the run these numbers actually came from.
@@ -305,18 +312,20 @@ def verify(entries: list[dict], root: Path) -> dict:
 
     cache = GeneratedTextCache(root)
     act = ActivationCache(root)
+    greedy_hash = GeneratedTextCache.sampling_hash(GeneratedTextCache.GREEDY_SAMPLING)
     stats = {"verified": 0, "shared_with_functional": 0, "per_config": {}}
 
     for e in entries:
         rep = cache.load(
             e["base_model_id"], e["adapter_id"], e["query_key"],
-            e["max_new_tokens"], e["embedder_hash"],
+            e["max_new_tokens"], 1, greedy_hash, e["embedder_hash"],
         )
         if not np.array_equal(rep.matrix, e["matrix"]):
             raise SystemExit(f"{e['old_stem']}: matrix changed through the migration")
         if rep.model_id != e["model_id"]:
             raise SystemExit(f"{e['old_stem']}: model_id changed through the migration")
-        if rep.metadata.get("generated_texts") != e["generated_texts"]:
+        # The reader nests per query; these entries are one-per-query.
+        if [t[0] for t in rep.metadata.get("generated_texts", [])] != e["generated_texts"]:
             raise SystemExit(f"{e['old_stem']}: generated text changed through the migration")
         if rep.matrix.shape[0] != int(e["query_key"]["n_samples"]):
             raise SystemExit(
@@ -408,13 +417,19 @@ def revert(root: Path, dry_run: bool) -> int:
 
         rep = cache.load(
             run.get("base_model_id") or _base_from_path(emb, base),
-            model_id, query_key, max_new_tokens, emb_hash,
+            model_id, query_key, max_new_tokens,
+            int(m["replicates"]), m["sampling"], emb_hash,
         )
         shutil.copy2(emb, old_dir / "embeddings" / f"{stem}.safetensors")
         (old_dir / "generations" / f"{stem}.json").write_text(
             json.dumps(
                 {"model_id": model_id,
-                 "generated_texts": rep.metadata.get("generated_texts", [])},
+                 # The old layout stored a flat list; the reader now nests per
+                 # query, so flatten back on the way out.
+                 "generated_texts": [
+                     t for per_query in rep.metadata.get("generated_texts", [])
+                     for t in per_query
+                 ]},
                 indent=2,
             )
         )

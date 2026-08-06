@@ -1,0 +1,227 @@
+# Retrain the five yahoo mixtures on question+answer PAIRS — the item 11 fix.
+#
+# The existing adapters were fit on bare `best_answer` prose: finetune_lora.py hands
+# `text_field` to SFTTrainer as `dataset_text_field`, and the training recipes name
+# `best_answer`, so the models never saw a question. Behavioral extraction then
+# prompts them with a `question_title` and asks for a continuation — an input shape
+# that never appeared in training. The 2026-08-05 measurement is what that predicts:
+# behavioral recovered the mixing order EXACTLY BACKWARDS (r = -0.9995, rho =
+# -1.0000, Procrustes p = 0.955) while the other three levels were positively
+# ordered and significant.
+#
+# These blocks name `text_fields: [question_title, best_answer]` instead, so a
+# training row is "{question_title}\n{best_answer}" and continuing a question is a
+# shape the adapter has seen. Everything else is held fixed against the adapters on
+# disk, read from their experiment_meta.json, so the ONLY difference between the two
+# adapter sets is the projection. That is what makes the comparison attributable.
+#
+# What is deliberately NOT changed:
+#   - the query set. Extraction still prompts with `question_title` (the
+#     yahoo_queries recipe, 04a65e58df502e45), so old and new adapters land at the
+#     same {recipe_hash}/n64_s00/ coordinates in 05_generated and differ only in the
+#     adapter component.
+#   - 02_dataset_embeddings, which still embeds `best_answer`. So a cross-taxonomy
+#     comparison against these adapters scores a QA-trained model against a
+#     best_answer-derived dataset geometry. See docs/notes/TODO.md item 11 — the
+#     dataset level moving too is a separate decision, and it re-embeds 520 entries.
+#
+# The `yahoo_qa_` name prefix is load-bearing: the adapter directory is
+# {dataset_name}_r{rank}_i{init_seed:02d}, so these land beside the originals rather
+# than on top of them. Nothing existing is overwritten.
+
+name: yahoo_qa_pairs_s[0]
+output_dir: results/yahoo_qa_pairs
+cache_dir: results/shared_cache
+
+slurm:
+  # Starting guess only. Re-check what is actually free immediately before
+  # generating the sbatch script — a queue snapshot written into a config is stale
+  # by the time it runs.
+  partition: a100
+  gpus_per_node: 1
+  mem_gb: 80
+  # Five adapters at 1000 samples x 3 epochs, effective batch 16 => ~188 optimizer
+  # steps each. Padded well past that; an over-requested 1-GPU job still backfills.
+  time: "4:00:00"
+  cpus_per_task: 8
+  conda_env: taxonomy-env
+  modules: []
+  account: null
+
+# Five mixtures spanning the full proportion range, one seed, one size.
+# Composition is inside recipe_hash — ClassDatasetEntry.to_dict() emits text_fields
+# when set — so each of these hashes differently from its best_answer original and
+# gets its own draw in 01_datasets. Entries that do NOT set text_fields serialize
+# exactly as before, which is why none of the six existing recipe hashes moved.
+datasets:
+  - name: yahoo_qa_100t0_000t1
+    seeds: [0]
+    # A one-element sweep, not `n_samples: 1000`: the `_n{n}` in the final block
+    # name comes from expand_dataset_n_samples, and the adapter directory is named
+    # from that block. Without it these would be yahoo_qa_*_s00, not
+    # yahoo_qa_*_n1000_s00, and would not line up with the originals.
+    n_samples_sweep: [1000]
+    recipe_type: class_aware
+    entries:
+      - dataset_id: yahoo_answers_topics
+        split: train
+        weight: 1.0
+        text_field: best_answer                        # kept: the fallback projection
+        text_fields: [question_title, best_answer]     # THE change
+        text_separator: "\n"
+        class_field: topic
+        class_filter: [0]
+
+  - name: yahoo_qa_075t0_025t1
+    seeds: [0]
+    n_samples_sweep: [1000]
+    recipe_type: class_aware
+    entries:
+      - dataset_id: yahoo_answers_topics
+        split: train
+        weight: 1.0
+        text_field: best_answer
+        text_fields: [question_title, best_answer]
+        text_separator: "\n"
+        class_field: topic
+        class_filter: [0, 1]
+        class_weights: {0: 3.0, 1: 1.0}
+
+  - name: yahoo_qa_050t0_050t1
+    seeds: [0]
+    n_samples_sweep: [1000]
+    recipe_type: class_aware
+    entries:
+      - dataset_id: yahoo_answers_topics
+        split: train
+        weight: 1.0
+        text_field: best_answer
+        text_fields: [question_title, best_answer]
+        text_separator: "\n"
+        class_field: topic
+        class_filter: [0, 1]
+        class_weights: {0: 1.0, 1: 1.0}
+
+  - name: yahoo_qa_025t0_075t1
+    seeds: [0]
+    n_samples_sweep: [1000]
+    recipe_type: class_aware
+    entries:
+      - dataset_id: yahoo_answers_topics
+        split: train
+        weight: 1.0
+        text_field: best_answer
+        text_fields: [question_title, best_answer]
+        text_separator: "\n"
+        class_field: topic
+        class_filter: [0, 1]
+        class_weights: {0: 1.0, 1: 3.0}
+
+  - name: yahoo_qa_000t0_100t1
+    seeds: [0]
+    n_samples_sweep: [1000]
+    recipe_type: class_aware
+    entries:
+      - dataset_id: yahoo_answers_topics
+        split: train
+        weight: 1.0
+        text_field: best_answer
+        text_fields: [question_title, best_answer]
+        text_separator: "\n"
+        class_field: topic
+        class_filter: [1]
+
+  # The query set, listed here so build_datasets writes its recipe to
+  # {output_dir}/datasets/ where make_queries looks for it, and so make_queries can
+  # read its seed. Not in fine_tuning.datasets, so nothing trains on it. Identical
+  # content to the block in yahoo_behavioral_smoke.yaml, therefore the identical
+  # recipe_hash (04a65e58df502e45) and the identical draw — content addressing is
+  # what makes that true. It is deliberately UNCOMPOSED: prompts are bare question
+  # titles.
+  - name: yahoo_queries
+    recipe_type: class_aware
+    n_samples: 64
+    seed: 0
+    entries:
+      - dataset_id: yahoo_answers_topics
+        split: train
+        weight: 1.0
+        text_field: question_title
+        class_field: topic
+        class_filter: [0, 1]
+        class_weights: {0: 1.0, 1: 1.0}
+
+base_models:
+  - meta-llama/Llama-3.2-3B
+
+# Every value here is read off the adapters already on disk
+# (03_adapters/meta-llama--Llama-3.2-3B/yahoo_*_n1000_s00_r16_i00/experiment_meta.json)
+# so the two sets differ in the training text and in nothing else. Do not "improve"
+# any of them without retraining both sides.
+fine_tuning:
+  enabled: true
+  datasets:
+    - yahoo_qa_100t0_000t1
+    - yahoo_qa_075t0_025t1
+    - yahoo_qa_050t0_050t1
+    - yahoo_qa_025t0_075t1
+    - yahoo_qa_000t0_100t1
+  n_samples: 1000
+  seed: 0
+  lora_rank: 16
+  lora_alpha: 32
+  target_modules: [q_proj, v_proj, k_proj, o_proj]
+  lora_dropout: 0.05
+  n_epochs: 3
+  learning_rate: 2.0e-4
+  per_device_train_batch_size: 4
+  gradient_accumulation_steps: 4
+  max_seq_length: 512
+  torch_dtype: float16
+  lora_init_seed: 0
+
+# The behavioral run over the newly trained adapters. Settings are identical to
+# yahoo_behavioral_smoke.yaml — same query draw, same token budget, same sampling —
+# because the whole point is that the training projection is the only difference.
+extraction:
+  models:
+    - results/shared_cache/03_adapters/meta-llama--Llama-3.2-3B/yahoo_qa_100t0_000t1_n1000_s00_r16_i00
+    - results/shared_cache/03_adapters/meta-llama--Llama-3.2-3B/yahoo_qa_075t0_025t1_n1000_s00_r16_i00
+    - results/shared_cache/03_adapters/meta-llama--Llama-3.2-3B/yahoo_qa_050t0_050t1_n1000_s00_r16_i00
+    - results/shared_cache/03_adapters/meta-llama--Llama-3.2-3B/yahoo_qa_025t0_075t1_n1000_s00_r16_i00
+    - results/shared_cache/03_adapters/meta-llama--Llama-3.2-3B/yahoo_qa_000t0_100t1_n1000_s00_r16_i00
+
+  # The UNCOMPOSED query recipe: prompts are bare question titles, exactly as in the
+  # smoke run. Requested at n_samples == n_queries because n enters the sampler — a
+  # 64-row draw is not the first 64 rows of a 128-row one.
+  queries_dataset: yahoo_queries
+  n_queries: 64
+  device: cuda
+  # (batch x replicates) x (prompt + max_new_tokens) sets KV-cache growth, so 2 x 8
+  # is the same 16 concurrent sequences the earlier runs used. Under sampling this
+  # is not purely a throughput knob: one RNG stream serves the batch, so batch shape
+  # changes what is drawn. Reproducible at the same batch_size, not across.
+  batch_size: 2
+  torch_dtype: float16
+
+  taxonomies:
+    functional:
+      enabled: false
+    dataset_embedding:
+      enabled: false
+
+    behavioral:
+      enabled: true
+      max_new_tokens: 128
+      replicates: 8
+      do_sample: true
+      temperature: 1.0
+      top_p: 1.0
+      generation_seed: 0
+      embedder:
+        # Matching the embedder that produced 02_dataset_embeddings is what makes the
+        # levels comparable; prompt_name is inside the embedder cache key, so a
+        # different value would put them in differently-keyed spaces.
+        model_name: nomic-ai/nomic-embed-text-v1.5
+        normalize_embeddings: true
+        trust_remote_code: true

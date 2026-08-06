@@ -4,6 +4,95 @@
 
 ## Unreleased
 
+### Behavioral generation samples, and stores several continuations per query
+
+**`replicates`.** `BehavioralTaxonomy` draws `R` continuations per query via
+`num_return_sequences`, and stores them all: the matrix is `(n_queries * R, d)`
+in **query-major** order (`q0r0, q0r1, …, q1r0, …`) and `generated_texts` is
+nested per query. Reading with `replicate_reduction="mean"` averages each query's
+replicates back to `(n_queries, d)`, through the existing surrogate mechanism so
+the reduction is computed once. The cache keeps the superset for the same reason
+TODO item 12 settled query pooling on the read side: the mean is recoverable from
+the rows, the spread is not recoverable from the mean. At 64 queries and `R=8`
+an entry is 1.57 MB, so `05_generated` goes from 2.4 MB to ~21 MB — against
+669 MB already in `04_activations`.
+
+**Decoding now samples** (`do_sample=True`, with `temperature`, `top_p`,
+`top_k`, `generation_seed`). Replicates are meaningless without it — greedy
+decoding would store `R` copies of one continuation — so `replicates > 1` with
+`do_sample=False` is rejected at construction rather than silently duplicating.
+
+**Filenames grew two components**, because both change the numbers and neither
+was anywhere else in the path:
+
+    before: generations/generation128.json
+            embeddings/generation128_{embedder}.safetensors
+    after:  generations/generation128_8r_{sampling8}.json
+            embeddings/generation128_8r_{sampling8}_{embedder}.safetensors
+
+`save()` is idempotent *on the filename*, so without them a second run at a
+different temperature would have found the first run's file, returned early, and
+handed back the first run's numbers — the hazard already documented for
+`torch_dtype`, on an axis that changes the result far more. `behavioral_selector`
+gains `replicates`, `sampling_hash` and `replicate_reduction` to match, and
+`_behavioral_variant_choice` resolves a 4-tuple parsed through `_GEN_RE` instead
+of slicing the stem.
+
+`mode_token` is untouched: it is the same function object on `ActivationCache`,
+and widening it would move `04_activations` filenames for a parameter the
+functional level does not have. The new components come from
+`GeneratedTextCache.variant_token()`.
+
+**Reproducibility is now conditional on `batch_size`.** One RNG stream serves a
+whole `generate` call, so batch shape determines which tokens are drawn; the
+per-batch seeding in `_seed_for_batch` makes a re-run at the same `batch_size`
+and `generation_seed` exact, and a different `batch_size` genuinely different.
+`batch_size` stays out of the cache key and stays in `metadata` and `runs/`.
+The GPU check changed accordingly: `t_behavioral_batch_invariance` asserted a
+greedy tie-flipping signature that sampling makes meaningless, and now asserts
+same-seed reproducibility, that reseeding changes the text, and that replicates
+within a query differ — reporting cross-batch divergence rather than failing on
+it.
+
+**Migrated by `scripts/migrate_behavioral_replicates.py`** (`--dry-run` /
+`--apply` / `--revert`): 10 entries renamed to `1r_6f000f01` — the frozen greedy
+sampling hash — tensors byte-identical, 640 generations nested, none dropped.
+Apply-then-revert was verified byte-identical against the original tree. The
+greedy entries are kept rather than superseded: they are what the 2026-08-05
+measurement was computed from, and they are not comparable with sampled runs,
+which is exactly why the hash is in the name.
+
+### Recipes can compose several columns into their text — half of item 11
+
+**`text_fields` and `text_separator`** on `ClassDatasetEntry` / `DatasetEntry`.
+An entry may name several columns instead of one, joined by the separator, so
+`question_title` + `best_answer` pairs are expressible. `finetune_lora.py`
+synthesizes a `_composed_text` column and hands *that* to `SFTTrainer`, since
+`dataset_text_field` takes one column name.
+
+This exists because the 25 yahoo adapters were fit on bare `best_answer` prose —
+no question, no template — while behavioral extraction prompts them with a
+`question_title` to continue. The generations therefore came from an input shape
+that never appeared in training, and behavioral recovered the mixing order
+**exactly backwards** (r = −0.9995, Procrustes p = 0.955).
+
+**The addition is additive, not a migration.** `recipe_hash` is a SHA-256 over
+`to_dict()` output, so emitting the new keys unconditionally would have changed
+all six existing recipe hashes at once and orphaned 523 draws, 25 adapters and
+everything keyed on them. `composition_dict()` returns nothing when no
+composition is set, so an entry that does not use it serializes byte-identically;
+a check pins the six known hashes. The three copies of the row→text loop in
+`mixed_dataset.py` collapsed into `_text_projection.row_text`.
+
+`experiments/yahoo_qa_model_train.yaml` retrains the five mixtures on pairs, with
+every LoRA parameter read off the adapters on disk so the projection is the only
+difference, under `yahoo_qa_*` names so nothing is overwritten. The query recipe
+is unchanged and still hashes to `04a65e58df502e45`, so old and new adapters land
+at the same draw coordinates. `02_dataset_embeddings` deliberately still embeds
+`best_answer` — moving it re-embeds 520 entries and is a separate decision, so a
+cross-taxonomy comparison against these adapters scores a QA-trained model
+against a `best_answer`-derived dataset geometry.
+
 ### Every stage now spells a draw the same way, and `02` finally says which one
 
 **`src/cache/_draw.py` owns the draw token.** `n{n}_s{seed:02d}`, zero-padded.

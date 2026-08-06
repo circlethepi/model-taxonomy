@@ -139,16 +139,27 @@ def build_taxonomy_artifacts(
         2.  Both are usually wanted, and the cache now keeps them apart.
     behavioral_selector:
         Which cached behavioral representations to read and how to view them:
-        ``{"draw", "max_new_tokens", "embedder_hash", "view", "normalize",
+        ``{"draw", "max_new_tokens", "replicates", "sampling_hash",
+        "embedder_hash", "replicate_reduction", "view", "normalize",
         "representation", "renormalize"}``, all optional.  ``draw`` resolves to the
         one every model shares and the variant to the one present within it;
         several of either is an error naming the options, since two draws are
-        different query sets and two embedders are different vector spaces.
+        different query sets, two embedders are different vector spaces, and two
+        sampling settings are different generated text.
+
+        ``replicate_reduction`` sits between addressing and pooling.  A stored
+        matrix is ``(n_queries * replicates, d)`` in query-major order;
+        ``"mean"`` averages each query's replicates back to ``(n_queries, d)``,
+        while the default ``"all"`` keeps them, so a distance reflects the
+        within-query spread instead of averaging it away first.  It is applied
+        inside the cache, before ``normalize`` and before ``view``, because a
+        ``gram`` of the unreduced matrix is a kernel over replicates and
+        averaging *that* is a different quantity.
 
         The last two keys are a *read-time pooling* step applied after the cache
-        hands back a representation, and they compose with the first five rather
+        hands back a representation, and they compose with the ones above rather
         than replacing them.  ``representation="matrix"`` (the default) is the
-        stored ``(n_queries, d)`` tensor; ``"mean"`` pools it to a ``(1, d)``
+        tensor as addressed; ``"mean"`` pools it to a ``(1, d)``
         centroid, matching
         :class:`~src.taxonomy.dataset_embedding.DatasetEmbeddingTaxonomy`'s
         ``representation="mean"``.  ``renormalize`` L2-normalizes that centroid.
@@ -454,15 +465,24 @@ def _behavioral_matrix(
     optionally pools what comes back::
 
         {"draw": {"recipe_hash": ..., "n_samples": 64, "seed": 0},
-         "max_new_tokens": 128, "embedder_hash": ...,
+         "max_new_tokens": 128, "replicates": 8, "sampling_hash": ...,
+         "embedder_hash": ...,
+         "replicate_reduction": "all",            # all | mean
          "view": "matrix", "normalize": "none",   # matrix | gram
          "representation": "matrix", "renormalize": False}   # matrix | mean
 
     Every field has a default.  ``draw=None`` resolves to the one draw every
-    model shares, and ``embedder_hash=None`` to the one variant present within
-    it — both with a "several exist, name one" error rather than a silent pick,
-    since two draws are different query sets and two embedders are different
-    vector spaces.
+    model shares, and any unnamed part of ``(max_new_tokens, replicates,
+    sampling_hash, embedder_hash)`` to the one variant present within it — both
+    with a "several exist, name one" error rather than a silent pick, since two
+    draws are different query sets, two embedders are different vector spaces,
+    and two sampling settings are different text.
+
+    ``replicate_reduction`` is the odd one out: it does not select a stored
+    entry, it averages the replicates of each query at read time, giving back the
+    ``(n_queries, d)`` shape a single-sample run produced.  Leaving it at
+    ``"all"`` compares ``(n_queries * replicates, d)`` matrices, where a distance
+    includes the within-query spread rather than averaging it away first.
 
     **This replaced a single ``config_hash``**, which selected a whole run at
     once.  The disambiguation did not disappear with it; it split in two — which
@@ -482,27 +502,35 @@ def _behavioral_matrix(
     cache = GeneratedTextCache(root)
     sel = dict(selector or {})
     unknown = set(sel) - {
-        "draw", "max_new_tokens", "embedder_hash", "view", "normalize",
+        "draw", "max_new_tokens", "replicates", "sampling_hash", "embedder_hash",
+        "replicate_reduction", "view", "normalize",
         "representation", "renormalize",
     }
     if unknown:
         raise ValueError(
             f"unknown behavioral_selector key(s) {sorted(unknown)}. Choose from "
-            "'draw', 'max_new_tokens', 'embedder_hash', 'view', 'normalize', "
+            "'draw', 'max_new_tokens', 'replicates', 'sampling_hash', "
+            "'embedder_hash', 'replicate_reduction', 'view', 'normalize', "
             "'representation', 'renormalize'."
         )
     view = sel.get("view", "matrix")
     normalize = sel.get("normalize", "none")
+    replicate_reduction = sel.get("replicate_reduction", "all")
 
     draw = sel.get("draw")
     if draw is None:
         draw = _draw_choice(cache, index, "behavioral", "behavioral")
 
     max_new_tokens = sel.get("max_new_tokens")
+    replicates = sel.get("replicates")
+    sampling_hash = sel.get("sampling_hash")
     embedder_hash = sel.get("embedder_hash")
-    if max_new_tokens is None or embedder_hash is None:
-        max_new_tokens, embedder_hash = _behavioral_variant_choice(
-            cache, index, draw, max_new_tokens, embedder_hash
+    if None in (max_new_tokens, replicates, sampling_hash, embedder_hash):
+        max_new_tokens, replicates, sampling_hash, embedder_hash = (
+            _behavioral_variant_choice(
+                cache, index, draw, max_new_tokens, replicates,
+                sampling_hash, embedder_hash,
+            )
         )
 
     reps = []
@@ -516,14 +544,19 @@ def _behavioral_matrix(
         try:
             rep = cache.load(
                 base_id, entry.model_id, draw,
-                max_new_tokens=max_new_tokens, embedder_hash=embedder_hash,
+                max_new_tokens=max_new_tokens,
+                replicates=replicates,
+                sampling_hash=sampling_hash,
+                embedder_hash=embedder_hash,
                 view=view, normalize=normalize,
+                replicate_reduction=replicate_reduction,
             )
         except FileNotFoundError as e:
             raise ValueError(
                 f"no behavioral representation for {entry.adapter_name!r} under draw "
                 f"{GeneratedTextCache.draw_name(draw)} "
-                f"(generation{max_new_tokens}, embedder {embedder_hash}): {e}. "
+                f"({cache.variant_token(max_new_tokens, replicates, sampling_hash)}, "
+                f"embedder {embedder_hash}): {e}. "
                 "Filter with index.with_available('behavioral_repr')."
             ) from None
         reps.append(_behavioral_view(rep, sel, view=view))
@@ -713,51 +746,63 @@ def _draw_choice(cache, index: CacheIndex, taxonomy: str, extract_flag: str) -> 
 
 def _behavioral_variant_choice(
     cache, index: CacheIndex, draw: dict,
-    max_new_tokens: int | None, embedder_hash: str | None,
-) -> tuple[int, str]:
-    """The single ``(max_new_tokens, embedder_hash)`` every entry shares under *draw*.
+    max_new_tokens: int | None, replicates: int | None,
+    sampling_hash: str | None, embedder_hash: str | None,
+) -> tuple[int, int, str, str]:
+    """The one variant every entry shares under *draw*.
+
+    A variant is ``(max_new_tokens, replicates, sampling_hash, embedder_hash)``:
+    the four axes that make two stored generations different numbers rather than
+    the same numbers addressed twice.
 
     Modelled on :func:`_embedder_choice`, and like it this is a **directory
     listing, not a file open** — the variant is entirely in the filename, so
     answering "what has been computed here?" costs one ``glob`` per model rather
-    than one safetensors load.
+    than one safetensors load.  It parses the filename through the cache's own
+    :data:`~src.cache.generated_text_cache._GEN_RE` rather than slicing the
+    string, which is what an earlier version did and what stopped working the
+    moment the stem grew a second component.
 
     Partial selectors are honoured: naming only ``embedder_hash`` narrows the
     candidates and then requires the rest to be unambiguous, which is what makes
     "the same draw, re-embedded" expressible.
     """
+    wanted = (max_new_tokens, replicates, sampling_hash, embedder_hash)
     per_entry = []
     for entry in index.entries:
         if not entry.base_model_id:
             continue
         variants = set()
-        for mode_token, emb in cache.list_variants(entry.base_model_id, entry.model_id, draw):
+        for mode_token, reps, samp, emb in cache.list_variants(
+            entry.base_model_id, entry.model_id, draw
+        ):
             if not mode_token.startswith("generation"):
                 continue
-            mnt = int(mode_token[len("generation"):])
-            if max_new_tokens is not None and mnt != max_new_tokens:
-                continue
-            if embedder_hash is not None and emb != embedder_hash:
-                continue
-            variants.add((mnt, emb))
+            candidate = (int(mode_token[len("generation"):]), reps, samp, emb)
+            if all(w is None or w == c for w, c in zip(wanted, candidate)):
+                variants.add(candidate)
         per_entry.append(variants)
 
     shared = set.intersection(*per_entry) if per_entry else set()
     if not shared:
         raise ValueError(
-            "no single (max_new_tokens, embedder) variant has behavioral "
-            "representations for every model under draw "
+            "no single (max_new_tokens, replicates, sampling, embedder) variant "
+            "has behavioral representations for every model under draw "
             f"{cache.draw_name(draw)}. Run scripts/extract_reprs.py --taxonomy "
             "behavioral, or name one with behavioral_selector="
-            "{'max_new_tokens': ..., 'embedder_hash': ...}."
+            "{'max_new_tokens': ..., 'replicates': ..., 'sampling_hash': ..., "
+            "'embedder_hash': ...}."
         )
     if len(shared) > 1:
-        listed = sorted(f"generation{m}_{e}" for m, e in shared)
+        listed = sorted(
+            f"generation{m}_{r}r_{s}_{e}" for m, r, s, e in shared
+        )
         raise ValueError(
             f"{len(listed)} behavioral variants are cached for every model: {listed}. "
-            "They differ in generation length or embedder and are not comparable, so "
-            "pass behavioral_selector={'max_new_tokens': ..., 'embedder_hash': ...} "
-            "to choose one."
+            "They differ in generation length, replicate count, sampling settings "
+            "or embedder and are not comparable, so pass behavioral_selector="
+            "{'max_new_tokens': ..., 'replicates': ..., 'sampling_hash': ..., "
+            "'embedder_hash': ...} to choose one."
         )
     return next(iter(shared))
 

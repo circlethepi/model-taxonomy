@@ -51,6 +51,8 @@ import json
 import os
 from pathlib import Path
 
+from src.cache._draw import draw_name
+
 #: Draw-manifest schema.  Independent of recipe.json's schema_version.
 DRAW_SCHEMA_VERSION = "2"
 
@@ -78,7 +80,14 @@ class SampledDatasetCache:
         return self.root / recipe_hash
 
     def _path(self, recipe_hash: str, n_samples: int, seed: int) -> Path:
-        return self._dir(recipe_hash) / f"n{n_samples}_s{seed}.json"
+        """The manifest for one draw.
+
+        The stem comes from :func:`src.cache._draw.draw_name` rather than being
+        formatted here, so this stage cannot drift from ``02``, ``04`` and
+        ``05``.  It had drifted: this line wrote an unpadded seed while the
+        inference caches wrote ``s{seed:02d}``, and the two were never compared.
+        """
+        return self._dir(recipe_hash) / f"{draw_name(n_samples, seed)}.json"
 
     def _recipe_path(self, recipe_hash: str) -> Path:
         return self._dir(recipe_hash) / "recipe.json"

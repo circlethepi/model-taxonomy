@@ -1221,6 +1221,55 @@ def t_recipe_identity():
     return "name excluded, entries and recipe_type included, schema_version=2"
 
 
+@check("draw name: every stage spells one draw exactly one way")
+def t_one_draw_name():
+    """The regression guard for item 15.
+
+    Four stages name a draw and they used to disagree: ``01_datasets`` wrote an
+    unpadded seed, ``04``/``05`` a padded one, and ``02`` wrote nothing at all.
+    Nothing detected that, because each stage only ever read its own names — the
+    drift was invisible until someone tried to line the trees up by eye.
+
+    So assert the agreement directly.  If a stage ever formats the token itself
+    again instead of calling :mod:`src.cache._draw`, this fails.
+    """
+    from src.cache._draw import DRAW_RE, draw_name, parse_draw_name
+    from src.cache._draw_keyed import DrawKeyedCache
+    from src.cache.sampled_dataset_cache import SampledDatasetCache
+
+    n, seed = 1000, 3
+    want = draw_name(n, seed)
+    assert want == "n1000_s03", want
+
+    # 04/05, via the inference base class.
+    got_inference = DrawKeyedCache.draw_name({"n_samples": n, "seed": seed})
+    assert got_inference == want, f"inference caches say {got_inference}, not {want}"
+
+    # 01, via the sample cache's own path helper.  A temp root because the cache
+    # creates its root on construction; nothing is written into it here.
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmp:
+        stem = SampledDatasetCache(Path(tmp))._path("h", n, seed).stem
+    assert stem == want, f"01_datasets says {stem}, not {want}"
+
+    # Reading must stay wider than writing, or the migration loses the old names.
+    assert parse_draw_name("n1000_s3") == (n, seed), "unpadded names must still read"
+    assert parse_draw_name("n1000_s03") == (n, seed)
+    assert parse_draw_name("recipe.json") is None, "non-draw entries must not parse"
+    assert DRAW_RE.match("n1000_s03"), "DRAW_RE must accept what draw_name writes"
+
+    # A seedless draw names nothing; it must not quietly become "sNone".
+    try:
+        draw_name(n, None)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("draw_name(None) must raise, not produce 'sNone'")
+
+    return f"01, 04 and 05 all say {want}; unpadded still parses"
+
+
 @check("embedder hash: seed separates draws of one content-addressed recipe")
 def t_embedder_hash_seed():
     from src.cache.dataset_embedding_cache import DatasetEmbeddingCache
@@ -2593,7 +2642,8 @@ SYNTHETIC = [
     t_simplex_dimension_requirement, t_projection_dimension_matters,
     t_procrustes_transform, t_collection_multidim, t_analysis_geometries,
     # content-addressed recipe identity, and the draw storage it enables
-    t_recipe_identity, t_embedder_hash_seed, t_draw_schema_roundtrip, t_names_merge,
+    t_recipe_identity, t_one_draw_name, t_embedder_hash_seed, t_draw_schema_roundtrip,
+    t_names_merge,
     # behavioral taxonomy: its cache, and the padding property batch invariance needs
     t_generated_cache_roundtrip, t_generated_cache_hash_stable, t_behavioral_padding_side,
     # embedder task prefixes: the model is misused without them, and the failure is silent

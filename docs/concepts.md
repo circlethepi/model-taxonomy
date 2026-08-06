@@ -144,10 +144,16 @@ results/shared_cache/
     02_dataset_embeddings/       {recipe_hash}/{embedder_hash}/
     03_adapters/                 raw PEFT weights + extracted structural representations
     03A_adapter_alignments/      pairwise Procrustes alignments
-    04_activations/              functional representations
-    05_generated/                behavioral representations
+    04_activations/              {base}/{adapter}/{recipe_hash}/n{n}_s{seed}/
+    05_generated/                {base}/{adapter}/{recipe_hash}/n{n}_s{seed}/
     06_collections/              distance matrices, geometries, index.json
 ```
+
+The two inference stages share that key exactly, from
+`src/cache/_draw_keyed.py::DrawKeyedCache`, so one model under one query draw
+sits at the same coordinates in both and the trees can be read side by side.
+They differ only in the artifact filename: `{mode}_{pooling}_layer{NNN}` for
+activations, `{mode}_{embedder_hash}` for generations.
 
 Directories sharing a number sit at the same stage. A **letter suffix means analysis
 *of* the objects at that stage** — `03A_adapter_alignments` holds things computed from

@@ -294,7 +294,7 @@ def scan_cache(
     base_model_id: str | None = None,
     resolve_recipes: bool = True,
     scan_all_recipes: bool = False,
-    behavioral_config_hash: str | None = None,
+    behavioral_draw: dict | None = None,
     functional_draw: dict | None = None,
 ) -> CacheIndex:
     """Walk the shared cache and join adapters to the recipes they were trained on.
@@ -313,25 +313,25 @@ def scan_cache(
         Additionally enumerate *every* recipe in the dataset-embedding cache, not
         just the referenced ones.  Off by default because that is one read per
         recipe and the cache can hold thousands.
-    behavioral_config_hash:
-        Which behavioral run the ``behavioral_repr`` token should report on.
+    behavioral_draw:
+        Which query draw the ``behavioral_repr`` token should report on, as a
+        ``{recipe_hash, n_samples, seed}`` dict.
 
         **The meaning of the token depends on this argument, so read it before
-        relying on it.**  When a hash is given, ``behavioral_repr`` is exact: True
-        means *this model has a representation under this exact config*.  When it
-        is omitted the token degrades to "some behavioral representation exists for
-        this model, under some config" — which is weaker than it looks, because a
-        representation generated from different queries or a different embedder is
-        not interchangeable with the one a caller probably wants.  Pass the hash
-        whenever the answer will be used to select models for a comparison.
+        relying on it.**  Given a draw the token is exact: True means *this model
+        has a representation over this exact query draw*.  Omitted, it degrades
+        to "some behavioral representation exists for this model, under some
+        draw" — weaker than it looks, because a representation generated from a
+        different query set is not interchangeable with the one a caller probably
+        wants.  Pass it whenever the answer will select models for a comparison.
+
+        This replaced ``behavioral_config_hash``, and the old keyword is **gone
+        rather than deprecated**.  The tree it addressed no longer exists, so a
+        ``TypeError`` is the correct immediate failure; an alias that quietly
+        did nothing would be the same class of silent bug this layout change
+        exists to remove.
     functional_draw:
-        Which query draw the ``functional_repr`` token should report on, as a
-        ``{recipe_hash, n_samples, seed}`` dict.  Carries the **same caveat** as
-        ``behavioral_config_hash``: given a draw the token is exact, and without
-        one it degrades to "some activations exist for this model, under some
-        draw" — weaker than it looks, since activations from a different query
-        set are not interchangeable.  Pass it whenever the answer will select
-        models for a comparison.
+        The same, for ``functional_repr``, with the same caveat.
     """
     root = Path(cache_root)
     adapters_root = root / "03_adapters"
@@ -350,9 +350,6 @@ def scan_cache(
     de_cache = DatasetEmbeddingCache(root)
     gen_cache = GeneratedTextCache(root)
     act_cache = ActivationCache(root)
-    behavioral_hashes = (
-        [behavioral_config_hash] if behavioral_config_hash else gen_cache.list_configs()
-    )
 
     slugs = (
         [base_model_id.replace("/", "--")]
@@ -406,10 +403,10 @@ def scan_cache(
                 ),
                 # Ask the cache where its own files live rather than rebuilding the
                 # path here — see _sampled_rows_exist below for why that matters.
-                "behavioral_repr": any(
-                    gen_cache.exists(h, entry.model_id) for h in behavioral_hashes
+                "behavioral_repr": _draw_keyed_repr_exists(
+                    gen_cache, entry.base_model_id, entry.model_id, behavioral_draw
                 ),
-                "functional_repr": _functional_repr_exists(
+                "functional_repr": _draw_keyed_repr_exists(
                     act_cache, entry.base_model_id, entry.model_id, functional_draw
                 ),
             }
@@ -492,22 +489,29 @@ def _sampled_rows_exist(
     return (sampled_root / recipe_hash / f"n{n_samples}_s{seed}.json").exists()
 
 
-def _functional_repr_exists(
-    act_cache, base_model_id: str | None, model_id: str, draw: dict | None
+def _draw_keyed_repr_exists(
+    cache, base_model_id: str | None, model_id: str, draw: dict | None
 ) -> bool:
-    """Whether this model has stored activations — exactly, or coarsely.
+    """Whether this model has a stored representation — exactly, or coarsely.
 
-    Both branches ask :class:`ActivationCache` where its own files live rather
-    than rebuilding the path.  ``_sampled_rows_exist`` above is the counterexample
-    already in this codebase: it hardcodes ``SampledDatasetCache``'s layout, so
-    the two are free to drift and the failure mode is silent — every write
-    succeeds while the cache reads as empty.
+    One helper for both inference levels: since ``05_generated`` was re-keyed to
+    match ``04_activations``, :class:`~src.cache._draw_keyed.DrawKeyedCache` gives
+    them the same ``has_draw``/``has_any`` protocol, so asking "does this model
+    have a functional representation?" and "…a behavioral one?" is the same
+    question against a different cache.
+
+    Both branches ask the cache where its own files live rather than rebuilding
+    the path.  ``_sampled_rows_exist`` above is the counterexample already in
+    this codebase: it hardcodes ``SampledDatasetCache``'s layout, so the two are
+    free to drift and the failure mode is silent — every write succeeds while the
+    cache reads as empty.  The behavioral cache spent its whole life in exactly
+    that state; see ``docs/notes/TODO.md`` item 13.
     """
     if not base_model_id:
         return False
     if draw is None:
-        return act_cache.has_any(base_model_id, model_id)
-    return act_cache.has_draw(base_model_id, model_id, draw)
+        return cache.has_any(base_model_id, model_id)
+    return cache.has_draw(base_model_id, model_id, draw)
 
 
 def _attach_unreferenced_recipes(

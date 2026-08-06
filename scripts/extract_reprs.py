@@ -72,7 +72,7 @@ def extract_representations(cfg: dict, only_taxonomies: list[str] | None = None)
     query_key: dict = {}
     if model_ids and need_queries:
         print("  Loading queries...")
-        queries, query_key = make_queries(cfg)
+        queries, query_key, source_indices = make_queries(cfg)
         print(f"  Got {len(queries)} queries.  draw={query_key}")
 
     # ── Functional taxonomy ────────────────────────────────────────────────────
@@ -81,7 +81,8 @@ def extract_representations(cfg: dict, only_taxonomies: list[str] | None = None)
               f"  mode={fcfg.get('activation_mode', 'input')}"
               f"  pooling={fcfg.get('pooling', 'mean')}")
         taxonomy = make_functional_taxonomy(
-            cfg, queries, query_key, cache=make_activation_cache(cache_dir)
+            cfg, queries, query_key, cache=make_activation_cache(cache_dir),
+            source_indices=source_indices,
         )
         try:
             for model_id in tqdm(model_ids, desc="functional", unit="model"):
@@ -96,7 +97,8 @@ def extract_representations(cfg: dict, only_taxonomies: list[str] | None = None)
     if bcfg.get("enabled", True) and (enabled is None or "behavioral" in enabled):
         print(f"\n  [behavioral]  max_new_tokens={bcfg.get('max_new_tokens', 64)}")
         taxonomy = make_behavioral_taxonomy(
-            cfg, queries, query_key, cache=make_generated_text_cache(cache_dir)
+            cfg, queries, query_key, cache=make_generated_text_cache(cache_dir),
+            source_indices=source_indices,
         )
         try:
             for model_id in tqdm(model_ids, desc="behavioral", unit="model"):

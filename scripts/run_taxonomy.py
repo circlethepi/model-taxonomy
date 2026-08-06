@@ -109,9 +109,10 @@ def run_taxonomy(cfg: dict, only_taxonomies: list[str] | None = None) -> ModelTa
     # ── Functional ─────────────────────────────────────────────────────────────
     if "functional" in configured_taxonomies:
         print("\n  [functional]")
-        queries, query_key = make_queries(cfg)
+        queries, query_key, source_indices = make_queries(cfg)
         taxonomy = make_functional_taxonomy(
-            cfg, queries, query_key, cache=make_activation_cache(cache_dir)
+            cfg, queries, query_key, cache=make_activation_cache(cache_dir),
+            source_indices=source_indices,
         )
         metric_names = _to_list(metrics_cfg.get("functional", "cka"))
 
@@ -135,9 +136,10 @@ def run_taxonomy(cfg: dict, only_taxonomies: list[str] | None = None) -> ModelTa
     # ── Behavioral ─────────────────────────────────────────────────────────────
     if "behavioral" in configured_taxonomies:
         print("\n  [behavioral]")
-        queries, query_key = make_queries(cfg)
+        queries, query_key, source_indices = make_queries(cfg)
         taxonomy = make_behavioral_taxonomy(
-            cfg, queries, query_key, cache=make_generated_text_cache(cache_dir)
+            cfg, queries, query_key, cache=make_generated_text_cache(cache_dir),
+            source_indices=source_indices,
         )
         metric_names = _to_list(metrics_cfg.get("behavioral", "frobenius"))
 

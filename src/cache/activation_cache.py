@@ -1,39 +1,32 @@
 from __future__ import annotations
 
-import hashlib
-import json
-import os
 import re
-from datetime import datetime, timezone
 from pathlib import Path
 
 import numpy as np
 
+from src.cache._draw_keyed import (
+    DrawKeyedCache,
+    _atomic_save_tensor,
+    _atomic_write_json,
+    _row_normalize,
+    _slug,
+    adapter_slug,
+)
 from src.core.representation import ModelRepresentation
 
-
-def _slug(model_id: str) -> str:
-    """Filesystem-safe slug for a model or adapter ID.
-
-    Deliberately the same scheme as :func:`src.cache.lora_cache._slug` — a
-    functional entry sits at the same ``{base}/{adapter}`` coordinates as the
-    structural entry for the same adapter, so the two trees can be read together.
-
-    Note this differs from :func:`src.cache.generated_text_cache.model_slug`,
-    which hashes the *full path*.  That makes a behavioral entry keyed to where
-    the adapter directory happened to live on disk; this one is not.  The
-    divergence is recorded in ``docs/notes/TODO.md``.
-    """
-    return str(model_id).replace("/", "--")
-
-
-def adapter_slug(model_id: str) -> str:
-    """Slug for the adapter component of a model key.
-
-    Local adapter directories are absolute paths, so slugging the whole path
-    would bury the name under the tree it lives in.  Take the directory name.
-    """
-    return _slug(Path(str(model_id)).name)
+# Re-exported so existing importers of ``activation_cache._slug`` /
+# ``adapter_slug`` keep working; the definitions now live on the shared base so
+# the two inference caches cannot drift apart.  See ``_draw_keyed`` for why that
+# matters — the drift is exactly what orphaned the behavioral cache.
+__all__ = [
+    "ActivationCache",
+    "_slug",
+    "adapter_slug",
+    "_row_normalize",
+    "_atomic_write_json",
+    "_atomic_save_tensor",
+]
 
 
 #: Filenames look like ``input_mean_layer028.safetensors``.  Everything that
@@ -42,7 +35,7 @@ def adapter_slug(model_id: str) -> str:
 _ACT_RE = re.compile(r"^(?P<mode>[a-z]+\d*)_(?P<pooling>[a-z_]+)_layer(?P<layer>\d+)$")
 
 
-class ActivationCache:
+class ActivationCache(DrawKeyedCache):
     """Cache for functional representations: pooled per-layer activations.
 
     Directory layout::
@@ -55,13 +48,8 @@ class ActivationCache:
                 config.json
                 surrogate.safetensors
 
-    Keyed **model-wise then draw-wise**, following :class:`LoRACache`, rather
-    than run-wise like :class:`GeneratedTextCache`.  The reason is that one
-    forward pass produces *every* layer at once, so which layers you look at
-    should be a read-time choice: a run stores all of them and re-observing a
-    different subset costs nothing.  Under a run-wise ``{config_hash}/`` layout,
-    changing ``layer_indices`` changes the hash and re-runs inference to
-    recompute tensors already on disk.
+    The addressing above the artifact is :class:`DrawKeyedCache`; see that module
+    for why it is shared with ``05_generated``.
 
     One file per ``(mode, pooling, layer)`` makes writes purely additive — a
     later run that adds a mode never rewrites an existing file.
@@ -74,6 +62,14 @@ class ActivationCache:
     budget for generation — is in the filename.  Normalization is *not*: raw
     activations are stored and normalization is a property of a surrogate, so
     differently normalized views coexist without re-running inference.
+
+    **One thing is deliberately not in the filename, and it is a hazard:**
+    ``torch_dtype``.  An fp16 run and an fp32 run over the same draw write the
+    same filenames, so the second is a no-op skip rather than a second entry —
+    the numbers on disk are whichever ran first.  It is detectable after the
+    fact, because each run leaves its own ``runs/{config_hash}.json`` and the
+    dtype is in there; it is not prevented.  ``05_generated`` has the same
+    property for the same reason, and the symmetry is intentional.
 
     Normalization has two modes, both applied to *rows* (a row is a query):
 
@@ -102,56 +98,12 @@ class ActivationCache:
     ``none`` stores the raw concatenation.  See ``docs/notes/gram_and_cka.md``.
     """
 
-    #: Accepted normalization modes.  Bools are accepted too and canonicalized
-    #: by :meth:`_canon_normalize`, so ``True`` and ``"layer"`` cannot produce
-    #: two surrogates for one request.
-    NORM_MODES = frozenset({"layer", "global", "none"})
-
-    #: Views that are kernel matrices rather than feature matrices.  Handing one
-    #: to a metric that forms its own kernel computes a different quantity
-    #: silently, so representations built from these are tagged (see ``load``).
-    KERNEL_VIEWS = frozenset({"gram"})
-
-    def __init__(self, cache_root: Path | str) -> None:
-        self.root = Path(cache_root)
-        self._base = self.root / "04_activations"
+    _STAGE_DIR = "04_activations"
+    _ARTIFACT_DIR = "activations"
 
     # ------------------------------------------------------------------
-    # Path helpers — everything else must call these rather than rebuild paths
+    # Path helpers
     # ------------------------------------------------------------------
-
-    @staticmethod
-    def draw_name(query_key: dict) -> str:
-        """``n{n}_s{seed}``, matching the draw filenames in ``01_datasets``."""
-        return f"n{query_key['n_samples']}_s{int(query_key['seed']):02d}"
-
-    def draw_dir(self, base_model_id: str, adapter_id: str, query_key: dict) -> Path:
-        return (
-            self._base
-            / _slug(base_model_id)
-            / adapter_slug(adapter_id)
-            / query_key["recipe_hash"]
-            / self.draw_name(query_key)
-        )
-
-    @staticmethod
-    def mode_token(mode: str, max_new_tokens: int | None = None) -> str:
-        """The stored-mode component of an activation filename.
-
-        ``generation`` carries its token budget because generating 32 tokens and
-        generating 128 produce different mean-pooled vectors; storing both under
-        one name would let them overwrite each other.
-        """
-        if mode == "input":
-            return "input"
-        if mode == "generation":
-            if not max_new_tokens:
-                raise ValueError("generation mode requires max_new_tokens > 0")
-            return f"generation{int(max_new_tokens)}"
-        raise ValueError(
-            f"{mode!r} is not a stored mode; only 'input' and 'generation' are "
-            "written to disk. 'both' is a read-time combination of the two."
-        )
 
     def activation_path(
         self,
@@ -171,35 +123,6 @@ class ActivationCache:
             )
         name = f"{self.mode_token(mode, max_new_tokens)}_{pooling}_layer{layer:03d}.safetensors"
         return self.draw_dir(base_model_id, adapter_id, query_key) / "activations" / name
-
-    # ------------------------------------------------------------------
-    # Hash helpers
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def config_hash(config: dict) -> str:
-        """16-char SHA-256 prefix identifying a config dict."""
-        payload = json.dumps(config, sort_keys=True, default=str).encode()
-        return hashlib.sha256(payload).hexdigest()[:16]
-
-    @classmethod
-    def canon_normalize(cls, normalize: str | bool) -> str:
-        """One spelling per normalization request.
-
-        ``normalize=True`` and ``normalize="layer"`` are the same thing asked
-        two ways.  They must reach the surrogate spec identically or they hash
-        differently and the same view is computed and stored twice.
-        """
-        if normalize is True:
-            return "layer"
-        if normalize is False:
-            return "none"
-        if normalize in cls.NORM_MODES:
-            return str(normalize)
-        raise ValueError(
-            f"unknown normalize {normalize!r}; expected one of "
-            f"{sorted(cls.NORM_MODES)}, or a bool (True→'layer', False→'none')"
-        )
 
     # ------------------------------------------------------------------
     # Existence
@@ -270,37 +193,20 @@ class ActivationCache:
         (draw / "runs").mkdir(parents=True, exist_ok=True)
 
         with FileLock(str(draw / ".lock")):
-            # queries.json — which source row is row i of every matrix here.
-            # The draw in 01_datasets is canonical and already stores source
-            # indices, and (recipe_hash, n_samples, seed) determines the text
-            # completely, so there is no reason to duplicate the text.
-            queries_path = draw / "queries.json"
-            if not queries_path.exists():
-                _atomic_write_json(
-                    queries_path,
-                    {
-                        "schema_version": "1",
-                        "query_key": query_key,
-                        "source_indices": source_indices or [],
-                    },
-                )
+            self._write_queries_once(draw, query_key, source_indices)
 
             if config is not None:
-                run_path = draw / "runs" / f"{self.config_hash(config)}.json"
-                if not run_path.exists():
-                    _atomic_write_json(
-                        run_path,
-                        {
-                            "schema_version": "1",
-                            "config": config,
-                            "mode": mode,
-                            "pooling": pooling,
-                            "max_new_tokens": max_new_tokens,
-                            "resolved_layers": sorted(layers),
-                            **(run_metadata or {}),
-                            "written_at": datetime.now(timezone.utc).isoformat(),
-                        },
-                    )
+                self._write_run_record(
+                    draw,
+                    config,
+                    {
+                        "mode": mode,
+                        "pooling": pooling,
+                        "max_new_tokens": max_new_tokens,
+                        "resolved_layers": sorted(layers),
+                        **(run_metadata or {}),
+                    },
+                )
 
             for layer, arr in layers.items():
                 path = self.activation_path(
@@ -368,63 +274,9 @@ class ActivationCache:
             out[ell] = load_file(str(path))["activations"]
         return out
 
-    def load_config(
-        self, base_model_id: str, adapter_id: str, query_key: dict, config_hash: str
-    ) -> dict:
-        path = self.draw_dir(base_model_id, adapter_id, query_key) / "runs" / f"{config_hash}.json"
-        return json.loads(path.read_text())
-
-    def load_queries(self, base_model_id: str, adapter_id: str, query_key: dict) -> dict:
-        path = self.draw_dir(base_model_id, adapter_id, query_key) / "queries.json"
-        return json.loads(path.read_text())
-
     # ------------------------------------------------------------------
-    # Surrogates — computed on demand, written back
+    # Views
     # ------------------------------------------------------------------
-
-    def surrogate_dir(
-        self, base_model_id: str, adapter_id: str, query_key: dict, spec: dict
-    ) -> Path:
-        return (
-            self.draw_dir(base_model_id, adapter_id, query_key)
-            / "surrogates"
-            / self.config_hash(spec)
-        )
-
-    def save_surrogate(
-        self,
-        base_model_id: str,
-        adapter_id: str,
-        query_key: dict,
-        spec: dict,
-        matrix: np.ndarray,
-    ) -> None:
-        from filelock import FileLock
-
-        d = self.surrogate_dir(base_model_id, adapter_id, query_key, spec)
-        d.mkdir(parents=True, exist_ok=True)
-        with FileLock(str(d / ".lock")):
-            if (d / "surrogate.safetensors").exists():
-                return
-            _atomic_write_json(d / "config.json", {"schema_version": "1", **spec})
-            _atomic_save_tensor(
-                d / "surrogate.safetensors",
-                np.ascontiguousarray(matrix.astype(np.float32)),
-                key="surrogate",
-            )
-
-    def load_surrogate(
-        self, base_model_id: str, adapter_id: str, query_key: dict, spec: dict
-    ) -> np.ndarray | None:
-        from safetensors.numpy import load_file
-
-        path = (
-            self.surrogate_dir(base_model_id, adapter_id, query_key, spec)
-            / "surrogate.safetensors"
-        )
-        if not path.exists():
-            return None
-        return load_file(str(path))["surrogate"]
 
     def load(
         self,
@@ -555,97 +407,3 @@ class ActivationCache:
             # a row a layer, which is a different object with a different meaning.
             return (H @ H.T).astype(np.float32)
         raise ValueError(f"unknown view {view!r}; expected 'concat' or 'gram'")
-
-    # ------------------------------------------------------------------
-    # Enumeration
-    # ------------------------------------------------------------------
-
-    def list_base_models(self) -> list[str]:
-        if not self._base.exists():
-            return []
-        return [d.name.replace("--", "/") for d in sorted(self._base.iterdir()) if d.is_dir()]
-
-    def list_models(self, base_model_id: str | None = None) -> list[tuple[str, str]]:
-        """``[(base_slug, adapter_slug), ...]`` present in the cache."""
-        if not self._base.exists():
-            return []
-        bases = (
-            [self._base / _slug(base_model_id)]
-            if base_model_id is not None
-            else [d for d in sorted(self._base.iterdir()) if d.is_dir()]
-        )
-        out = []
-        for bd in bases:
-            if not bd.exists():
-                continue
-            out.extend((bd.name, ad.name) for ad in sorted(bd.iterdir()) if ad.is_dir())
-        return out
-
-    def list_draws(self, base_model_id: str, adapter_id: str) -> list[dict]:
-        """``[{recipe_hash, n_samples, seed}, ...]`` stored for one model."""
-        adapter_dir = self._base / _slug(base_model_id) / adapter_slug(adapter_id)
-        if not adapter_dir.exists():
-            return []
-        draws = []
-        for recipe_dir in sorted(adapter_dir.iterdir()):
-            if not recipe_dir.is_dir():
-                continue
-            for draw_dir in sorted(recipe_dir.iterdir()):
-                m = re.match(r"^n(\d+)_s(\d+)$", draw_dir.name)
-                if draw_dir.is_dir() and m:
-                    draws.append({
-                        "recipe_hash": recipe_dir.name,
-                        "n_samples": int(m.group(1)),
-                        "seed": int(m.group(2)),
-                    })
-        return draws
-
-    def list_runs(self, base_model_id: str, adapter_id: str, query_key: dict) -> list[str]:
-        runs_dir = self.draw_dir(base_model_id, adapter_id, query_key) / "runs"
-        if not runs_dir.exists():
-            return []
-        return sorted(p.stem for p in runs_dir.glob("*.json"))
-
-    def has_draw(self, base_model_id: str, adapter_id: str, query_key: dict) -> bool:
-        """True when any activations are stored for this model under this exact draw.
-
-        The exact availability test, as opposed to :meth:`has_any`.
-        """
-        act_dir = self.draw_dir(base_model_id, adapter_id, query_key) / "activations"
-        return act_dir.exists() and any(act_dir.glob("*.safetensors"))
-
-    def has_any(self, base_model_id: str, adapter_id: str) -> bool:
-        """True when any activations exist for this model, under any draw.
-
-        The coarse availability test discovery falls back to when it has not been
-        told which draw to look for.
-        """
-        adapter_dir = self._base / _slug(base_model_id) / adapter_slug(adapter_id)
-        if not adapter_dir.exists():
-            return False
-        return any(adapter_dir.glob("*/*/activations/*.safetensors"))
-
-
-def _row_normalize(m: np.ndarray) -> np.ndarray:
-    """L2-normalize each row, leaving zero rows at zero rather than NaN.
-
-    Applied at two scales — per layer block and to the whole concatenation — so
-    it is a helper rather than an inline expression.
-    """
-    norms = np.linalg.norm(m, axis=1, keepdims=True)
-    return m / np.where(norms < 1e-12, 1.0, norms)
-
-
-def _atomic_write_json(path: Path, payload: dict) -> None:
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(payload, indent=2, default=str))
-    os.replace(tmp, path)
-
-
-def _atomic_save_tensor(path: Path, arr: np.ndarray, key: str = "activations") -> None:
-    from safetensors.numpy import save_file
-
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(".safetensors.tmp")
-    save_file({key: arr}, str(tmp))
-    os.replace(tmp, path)

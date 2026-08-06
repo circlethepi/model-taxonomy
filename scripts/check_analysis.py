@@ -1270,19 +1270,73 @@ def t_one_draw_name():
     return f"01, 04 and 05 all say {want}; unpadded still parses"
 
 
-@check("embedder hash: seed separates draws of one content-addressed recipe")
+@check("embedder hash: the draw separates entries, now via the path not the hash")
 def t_embedder_hash_seed():
+    """The inverse of what this check used to assert, and deliberately so.
+
+    It used to demand that ``seed`` be *inside* ``embedder_hash``.  That was the
+    right guarantee in the wrong place: once ``recipe_hash`` became
+    content-addressed, something had to separate two seeds of one mixture, and
+    the hash was where it went.  Item 15 moved it into the path.
+
+    So the guarantee has moved, not gone, and this checks it in its new home. The
+    failure being prevented is unchanged — two seeds sharing one entry would
+    collapse a seed sweep to a single point and report a variance of zero that is
+    an artifact of the cache rather than a property of the data.
+    """
+    import tempfile
+
     from src.cache.dataset_embedding_cache import DatasetEmbeddingCache
 
-    cfg, rep, n = {"embedder_class": "X", "model_name": "m"}, "mean", 1000
-    h0 = DatasetEmbeddingCache.embedder_hash(cfg, rep, n, 0)
-    h1 = DatasetEmbeddingCache.embedder_hash(cfg, rep, n, 1)
-    assert h0 != h1, (
-        "seeds collide — every seed of a mixture would share one embedding entry, "
-        "silently collapsing a seed sweep to a single point"
-    )
-    assert h0 != DatasetEmbeddingCache.embedder_hash(cfg, rep, 2000, 0), "n must still count"
-    return "distinct per seed and per n_samples"
+    cfg = {"embedder_class": "X", "model_name": "m"}
+    with tempfile.TemporaryDirectory() as tmp:
+        cache = DatasetEmbeddingCache(Path(tmp))
+        emb = cache.embedder_hash(cfg)
+        spec = cache.spec_for("mean")
+
+        d_s0 = cache.surrogate_dir("h", 1000, 0, emb, spec)
+        d_s1 = cache.surrogate_dir("h", 1000, 1, emb, spec)
+        d_n2 = cache.surrogate_dir("h", 2000, 0, emb, spec)
+        assert d_s0 != d_s1, (
+            "seeds collide in the path — every seed of a mixture would share one "
+            "entry, silently collapsing a seed sweep to a single point"
+        )
+        assert d_s0 != d_n2, "n_samples must still separate entries"
+        assert "n1000_s00" in d_s0.parts, d_s0
+        assert "n1000_s01" in d_s1.parts, d_s1
+
+        # And the hash itself must now be blind to the draw, or the path level
+        # would be decorative and the old collapse could return through it.
+        assert emb == cache.embedder_hash(dict(cfg)), "embedder hash must be stable"
+
+        # Representation lives in the surrogate spec, not the embedder hash.
+        assert cache.surrogate_hash(spec) != cache.surrogate_hash(
+            cache.spec_for("matrix")
+        ), "two representations must not share a surrogate directory"
+
+    return "draw separates by path; hash keys the embedder alone"
+
+
+@check("surrogate hash: 02 and the inference caches agree on one spec digest")
+def t_surrogate_hash_shared():
+    """Two hashing schemes for one concept is how the draw token drifted.
+
+    ``02`` and ``04``/``05`` both hash a spec dict to name a surrogate directory.
+    If they ever compute that digest differently, the same spec means two
+    directories and nothing detects it — so pin them together.
+    """
+    from src.cache._draw_keyed import DrawKeyedCache
+    from src.cache.dataset_embedding_cache import DatasetEmbeddingCache
+
+    spec = {"representation": "mean", "normalize": "layer"}
+    a = DatasetEmbeddingCache.surrogate_hash(spec)
+    b = DrawKeyedCache.config_hash(spec)
+    assert a == b, f"02 says {a}, inference caches say {b}"
+    # Key order must not matter, or a spec built differently is a different dir.
+    assert a == DatasetEmbeddingCache.surrogate_hash(
+        {"normalize": "layer", "representation": "mean"}
+    ), "spec hashing must be order-independent"
+    return f"both say {a}"
 
 
 @check("draw manifest: v1 rows and v2 indices round-trip to the same rows")
@@ -1333,6 +1387,69 @@ def t_names_merge():
     assert first == sorted({"yahoo_x_n100_s00", "yahoo_x_n1000_s03"}), first
     assert first == second, f"order-dependent: {first} vs {second}"
     return f"{len(first)} names merged, insertion order irrelevant"
+
+
+@check("[data] dataset embeddings: every entry is under a draw and a surrogate")
+def t_dataset_embedding_layout():
+    """Nothing of the pre-item-15 layout may survive in the real cache.
+
+    The old shape put the tensor directly under ``{recipe_hash}/{embedder_hash}/``
+    with the draw folded into that hash.  A leftover would still *load* — the
+    file is a valid safetensors either way — so the only thing that catches a
+    half-finished migration is asserting the shape itself.
+    """
+    from src.cache._draw import parse_draw_name
+
+    root = REPO / "results/shared_cache/02_dataset_embeddings"
+    if not root.exists():
+        raise _Skip(f"{root} not present")
+
+    entries = surrogates = 0
+    for recipe_dir in sorted(root.iterdir()):
+        if not recipe_dir.is_dir():
+            continue
+        for draw_dir in sorted(recipe_dir.iterdir()):
+            if not draw_dir.is_dir():
+                continue
+            parsed = parse_draw_name(draw_dir.name)
+            assert parsed, (
+                f"{draw_dir} is not a draw directory — the old "
+                "{recipe_hash}/{embedder_hash}/ layout survives here"
+            )
+            n, seed = parsed
+            assert draw_dir.name == f"n{n}_s{seed:02d}", (
+                f"{draw_dir.name} is an unpadded draw name; it must be padded"
+            )
+            for entry in sorted(draw_dir.iterdir()):
+                if not entry.is_dir():
+                    continue
+                cfg_path = entry / "config.json"
+                assert cfg_path.exists(), f"{entry} has no config.json"
+                cfg = json.loads(cfg_path.read_text())
+                # The path and the file must agree, or one of them is a lie.
+                assert cfg["n_samples"] == n and cfg["seed"] == seed, (
+                    f"{entry} sits at n{n}_s{seed:02d} but its config says "
+                    f"n{cfg['n_samples']}_s{cfg.get('seed')}"
+                )
+                assert "representation" not in cfg, (
+                    f"{entry} still records representation in the entry config; "
+                    "it belongs to the surrogate now"
+                )
+                assert not (entry / "embeddings.safetensors").exists(), (
+                    f"{entry} still holds a pre-migration embeddings.safetensors"
+                )
+                surr_root = entry / "surrogates"
+                assert surr_root.is_dir(), f"{entry} has no surrogates/"
+                for s in sorted(surr_root.iterdir()):
+                    if not s.is_dir():
+                        continue
+                    assert (s / "surrogate.safetensors").exists(), f"{s} has no tensor"
+                    assert (s / "config.json").exists(), f"{s} has no config.json"
+                    surrogates += 1
+                entries += 1
+
+    assert entries, "no entries found; the cache is present but empty"
+    return f"{entries} entry(ies), {surrogates} surrogate(s), all under a padded draw"
 
 
 @check("[data] cache: every recipe is schema 2 and every draw is index-backed")
@@ -1442,8 +1559,8 @@ def t_embedder_prefix_in_cache_key():
 
     # What the key looked like before the fix: same fields, no resolved literal.
     bare = {k: v for k, v in cfg.items() if k != "prompt_prefix"}
-    h_new = DatasetEmbeddingCache.embedder_hash(cfg, "mean", 1000)
-    h_old = DatasetEmbeddingCache.embedder_hash(bare, "mean", 1000)
+    h_new = DatasetEmbeddingCache.embedder_hash(cfg)
+    h_old = DatasetEmbeddingCache.embedder_hash(bare)
     assert h_new != h_old, (
         "prefixed and bare embeddings hash identically; the cache would treat them "
         "as interchangeable"
@@ -1454,7 +1571,7 @@ def t_embedder_prefix_in_cache_key():
         model_name="nomic-ai/nomic-embed-text-v1.5", prompt_name="search_query",
         use_generated_text=False, trust_remote_code=True,
     )
-    h_q = DatasetEmbeddingCache.embedder_hash(q.config_dict(), "mean", 1000)
+    h_q = DatasetEmbeddingCache.embedder_hash(q.config_dict())
     assert h_q != h_new, "search_query and search_document share a hash"
     return f"bare={h_old} document={h_new} query={h_q}, all distinct"
 
@@ -2642,7 +2759,9 @@ SYNTHETIC = [
     t_simplex_dimension_requirement, t_projection_dimension_matters,
     t_procrustes_transform, t_collection_multidim, t_analysis_geometries,
     # content-addressed recipe identity, and the draw storage it enables
-    t_recipe_identity, t_one_draw_name, t_embedder_hash_seed, t_draw_schema_roundtrip,
+    t_recipe_identity, t_one_draw_name, t_embedder_hash_seed, t_surrogate_hash_shared,
+    t_dataset_embedding_layout,
+    t_draw_schema_roundtrip,
     t_names_merge,
     # behavioral taxonomy: its cache, and the padding property batch invariance needs
     t_generated_cache_roundtrip, t_generated_cache_hash_stable, t_behavioral_padding_side,

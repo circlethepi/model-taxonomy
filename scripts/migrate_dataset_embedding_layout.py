@@ -58,6 +58,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import json
 import shutil
 import sys
 from pathlib import Path
@@ -148,6 +149,122 @@ def prune_datasets(moves: list[tuple[Path, Path]], dry_run: bool) -> int:
     return removed
 
 
+# ── stage 2: draw + surrogate levels in 02_dataset_embeddings ─────────────────
+
+
+def plan_embeddings(root: Path) -> list[dict]:
+    """``[{old_dir, entry_dir, surr_dir, config}, ...]`` for every stored entry.
+
+    Every field the new path needs is already in the entry's ``config.json``, so
+    destinations are read off what is stored rather than recomputed from the
+    sampler — the rule ``TODO.md`` records under "do not simplify these".
+    """
+    from src.cache.dataset_embedding_cache import DatasetEmbeddingCache
+
+    base = root / EMBEDDINGS_DIR
+    if not base.exists():
+        return []
+
+    cache = DatasetEmbeddingCache(root)
+    planned: dict[Path, Path] = {}
+    moves: list[dict] = []
+
+    for recipe_dir in sorted(base.iterdir()):
+        if not recipe_dir.is_dir():
+            continue
+        for old in sorted(recipe_dir.iterdir()):
+            cfg_path = old / "config.json"
+            if not old.is_dir() or not cfg_path.exists():
+                continue
+            # Already migrated: the draw level parses as a draw, not a hash.
+            if parse_draw_name(old.name):
+                continue
+
+            config = json.loads(cfg_path.read_text())
+            n = config["n_samples"]
+            seed = config.get("seed")
+            if seed is None:
+                raise SystemExit(
+                    f"{old} has no seed; it cannot be placed in a draw directory. "
+                    "Resolve by hand — see the module docstring."
+                )
+
+            emb = cache.embedder_hash(config["embedder_config"])
+            spec = cache.spec_for(config["representation"])
+            entry_dir = cache.entry_dir(recipe_dir.name, n, seed, emb)
+            surr_dir = cache.surrogate_dir(recipe_dir.name, n, seed, emb, spec)
+
+            if surr_dir in planned:
+                raise SystemExit(
+                    f"Refusing to merge: {old} and {planned[surr_dir]} both map to "
+                    f"{surr_dir}. Two entries claim one (draw, embedder, "
+                    "representation) key."
+                )
+            planned[surr_dir] = old
+            moves.append({
+                "old": old,
+                "entry_dir": entry_dir,
+                "surr_dir": surr_dir,
+                "config": config,
+                "spec": spec,
+            })
+    return moves
+
+
+def apply_embeddings(moves: list[dict], dry_run: bool) -> dict:
+    stats = {"written": 0, "already": 0}
+    for m in moves:
+        src = m["old"] / "embeddings.safetensors"
+        dst = m["surr_dir"] / "surrogate.safetensors"
+        if dst.exists() and _sha256(src) == _sha256(dst):
+            stats["already"] += 1
+            continue
+        if not dry_run:
+            m["surr_dir"].mkdir(parents=True, exist_ok=True)
+
+            cfg = dict(m["config"])
+            # representation leaves the entry config: it is the surrogate's
+            # identity now, not the embedder's.
+            cfg.pop("representation", None)
+            cfg["schema_version"] = "3"
+            _write_json(m["entry_dir"] / "config.json", cfg)
+            _write_json(m["surr_dir"] / "config.json", {"schema_version": "1", **m["spec"]})
+            shutil.copy2(src, dst)
+        stats["written"] += 1
+    return stats
+
+
+def verify_embeddings(moves: list[dict]) -> int:
+    verified = 0
+    for m in moves:
+        src = m["old"] / "embeddings.safetensors"
+        dst = m["surr_dir"] / "surrogate.safetensors"
+        if not dst.exists():
+            raise SystemExit(f"missing after copy: {dst}")
+        if _sha256(src) != _sha256(dst):
+            raise SystemExit(f"content differs after copy: {src} -> {dst}")
+        verified += 1
+    return verified
+
+
+def prune_embeddings(moves: list[dict], dry_run: bool) -> int:
+    removed = 0
+    for m in moves:
+        src = m["old"] / "embeddings.safetensors"
+        dst = m["surr_dir"] / "surrogate.safetensors"
+        if not dst.exists() or _sha256(src) != _sha256(dst):
+            raise SystemExit(f"refusing to prune {m['old']}: {dst} missing or differs")
+        if not dry_run:
+            shutil.rmtree(m["old"])
+        removed += 1
+    return removed
+
+
+def _write_json(path: Path, payload: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, indent=2))
+
+
 # ── driver ────────────────────────────────────────────────────────────────────
 
 
@@ -168,21 +285,28 @@ def main() -> int:
     moves = plan_datasets(root)
     print(f"  {len(moves)} draw(s) to rename")
 
+    print("Stage 2 — 02_dataset_embeddings: draw and surrogate levels")
+    emb = plan_embeddings(root)
+    print(f"  {len(emb)} entry(ies) to relayout")
+
     if args.prune:
-        removed = prune_datasets(moves, dry_run=False)
-        print(f"  {removed} old name(s) removed")
-        if not moves:
+        print(f"  {prune_datasets(moves, dry_run=False)} old draw name(s) removed")
+        print(f"  {prune_embeddings(emb, dry_run=False)} old entry dir(s) removed")
+        if not moves and not emb:
             print("  nothing to prune — already migrated and pruned")
         return 0
 
     stats = apply_datasets(moves, dry_run=args.dry_run)
-    print(f"  {stats['copied']} copied, {stats['already']} already present")
+    print(f"  stage 1: {stats['copied']} copied, {stats['already']} already present")
+    estats = apply_embeddings(emb, dry_run=args.dry_run)
+    print(f"  stage 2: {estats['written']} written, {estats['already']} already present")
 
     if args.dry_run:
         print("\nDry run only. Re-run with --apply to make these changes.")
         return 0
 
-    print(f"  {verify_datasets(moves)} verified byte-identical")
+    print(f"  {verify_datasets(moves)} draw(s) verified byte-identical")
+    print(f"  {verify_embeddings(emb)} embedding(s) verified byte-identical")
 
     print("\nDone. Next:")
     print("    python scripts/check_analysis.py")

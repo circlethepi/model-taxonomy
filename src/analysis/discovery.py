@@ -390,8 +390,13 @@ def scan_cache(
                     )
                 entry.recipe = recipe_cache[entry.recipe_hash]
 
-            if entry.recipe_hash:
-                entry.embedder_hashes = de_cache.list_embedder_hashes(entry.recipe_hash)
+            # Per draw, not per recipe.  A recipe hash is content-addressed, so
+            # asking it alone answers "was this mixture ever embedded, at any n
+            # and seed?" — which is not what the availability flag below means.
+            if entry.recipe_hash and entry.n_samples is not None and entry.seed is not None:
+                entry.embedder_hashes = de_cache.list_embedder_hashes(
+                    entry.recipe_hash, entry.n_samples, entry.seed
+                )
 
             entry.available = {
                 "structural_weights": (adapter_dir / "adapter_model.safetensors").exists(),
@@ -553,7 +558,9 @@ def _attach_unreferenced_recipes(
                     mixture=mixture,
                     n_samples=n_samples,
                     seed=seed,
-                    embedder_hashes=de_cache.list_embedder_hashes(recipe_hash),
+                    embedder_hashes=de_cache.list_embedder_hashes(
+                        recipe_hash, n_samples, seed
+                    ),
                     available={
                         "structural_weights": False,
                         "structural_repr": False,

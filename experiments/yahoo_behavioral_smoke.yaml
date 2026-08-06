@@ -21,10 +21,11 @@ slurm:
   partition: l40s
   gpus_per_node: 1
   mem_gb: 48
-  # Padded well past the ~25 min this should take. A job killed at the wall wastes
-  # both the allocation and the queue wait, whereas an over-requested 1-GPU job
-  # still backfills readily.
-  time: "01:00:00"
+  # The greedy run took ~25 min for 320 generations. At replicates: 8 this is
+  # 2,560 generations of 128 tokens, so budget ~8x and pad it: a job killed at the
+  # wall wastes both the allocation and the queue wait, whereas an over-requested
+  # 1-GPU job still backfills readily.
+  time: "04:00:00"
   cpus_per_task: 8
   conda_env: taxonomy-env
   modules: []

@@ -102,6 +102,7 @@ def build_taxonomy_artifacts(
     embedder_hash: str | None = None,
     behavioral_selector: dict | None = None,
     functional_selector: dict | None = None,
+    behavioral_selector: dict | None = None,
     id_scheme: str = "recipe_id",
     mds_kwargs: Mapping[str, Any] | None = None,
 ) -> tuple[DistanceMatrix, dict[str, GeometryResult]]:
@@ -144,10 +145,32 @@ def build_taxonomy_artifacts(
         naming the options, since two draws are different query sets and two
         embedders are different vector spaces.
     functional_selector:
+        Which cached activations to read and how to view them:
+        ``{"draw", "mode", "pooling", "layers", "view", "normalize"}``, all
+        optional.  Functional is keyed by model rather than by run, so this is a
+        dict where behavioral takes a single hash.  ``layers`` is a read-time
+        choice — a run stores every layer — so changing it costs a surrogate
+        build, not a GPU pass.  The same collection-cache caveat as
+        ``behavioral_config_hash`` applies.
         The same shape, for activations:
         ``{"draw", "mode", "pooling", "layers", "view", "normalize"}``.
         ``layers`` is a read-time choice — a run stores every layer — so changing
         it costs a surrogate build, not a GPU pass.
+    behavioral_selector:
+        How to read the cached behavioral embeddings:
+        ``{"representation": "matrix" | "mean", "normalize": bool}``, both optional.
+        ``"matrix"`` (the default) is the stored ``(n_queries, d)`` tensor;
+        ``"mean"`` pools it to a ``(1, d)`` centroid, matching
+        :class:`~src.taxonomy.dataset_embedding.DatasetEmbeddingTaxonomy`'s
+        ``representation="mean"``.  ``normalize`` L2-normalizes the pooled vector
+        and is a separate step because the dataset level does not do it: rows here
+        are already unit-norm, so their mean is not, and leaving it un-normalized
+        puts a large constant offset into ``dot_product`` distances.  This is a
+        *read-time* choice only — :class:`~src.taxonomy.behavioral.BehavioralTaxonomy`
+        still stores the full matrix either way.  Same collection-cache caveat as
+        ``functional_selector``: the hash does not see this, so two representations
+        at one metric would collide.
+        
 
     .. warning::
        **The collection cache does not see either selector.**
@@ -187,6 +210,7 @@ def build_taxonomy_artifacts(
             layers=layers, projections=projections, embedder_hash=embedder_hash,
             behavioral_selector=behavioral_selector,
             functional_selector=functional_selector,
+            behavioral_selector=behavioral_selector,
         )
         if cache is not None:
             chash = cache.save_distance_matrix(
@@ -306,13 +330,16 @@ def _compute_distance_matrix(
     embedder_hash: str | None = None,
     behavioral_selector: dict | None = None,
     functional_selector: dict | None = None,
+    behavioral_selector: dict | None = None,
 ) -> DistanceMatrix:
     if taxonomy == "structural":
         return _structural_matrix(index, metric, ids, layers, projections)
     if taxonomy == "dataset_embedding":
         return _dataset_embedding_matrix(index, metric, ids, embedder_hash)
     if taxonomy == "behavioral":
-        return _behavioral_matrix(index, metric, ids, behavioral_selector)
+        return _behavioral_matrix(
+            index, metric, ids, behavioral_config_hash, behavioral_selector
+        )
     if taxonomy == "functional":
         return _functional_matrix(index, metric, ids, functional_selector)
     raise ValueError(
@@ -406,27 +433,26 @@ def _dataset_embedding_matrix(
 
 
 def _behavioral_matrix(
-    index: CacheIndex, metric: Any, ids: Sequence[ModelID], selector: dict | None
+    index: CacheIndex,
+    metric: Any,
+    ids: Sequence[ModelID],
+    config_hash: str | None,
+    selector: dict | None = None,
 ) -> DistanceMatrix:
     """Pairwise distances over cached behavioral representations.
 
-    Mirrors :func:`_functional_matrix`, because since the re-key the two levels
-    are addressed identically.  A selector names the draw and the variant::
+    Simpler than :func:`_dataset_embedding_matrix` because there is nothing to
+    negotiate: that function needs ``_embedder_choice`` to find one
+    ``(embedder_config, representation)`` shared across recipes drawn at different
+    ``n_samples``, whereas one behavioral config hash already covers every model in
+    a run.  Picking the hash is therefore a choice between whole runs, not a
+    per-model reconciliation.
 
-        {"draw": {"recipe_hash": ..., "n_samples": 64, "seed": 0},
-         "max_new_tokens": 128, "embedder_hash": ...,
-         "view": "matrix", "normalize": "none"}   # matrix | gram
-
-    Every field has a default.  ``draw=None`` resolves to the one draw every
-    model shares, and ``embedder_hash=None`` to the one variant present within
-    it — both with a "several exist, name one" error rather than a silent pick,
-    since two draws are different query sets and two embedders are different
-    vector spaces.
-
-    **This replaced a single ``config_hash``**, which selected a whole run at
-    once.  The disambiguation did not disappear with it; it split in two — which
-    draw, and which variant within the draw — and gained the ability to say "the
-    same queries, re-embedded" instead of treating that as an unrelated run.
+    *selector* chooses the representation at read time —
+    ``{"representation": "matrix" | "mean", "normalize": bool}`` — because the cache
+    only ever stores the full ``(n_queries, d)`` matrix; see
+    :func:`build_taxonomy_artifacts` for what the keys mean and why ``normalize`` is
+    separate from ``"mean"``.
     """
     from src.cache.generated_text_cache import GeneratedTextCache
 
@@ -466,13 +492,7 @@ def _behavioral_matrix(
                     view=view, normalize=normalize,
                 )
             )
-        except FileNotFoundError as e:
-            raise ValueError(
-                f"no behavioral representation for {entry.adapter_name!r} under draw "
-                f"{GeneratedTextCache.draw_name(draw)} "
-                f"(generation{max_new_tokens}, embedder {embedder_hash}): {e}. "
-                "Filter with index.with_available('behavioral_repr')."
-            ) from None
+        reps.append(_behavioral_view(cache.load(config_hash, entry.model_id), selector))
 
     metric_obj = _resolve_metric(metric)
     n = len(reps)
@@ -486,6 +506,57 @@ def _behavioral_matrix(
         model_ids=list(ids),
         metric=metric_obj.metric_name,
         taxonomy="behavioral",
+    )
+
+
+_BEHAVIORAL_REPRESENTATIONS = ("matrix", "mean")
+
+
+def _behavioral_view(rep, selector: dict | None):
+    """Apply a behavioral selector to one loaded representation.
+
+    The cache stores only the full ``(n_queries, d)`` matrix, so pooling is a
+    read-time projection.  Kept out of :class:`GeneratedTextCache` deliberately:
+    what is on disk stays the superset, and choosing a view costs no re-extraction.
+    """
+    if not selector:
+        return rep
+
+    unknown = set(selector) - {"representation", "normalize"}
+    if unknown:
+        raise ValueError(
+            f"unknown behavioral_selector key(s) {sorted(unknown)}. "
+            "Choose from 'representation', 'normalize'."
+        )
+
+    representation = selector.get("representation", "matrix")
+    if representation not in _BEHAVIORAL_REPRESENTATIONS:
+        raise ValueError(
+            f"unknown behavioral representation {representation!r}. "
+            f"Choose from {list(_BEHAVIORAL_REPRESENTATIONS)}."
+        )
+    normalize = bool(selector.get("normalize", False))
+
+    if representation == "matrix" and not normalize:
+        return rep
+
+    from dataclasses import replace
+
+    matrix = rep.matrix.astype(np.float64)
+    if representation == "mean":
+        # keepdims so the result stays 2-D, matching DatasetEmbeddingTaxonomy's
+        # (1, d) centroid rather than collapsing to a bare vector.
+        matrix = matrix.mean(axis=0, keepdims=True)
+    if normalize:
+        norms = np.linalg.norm(matrix, axis=1, keepdims=True)
+        # A zero row cannot be given a direction; leave it at zero rather than
+        # inventing one, and let the metric decide what that means.
+        matrix = np.divide(matrix, norms, out=np.zeros_like(matrix), where=norms > 1e-10)
+
+    return replace(
+        rep,
+        matrix=matrix.astype(np.float32),
+        metadata={**rep.metadata, "representation": representation, "normalize": normalize},
     )
 
 

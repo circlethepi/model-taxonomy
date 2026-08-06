@@ -137,18 +137,9 @@ class FunctionalTaxonomy(HFInferenceTaxonomy, Taxonomy):
         }
 
     # ------------------------------------------------------------------
-    # Cache coordinates
+    # Cache coordinates — ``_model_key`` is on HFInferenceTaxonomy, shared with
+    # BehavioralTaxonomy so both levels address one model identically.
     # ------------------------------------------------------------------
-
-    def _model_key(self, model_id: ModelID) -> tuple[str, str]:
-        """``(base_model_id, adapter_id)`` for cache addressing.
-
-        A plain HuggingFace model has no adapter and lands under ``_base``.
-        """
-        base = self._resolve_base_model_id(model_id)
-        if base is None:
-            return str(model_id), "_base"
-        return base, str(model_id)
 
     @property
     def _stored_modes(self) -> list[str]:

@@ -490,16 +490,24 @@ def resolve_device(cfg: dict, override: str | None = None) -> str:
         return configured
     return "cuda" if torch.cuda.is_available() else "cpu"
 
-def make_queries(cfg: dict) -> tuple[list[str], dict]:
+def make_queries(cfg: dict) -> tuple[list[str], dict, list | None]:
     """Load query strings from the configured queries_dataset.
 
-    Returns ``(queries, query_key)``, where *query_key* is the
+    Returns ``(queries, query_key, source_indices)``, where *query_key* is the
     ``{recipe_hash, n_samples, seed}`` triple identifying the draw in
     ``01_datasets``.  Callers that cache representations keyed on the query set
     should store the key rather than the strings themselves: the strings are
     derived data, and hashing all of them makes a cache entry sensitive to every
     upstream change that shifts the draw, with no way to tell from the key which
     draw an entry belonged to.
+
+    *source_indices* is ``[(entry_index, row_index), ...]`` — which source row of
+    ``01_datasets`` produced each query.  Row *i* of the list is query *i*: the
+    sampler builds both from one ``rng.permutation`` and truncates them
+    identically (``MixedDataset._load``), and ``to_queries(n)`` is a prefix of
+    that same ordering, so the alignment holds by construction.  It is a
+    denormalized convenience — the draw file stores the same list — and stays
+    outside every ``config_dict``, so passing it never fragments a cache.
 
     The draw is requested at exactly *n_queries*.  ``n`` enters the sampler, so a
     32-row draw is not the first 32 rows of a 64-row one — never slice a larger
@@ -538,10 +546,20 @@ def make_queries(cfg: dict) -> tuple[list[str], dict]:
         "n_samples": n_queries,
         "seed": seed,
     }
-    return mixed.to_queries(n=n_queries), query_key
+    queries = mixed.to_queries(n=n_queries)
+    # Truncated to match: to_queries(n) is a prefix, and source_indices is only
+    # as long as the loaded sample list, so slice rather than assume equality.
+    indices = list(mixed.source_indices or [])[:n_queries] or None
+    return queries, query_key, indices
 
 
-def make_functional_taxonomy(cfg: dict, queries: list[str], query_key: dict | None = None, cache=None):
+def make_functional_taxonomy(
+    cfg: dict,
+    queries: list[str],
+    query_key: dict | None = None,
+    cache=None,
+    source_indices: list | None = None,
+):
     from src.taxonomy.functional import FunctionalTaxonomy
 
     ext_cfg = cfg.get("extraction", {})
@@ -565,10 +583,17 @@ def make_functional_taxonomy(cfg: dict, queries: list[str], query_key: dict | No
         activation_mode=fcfg.get("activation_mode", "input"),
         max_new_tokens=fcfg.get("max_new_tokens", 32),
         view=fcfg.get("view", "concat"),
+        source_indices=source_indices,
     )
 
 
-def make_behavioral_taxonomy(cfg: dict, queries: list[str], query_key: dict | None = None, cache=None):
+def make_behavioral_taxonomy(
+    cfg: dict,
+    queries: list[str],
+    query_key: dict | None = None,
+    cache=None,
+    source_indices: list | None = None,
+):
     from src.taxonomy.behavioral import BehavioralTaxonomy
     from src.embedders.sentence_transformer import SentenceTransformerEmbedder
 
@@ -594,6 +619,7 @@ def make_behavioral_taxonomy(cfg: dict, queries: list[str], query_key: dict | No
         max_new_tokens=bcfg.get("max_new_tokens", 64),
         torch_dtype=parse_dtype(ext_cfg.get("torch_dtype", "float16")),
         hf_token=hf_token(cfg),
+        source_indices=source_indices,
     )
 
 

@@ -1,9 +1,9 @@
 #!/bin/bash
 #SBATCH --job-name=yahoo_behavioral_replicates_smoke
-#SBATCH --partition=l40s
+#SBATCH --partition=l40s,h100,nvl,a100
 #SBATCH --gres=gpu:1
 #SBATCH --mem=48G
-#SBATCH --time=00:30:00
+#SBATCH --time=00:15:00
 #SBATCH --cpus-per-task=8
 #SBATCH --output=results/yahoo_topics_mean_cosine/slurm-%j.out
 #SBATCH --error=results/yahoo_topics_mean_cosine/slurm-%j.err

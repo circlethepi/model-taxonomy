@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH --job-name=yahoo_qa_pairs_s[0]
-#SBATCH --partition=a100
+#SBATCH --partition=l40s,h100,nvl,a100
 #SBATCH --gres=gpu:1
 #SBATCH --mem=80G
 #SBATCH --time=4:00:00

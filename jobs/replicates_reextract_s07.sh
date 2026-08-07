@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH --job-name=yahoo_behavioral_reextract_s07
-#SBATCH --partition=l40s
+#SBATCH --partition=l40s,h100,nvl,a100
 #SBATCH --gres=gpu:1
 #SBATCH --mem=48G
 #SBATCH --time=04:00:00

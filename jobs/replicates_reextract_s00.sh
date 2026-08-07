@@ -3,7 +3,7 @@
 #SBATCH --partition=l40s,h100,nvl,a100
 #SBATCH --gres=gpu:1
 #SBATCH --mem=48G
-#SBATCH --time=04:00:00
+#SBATCH --time=02:00:00
 #SBATCH --cpus-per-task=8
 #SBATCH --output=results/yahoo_topics_mean_cosine/slurm-%j.out
 #SBATCH --error=results/yahoo_topics_mean_cosine/slurm-%j.err

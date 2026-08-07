@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=yahoo_behavioral_answerfield
+#SBATCH --job-name=yahoo_behavioral_reextract_s07
 #SBATCH --partition=l40s
 #SBATCH --gres=gpu:1
 #SBATCH --mem=48G

@@ -31,6 +31,8 @@ from src.analysis import (
     correlation_table,
     fit_geometry,
     kruskal_stress,
+    dcor_test,
+    distance_correlation,
     mantel_test,
     matrix_correlation,
     per_point_residuals,
@@ -252,6 +254,64 @@ def t_mantel():
     res2 = mantel_test(dm, shuffled, n_permutations=999, random_state=0)
     assert res2.p_value > 0.05, f"shuffled matrix looked significant: p={res2.p_value}"
     return f"self p={res.p_value:.4f}, shuffled p={res2.p_value:.3f}"
+
+
+@check("dcor: bias correction is what makes it usable at five models")
+def t_dcor_bias():
+    """The classical V-statistic dCor is severely inflated at small n.
+
+    This is the whole reason `distance_correlation` defaults to the
+    bias-corrected form: at the five-model slices this repo actually compares,
+    the classical statistic reports a large value between *independent*
+    matrices, so it could never distinguish signal from nothing.
+    """
+    rng = np.random.default_rng(11)
+    classical, corrected = [], []
+    for _ in range(300):
+        a = _random_dm(5, seed=int(rng.integers(1 << 30)))
+        b = _random_dm(5, seed=int(rng.integers(1 << 30)))
+        classical.append(distance_correlation(a, b, bias_corrected=False))
+        corrected.append(distance_correlation(a, b, bias_corrected=True))
+
+    assert np.mean(classical) > 0.5, np.mean(classical)
+    assert abs(np.mean(corrected)) < 0.15, np.mean(corrected)
+
+    # Self-correlation is exactly 1 under both, which pins the normalisation.
+    dm = _random_dm(9, seed=3)
+    for bc in (False, True):
+        s = distance_correlation(dm, dm, bias_corrected=bc)
+        assert abs(s - 1.0) < 1e-9, (bc, s)
+
+    return (
+        f"n=5 independent: classical mean={np.mean(classical):.3f}, "
+        f"bias-corrected mean={np.mean(corrected):+.3f}; self=1.0 under both"
+    )
+
+
+@check("dcor: exact enumeration, and a calibrated null")
+def t_dcor_test():
+    # 5! = 120 <= 999, so every relabelling is enumerated and p is exact.
+    dm = _random_dm(5, seed=1)
+    res = dcor_test(dm, dm, n_permutations=999)
+    assert res.exact and res.n_permutations == 120, (res.exact, res.n_permutations)
+    assert abs(res.statistic - 1.0) < 1e-9, res.statistic
+    # A perfect match ties only with the relabellings that preserve it.
+    assert res.p_value <= 1.0 / 120 + 1e-12, res.p_value
+
+    # 8! = 40320 > 999, so it falls back to sampling and the +1 correction.
+    big = _random_dm(8, seed=2)
+    sampled = dcor_test(big, big, n_permutations=999)
+    assert not sampled.exact and sampled.n_permutations == 999
+
+    # Unrelated matrices must not look significant.
+    other = _random_dm(5, seed=7)
+    null = dcor_test(dm, other, n_permutations=999)
+    assert null.p_value > 0.05, f"unrelated matrices looked significant: p={null.p_value}"
+
+    return (
+        f"self: stat={res.statistic:.3f} p={res.p_value:.4f} over {res.n_permutations} "
+        f"exact perms; unrelated p={null.p_value:.3f}; n=8 sampled {sampled.n_permutations}"
+    )
 
 
 @check("procrustes: invariant to rotation, reflection and scale")
@@ -3187,7 +3247,7 @@ def t_cross_taxonomy_coordinates():
 SYNTHETIC = [
     t_anchor_fixed, t_similarity_invariance, t_affine_invariance_in_hull,
     t_known_mixture, t_simplex_high_dim, t_degenerate_anchors, t_compare_simplices,
-    t_mantel, t_procrustes, t_procrustes_vs_scipy, t_per_point_residuals,
+    t_mantel, t_dcor_bias, t_dcor_test, t_procrustes, t_procrustes_vs_scipy, t_per_point_residuals,
     t_dispersion, t_quality, t_correlation_table, t_match_models, t_fit_geometry,
     t_similarity_conversion, t_simplex_roundtrip, t_cosine_equivalence,
     t_relabel_collision,

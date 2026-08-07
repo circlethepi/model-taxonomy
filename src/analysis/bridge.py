@@ -203,19 +203,49 @@ def save_collection(
     geometries: Iterable[GeometryResult] = (),
     cache_root: Path | str = "results/shared_cache",
     model_entries: list[dict] | None = None,
+    label: str | None = None,
+    slice_key: dict | None = None,
 ) -> str:
     """Persist a distance matrix and its geometries via :class:`CollectionCache`.
 
     Gives notebook-built structural matrices the same on-disk life as pipeline
     results, instead of existing only until the kernel restarts.
 
-    Returns the collection hash (the directory name under
-    ``{cache_root}/06_collections/``).
+    *model_entries* should carry an ``artifact_path`` per model, as
+    :func:`~src.analysis.comparison.build_taxonomy_artifacts` supplies — that is
+    what keys the collection to the tensors it was built from.  Without it the
+    entries key on model IDs alone, which is the item-14 blind spot: two matrices
+    over the same models under different views would collide.  A matrix built by
+    hand in a notebook usually has no such path, so this is a warning rather than
+    an error, but prefer ``build_taxonomy_artifacts`` where you can.
+
+    Returns the handle (the path under ``{cache_root}/06_collections/``).
     """
+    import warnings
+
     from src.cache.collection_cache import CollectionCache
 
     cc = CollectionCache(cache_root)
-    chash = cc.save_distance_matrix(dm, model_entries)
+    entries = model_entries or [
+        {"model_id": mid, "entry_type": "base_model"} for mid in dm.model_ids
+    ]
+    if any(e.get("artifact_path") is None for e in entries):
+        warnings.warn(
+            "save_collection: model_entries carry no 'artifact_path', so this "
+            "collection is keyed on model IDs alone and will collide with any "
+            "other view of the same models (TODO.md item 14). Prefer "
+            "build_taxonomy_artifacts, which supplies them.",
+            stacklevel=2,
+        )
+    handle = cc.handle(
+        dm.taxonomy,
+        cc.collection_key(entries),
+        dm.metric,
+        cc.surrogate_key([e.get("surrogate_hash") for e in entries]),
+    )
+    cc.save_distance_matrix(
+        dm, handle, model_entries=entries, label=label, slice_key=slice_key
+    )
     for geo in geometries:
-        cc.save_geometry(chash, geo)
-    return chash
+        cc.save_geometry(handle, geo)
+    return handle

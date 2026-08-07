@@ -104,8 +104,14 @@ Removing `n_samples` from the key removed the reason for the workaround.
 
 `dataset_selector` was added alongside `behavioral_selector` and
 `functional_selector`, because `representation` left the hash and `embedder_hash=`
-alone can no longer express which representation to read. It is one more axis
-`CollectionCache.collection_hash()` cannot see — that is item 14.
+alone can no longer express which representation to read. It was one more axis
+the collection cache could not see — **item 14, now closed**: a collection is
+keyed on each model's resolved artifact path and surrogate hash, so this stage's
+`embedder_hash` (a path component, hence part of `collection_key`) and its
+`representation` surrogate (part of `surrogate_key`) are both in the key. Note
+the two land in *different* halves of the handle from behavioral's, where the
+embedder is folded into the surrogate spec instead — both are fully captured, but
+the asymmetry follows from these stage layouts and is not a bug.
 
 ### The one semantic difference from `04`/`05`, stated rather than hidden
 

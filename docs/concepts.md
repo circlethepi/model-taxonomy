@@ -262,15 +262,32 @@ Stores the outputs of a full pipeline run — distance matrix plus any geometry 
 from src.cache import CollectionCache
 
 cc = CollectionCache("./cache")
-chash = cc.save_distance_matrix(distance_matrix, model_entries)
-cc.save_geometry(chash, geometry_result)
 
-dm = cc.load_distance_matrix(chash)
-pca = cc.load_geometry(chash, "pca")
-info = cc.load_info(chash)   # collection_info.json as dict
+# The handle names what the matrix was built from, not just which models it covers.
+handle = cc.handle(
+    distance_matrix.taxonomy,
+    cc.collection_key(model_entries),         # models + their artifact paths
+    distance_matrix.metric,
+    cc.surrogate_key([e["surrogate_hash"] for e in model_entries]),
+)
+cc.save_distance_matrix(distance_matrix, handle, model_entries=model_entries)
+cc.save_geometry(handle, geometry_result)
+
+dm = cc.load_distance_matrix(handle)
+mds = cc.load_geometry(handle, "mds", 2)
+info = cc.load_info(handle)     # collection_info.json as dict
+cfg = cc.load_config(handle)    # the leaf's surrogate spec and per-model hashes
 ```
 
-`collection_info.json` records the models and LoRA adapters in the collection, the metric and taxonomy used, and the list of geometry methods computed — enough to reconstruct the collection from scratch if needed.
+In practice you rarely assemble a handle by hand — `build_taxonomy_artifacts`
+does it from the representations it resolved, which is the point: the key is
+derived from the tensors actually read, so a collection cannot be returned for a
+selector it was not built with.
+
+`collection_info.json`, at the `{collection_key}` level, records the models and
+LoRA adapters and their artifact paths, shared by every metric and view over
+them. Each leaf's `config.json` records the surrogate spec and the per-model
+surrogate hashes — enough to trace the collection back to its inputs.
 
 ---
 

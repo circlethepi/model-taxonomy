@@ -655,24 +655,59 @@ Hierarchical cache for structural (LoRA) representations. Stores a `config.json`
 class CollectionCache:
     def __init__(self, cache_root: Path | str)
 
+    # The handle: "{taxonomy}/{collection_key}/{metric}_{surrogate_key}"
     @staticmethod
-    def collection_hash(model_ids: list[str], taxonomy: str, metric: str) -> str
+    def collection_key(model_entries: list[dict]) -> str
+    @staticmethod
+    def surrogate_key(surrogate_hashes: list[str | None]) -> str
+    @staticmethod
+    def handle(taxonomy: str, collection_key: str, metric: str,
+               surrogate_key: str) -> str
 
-    def exists(self, collection_hash: str) -> bool
+    def exists(self, handle: str) -> bool
     def save_distance_matrix(
         self,
         distance_matrix: DistanceMatrix,
+        handle: str,
         model_entries: list[dict] | None = None,
-    ) -> str    # returns collection_hash
+        label: str | None = None,
+        slice_key: dict | None = None,
+        config: dict | None = None,
+    ) -> str    # returns the handle
 
-    def save_geometry(self, collection_hash: str, geometry: GeometryResult) -> None
-    def load_distance_matrix(self, collection_hash: str) -> DistanceMatrix
-    def load_geometry(self, collection_hash: str, method: str) -> GeometryResult
-    def load_info(self, collection_hash: str) -> dict
+    def save_geometry(self, handle: str, geometry: GeometryResult,
+                      mds_kwargs: dict | None = None) -> None
+    def load_distance_matrix(self, handle: str) -> DistanceMatrix
+    def load_geometry(self, handle: str, method: str,
+                      n_components: int | None = None,
+                      mds_kwargs: dict | None = None) -> GeometryResult
+    def load_info(self, handle: str) -> dict      # collection level
+    def load_config(self, handle: str) -> dict    # leaf: spec + per-model hashes
     def list_collections(self) -> list[str]
+    def find(self, **criteria) -> list[str]
 ```
 
-Stores distance matrices and geometry results for a model collection. `collection_info.json` records all models (and their LoRA adapter details if applicable), the metric and taxonomy used, and the list of geometry methods computed. `save_geometry` can be called multiple times to add PCA, MDS, and UMAP results to the same collection.
+Stores distance matrices and geometry results for a model collection.
+
+**A collection is keyed on what it was built from, not on its model list.** The
+handle has three parts: `collection_key` hashes each model's stored artifact
+path (relative to the cache root, stopping before `surrogates/`), and
+`surrogate_key` hashes the ordered list of per-model surrogate hashes — the
+read-time view. So two comparisons that differ in draw, embedder, view,
+normalization or pooling get different directories, while two that read the same
+tensors share one even if the selector was spelled differently.
+
+This replaced a key of `(sorted model_ids, taxonomy, metric)`, which was blind to
+all of the above and silently returned one selector's matrix for another. See
+`docs/notes/TODO.md` item 14. Entries written under the old key are not readable
+under the new one; `scripts/migrate_collection_key.py` quarantines them.
+
+`collection_info.json` sits at the `collection_key` level and records the models
+and their artifact paths, shared by every metric and view computed over them.
+Each leaf's `config.json` records the surrogate spec and every per-model
+surrogate hash — since the directory name is a digest, that file is what traces a
+collection back to its inputs. `save_geometry` can be called repeatedly to add
+embeddings at several dimensions to the same leaf.
 
 `model_entries` is an ordered list of dicts describing each model in `distance_matrix.model_ids`. Each entry should have at minimum `{"model_id": ..., "entry_type": "base_model" | "lora_adapter"}`. LoRA adapter entries can additionally record `base_model_id` and `adapter_cache_slug` to allow cache lookup.
 

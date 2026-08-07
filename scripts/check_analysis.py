@@ -666,7 +666,20 @@ def t_collection_multidim():
     dm = _random_dm(6, seed=3)
     with tempfile.TemporaryDirectory() as td:
         cc = CollectionCache(td)
-        chash = cc.save_distance_matrix(dm, label="check", slice_key={"n_samples": 10})
+        entries = [
+            {"model_id": mid, "artifact_path": f"04_activations/x/{mid}/r/n64_s00"}
+            for mid in dm.model_ids
+        ]
+        chash = cc.handle(
+            dm.taxonomy,
+            cc.collection_key(entries),
+            dm.metric,
+            cc.surrogate_key(["s0"] * len(entries)),
+        )
+        cc.save_distance_matrix(
+            dm, chash, model_entries=entries,
+            label="check", slice_key={"n_samples": 10},
+        )
         made = {n: fit_geometry(dm, "mds", n_components=n, random_state=0) for n in (1, 2)}
         for geo in made.values():
             cc.save_geometry(chash, geo)
@@ -886,6 +899,60 @@ def t_collection_roundtrip():
     return f"collection {chash} round-tripped"
 
 
+@check("[data] cache: two selectors at one metric are two collections")
+def t_collection_key_sees_selector():
+    """The regression test for TODO.md item 14.
+
+    The collection key used to be ``(model_ids, taxonomy, metric)``, so a
+    collection built under ``normalize="global"`` was returned unchanged to a
+    caller asking for ``"layer"`` — silently, and with no way to tell from the
+    outside.  Two things have to hold now: the two selectors must land in
+    *different* directories, and the matrices in them must actually differ.
+
+    Checking only the first would pass on a key that was merely salted; checking
+    only the second would pass without any cache at all.
+    """
+    import tempfile
+
+    from src.analysis import build_taxonomy_artifacts, scan_cache
+    from src.cache import CollectionCache
+
+    root = REPO / "results/shared_cache"
+    if not (root / "04_activations").exists():
+        raise _Skip(f"{root}/04_activations not present")
+
+    index = scan_cache(root).with_available("functional_repr")
+    slices = index.slices(("n_samples", "seed"))
+    if not slices or len(slices[max(slices)]) < 3:
+        raise _Skip("no (n_samples, seed) slice with 3+ functional models")
+    sub = slices[max(slices)]
+
+    with tempfile.TemporaryDirectory() as td:
+        mats = {}
+        for norm in ("global", "layer"):
+            mats[norm], _ = build_taxonomy_artifacts(
+                sub, "functional", "cka", cache_root=td, n_components=(2,),
+                functional_selector={"normalize": norm},
+            )
+        handles = CollectionCache(td).list_collections()
+
+    assert len(handles) == 2, f"expected 2 collections, got {len(handles)}: {handles}"
+    key_a, key_b = (h.split("/")[1] for h in handles)
+    assert key_a == key_b, (
+        "the two collections differ in collection_key, but they are the same "
+        f"models reading the same artifacts: {handles}"
+    )
+    surrogates = {h.rsplit("_", 1)[1] for h in handles}
+    assert len(surrogates) == 2, f"surrogate_key did not separate them: {handles}"
+
+    delta = float(np.abs(mats["global"].matrix - mats["layer"].matrix).max())
+    assert delta > 0, "the two normalizations produced identical matrices"
+    return (
+        f"2 collections under one collection_key, surrogate_key separates them, "
+        f"max|Δ| = {delta:.2e}"
+    )
+
+
 @check("[data] cross-taxonomy: correlation table over a saved profile")
 def t_cross_taxonomy():
     from src.core.analysis import ModelTaxonomyProfile
@@ -1039,6 +1106,43 @@ def _shared_inference_draw(root: Path, stage: str) -> dict | None:
     return {"recipe_hash": recipe_hash, "n_samples": n_samples, "seed": seed}
 
 
+def _shared_behavioral_variant(root: Path, draw: dict, index) -> dict | None:
+    """A named behavioral variant every model in *index* has, chosen deterministically.
+
+    Naming one is now mandatory rather than incidental: extraction at a second
+    replicate count or sampling setting adds a variant beside the first, and
+    ``_behavioral_variant_choice`` rightly refuses to guess between them.  This
+    check must therefore pick, and pick the *same* one every run — otherwise its
+    numbers move whenever an extraction job lands.
+
+    Sorting and taking the first is arbitrary but stable.  The alternative,
+    letting the level drop out when several exist, is exactly the failure item 13
+    records: behavioral was silently excluded from this check for its entire life
+    because it required there to be exactly one config.
+    """
+    from src.cache.generated_text_cache import GeneratedTextCache
+
+    cache = GeneratedTextCache(root)
+    per_entry = []
+    for entry in index.entries:
+        if not entry.base_model_id:
+            continue
+        per_entry.append({
+            v for v in cache.list_variants(entry.base_model_id, entry.model_id, draw)
+            if v[0].startswith("generation")
+        })
+    shared = set.intersection(*per_entry) if per_entry else set()
+    if not shared:
+        return None
+    mode_token, replicates, sampling_hash, embedder_hash = sorted(shared)[0]
+    return {
+        "max_new_tokens": int(mode_token[len("generation"):]),
+        "replicates": replicates,
+        "sampling_hash": sampling_hash,
+        "embedder_hash": embedder_hash,
+    }
+
+
 @check("[data] comparison: end-to-end on one slice, reported not asserted")
 def t_comparison_end_to_end():
     """Full chain on real adapters: cache -> distances -> MDS -> simplex -> truth.
@@ -1088,6 +1192,16 @@ def t_comparison_end_to_end():
             taxonomies.append("functional")
 
     index = index.with_available(*tokens)
+
+    # Name the variant as well as the draw.  Since the replicates work there are
+    # two variants per model (greedy 1r and sampled 8r), and they are not
+    # comparable, so the level cannot be read without choosing.
+    behavioral_sel = None
+    if behavioral_draw is not None:
+        variant = _shared_behavioral_variant(root, behavioral_draw, index)
+        if variant is not None:
+            behavioral_sel = {"draw": behavioral_draw, **variant}
+
     slices = index.slices(("n_samples", "seed"))
     if not slices:
         raise _Skip("no complete (n_samples, seed) slice in the cache")
@@ -1104,7 +1218,7 @@ def t_comparison_end_to_end():
             matrices[tax], _ = build_taxonomy_artifacts(
                 sub, tax, "cosine", cache_root=td, n_components=(2,),
                 layers=[27], projections="o",
-                behavioral_selector={"draw": behavioral_draw} if behavioral_draw else None,
+                behavioral_selector=behavioral_sel,
             )
         result = compare_taxonomies(
             matrices, sub.recipes(), n_permutations=199,
@@ -3110,6 +3224,7 @@ DATA_BACKED = [
     t_cache_fully_migrated, t_behavioral_reps_well_formed,
     t_functional_reps_well_formed,
     t_behavioral_layout_migrated, t_cross_taxonomy_coordinates,
+    t_collection_key_sees_selector,
 ]
 #: A third tier: real checks that need a GPU and a multi-GB model load, so they are
 #: too slow for a harness meant to run in seconds around every edit.  Off unless

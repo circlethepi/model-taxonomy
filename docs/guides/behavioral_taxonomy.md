@@ -10,14 +10,26 @@ For each model in the collection:
 
 1. Load the model and tokenizer from HuggingFace.
 2. For each probe string (processed in batches):
-   - Run `model.generate()` with `max_new_tokens` steps.
-   - Decode the generated continuation.
-   - Pass the generated text to an `Embedder` to get a vector `e ∈ R^d`.
-3. Stack the `N` probe vectors into a matrix `M ∈ R^{N × d}`.
+   - Run `model.generate()` with `max_new_tokens` steps and `num_return_sequences=replicates`.
+   - Decode each generated continuation.
+   - Pass each generated text to an `Embedder` to get a vector `e ∈ R^d`.
+3. Stack the vectors into a matrix `M ∈ R^{(N × R) × d}`, **query-major**: rows are
+   `q0r0, q0r1, …, q0r(R-1), q1r0, …`. At `replicates=1` this is the familiar
+   `N × d`, one row per probe.
 4. Delete the model from GPU memory; clear the CUDA cache.
 5. Return `ModelRepresentation(matrix=M, metadata={"generated_texts": [...]}, ...)`.
 
-Generated texts are stored in `ModelRepresentation.metadata["generated_texts"]` so you can audit what the model produced without re-running extraction.
+Generated texts are stored in `ModelRepresentation.metadata["generated_texts"]` so you can audit what the model produced without re-running extraction. They are nested per probe: `generated_texts[q][r]` is replicate `r` of probe `q`.
+
+### Replicates and sampling
+
+Decoding **samples** by default (`do_sample=True`). That is what makes `replicates > 1` meaningful: greedy decoding is deterministic, so R greedy replicates would be R copies of one continuation, and asking for that combination raises a `ValueError` rather than quietly storing duplicates.
+
+Replicates exist to separate two things a single sample confounds: how far apart two models are, and how far apart two samples from *one* model are. Read them with `replicate_reduction="all"` to let a distance include the within-probe spread, or `"mean"` to average each probe's replicates back to one row and recover exactly the shape a single-sample run produced.
+
+**Reproducibility is conditional on `batch_size`.** One RNG stream serves a whole `generate` call, so batch shape determines which tokens are drawn. A re-run at the same `batch_size` and `generation_seed` reproduces byte for byte; at a different `batch_size` it does not. `batch_size` is deliberately *not* part of the cache key — it is a machine detail, not a result — but it is recorded in `metadata` and in the `runs/` record so a mismatch is detectable after the fact. Under the previous greedy decoding this was only a last-bit effect (measured: 6/8 continuations byte-identical between batch 1 and batch 8); it is now first-order.
+
+Note also that `replicates` multiplies the effective batch: `generate` sees `batch_size × replicates` sequences, and KV-cache growth scales with that product times `(prompt + max_new_tokens)`.
 
 ## Configuration
 
@@ -29,6 +41,12 @@ BehavioralTaxonomy(
     device="cuda",                # or "cpu"
     batch_size=8,                 # probes per generate call
     max_new_tokens=64,            # required: must be > 0
+    replicates=1,                 # continuations drawn per probe
+    do_sample=True,               # False = greedy; incompatible with replicates > 1
+    temperature=1.0,              # 1.0 + top_p 1.0 = the model's own distribution
+    top_p=1.0,                    # < 1.0 truncates the tail
+    top_k=None,                   # None = no top-k truncation
+    generation_seed=0,            # reproduces a run at the SAME batch_size
     torch_dtype=torch.float16,    # use bfloat16 for Llama/Gemma
     hf_token=None,                # falls back to HF_TOKEN env var
 )
@@ -36,7 +54,7 @@ BehavioralTaxonomy(
 
 `max_new_tokens` must be greater than zero — behavioral comparison is defined by what models generate. If you pass `max_new_tokens=0`, a `ValueError` is raised at construction time with a pointer to `FunctionalTaxonomy`.
 
-Set `batch_size` based on the model size and GPU memory. A 7B model at float16 needs ~14 GB; with a batch of 8 probes the generated token buffers add ~1–2 GB.
+Set `batch_size` based on the model size and GPU memory. A 7B model at float16 needs ~14 GB; with a batch of 8 probes the generated token buffers add ~1–2 GB — and remember the batch `generate` actually sees is `batch_size × replicates`, so raising `replicates` without lowering `batch_size` raises memory proportionally.
 
 ## Embedder strategy
 
@@ -90,14 +108,18 @@ probes = [row["question"] for row in ds]
 
 ## Caching
 
-Representations are cached to disk when a `DiskCache` is passed. The cache key encodes the model ID, probe list, embedder config, `max_new_tokens`, and all other extraction parameters. Changing any one of these produces a different key and triggers fresh inference.
+Representations are cached to disk when a `GeneratedTextCache` is passed. An entry is addressed by `{base}/{adapter}/{recipe_hash}/n{n}_s{seed}/`, and within a draw by the filename:
+
+```
+generations/generation{max_new_tokens}_{replicates}r_{sampling_hash}.json
+embeddings/generation{max_new_tokens}_{replicates}r_{sampling_hash}_{embedder_hash}.safetensors
+```
+
+Everything that changes the stored numbers is in that name, so `ls embeddings/` is a complete description of what has been computed over a draw. `sampling_hash` is an 8-hex digest of `{do_sample, temperature, top_p, top_k, generation_seed}`; it is in the name because `save()` is idempotent *on the filename*, so without it a second run at a different temperature would silently return the first run's numbers.
+
+Generated texts are stored in `ModelRepresentation.metadata["generated_texts"]` inside the cache entry, so you can inspect what was generated without re-running the model — and because text lives in a plain JSON beside the tensors, auditing it needs no safetensors load.
 
 Generated texts are stored in `ModelRepresentation.metadata["generated_texts"]` inside the cache entry, so you can inspect what was generated without re-running the model.
-
-```python
-cache = DiskCache("./cache")              # safetensors (default, fast)
-cache = DiskCache("./cache", format="npz")  # NumPy zip (backward compat)
-```
 
 The cache is safe for concurrent use across SLURM jobs sharing a network filesystem.
 

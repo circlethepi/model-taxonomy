@@ -6,6 +6,12 @@ import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from src.datasets._text_projection import (
+    DEFAULT_SEPARATOR,
+    composition_dict,
+    read_composition,
+)
+
 
 @dataclass
 class ClassDatasetEntry:
@@ -15,6 +21,11 @@ class ClassDatasetEntry:
     ``"label"``).  ``class_filter`` restricts sampling to a subset of class
     values.  ``class_weights`` controls the proportion drawn from each class;
     if omitted, classes are sampled uniformly.
+
+    ``text_fields`` composes several columns into the entry's text instead of
+    taking one, joined by ``text_separator`` — see
+    :mod:`src.datasets._text_projection` for why that exists and why an entry
+    that does not use it must serialize exactly as it did before.
     """
 
     dataset_id: str
@@ -25,6 +36,8 @@ class ClassDatasetEntry:
     subset: str | None = None
     class_filter: list | None = None
     class_weights: dict | None = None
+    text_fields: list[str] | None = None
+    text_separator: str = DEFAULT_SEPARATOR
 
     # Derived in __post_init__
     normalized_class_weights: dict | None = field(init=False, repr=False, default=None)
@@ -64,6 +77,9 @@ class ClassDatasetEntry:
             "class_filter": self.class_filter,
             "class_weights": self.class_weights,
             "normalized_class_weights": self.normalized_class_weights,
+            # Spliced in only when set: this dict is what recipe_hash is computed
+            # over, so an unconditional key would move every existing hash.
+            **composition_dict(self.text_fields, self.text_separator),
         }
 
     @classmethod
@@ -78,6 +94,7 @@ class ClassDatasetEntry:
                 class_weights = {elem_type(k): v for k, v in class_weights.items()}
             except (ValueError, TypeError):
                 pass
+        text_fields, text_separator = read_composition(d)
         return cls(
             dataset_id=d["dataset_id"],
             split=d.get("split", "train"),
@@ -87,6 +104,8 @@ class ClassDatasetEntry:
             subset=d.get("subset"),
             class_filter=class_filter,
             class_weights=class_weights,
+            text_fields=text_fields,
+            text_separator=text_separator,
         )
 
 

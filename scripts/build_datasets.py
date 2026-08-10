@@ -56,8 +56,17 @@ def build_datasets(cfg: dict, validate: bool = False) -> dict:
             rtype = ds_cfg.get("recipe_type", "simple")
             tqdm.write(f"  [{name}]  type={rtype}  hash={recipe.recipe_hash()}  ->  {recipe_path}")
             for entry in recipe.datasets:
+                # Print the projection that will actually be used, not just
+                # text_field: a composed entry ignores it, and printing the
+                # ignored name is how "what was this trained on?" goes wrong
+                # unnoticed -- which is the whole of TODO item 11.
+                fields = getattr(entry, "text_fields", None)
+                projection = (
+                    f"text_fields={fields} sep={entry.text_separator!r}"
+                    if fields else f"text_field={entry.text_field}"
+                )
                 line = (f"    {entry.dataset_id}  split={entry.split}"
-                        f"  weight={entry.weight}  text_field={entry.text_field}")
+                        f"  weight={entry.weight}  {projection}")
                 cf = getattr(entry, "class_filter", None)
                 cw = getattr(entry, "class_weights", None)
                 if cf is not None:

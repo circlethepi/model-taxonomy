@@ -153,7 +153,11 @@ The two inference stages share that key exactly, from
 `src/cache/_draw_keyed.py::DrawKeyedCache`, so one model under one query draw
 sits at the same coordinates in both and the trees can be read side by side.
 They differ only in the artifact filename: `{mode}_{pooling}_layer{NNN}` for
-activations, `{mode}_{embedder_hash}` for generations.
+activations, `{mode}_{replicates}r_{sampling_hash}_{embedder_hash}` for
+generations. The two extra components on the generation side are what sampling
+cost: a temperature and a replicate count both change the text, and neither
+appears anywhere else in the path, so both are in the name or a second run
+silently reuses the first one's entry.
 
 Directories sharing a number sit at the same stage. A **letter suffix means analysis
 *of* the objects at that stage** — `03A_adapter_alignments` holds things computed from

@@ -108,6 +108,22 @@ extraction:
     behavioral:
       enabled: true
       max_new_tokens: 64            # tokens each model generates per query
+      replicates: 1                 # continuations drawn per query. R > 1 stores a
+                                    # (n_queries * R, d) matrix, query-major, and
+                                    # requires do_sample: true — greedy decoding
+                                    # would store R copies of one continuation.
+                                    # Note R multiplies the effective batch:
+                                    # generate() sees batch_size * R sequences.
+      do_sample: true               # false = greedy. Sampling settings are in the
+                                    # stored filename, so two temperatures over one
+                                    # draw are two entries rather than one silently
+                                    # reused.
+      temperature: 1.0              # 1.0 + top_p 1.0 = the model's own distribution
+      top_p: 1.0                    # < 1.0 truncates the tail
+      # top_k: null                 # optional; omitted = no top-k truncation
+      generation_seed: 0            # reproduces a run at the SAME batch_size only:
+                                    # one RNG stream serves a whole batch, so batch
+                                    # shape changes what is drawn
       embedder:
         type: sentence_transformer  # currently the only supported embedder type
         model_name: sentence-transformers/all-MiniLM-L6-v2  # any ST-compatible HF model

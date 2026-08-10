@@ -21,10 +21,11 @@ slurm:
   partition: l40s
   gpus_per_node: 1
   mem_gb: 48
-  # Padded well past the ~25 min this should take. A job killed at the wall wastes
-  # both the allocation and the queue wait, whereas an over-requested 1-GPU job
-  # still backfills readily.
-  time: "01:00:00"
+  # The greedy run took ~25 min for 320 generations. At replicates: 8 this is
+  # 2,560 generations of 128 tokens, so budget ~8x and pad it: a job killed at the
+  # wall wastes both the allocation and the queue wait, whereas an over-requested
+  # 1-GPU job still backfills readily.
+  time: "04:00:00"
   cpus_per_task: 8
   conda_env: taxonomy-env
   modules: []
@@ -77,12 +78,17 @@ extraction:
   queries_dataset: yahoo_queries
   n_queries: 64
   device: cuda
-  # KV-cache growth scales with batch x (prompt + max_new_tokens). 16 should fit
-  # comfortably on a 48 GB L40S alongside a 3B fp16 model and the embedder, but
-  # verify rather than assume: on CUDA OOM drop to 8, then 4. The resulting matrix is
-  # batch-size-independent in principle (the [gpu] batch-invariance check proves it),
-  # so this is purely a throughput knob.
-  batch_size: 16
+  # KV-cache growth scales with (batch x replicates) x (prompt + max_new_tokens),
+  # because generate() is called with num_return_sequences=replicates. 16 concurrent
+  # sequences fit comfortably on a 48 GB L40S alongside a 3B fp16 model and the
+  # embedder, so at replicates: 8 this is 2 rather than 16. On CUDA OOM halve it.
+  #
+  # This is NO LONGER purely a throughput knob. Under sampling one RNG stream serves
+  # the whole batch, so batch shape changes which tokens are drawn: a re-run
+  # reproduces exactly at the same batch_size and not at a different one. It stays
+  # out of the cache key (it is a machine detail, not a result) and is recorded in
+  # metadata and in runs/, so a mismatch is detectable after the fact.
+  batch_size: 2
   torch_dtype: float16
 
   taxonomies:
@@ -98,6 +104,16 @@ extraction:
     behavioral:
       enabled: true
       max_new_tokens: 128
+      # 8 sampled continuations per query. Pure sampling (temperature 1.0, no top-p
+      # truncation), so the replicates estimate the model's own output distribution
+      # rather than a truncated version of it — the point being to measure the
+      # within-query spread against the between-model spread, and a truncated tail
+      # would understate the former.
+      replicates: 8
+      do_sample: true
+      temperature: 1.0
+      top_p: 1.0
+      generation_seed: 0
       embedder:
         # Matching the embedder that produced 02_dataset_embeddings is what makes the
         # two levels comparable; prompt_name is inside the embedder cache key, so a

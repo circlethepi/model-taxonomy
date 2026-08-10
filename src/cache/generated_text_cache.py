@@ -18,16 +18,30 @@ from src.core.representation import ModelRepresentation
 __all__ = ["GeneratedTextCache", "_GEN_RE"]
 
 
-#: Embedding filenames look like ``generation128_5191ad734b81daff.safetensors``:
-#: the generation mode (carrying its token budget) and the embedder that turned
-#: the text into vectors.  Peer of ``activation_cache._ACT_RE`` — everything that
-#: changes the stored numbers is in the name, so a directory listing is a
-#: complete description of what was computed.
+#: Embedding filenames look like
+#: ``generation128_8r_3f9c1a2b_5191ad734b81daff.safetensors``: the generation
+#: mode (carrying its token budget), how many replicates were drawn per query,
+#: the sampling settings that drew them, and the embedder that turned the text
+#: into vectors.  Peer of ``activation_cache._ACT_RE`` — everything that changes
+#: the stored numbers is in the name, so a directory listing is a complete
+#: description of what was computed.
+#:
+#: ``_{r}r`` and ``_{sampling}`` were added together and for one reason: once
+#: decoding samples, two runs over the same draw at different temperatures (or
+#: different replicate counts) produce genuinely different text.  :meth:`save` is
+#: idempotent on filename, so without both components in the name the second run
+#: is a silent no-op that reuses the first entry's numbers — the hazard this
+#: class documents for ``torch_dtype``, but on an axis that changes the result
+#: far more than dtype does.
 #:
 #: If TODO item 12 gives behavioral a ``representation:`` knob, it extends this
-#: name to ``{mode}_{embedder}_{representation}`` rather than becoming a side
-#: file; keep the regex and the writer in step.
-_GEN_RE = re.compile(r"^(?P<mode>[a-z]+\d*)_(?P<embedder>[0-9a-f]{16})$")
+#: name rather than becoming a side file; keep the regex and the writer in step.
+_GEN_RE = re.compile(
+    r"^(?P<mode>generation\d+)"
+    r"_(?P<replicates>\d+)r"
+    r"_(?P<sampling>[0-9a-f]{8})"
+    r"_(?P<embedder>[0-9a-f]{16})$"
+)
 
 
 class GeneratedTextCache(DrawKeyedCache):
@@ -38,11 +52,13 @@ class GeneratedTextCache(DrawKeyedCache):
         cache_root/05_generated/{base_slug}/{adapter_slug}/{recipe_hash}/n{n}_s{seed}/
             queries.json                                ← query_key + source row indices
             runs/{config_hash}.json                     ← extraction provenance
-            generations/{mode_token}.json               ← {model_id, generated_texts}
-            embeddings/{mode_token}_{embedder_hash}.safetensors
+            generations/{variant_token}.json            ← {model_id, generated_texts}
+            embeddings/{variant_token}_{embedder_hash}.safetensors
             surrogates/{surrogate_hash}/
                 config.json
                 surrogate.safetensors
+
+    where ``variant_token`` is ``generation{max_new_tokens}_{replicates}r_{sampling_hash}``.
 
     The prefix through ``n{n}_s{seed}`` is **byte-identical** to
     :class:`~src.cache.activation_cache.ActivationCache`'s, because both come
@@ -65,11 +81,21 @@ class GeneratedTextCache(DrawKeyedCache):
     :class:`ModelRepresentation` the rest of the pipeline expects, so the split
     is an on-disk detail rather than an API change.
 
-    **Generations are keyed by mode alone, embeddings by mode and embedder.**
-    That is the asymmetry that makes a second embedder cheap: the text is
-    generated once, and re-embedding it adds one file beside the first with no
-    GPU generation pass.  ``ls embeddings/`` answers "which embedders have run
-    over this draw?" from a directory listing.
+    **Generations are keyed by the generation variant alone, embeddings by that
+    variant and the embedder.**  That is the asymmetry that makes a second
+    embedder cheap: the text is generated once, and re-embedding it adds one file
+    beside the first with no GPU generation pass.  ``ls embeddings/`` answers
+    "which embedders have run over this draw?" from a directory listing.
+
+    **A row is one replicate, not one query.**  With ``replicates=R`` the stored
+    matrix is ``(n_queries * R, d)`` in query-major order — ``q0r0, q0r1, …,
+    q1r0, …`` — which is the order ``model.generate(num_return_sequences=R)``
+    returns, and ``generated_texts`` is correspondingly a list of ``R``-element
+    lists.  Keeping every replicate rather than averaging at write time follows
+    the same rule as TODO item 12's read-time pooling: the mean is recoverable
+    from the rows, the spread is not recoverable from the mean.  Ask for
+    ``replicate_reduction="mean"`` at read time to get the ``(n_queries, d)``
+    shape back.
 
     **``torch_dtype`` is deliberately not in any filename**, matching
     ``04_activations``.  An fp16 and an fp32 run over the same draw write the
@@ -107,12 +133,69 @@ class GeneratedTextCache(DrawKeyedCache):
         """
         return cls.config_hash(embedder_config)
 
+    #: The sampling axes that change the generated text.  Fixed and explicit so
+    #: that a caller passing a partial dict still hashes to the same thing as one
+    #: passing every key, and so adding an axis later is a visible edit here
+    #: rather than a silent change of every digest.
+    SAMPLING_KEYS = ("do_sample", "temperature", "top_p", "top_k", "generation_seed")
+
+    #: What greedy decoding hashes to.  Every entry written before sampling
+    #: existed is greedy, so this is the token
+    #: ``scripts/migrate_behavioral_replicates.py`` renames them under.
+    GREEDY_SAMPLING = {
+        "do_sample": False,
+        "temperature": None,
+        "top_p": None,
+        "top_k": None,
+        "generation_seed": None,
+    }
+
+    @classmethod
+    def sampling_hash(cls, sampling: dict) -> str:
+        """8-hex identity of the decoding settings that produced a generation.
+
+        Shorter than the 16-hex hashes elsewhere in the cache because it shares a
+        filename with two of them and the namespace it has to separate is tiny —
+        a handful of decoding settings per project, not a content-addressed space
+        of recipes.
+
+        Unknown keys are rejected rather than ignored: a typo'd ``temp`` that
+        hashed the same as the default would put two different runs in one entry,
+        which is the exact failure this hash exists to prevent.
+        """
+        unknown = set(sampling) - set(cls.SAMPLING_KEYS)
+        if unknown:
+            raise ValueError(
+                f"unknown sampling key(s) {sorted(unknown)}; expected a subset of "
+                f"{list(cls.SAMPLING_KEYS)}"
+            )
+        canonical = {k: sampling.get(k) for k in cls.SAMPLING_KEYS}
+        return cls.config_hash(canonical)[:8]
+
     # ------------------------------------------------------------------
     # Path helpers
     # ------------------------------------------------------------------
 
-    def _variant_stem(self, mode_token: str, embedder_hash: str) -> str:
-        return f"{mode_token}_{embedder_hash}"
+    def variant_token(
+        self, max_new_tokens: int, replicates: int, sampling_hash: str
+    ) -> str:
+        """``generation{max_new_tokens}_{replicates}r_{sampling_hash}``.
+
+        Deliberately *not* an override of
+        :meth:`~src.cache._draw_keyed.DrawKeyedCache.mode_token`, which
+        ``04_activations`` shares byte-for-byte — replicates are a behavioral
+        concept, and widening the shared spelling would move functional filenames
+        for a parameter the functional level does not have.
+        ``scripts/check_analysis.py`` asserts the two caches hold the *same*
+        ``mode_token`` function object, and that assertion should keep passing.
+        """
+        if int(replicates) < 1:
+            raise ValueError(f"replicates must be >= 1, got {replicates!r}")
+        base = self.mode_token("generation", max_new_tokens)
+        return f"{base}_{int(replicates)}r_{sampling_hash}"
+
+    def _variant_stem(self, variant_token: str, embedder_hash: str) -> str:
+        return f"{variant_token}_{embedder_hash}"
 
     def generations_path(
         self,
@@ -120,8 +203,10 @@ class GeneratedTextCache(DrawKeyedCache):
         adapter_id: str,
         query_key: dict,
         max_new_tokens: int,
+        replicates: int,
+        sampling_hash: str,
     ) -> Path:
-        token = self.mode_token("generation", max_new_tokens)
+        token = self.variant_token(max_new_tokens, replicates, sampling_hash)
         return (
             self.draw_dir(base_model_id, adapter_id, query_key)
             / "generations"
@@ -134,9 +219,11 @@ class GeneratedTextCache(DrawKeyedCache):
         adapter_id: str,
         query_key: dict,
         max_new_tokens: int,
+        replicates: int,
+        sampling_hash: str,
         embedder_hash: str,
     ) -> Path:
-        token = self.mode_token("generation", max_new_tokens)
+        token = self.variant_token(max_new_tokens, replicates, sampling_hash)
         return (
             self.draw_dir(base_model_id, adapter_id, query_key)
             / "embeddings"
@@ -153,14 +240,18 @@ class GeneratedTextCache(DrawKeyedCache):
         adapter_id: str,
         query_key: dict,
         max_new_tokens: int,
+        replicates: int,
+        sampling_hash: str,
         embedder_hash: str,
     ) -> bool:
         return (
             self.embeddings_path(
-                base_model_id, adapter_id, query_key, max_new_tokens, embedder_hash
+                base_model_id, adapter_id, query_key, max_new_tokens,
+                replicates, sampling_hash, embedder_hash,
             ).exists()
             and self.generations_path(
-                base_model_id, adapter_id, query_key, max_new_tokens
+                base_model_id, adapter_id, query_key, max_new_tokens,
+                replicates, sampling_hash,
             ).exists()
         )
 
@@ -189,6 +280,8 @@ class GeneratedTextCache(DrawKeyedCache):
         rep: ModelRepresentation,
         *,
         max_new_tokens: int,
+        replicates: int,
+        sampling: dict,
         embedder_hash: str,
         config: dict | None = None,
         source_indices: list | None = None,
@@ -197,20 +290,27 @@ class GeneratedTextCache(DrawKeyedCache):
 
         Idempotent: returns immediately if this model's entry already exists.
         Note the consequence — there is no invalidation path.  Anything inside
-        *config* that changes the ``embedder_hash`` produces a new filename and
-        so a new entry, which is the behaviour you want and is legible on disk.
-        Anything outside it (``device``, ``batch_size``, and see the class
-        docstring on ``torch_dtype``) silently reuses the existing entry.
+        *config* that changes the ``embedder_hash``, the replicate count or the
+        ``sampling_hash`` produces a new filename and so a new entry, which is
+        the behaviour you want and is legible on disk.  Anything outside them
+        (``device``, ``batch_size``, and see the class docstring on
+        ``torch_dtype``) silently reuses the existing entry.
+
+        *sampling* is the decoding settings dict, not its hash: the hash goes in
+        the filename and the dict is written into the entry, so a stored
+        generation says what produced it without a lookup table.
         """
         from filelock import FileLock
 
+        sampling_hash = self.sampling_hash(sampling)
         draw = self.draw_dir(base_model_id, adapter_id, query_key)
         (draw / "generations").mkdir(parents=True, exist_ok=True)
         (draw / "embeddings").mkdir(parents=True, exist_ok=True)
 
         with FileLock(str(draw / ".lock")):
             if self.exists(
-                base_model_id, adapter_id, query_key, max_new_tokens, embedder_hash
+                base_model_id, adapter_id, query_key, max_new_tokens,
+                replicates, sampling_hash, embedder_hash,
             ):
                 return
 
@@ -226,6 +326,9 @@ class GeneratedTextCache(DrawKeyedCache):
                     {
                         "mode": "generation",
                         "max_new_tokens": max_new_tokens,
+                        "replicates": replicates,
+                        "sampling": dict(sampling),
+                        "sampling_hash": sampling_hash,
                         "embedder_hash": embedder_hash,
                         "model_id": rep.model_id,
                         # Provenance the config deliberately excludes so it does
@@ -235,18 +338,27 @@ class GeneratedTextCache(DrawKeyedCache):
                     },
                 )
 
-            # generations/{mode_token}.json — written once per mode, then shared
-            # by every embedder that runs over this draw.
+            # generations/{variant_token}.json — written once per generation
+            # variant, then shared by every embedder that runs over this draw.
             gen_path = self.generations_path(
-                base_model_id, adapter_id, query_key, max_new_tokens
+                base_model_id, adapter_id, query_key, max_new_tokens,
+                replicates, sampling_hash,
             )
             if not gen_path.exists():
                 _atomic_write_json(
                     gen_path,
-                    {"model_id": rep.model_id, "generated_texts": generated_texts or []},
+                    {
+                        # 3 = generated_texts is nested per query; 1-2 were flat
+                        # lists from before replicates existed.
+                        "schema_version": "3",
+                        "model_id": rep.model_id,
+                        "replicates": replicates,
+                        "sampling": dict(sampling),
+                        "generated_texts": _nest_texts(generated_texts, replicates),
+                    },
                 )
 
-            # embeddings/{mode_token}_{embedder_hash}.safetensors
+            # embeddings/{variant_token}_{embedder_hash}.safetensors
             meta_bytes = np.frombuffer(
                 json.dumps(
                     {
@@ -256,13 +368,17 @@ class GeneratedTextCache(DrawKeyedCache):
                         "query_key": query_key,
                         "embedder_hash": embedder_hash,
                         "max_new_tokens": max_new_tokens,
+                        "replicates": replicates,
+                        "sampling": dict(sampling),
+                        "sampling_hash": sampling_hash,
                         "metadata": metadata,
                     }
                 ).encode("utf-8"),
                 dtype=np.uint8,
             )
             st_path = self.embeddings_path(
-                base_model_id, adapter_id, query_key, max_new_tokens, embedder_hash
+                base_model_id, adapter_id, query_key, max_new_tokens,
+                replicates, sampling_hash, embedder_hash,
             )
             _atomic_save_matrix(
                 st_path,
@@ -280,12 +396,23 @@ class GeneratedTextCache(DrawKeyedCache):
         adapter_id: str,
         query_key: dict,
         max_new_tokens: int,
-    ) -> list[str]:
-        """The generated text for one model, without touching the tensors."""
-        path = self.generations_path(base_model_id, adapter_id, query_key, max_new_tokens)
+        replicates: int,
+        sampling_hash: str,
+    ) -> list[list[str]]:
+        """The generated text for one model, without touching the tensors.
+
+        Nested per query: ``texts[q][r]`` is replicate *r* of query *q*.  Entries
+        written before replicates existed stored a flat list and are normalized
+        to one-element lists here, so a caller sees one shape.
+        """
+        path = self.generations_path(
+            base_model_id, adapter_id, query_key, max_new_tokens,
+            replicates, sampling_hash,
+        )
         if not path.exists():
             return []
-        return json.loads(path.read_text()).get("generated_texts", [])
+        texts = json.loads(path.read_text()).get("generated_texts", [])
+        return [t if isinstance(t, list) else [t] for t in texts]
 
     def load_matrix(
         self,
@@ -293,19 +420,23 @@ class GeneratedTextCache(DrawKeyedCache):
         adapter_id: str,
         query_key: dict,
         max_new_tokens: int,
+        replicates: int,
+        sampling_hash: str,
         embedder_hash: str,
     ) -> tuple[np.ndarray, dict]:
-        """The stored ``(n_queries, d)`` embedding matrix and its ``_meta_json``."""
+        """The stored ``(n_queries * replicates, d)`` matrix and its ``_meta_json``."""
         from safetensors.numpy import load_file
 
         path = self.embeddings_path(
-            base_model_id, adapter_id, query_key, max_new_tokens, embedder_hash
+            base_model_id, adapter_id, query_key, max_new_tokens,
+            replicates, sampling_hash, embedder_hash,
         )
         if not path.exists():
             raise FileNotFoundError(
                 f"no stored behavioral embeddings for {adapter_id} under draw "
                 f"{self.draw_name(query_key)} "
-                f"(generation{max_new_tokens}, embedder {embedder_hash}) at {path}"
+                f"({self.variant_token(max_new_tokens, replicates, sampling_hash)}, "
+                f"embedder {embedder_hash}) at {path}"
             )
         tensors = load_file(str(path))
         meta = json.loads(tensors["_meta_json"].tobytes().decode("utf-8"))
@@ -317,56 +448,84 @@ class GeneratedTextCache(DrawKeyedCache):
         adapter_id: str,
         query_key: dict,
         max_new_tokens: int,
+        replicates: int,
+        sampling_hash: str,
         embedder_hash: str,
         view: str = "matrix",
         normalize: str | bool = "none",
+        replicate_reduction: str = "all",
     ) -> ModelRepresentation:
         """Reconstruct a ModelRepresentation, generations folded back in.
 
         ``metadata["generated_texts"]`` is restored from ``generations/`` so the
         returned object is indistinguishable from one that was never cached.
 
-        ``view="matrix"`` is the stored embedding itself and is the default,
-        which is why it is *not* routed through ``surrogates/``: writing a
-        byte-copy of the stored matrix back beside it would double this stage's
-        footprint to buy nothing.  Any other view goes through the same
-        surrogate mechanism the functional level uses, so a ``gram`` is computed
-        at most once per ``(draw, mode, embedder, view, normalize)``.
+        The stored ``("matrix", "none", "all")`` triple is returned as-is, which
+        is why it is *not* routed through ``surrogates/``: writing a byte-copy of
+        the stored matrix back beside it would double this stage's footprint to
+        buy nothing.  Anything else goes through the same surrogate mechanism the
+        functional level uses, so a view is computed at most once per
+        ``(draw, variant, embedder, view, normalize, replicate_reduction)``.
+
+        ``replicate_reduction="mean"`` averages the ``R`` replicates of each
+        query, returning the ``(n_queries, d)`` shape a single-sample run
+        produced.  It is applied **first**, before normalization and before the
+        view: a ``gram`` of the unreduced matrix is a ``(n·R, n·R)`` kernel whose
+        rows are replicate-to-replicate similarities, and averaging those is not
+        the same quantity as averaging the underlying vectors.
         """
         normalize = self.canon_normalize(normalize)
+        replicate_reduction = self.canon_replicate_reduction(replicate_reduction)
         matrix, meta = self.load_matrix(
-            base_model_id, adapter_id, query_key, max_new_tokens, embedder_hash
+            base_model_id, adapter_id, query_key, max_new_tokens,
+            replicates, sampling_hash, embedder_hash,
         )
 
         cached = None
-        if view != "matrix" or normalize != "none":
+        if view != "matrix" or normalize != "none" or replicate_reduction != "all":
             spec = {
                 "kind": "behavioral_surrogate",
                 "query_key": query_key,
-                "mode": self.mode_token("generation", max_new_tokens),
+                "mode": self.variant_token(max_new_tokens, replicates, sampling_hash),
                 "embedder_hash": embedder_hash,
                 "view": view,
                 "normalize": normalize,
+                "replicate_reduction": replicate_reduction,
             }
             got = self.load_surrogate(base_model_id, adapter_id, query_key, spec)
             cached = got is not None
             if got is None:
-                got = self._build_view(matrix, view, normalize)
+                got = self._build_view(
+                    matrix, view, normalize, replicates, replicate_reduction
+                )
                 self.save_surrogate(base_model_id, adapter_id, query_key, spec, got)
             matrix = got
 
         metadata = dict(meta.get("metadata", {}))
         metadata["generated_texts"] = self.load_generations(
-            base_model_id, adapter_id, query_key, max_new_tokens
+            base_model_id, adapter_id, query_key, max_new_tokens,
+            replicates, sampling_hash,
         )
+        n_rows = int(matrix.shape[0])
         metadata.update(
             base_model_id=base_model_id,
             query_key=query_key,
             embedder_hash=embedder_hash,
             max_new_tokens=max_new_tokens,
+            replicates=int(replicates),
+            sampling=meta.get("sampling"),
+            sampling_hash=sampling_hash,
+            replicate_reduction=replicate_reduction,
             view=view,
             normalize=normalize,
-            n_queries=int(matrix.shape[0]),
+            n_rows=n_rows,
+            # After a mean the rows are queries again; before it each query owns
+            # R of them.  A kernel's rows are neither, so it reports no count.
+            n_queries=(
+                None
+                if view in self.KERNEL_VIEWS
+                else (n_rows if replicate_reduction == "mean" else n_rows // int(replicates))
+            ),
             is_kernel=view in self.KERNEL_VIEWS,
         )
         if cached is not None:
@@ -379,19 +538,57 @@ class GeneratedTextCache(DrawKeyedCache):
             metadata=metadata,
             cache_key=(
                 f"{adapter_slug(adapter_id)}/{self.draw_name(query_key)}/"
-                f"{self._variant_stem(self.mode_token('generation', max_new_tokens), embedder_hash)}"
+                f"{self._variant_stem(self.variant_token(max_new_tokens, replicates, sampling_hash), embedder_hash)}"
             ),
         )
 
+    #: Accepted replicate reductions.  ``all`` keeps the stored rows.
+    REPLICATE_REDUCTIONS = frozenset({"all", "mean"})
+
+    @classmethod
+    def canon_replicate_reduction(cls, reduction: str | None) -> str:
+        """One spelling per reduction request, mirroring :meth:`canon_normalize`.
+
+        ``None`` means "unspecified", which is the stored form.  Two spellings of
+        the same request would hash to two surrogates for one matrix.
+        """
+        if reduction is None:
+            return "all"
+        if reduction in cls.REPLICATE_REDUCTIONS:
+            return str(reduction)
+        raise ValueError(
+            f"unknown replicate_reduction {reduction!r}; expected one of "
+            f"{sorted(cls.REPLICATE_REDUCTIONS)}"
+        )
+
     @staticmethod
-    def _build_view(matrix: np.ndarray, view: str, normalize: str) -> np.ndarray:
+    def _build_view(
+        matrix: np.ndarray,
+        view: str,
+        normalize: str,
+        replicates: int = 1,
+        replicate_reduction: str = "all",
+    ) -> np.ndarray:
         """Apply a read-time view to the stored embedding matrix.
 
-        Rows are queries, exactly as at the functional level, so ``gram`` here
-        and ``gram`` there mean the same thing: a ``(n_queries, n_queries)``
-        kernel over the same draw.
+        Rows are queries — after a ``mean`` reduction, or exactly when
+        ``replicates=1`` — as at the functional level, so ``gram`` here and
+        ``gram`` there mean the same thing over the same draw.  With replicates
+        kept, a ``gram`` is ``(n·R, n·R)``: still a kernel, but over replicates
+        rather than queries, and the metric sees it that way.
         """
         H = matrix.astype(np.float64)
+        if replicate_reduction == "mean" and int(replicates) > 1:
+            R = int(replicates)
+            if H.shape[0] % R:
+                raise ValueError(
+                    f"cannot average {R} replicates: {H.shape[0]} rows is not a "
+                    "multiple of the replicate count. The matrix and the "
+                    "filename disagree about how it was written."
+                )
+            # Query-major storage is what makes this a reshape rather than a
+            # gather: rows q0r0..q0r(R-1) are already adjacent.
+            H = H.reshape(H.shape[0] // R, R, H.shape[1]).mean(axis=1)
         if normalize in ("layer", "global"):
             # There is one block, so the two modes coincide; both are accepted
             # so a caller can pass the same selector to either level.
@@ -408,11 +605,13 @@ class GeneratedTextCache(DrawKeyedCache):
 
     def list_variants(
         self, base_model_id: str, adapter_id: str, query_key: dict
-    ) -> list[tuple[str, str]]:
-        """``[(mode_token, embedder_hash), ...]`` stored for one model-draw.
+    ) -> list[tuple[str, int, str, str]]:
+        """``[(mode_token, replicates, sampling_hash, embedder_hash), ...]``.
 
         A directory listing, no file opens — the peer of
-        ``ActivationCache.list_layers``.
+        ``ActivationCache.list_layers``.  Everything that distinguishes two
+        stored generations is in the name, which is what lets a caller answer
+        "what has been computed over this draw?" without a safetensors load.
         """
         emb_dir = self.draw_dir(base_model_id, adapter_id, query_key) / "embeddings"
         if not emb_dir.exists():
@@ -421,8 +620,30 @@ class GeneratedTextCache(DrawKeyedCache):
         for p in sorted(emb_dir.glob("*.safetensors")):
             m = _GEN_RE.match(p.stem)
             if m:
-                out.append((m["mode"], m["embedder"]))
+                out.append((m["mode"], int(m["replicates"]), m["sampling"], m["embedder"]))
         return out
+
+
+def _nest_texts(texts, replicates: int) -> list[list[str]]:
+    """Normalize generated text to ``texts[query][replicate]``.
+
+    Accepts what the taxonomy produces (already nested) and a flat list, so a
+    caller assembling a representation by hand does not have to know which shape
+    the writer wants.  A flat list is only unambiguous at ``replicates=1``;
+    beyond that it is regrouped query-major, matching how the rows are stored.
+    """
+    texts = list(texts or [])
+    if not texts:
+        return []
+    if all(isinstance(t, list) for t in texts):
+        return [list(t) for t in texts]
+    R = int(replicates)
+    if len(texts) % R:
+        raise ValueError(
+            f"{len(texts)} generated texts is not a multiple of replicates={R}; "
+            "cannot tell which replicate belongs to which query"
+        )
+    return [list(texts[i : i + R]) for i in range(0, len(texts), R)]
 
 
 def _atomic_save_matrix(path: Path, matrix: np.ndarray, meta_bytes: np.ndarray) -> None:

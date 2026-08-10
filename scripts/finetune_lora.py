@@ -86,15 +86,34 @@ def _finetune_one(
     model = get_peft_model(model, lora_config)
     model.print_trainable_parameters()
 
+    from src.datasets._text_projection import row_text
+
     recipe = load_recipe(recipe_path)
     n_samples = ft_cfg.get("n_samples", 1000)
     seed = ft_cfg.get("seed", 42)
-    text_field = recipe.datasets[0].text_field
+    entry = recipe.datasets[0]
+    text_fields = getattr(entry, "text_fields", None)
+    text_field = entry.text_field
+    described = f"{text_fields!r} joined by {entry.text_separator!r}" if text_fields else repr(text_field)
 
-    print(f"    Building dataset: {n_samples} samples from '{dataset_name}' (field: {text_field!r})")
+    print(f"    Building dataset: {n_samples} samples from '{dataset_name}' (field: {described})")
     mixed = make_mixed_dataset(recipe, total_samples=n_samples, seed=seed, hf_token=token,
                                sample_cache=sample_cache, name=dataset_name)
-    hf_dataset = Dataset.from_list(list(mixed.for_finetuning()))
+    rows = list(mixed.for_finetuning())
+
+    if text_fields:
+        # SFTTrainer takes ONE column name, so a composition has to become a
+        # column.  Synthesized here rather than in the sampler so that what is
+        # cached in 01_datasets stays the raw rows: the composition is a
+        # projection of them, recorded in the recipe, not a different draw.
+        #
+        # This is the item 11 fix. Training on the bare answer column while
+        # extraction prompts with a question is what put the behavioral level
+        # out of distribution; the composed column is the shape both sides mean.
+        text_field = "_composed_text"
+        rows = [{**row, text_field: row_text(recipe, row)} for row in rows]
+
+    hf_dataset = Dataset.from_list(rows)
 
     sft_cfg = SFTConfig(
         output_dir=str(out_dir),
@@ -124,6 +143,14 @@ def _finetune_one(
         "base_model_id": base_model_id,
         "dataset_name": dataset_name,
         "recipe_hash": recipe.recipe_hash(),
+        # What a row was projected to before it reached the trainer.  Inside
+        # recipe_hash already, and repeated here because "what shape was this
+        # adapter fit on?" is the first question asked of an adapter whose
+        # generations look wrong, and it should not need a recipe lookup.
+        "text_projection": (
+            {"text_fields": text_fields, "text_separator": entry.text_separator}
+            if text_fields else {"text_field": text_field}
+        ),
         "lora_config": {
             "lora_rank": ft_cfg["lora_rank"],
             "lora_alpha": ft_cfg["lora_alpha"],

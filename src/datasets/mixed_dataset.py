@@ -7,6 +7,7 @@ import numpy as np
 
 from src.datasets.recipe import DatasetRecipe
 from src.datasets.class_recipe import ClassAwareDatasetRecipe, ClassDatasetEntry
+from src.datasets._text_projection import row_text
 
 if TYPE_CHECKING:
     from src.datasets.recipe import DatasetRecipe as _AnyRecipe
@@ -141,7 +142,8 @@ class MixedDataset:
         """Return text strings suitable for use as inference queries.
 
         If *n* is given, return the first *n* samples (must be ≤ total_samples).
-        The text is taken from each entry's configured ``text_field``.
+        The text is each entry's configured ``text_field``, or its composed
+        ``text_fields`` — see :func:`src.datasets._text_projection.row_text`.
         """
         samples = self._ensure_loaded()
         if n is not None:
@@ -151,20 +153,7 @@ class MixedDataset:
                 )
             samples = samples[:n]
 
-        # Build a field lookup keyed by dataset_id for fast access
-        field_map = {e.dataset_id: e.text_field for e in self.recipe.datasets}
-        default_field = self.recipe.datasets[0].text_field
-
-        texts: list[str] = []
-        for row in samples:
-            # Try each configured text_field in order of recipe entries
-            text = None
-            for tf in field_map.values():
-                if tf in row:
-                    text = str(row[tf])
-                    break
-            texts.append(text if text is not None else str(row.get(default_field, "")))
-        return texts
+        return [row_text(self.recipe, row) for row in samples]
 
     def for_finetuning(self) -> Iterator[dict]:
         """Yield sample dicts (all original columns) for fine-tuning."""
@@ -206,17 +195,7 @@ class CachedMixedDataset:
 
     def to_queries(self, n: int | None = None) -> list[str]:
         samples = self._samples[:n] if n is not None else self._samples
-        field_map = {e.dataset_id: e.text_field for e in self.recipe.datasets}
-        default_field = self.recipe.datasets[0].text_field
-        texts: list[str] = []
-        for row in samples:
-            text = None
-            for tf in field_map.values():
-                if tf in row:
-                    text = str(row[tf])
-                    break
-            texts.append(text if text is not None else str(row.get(default_field, "")))
-        return texts
+        return [row_text(self.recipe, row) for row in samples]
 
     def for_finetuning(self) -> Iterator[dict]:
         yield from self._samples
@@ -401,18 +380,7 @@ class ClassMixedDataset:
                 )
             samples = samples[:n]
 
-        field_map = {e.dataset_id: e.text_field for e in self.recipe.datasets}
-        default_field = self.recipe.datasets[0].text_field
-
-        texts: list[str] = []
-        for row in samples:
-            text = None
-            for tf in field_map.values():
-                if tf in row:
-                    text = str(row[tf])
-                    break
-            texts.append(text if text is not None else str(row.get(default_field, "")))
-        return texts
+        return [row_text(self.recipe, row) for row in samples]
 
     def for_finetuning(self) -> Iterator[dict]:
         """Yield sample dicts for fine-tuning."""

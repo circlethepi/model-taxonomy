@@ -7,6 +7,13 @@ blocks anything that ships today; both change what the comparison *reports*.
 
 ## 1. Mantel is the weakest test we run, and PROTEST is already better
 
+> **Done (TODO item 6).** `distance_correlation` and `dcor_test` are in
+> `src/analysis/matrices.py`, `compare_taxonomies` reports `dcor_vs_truth`
+> beside `matrix_corr_vs_truth`, and Mantel's p-value now carries a warning
+> while its statistic is untouched. Read "What the implementation found"
+> at the end of this section before using the numbers — two of the findings
+> change how the output should be read, and neither was anticipated here.
+
 The concern is real and well documented. `mantel_test`
 (`src/analysis/matrices.py`) correlates the two matrices' off-diagonal vectors and
 permutes the row/column index to build a null. The problem is that the
@@ -45,6 +52,60 @@ number (it is cheap and interpretable), stop treating its p-value as evidence, a
 add dCor as the matrix-level test since it needs no embedding and so is
 independent of the MDS step. Do **not** silently drop Mantel — existing figures
 reference it.
+
+### What the implementation found
+
+Three things, of which the first two change how the output must be read.
+
+**1. dCor is unsigned, so it does not subsume the correlation.** The plan above
+treats dCor as a strictly better matrix-level statistic. It is not a
+*replacement*: it measures dependence, so a taxonomy that recovers the mixing
+order exactly **backwards** scores `dCor = 1.0`, identically to a perfect one
+(verified on the 1-D truth matrix). That is not a hypothetical — the behavioral
+level does exactly this, and it is the whole content of the 2026-08-05 table in
+`TODO.md`. So the reason to keep Mantel is stronger than "existing figures
+reference it": the **sign** is information dCor structurally cannot carry.
+Pinned by `t_dcor_unsigned`.
+
+**2. At five models, no matrix-level test can reach p < 0.05, and that is the
+design's fault rather than the data's.** With `n = 5` there are only 120
+relabellings, which would put the floor at 1/120 ≈ 0.008 — but the ground truth
+on these slices is five evenly-spaced points on a 1-D simplex, and that matrix
+is symmetric enough that **8** of the 120 relabellings attain the maximum. A
+taxonomy reproducing the truth *exactly* therefore scores `p = 8/120 ≈ 0.067`,
+and the entire null takes **4 distinct values**. Read the p-values as ordering
+evidence, never against a 0.05 threshold. This is an argument for more adapters
+per slice, and it applies to PROTEST's permutation p-value for the same reason.
+Pinned by `t_dcor_permutation_floor`.
+
+**3. The bias correction is not optional at this scale.** Measured over 2,000
+draws of two *independent* five-model matrices, the classical V-statistic dCor
+averages **0.846**; the U-centred `dCor*` of Székely & Rizzo (2013) averages
+**−0.007**. Hence `bias_corrected=True` is the default. The cost is that `dCor*`
+lives on the squared scale and may be negative.
+
+**Caveat carried into the docstring:** `dCor = 0` characterises independence only
+for metrics of strong negative type (Lyons 2013). Euclidean qualifies; the cosine
+and CKA distances used here are not known to.
+
+### First numbers on the real slice
+
+Same slice as everything else — 5 adapters, `n_samples=1000, seed=0`, cosine —
+with the two existing columns for comparison:
+
+| taxonomy | matrix corr | PROTEST p | dCor* | dCor p |
+|---|---|---|---|---|
+| dataset_embedding | 1.0000 | 0.005 | 0.9667 | 0.0667 |
+| functional | 1.0000 | 0.015 | 0.9285 | 0.0667 |
+| structural | 1.0000 | 0.754 → see note | 0.7537 | 0.1000 |
+| behavioral | −1.0000 | 0.955 | 0.3870 | 0.2667 |
+
+Three of the four sit at the 0.0667 floor, so the p-values rank the levels but
+do not test them. The informative column is `dCor*` itself: it separates
+dataset_embedding and functional (≈0.93–0.97) from structural (0.75) and
+behavioral (0.39) — and note that behavioral's 0.39 is *unsigned*, so it is
+weak dependence, not merely inverted dependence. A perfect reversal would have
+scored 1.0.
 
 ---
 

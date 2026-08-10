@@ -326,6 +326,27 @@ def distance_correlation(
     between independent matrices.  Pass ``bias_corrected=False`` for the
     classical statistic in ``[0, 1]``.
 
+    .. warning::
+
+       **dCor is unsigned: it measures dependence, not agreement.**  A taxonomy
+       whose geometry is the exact *reversal* of the truth scores
+       ``dCor = 1.0``, identically to a perfect one.
+
+       This is not a defect of dCor specifically — **no matrix-level statistic
+       can see that inversion**, because a distance matrix has no notion of
+       direction to begin with.  ``matrix_correlation`` does not rescue it
+       either: on the real five-adapter slice the behavioral level recovers the
+       mixing order backwards, and its ``matrix_corr_vs_truth`` is nonetheless
+       ``+0.76``.  What catches it is the *recovery* correlation, downstream of
+       MDS and the barycentric projection, where the mixture weights finally
+       have a sign (behavioral scores ``r = -0.9995`` there; see the 2026-08-05
+       table in ``docs/notes/TODO.md``).
+
+       So read dCor as "how much of the truth's structure is present", and go to
+       :class:`~src.analysis.comparison.TaxonomyComparison.recovery` to ask
+       whether it points the right way.  Pinned by ``t_dcor_unsigned`` in
+       ``scripts/check_analysis.py``.
+
     .. note::
 
        ``dCor = 0`` characterises independence only for metrics of strong
@@ -384,6 +405,24 @@ def dcor_test(
     matters at the sizes here: with five models there are only 120 distinct
     relabellings, so 9,999 random draws would resample the same 120 values and
     the smallest attainable p-value is 1/120 ≈ 0.0083 either way.
+
+    .. warning::
+
+       **At five models, exact agreement is *penalised*, and the p-value is too
+       coarse to threshold at 0.05.**  U-centring adds symmetry the raw matrix
+       does not have: on the evenly-spaced 1-D ground truth these slices use,
+       the raw and doubly-centred matrices each have 2 automorphisms among the
+       120 relabellings, but the U-centred one has **8** — it can no longer tell
+       either endpoint from its neighbour.  All 8 tie at ``dCor = 1``, and ties
+       count toward a one-sided p-value, so a taxonomy reproducing the truth
+       *exactly* scores ``p = 8/120 ≈ 0.067`` while a merely good one can score
+       **lower**: on the real slice ``functional`` reaches ``4/120 ≈ 0.033``.
+
+       So this is not a floor — ``p < 0.05`` is attainable — but the statistic
+       is not monotone in agreement near the top, and the resolution is 1/120.
+       **Rank the levels by** :attr:`DcorResult.statistic`, **not by p**, and
+       treat the whole effect as an argument for more adapters per slice.
+       Pinned by ``t_dcor_u_centering_symmetry``.
 
     *key* is passed to :func:`match_models` to reconcile differing identifier
     schemes.

@@ -800,6 +800,9 @@ offdiag(matrix) -> np.ndarray
 matrix_correlation(dm_a, dm_b, method="spearman", key=None) -> float
 mantel_test(dm_a, dm_b, n_permutations=9999, method="spearman",
             random_state=0, key=None) -> MantelResult
+distance_correlation(dm_a, dm_b, bias_corrected=True, key=None) -> float
+dcor_test(dm_a, dm_b, n_permutations=9999, bias_corrected=True,
+          random_state=0, key=None) -> DcorResult
 correlation_table(analyses, method="spearman", min_models=3, key=None)
     -> tuple[list[str], np.ndarray]
 ```
@@ -809,6 +812,26 @@ Procrustes. `correlation_table` reports `nan` for pairs with no models in common
 rather than raising.
 
 `MantelResult`: `statistic`, `p_value`, `n_permutations`, `n_models`, `method`, `null`.
+Quote the statistic; **do not quote the p-value** — the off-diagonal entries are
+dependent and it is not calibrated. Use `dcor_test` or `protest` for inference.
+
+`DcorResult`: `statistic`, `p_value`, `n_permutations`, `n_models`,
+`bias_corrected`, `exact`, `null`.
+
+`distance_correlation` defaults to the bias-corrected `dCor*` of Székely & Rizzo
+(2013), which lives on the squared scale and **may be negative**. The default is
+not cosmetic: between two *independent* five-model matrices the classical
+statistic averages 0.85, so it cannot distinguish signal from nothing at the
+sizes here. `dcor_test` enumerates all `n!` relabellings when `n! <=
+n_permutations` and sets `exact`.
+
+Two limits that decide how to read the output:
+
+- **dCor is unsigned.** A taxonomy that recovers the ordering exactly backwards
+  scores 1.0, same as a perfect one. Always report `matrix_correlation` beside it.
+- **On a five-model slice, an exact recovery still scores `p = 8/120 ≈ 0.067`**,
+  because the truth matrix has enough symmetry that 8 relabellings tie it. Nothing
+  reaches `p < 0.05` at that size; it is a design limit, not a weak result.
 
 ### Identifier reconciliation
 

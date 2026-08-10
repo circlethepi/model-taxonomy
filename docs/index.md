@@ -53,5 +53,6 @@ Collection of models
 | [Compute Backends](guides/compute_backends.md) | Local execution and SLURM cluster setup |
 | [Geometry Methods](guides/geometry_methods.md) | MDS, PCA, UMAP — when to use each |
 | [Extending the Library](guides/extending.md) | Implementing a new taxonomy |
+| [Dataset recipes](api_reference.md#dataset-recipes) | Recipe entry fields, `text_field` vs `text_fields`, and why the projection is part of recipe identity |
 | [API Reference](api_reference.md) | Full class and method signatures |
 | [Changelog](CHANGELOG.md) | History of changes |

@@ -11,6 +11,14 @@ What was actually built, and where it departed from this note:
   framed the choice as "should identity-for-the-taxonomy and identity-for-the-cache be
   the same string"; the answer was that the taxonomy never needed the hash for labels
   (it keys on the config-block name), so identity could become purely content-addressed.
+- **`{recipe_type, datasets}` later grew a text-projection component (item 11).** An
+  entry may compose several columns (`text_fields` + `text_separator`) instead of
+  naming one (`text_field`), and since `to_dict()` feeds the hash, the composed
+  mixture is a distinct recipe with its own directory and draws. The keys are omitted
+  when unset, so the 6 hashes recorded here did not move — a composed `recipe.json`
+  just carries an unused `text_field` alongside the live `text_fields`. Because draws
+  store source *indices*, not text, a stored draw is projection-agnostic: the
+  composition is applied when rows are rehydrated, never baked into the cache.
 - **The row-ordering / prefix-nesting scheme below was not built, and is now moot.**
   It was the way to get 2.07 GiB → 0.87 GiB. Storing source indices instead gets
   2.07 GiB → 39 MiB without touching the sampler at all, which also avoided the

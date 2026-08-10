@@ -154,17 +154,28 @@ Guard this at the level above: `_functional_matrix` resolves one draw for the
 whole collection and refuses when several are present, and the `functional_repr`
 availability token is only exact when `scan_cache` is given a draw.
 
-One gap remains, and it is worth knowing about because it is silent:
-`CollectionCache.collection_hash()` keys on `(model_ids, taxonomy, metric)` only.
-The functional selector — draw, layers, view, **normalization** — is not in it,
-so a collection built before this change still returns its `global` matrix from
-cache no matter what selector you pass. `build_taxonomy_artifacts`' docstring
-flags the same caveat for `behavioral_selector`. To re-measure under a
-different normalization, bypass the collection cache or clear the entry.
+There used to be a silent gap here — `CollectionCache.collection_hash()` keyed on
+`(model_ids, taxonomy, metric)` only, so the functional selector (draw, layers,
+view, **normalization**) was not in it and a collection built under one still
+returned its `global` matrix whatever selector you passed. **Closed by TODO item
+14:** the key is now `{taxonomy}/{collection_key}/{metric}_{surrogate_key}`, where
+`surrogate_key` digests each model's resolved surrogate hash — so two
+normalizations are two directories. To re-measure without touching the cache at
+all, pass `use_cache=False` or call `_compute_distance_matrix` directly.
 
-Measured after the item-13 re-key, and worth recording because it separates the
-two hazards: rebuilding the one stored functional collection reproduces it to
-**4.09e-10** under `normalize="global"` — float reassociation, nothing more — and
-differs by **1.13e-03** under the current `layer` default. So the stored entry is
-intact and was built under `global`; the visible gap is entirely this
-`collection_hash` blind spot (TODO item 14), not drift in the activations.
+Measured after the item-13 re-key and re-confirmed through the new key, and worth
+recording because it separates the two hazards: rebuilding the one stored
+functional collection reproduces it to **4.09e-10** under `normalize="global"`
+and differs by **1.13e-03** under the current `layer` default. So the stored entry
+was intact and was built under `global`; the visible gap was entirely the old
+key's blind spot, not drift in the activations.
+
+That 4e-10 was recorded here as "float reassociation, nothing more". It is
+actually the **float32 storage round-trip**: `save_distance_matrix` casts to
+float32 and `load_distance_matrix` casts back to float64. Measured directly, a
+cache *hit* differs from a fresh computation by max|Δ| 4.5e-10 on values of order
+1.1e-2 — a relative 4e-8, which is float32 epsilon, and the same order as the
+"agreement" above. Harmless at these magnitudes, but it means **a hit and a miss
+do not return bit-identical numbers**, so compare distance matrices with a
+tolerance rather than `array_equal`. This was invisible while the metric-name bug
+meant `"cka"` collections never hit at all.

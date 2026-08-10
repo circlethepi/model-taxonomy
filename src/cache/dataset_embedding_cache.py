@@ -250,11 +250,21 @@ class DatasetEmbeddingCache:
         tensors = load_file(str(d / "surrogate.safetensors"))
         matrix = tensors["matrix"]
         meta = json.loads(tensors["_meta_json"].tobytes().decode("utf-8"))
+        metadata = dict(meta.get("metadata", {}))
+        # What identifies this read to CollectionCache — see the matching note in
+        # ActivationCache.load.  The artifact path stops at the embedder, since
+        # that is where this stage's surrogates branch off.
+        metadata["artifact_path"] = (
+            self.entry_dir(recipe_hash, n_samples, seed, embedder_hash)
+            .relative_to(self.root)
+            .as_posix()
+        )
+        metadata["surrogate_hash"] = self.surrogate_hash(spec)
         return ModelRepresentation(
             model_id=meta["model_id"],
             taxonomy=meta["taxonomy"],
             matrix=matrix,
-            metadata=meta.get("metadata", {}),
+            metadata=metadata,
             cache_key="",
         )
 

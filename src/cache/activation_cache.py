@@ -357,6 +357,15 @@ class ActivationCache(DrawKeyedCache):
                 # than silently computing (H Hᵀ)² — see KERNEL_VIEWS.
                 "is_kernel": view in self.KERNEL_VIEWS,
                 "surrogate_cached": cached,
+                # What identifies this read to CollectionCache: where the stored
+                # artifact lives (relative to the cache root) and which view of it
+                # was taken.  Surfaced here so the collection key is built from
+                # what was actually resolved, rather than from the caller's
+                # possibly-underspecified selector.
+                "artifact_path": self.artifact_path(
+                    base_model_id, adapter_id, query_key
+                ),
+                "surrogate_hash": self.config_hash(spec),
             },
             cache_key=f"{adapter_slug(adapter_id)}/{self.draw_name(query_key)}/{self.config_hash(spec)}",
         )

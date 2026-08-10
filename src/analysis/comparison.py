@@ -105,6 +105,7 @@ def build_taxonomy_artifacts(
     functional_selector: dict | None = None,
     id_scheme: str = "recipe_id",
     mds_kwargs: Mapping[str, Any] | None = None,
+    use_cache: bool = True,
 ) -> tuple[DistanceMatrix, dict[str, GeometryResult]]:
     """Distance matrix plus embeddings for one taxonomy over one collection.
 
@@ -182,17 +183,28 @@ def build_taxonomy_artifacts(
         ``layers`` is a read-time choice — a run stores every layer — so changing
         it costs a surrogate build, not a GPU pass.
 
-    .. warning::
-       **The collection cache does not see either selector.**
-       ``CollectionCache.collection_hash`` keys on ``(ids, taxonomy, metric)``
-       alone, so a collection built under one draw, view or normalization is
-       returned unchanged for a different one — silently.  This predates the
-       selectors and applies equally to ``embedder_hash``; it is
-       ``docs/notes/TODO.md`` item 14, deliberately not fixed here because the
-       fix invalidates every stored collection.  Until then, switching selectors
-       at one metric wants a fresh ``cache_root`` or a cleared entry.  Widening
-       ``behavioral_config_hash`` into a full selector makes this bite harder,
-       since there are now more ways for two collections to differ invisibly.
+    use_cache:
+        ``False`` skips ``06_collections`` entirely — nothing is read and nothing
+        is written.  ``cache_root=None`` does **not** do this: it falls back to
+        ``index.cache_root``, which a ``scan_cache`` index always carries, so a
+        caller meaning "just compute" wrote to the shared cache anyway.  That
+        fallback is load-bearing for callers that rely on inheriting the root, so
+        the escape hatch is its own flag rather than a change of meaning.
+
+    .. note::
+       **The collection key sees the selectors, via what they resolve to.**
+       A collection is keyed on ``{taxonomy}/{collection_key}/{metric}_{surrogate_key}``,
+       where ``collection_key`` hashes each model's stored artifact path and
+       ``surrogate_key`` hashes the per-model surrogate hashes.  So two calls
+       differing in draw, embedder, view, normalization, pooling or replicate
+       reduction land in different directories, and two calls that read the same
+       tensors share one even if they spelled the selector differently.
+
+       This was ``docs/notes/TODO.md`` item 14: the key used to be
+       ``(ids, taxonomy, metric)``, so a collection built under one selector was
+       returned unchanged for another, silently.  Entries written under the old
+       key are not readable under the new one and were quarantined rather than
+       migrated — their recorded provenance was too thin to rehash faithfully.
     id_scheme:
         ``"recipe_id"`` (default) keys the result by training recipe, which is the
         namespace every taxonomy shares.  Use ``"model_id"`` when a collection
@@ -205,37 +217,89 @@ def build_taxonomy_artifacts(
         raise ValueError(f"id_scheme must be 'recipe_id' or 'model_id', got {id_scheme!r}")
 
     ids = _resolve_ids(index, id_scheme)
-    cache = _collection_cache(cache_root or index.cache_root)
+    cache = _collection_cache(cache_root or index.cache_root) if use_cache else None
+
+    # Resolve first, then key.  The representations have to be loaded either way,
+    # and only once they are do we know which artifact and which view each model
+    # actually resolved to — which is what the collection is keyed on.  The cache
+    # then saves the pairwise computation, which is the expensive part.
+    reps, identity = _resolve_representations(
+        index, taxonomy,
+        layers=layers, projections=projections, embedder_hash=embedder_hash,
+        dataset_selector=dataset_selector,
+        behavioral_selector=behavioral_selector,
+        functional_selector=functional_selector,
+    )
+    model_entries = [{**ident, "model_id": i} for i, ident in zip(ids, identity)]
 
     dm: DistanceMatrix | None = None
-    chash: str | None = None
+    handle: str | None = None
     if cache is not None:
-        chash = cache.collection_hash(ids, taxonomy, _metric_name(metric))
-        if cache.exists(chash):
-            dm = cache.load_distance_matrix(chash)
+        # The metric name is resolved once here.  Looking up under the caller's
+        # spelling ("cka") while saving under the metric's own ("cka_linear") meant
+        # such a collection was stored where it was never sought, so it never hit
+        # and rewrote its directory on every run.
+        metric_name = _resolve_metric(metric).metric_name
+        handle = cache.handle(
+            taxonomy,
+            cache.collection_key(model_entries),
+            metric_name,
+            cache.surrogate_key([e["surrogate_hash"] for e in model_entries]),
+        )
+        if cache.exists(handle):
+            dm = cache.load_distance_matrix(handle)
 
     if dm is None:
-        dm = _compute_distance_matrix(
-            index, taxonomy, metric, ids,
-            layers=layers, projections=projections, embedder_hash=embedder_hash,
-            dataset_selector=dataset_selector,
-            behavioral_selector=behavioral_selector,
-            functional_selector=functional_selector,
-        )
+        dm = _distances(index, taxonomy, metric, ids, reps, layers, projections)
         if cache is not None:
-            chash = cache.save_distance_matrix(
+            cache.save_distance_matrix(
                 dm,
-                model_entries=[
-                    {"model_id": i, "entry_type": "lora_adapter" if e.adapter_dir else "recipe",
-                     "adapter_name": e.adapter_name, "recipe_hash": e.recipe_hash}
-                    for i, e in zip(ids, index.entries)
-                ],
+                handle,
+                model_entries=model_entries,
                 label=label,
                 slice_key=slice_key,
+                config=_leaf_config(
+                    taxonomy, reps, model_entries,
+                    layers=layers, projections=projections,
+                    embedder_hash=embedder_hash,
+                    dataset_selector=dataset_selector,
+                    behavioral_selector=behavioral_selector,
+                    functional_selector=functional_selector,
+                ),
             )
 
-    geometries = _fit_geometries(dm, n_components, cache, chash, mds_kwargs)
+    geometries = _fit_geometries(dm, n_components, cache, handle, mds_kwargs)
     return dm, geometries
+
+
+def _leaf_config(taxonomy, reps, model_entries, **selectors) -> dict:
+    """What the leaf ``config.json`` records, so a collection stays traceable.
+
+    The directory name is a digest of the per-model surrogate hashes, so the list
+    itself has to be written down: it is the only way back from a collection to
+    the exact tensors it was built from.
+    """
+    return {
+        "taxonomy": taxonomy,
+        "selectors": {k: v for k, v in selectors.items() if v is not None},
+        "representations": [
+            {
+                "model_id": e["model_id"],
+                "artifact_path": e["artifact_path"],
+                "surrogate_hash": e["surrogate_hash"],
+            }
+            for e in model_entries
+        ],
+        "resolved": (reps[0].metadata if reps else {}) and {
+            k: v
+            for k, v in (reps[0].metadata or {}).items()
+            # The shared read-time view.  Per-model values (paths, hashes, the
+            # generated text itself) are listed above or are far too large.
+            if k in ("mode", "pooling", "layers", "view", "normalize",
+                     "replicate_reduction", "embedder_hash", "max_new_tokens",
+                     "replicates", "sampling_hash", "is_kernel")
+        },
+    }
 
 
 def _resolve_ids(index: CacheIndex, id_scheme: str) -> list[ModelID]:
@@ -277,11 +341,22 @@ def _resolve_metric(metric: Any):
         "cosine": CosineDistanceMetric,
         "dot_product": DotProductDistanceMetric,
     }
-    if metric not in table:
-        raise ValueError(
-            f"unknown metric {metric!r}. Choose from {sorted(table)}."
-        )
-    return table[metric]()
+    if metric in table:
+        return table[metric]()
+
+    # A metric answers to two names: the token you select it by ("cka") and the
+    # one it reports ("cka_linear"), which is what gets stored on a DistanceMatrix.
+    # Accepting both is what lets a stored matrix be re-resolved from its own
+    # record. Not doing so is how the collection cache came to look collections up
+    # under one spelling and save them under the other, so that they never hit.
+    by_reported = {cls().metric_name: cls for cls in table.values()}
+    if metric in by_reported:
+        return by_reported[metric]()
+
+    raise ValueError(
+        f"unknown metric {metric!r}. Choose from {sorted(table)} "
+        f"(or a reported name: {sorted(by_reported)})."
+    )
 
 
 def _collection_cache(cache_root: Path | str | None):
@@ -314,13 +389,13 @@ def _fit_geometries(
         geo = None
         if cache is not None and chash is not None:
             try:
-                geo = cache.load_geometry(chash, "mds", n)
+                geo = cache.load_geometry(chash, "mds", n, mds_kwargs=kwargs)
             except (FileNotFoundError, ValueError, KeyError):
                 geo = None
         if geo is None:
             geo = fit_geometry(dm, method="mds", n_components=n, **kwargs)
             if cache is not None and chash is not None:
-                cache.save_geometry(chash, geo)
+                cache.save_geometry(chash, geo, mds_kwargs=kwargs)
         out[key] = geo
     if not out:
         raise ValueError(
@@ -342,19 +417,152 @@ def _compute_distance_matrix(
     behavioral_selector: dict | None = None,
     functional_selector: dict | None = None,
 ) -> DistanceMatrix:
+    """Distances for one taxonomy, always recomputed.
+
+    The selector-faithful path: it honours every selector on every call and never
+    reads or writes ``06_collections``.  :func:`build_taxonomy_artifacts` goes
+    through the cache instead; this is what to call to sweep selectors without
+    populating it.
+    """
+    reps, _ = _resolve_representations(
+        index, taxonomy, layers=layers, projections=projections,
+        embedder_hash=embedder_hash, dataset_selector=dataset_selector,
+        behavioral_selector=behavioral_selector,
+        functional_selector=functional_selector,
+    )
+    return _distances(index, taxonomy, metric, ids, reps, layers, projections)
+
+
+#: Selector keys per taxonomy, for resolving one model's representation.
+_TAXONOMIES = ("structural", "dataset_embedding", "functional", "behavioral")
+
+
+def _resolve_representations(
+    index: CacheIndex,
+    taxonomy: str,
+    *,
+    layers=None,
+    projections=None,
+    embedder_hash: str | None = None,
+    dataset_selector: dict | None = None,
+    behavioral_selector: dict | None = None,
+    functional_selector: dict | None = None,
+) -> tuple[list | None, list[dict]]:
+    """Resolve what each model's representation *is*, before any distance is computed.
+
+    Returns ``(reps, identity)``.  ``identity`` is one dict per model in
+    ``index.entries`` order, carrying the ``artifact_path`` and
+    ``surrogate_hash`` that key the collection — this is the ground truth the
+    collection cache is keyed on, rather than the caller's selector, which may be
+    underspecified (``{}`` and ``{"draw": ...}`` are the same read).
+
+    ``reps`` is ``None`` for **structural** only.  Structural gets the same
+    resolution seam and the same identity shape as the other three, but its
+    distances still come from the low-rank builders in
+    :mod:`src.notebook.structure`, which read the LoRA factors themselves and
+    never form ``B @ A``.  That is the one remaining special case, and it closes
+    with ``docs/notes/TODO.md`` item 8: once :mod:`src.metrics` handles
+    variable-length representation rows, structural returns real representations
+    here and only :func:`_distances` changes.
+    """
     if taxonomy == "structural":
-        return _structural_matrix(index, metric, ids, layers, projections)
+        return None, _structural_identity(index, layers, projections)
     if taxonomy == "dataset_embedding":
-        return _dataset_embedding_matrix(
-            index, metric, ids, embedder_hash, dataset_selector
+        reps = _dataset_embedding_reps(index, embedder_hash, dataset_selector)
+    elif taxonomy == "behavioral":
+        reps = _behavioral_reps(index, behavioral_selector)
+    elif taxonomy == "functional":
+        reps = _functional_reps(index, functional_selector)
+    else:
+        raise ValueError(
+            f"unknown taxonomy {taxonomy!r}. Choose from {', '.join(_TAXONOMIES)}."
         )
-    if taxonomy == "behavioral":
-        return _behavioral_matrix(index, metric, ids, behavioral_selector)
-    if taxonomy == "functional":
-        return _functional_matrix(index, metric, ids, functional_selector)
-    raise ValueError(
-        f"unknown taxonomy {taxonomy!r}. Choose from structural, "
-        "dataset_embedding, functional, behavioral."
+    return reps, _identity_from_reps(index, reps, taxonomy)
+
+
+def _identity_from_reps(
+    index: CacheIndex, reps: Sequence, taxonomy: str
+) -> list[dict]:
+    """One identity dict per model, read off what the caches actually resolved."""
+    out = []
+    for entry, rep in zip(index.entries, reps):
+        meta = rep.metadata or {}
+        path = meta.get("artifact_path")
+        if path is None:
+            raise ValueError(
+                f"the {taxonomy} cache returned a representation for "
+                f"{entry.model_id!r} with no 'artifact_path' in its metadata, so "
+                "the collection it belongs to cannot be keyed on what it was "
+                "built from. Every cache's load() must surface artifact_path and "
+                "surrogate_hash — see TODO.md item 14."
+            )
+        out.append(
+            {
+                "model_id": None,  # filled in by the caller, which knows id_scheme
+                "entry_type": "lora_adapter" if entry.adapter_dir else "recipe",
+                "adapter_name": entry.adapter_name,
+                "recipe_hash": entry.recipe_hash,
+                "artifact_path": path,
+                "surrogate_hash": meta.get("surrogate_hash"),
+            }
+        )
+    return out
+
+
+def _structural_identity(index: CacheIndex, layers, projections) -> list[dict]:
+    """Identity for the structural level, from the adapter files it reads.
+
+    Structural has no surrogate, so the read-time choice (*layers*,
+    *projections*) plays that role: it is what two structural collections over
+    the same adapters can differ by.
+    """
+    from src.cache._draw_keyed import DrawKeyedCache
+
+    view = DrawKeyedCache.config_hash(
+        {
+            "kind": "structural_view",
+            "layers": layers if layers is not None else "last",
+            "projections": projections if projections is not None else "o",
+        }
+    )
+    return [
+        {
+            "model_id": None,
+            "entry_type": "lora_adapter" if entry.adapter_dir else "recipe",
+            "adapter_name": entry.adapter_name,
+            "recipe_hash": entry.recipe_hash,
+            "artifact_path": f"03_adapters/{entry.adapter_name}",
+            "surrogate_hash": view,
+        }
+        for entry in index.entries
+    ]
+
+
+def _distances(
+    index: CacheIndex,
+    taxonomy: str,
+    metric: Any,
+    ids: Sequence[ModelID],
+    reps: Sequence | None,
+    layers=None,
+    projections=None,
+) -> DistanceMatrix:
+    """Pairwise distances from resolved representations."""
+    if reps is None:
+        return _structural_matrix(index, metric, ids, layers, projections)
+
+    metric_obj = _resolve_metric(metric)
+    n = len(reps)
+    arr = np.zeros((n, n), dtype=np.float64)
+    for i in range(n):
+        for j in range(i + 1, n):
+            arr[i, j] = arr[j, i] = metric_obj.compute(reps[i], reps[j])
+
+    return DistanceMatrix(
+        matrix=arr,
+        model_ids=list(ids),
+        metric=metric_obj.metric_name,
+        taxonomy=taxonomy,
     )
 
 
@@ -397,14 +605,17 @@ def _structural_matrix(
     return relabel(dm, rename)
 
 
-def _dataset_embedding_matrix(
+def _dataset_embedding_reps(
     index: CacheIndex,
-    metric: Any,
-    ids: Sequence[ModelID],
     embedder_hash: str | None,
     dataset_selector: dict | None = None,
-) -> DistanceMatrix:
-    """Pairwise distances over cached dataset embeddings."""
+) -> list:
+    """Resolve each model's cached dataset embedding.
+
+    Returns the representations rather than a distance matrix: the collection
+    key is built from what these resolved to, so resolution has to happen before
+    the cache is consulted (``docs/notes/TODO.md`` item 14).
+    """
     from src.cache.dataset_embedding_cache import DatasetEmbeddingCache
 
     root = index.cache_root
@@ -440,27 +651,15 @@ def _dataset_embedding_matrix(
             cache.load(entry.recipe_hash, entry.n_samples, entry.seed, chosen, spec)
         )
 
-    metric_obj = _resolve_metric(metric)
-    n = len(reps)
-    arr = np.zeros((n, n), dtype=np.float64)
-    for i in range(n):
-        for j in range(i + 1, n):
-            arr[i, j] = arr[j, i] = metric_obj.compute(reps[i], reps[j])
-
-    return DistanceMatrix(
-        matrix=arr,
-        model_ids=list(ids),
-        metric=metric_obj.metric_name,
-        taxonomy="dataset_embedding",
-    )
+    return reps
 
 
-def _behavioral_matrix(
-    index: CacheIndex, metric: Any, ids: Sequence[ModelID], selector: dict | None
-) -> DistanceMatrix:
-    """Pairwise distances over cached behavioral representations.
+def _behavioral_reps(
+    index: CacheIndex, selector: dict | None
+) -> list:
+    """Resolve each model's cached behavioral representation.
 
-    Mirrors :func:`_functional_matrix`, because since the re-key the two levels
+    Mirrors :func:`_functional_reps`, because since the re-key the two levels
     are addressed identically.  A selector names the draw and the variant, then
     optionally pools what comes back::
 
@@ -561,19 +760,7 @@ def _behavioral_matrix(
             ) from None
         reps.append(_behavioral_view(rep, sel, view=view))
 
-    metric_obj = _resolve_metric(metric)
-    n = len(reps)
-    arr = np.zeros((n, n), dtype=np.float64)
-    for i in range(n):
-        for j in range(i + 1, n):
-            arr[i, j] = arr[j, i] = metric_obj.compute(reps[i], reps[j])
-
-    return DistanceMatrix(
-        matrix=arr,
-        model_ids=list(ids),
-        metric=metric_obj.metric_name,
-        taxonomy="behavioral",
-    )
+    return reps
 
 
 _BEHAVIORAL_REPRESENTATIONS = ("matrix", "mean")
@@ -637,10 +824,10 @@ def _behavioral_view(rep, selector: dict, view: str = "matrix"):
     )
 
 
-def _functional_matrix(
-    index: CacheIndex, metric: Any, ids: Sequence[ModelID], selector: dict | None
-) -> DistanceMatrix:
-    """Pairwise distances over cached activations.
+def _functional_reps(
+    index: CacheIndex, selector: dict | None
+) -> list:
+    """Resolve each model's cached activations.
 
     Unlike behavioral, functional is keyed by *model* rather than by run, so the
     choice is not a single config hash.  A selector names the draw and the view::
@@ -662,6 +849,20 @@ def _functional_matrix(
 
     cache = ActivationCache(root)
     sel = dict(selector or {})
+    unknown = set(sel) - {
+        "draw", "mode", "pooling", "layers", "view", "normalize", "max_new_tokens",
+    }
+    if unknown:
+        # Mirrors the behavioral check below.  Without it a misspelled key —
+        # "normalise", or "layer" for "layers" — silently fell through to the
+        # default, so you measured all 29 layers concatenated while believing you
+        # had asked for one.  That now also produces a *correct* cache key for the
+        # default view, which would make the wrong answer permanent.
+        raise ValueError(
+            f"unknown functional_selector key(s) {sorted(unknown)}. Choose from "
+            "'draw', 'mode', 'pooling', 'layers', 'view', 'normalize', "
+            "'max_new_tokens'."
+        )
     mode = sel.get("mode", "input")
     pooling = sel.get("pooling", "mean")
     view = sel.get("view", "concat")
@@ -696,19 +897,7 @@ def _functional_matrix(
                 "Filter with index.with_available('functional_repr')."
             ) from None
 
-    metric_obj = _resolve_metric(metric)
-    n = len(reps)
-    arr = np.zeros((n, n), dtype=np.float64)
-    for i in range(n):
-        for j in range(i + 1, n):
-            arr[i, j] = arr[j, i] = metric_obj.compute(reps[i], reps[j])
-
-    return DistanceMatrix(
-        matrix=arr,
-        model_ids=list(ids),
-        metric=metric_obj.metric_name,
-        taxonomy="functional",
-    )
+    return reps
 
 
 def _draw_choice(cache, index: CacheIndex, taxonomy: str, extract_flag: str) -> dict:

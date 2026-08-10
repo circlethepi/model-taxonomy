@@ -34,7 +34,7 @@ Dependencies are called out in the State column.
 
 | ~~13~~ | ~~The two inference caches diverge on three axes~~ | this row; see also 9, 14 | **Done — all three axes, and (b) was worse than this row claimed.** **(a)** unified: `05_generated` is now model-wise, sharing `{base}/{adapter}/{recipe_hash}/n{n}_s{seed}/` with `04_activations` via a new `src/cache/_draw_keyed.py::DrawKeyedCache`. The row said this was "not obviously worth unifying"; it was, because fixing (b) *is* a migration of the model key and doing it twice would have cost the same twice. **(b)** fixed. The row said moving the cache root would orphan the entries — in fact **they were already orphaned**: the stored `model_id`s were *relative* paths, so `behavioral_repr` resolved to **0 hits across all 25 adapters × 2 configs** while 10 representations sat readable on disk. It went unnoticed because both checks touching behavioral bypassed the broken path — one read by config hash, the other excluded behavioral unless exactly one config existed, and there were two — so the level had **never** been exercised end to end. It now is, and `behavioral_repr` resolves to 5 from any cwd and from a relative root. **(c)** kept **as this row wrote it**: no query text is stored. A draft of the fix proposed inverting it, on the grounds that `text_field` is a read-time projection outside `recipe_hash`. That is false — `ClassDatasetEntry.to_dict()` includes `text_field`, `_canonical()` hashes the entries, so `(recipe_hash, n_samples, seed)` *does* determine the text. `_replay_queries` guessing the column was a bug in `_replay_queries`, now reading `text_field` from `recipe.json`. **Do not re-propose storing query text.** Also: `model_slug` is gone (its one live use was an in-memory PEFT adapter name, now `_hf_inference._adapter_name`), `source_indices` is populated rather than always empty, and `compare_all_slices` finally forwards the selectors it never had. Migrated by `scripts/migrate_behavioral_layout.py` (`--dry-run`/`--apply`/`--revert`): 10 entries byte-identical, 5 sharing coordinates with `04_activations`, 128 stored query strings dropped as redundant. |
 
-| 14 | **`CollectionCache.collection_hash()` ignores the taxonomy selector** | this row; see also 9, 13 | `collection_hash(model_ids, taxonomy, metric)` is the whole key, so everything that actually determines a functional matrix — draw, layers, view, **normalization** — is invisible to it, and the same for `behavioral_selector` (which since item 13 is a full selector rather than one config hash, so there are now *more* ways for two collections to differ invisibly). A cached collection is therefore returned for a selector it was not built with, silently. **Quantified** while verifying item 13: rebuilding the single stored functional collection reproduces it to **4.09e-10** under `normalize="global"` and differs by **1.13e-03** under today's `layer` default — so the stored entry is intact and this hash blind spot is the whole of the discrepancy. This was latent while there was one way to build each matrix; it stopped being latent when `normalize` gained modes and the default moved to `layer`, since every collection stored before that keeps serving `global` numbers. `build_taxonomy_artifacts` documents the hazard but cannot avoid it. **Fix:** fold the resolved selector into the hash. **Cost:** invalidates every stored collection, which is why it was not done alongside the normalization change — it is a separate decision about throwing away cached work. **Workaround today:** call `_compute_distance_matrix` directly, as `docs/notes/TODO.md`'s re-measurement did. |
+| ~~14~~ | ~~`CollectionCache.collection_hash()` ignores the taxonomy selector~~ | this row; see also 9, 13 | **Done.** The key is now `{taxonomy}/{collection_key}/{metric}_{surrogate_key}`, built from **what each model actually resolved to** rather than from the caller's selector: `collection_key` hashes the ordered `(model_id, artifact_path)` pairs — the cache-root-relative path, stopping *before* `surrogates/` — and `surrogate_key` hashes the ordered list of per-model surrogate hashes. Selectors are not hashed directly, deliberately: `{}` and `{'draw': ...}` are the same read but different dicts, and `{}` changes meaning once a second draw exists. Every cache's `load()` now surfaces `artifact_path` and `surrogate_hash` in the representation metadata, and `build_taxonomy_artifacts` **resolves before it keys** — the representations are loaded either way, and the cache exists to skip the pairwise computation, which is the expensive part. **The predicted cost did not materialise:** "invalidates every stored collection" was 4 entries and 52 KB, rebuildable on CPU. **Confirmed against the numbers this row recorded:** the quarantined functional entry rebuilds to **4.088e-10** under `normalize="global"` and **1.126e-03** under `layer` — matching 4.09e-10 / 1.13e-03 exactly, so the stored bytes were intact and the blind spot was the whole discrepancy. Pinned by `t_collection_key_sees_selector`, which asserts two normalizations give two directories under **one** `collection_key` and that their matrices differ. **Surrogate hashes are digested as a list, not asserted equal.** They coincide today — 13 of 13 functional surrogates are present for all 5 adapters, because a surrogate spec carries the shared *query* draw's recipe hash, not the model's training recipe — but that is a property of the data, and it breaks as soon as models are extracted against different query datasets. **Also fixed here:** the metric-name mismatch (lookup used `'cka'`, save used `'cka_linear'`, so such a collection never hit and rewrote its directory every run — `_resolve_metric` now accepts both spellings); `_fit_geometries` ignoring `mds_kwargs`, so a new `random_state` returned the old coordinates; `_functional_matrix` silently ignoring misspelled selector keys; and `cache_root=None` not disabling the cache, now a separate `use_cache=False`. Quarantined by `scripts/migrate_collection_key.py` (`--apply`/`--compare`/`--prune`/`--revert`): the functional entry was pruned once its rebuild reproduced it; the **three behavioral entries are still quarantined** in `06_collections/_legacy/`, since their `slice` records pre-item-13 vocabulary and their inputs were being rewritten by the item-16 re-extraction. Rebuild and prune them once that has settled. |
 
 | ~~15~~ | ~~`02_dataset_embeddings` hides the draw in a hash~~ | [dataset_embedding_layout.md](dataset_embedding_layout.md) | **Done.** `02` is now `{recipe_hash}/n{n}_s{seed:02d}/{embedder_hash}/surrogates/{hash}/`, matching `04`/`05`; `embedder_hash` keys `embedder_config` alone and `representation` moved into the surrogate spec. **The draw token was unified across three stages, not two** — `01` wrote an unpadded seed while `04`/`05` padded theirs, so `src/cache/_draw.py` now owns the spelling and `01`'s 523 draws were renamed to match. Migration was content-preserving: 523 + 520 verified byte-identical, then pruned; no GPU, no distance changed. Also fixed in passing: `scan_yahoo_cache` reported 1 draw per proportion instead of 94–135 and dropped one proportion entirely. Adds `dataset_selector`, which is one more axis item 14 cannot see.
 
@@ -179,16 +179,28 @@ narrow it further when you want a fast loop:
 
 Run it in the project conda environment (`conda activate taxonomy-env`, the same one
 the SLURM scripts activate) — `numpy` is not installed in the base env, so the
-checks fail at import there. Baseline as of 2026-08-06, after item 15:
-**60 passed, 2 failed, 1 skipped** across 63 registered checks (51 synthetic,
-12 `[data]`), plus 2 `[gpu]` checks behind `--include-gpu`. ⚠️ **The 2 failures are
-not item 15's** and were present before it: PR #7's behavioral migration has been
-merged as *code* but `scripts/migrate_behavioral_layout.py --apply` has never been
-run against the shared cache, so the old run-wise `05_generated/{config_hash}/`
-directories survive and no model-draw exists at both inference levels. Run that
-migration to clear both. The previous line here read 60/0/0 after the item-13
-re-key, which was true of the branch but not of this cache. Both inference levels are
-now populated, so nothing skips; the `[data]` checks for each must **skip**, never
+checks fail at import there. Baseline as of 2026-08-07, after item 14:
+**67 passed, 0 failed, 0 skipped** across 67 registered checks, plus 2 `[gpu]`
+checks behind `--include-gpu`.
+
+⚠️ **The previous entry here was stale in every number, and the stated cause was
+wrong — re-measure rather than trusting this paragraph.** It read "60 passed, 2
+failed, 1 skipped across 63" and blamed the 2 failures on
+`scripts/migrate_behavioral_layout.py --apply` never having been run against the
+shared cache. It *had* been run: `05_generated/` is fully model-wise with zero
+old-style run-wise `{config_hash}/` directories. The real state at the start of
+item 14 was **65 passed, 1 failed** across 66, and the one failure was new — the
+item-16 re-extraction had landed a second behavioral variant (`8r`), so
+`t_comparison_end_to_end` named a *draw* but not a *variant* and
+`_behavioral_variant_choice` rightly refused to guess. Fixed by
+`_shared_behavioral_variant`, which picks deterministically.
+
+That is the item-13 lesson recurring for the third time: **a check that assumes
+exactly one of something silently stops exercising the level when a second
+appears.** When adding a check over an inference level, name the variant.
+
+Both inference levels are
+populated, so nothing skips; the `[data]` checks for each must **skip**, never
 pass, whenever their stage directory is absent — verified by hiding `05_generated`,
 which turns exactly 3 `[data]` checks to SKIP and fails none. Earlier baselines:
 54/0/0 after layerwise normalization, 53/0/0 after the functional work, 45/0/1 after the
@@ -256,16 +268,19 @@ layers"; under `layer` they count as much as any other. That — not depth — i
 what the new default changes here, and it cuts both ways, since it also amplifies
 a near-zero-norm layer and whatever noise it carries up to parity.
 
-⚠️ **`CollectionCache` does not see the selector.** `collection_hash()` keys on
-`(model_ids, taxonomy, metric)`, so the draw, layers, view and normalization are
-not in it: a collection built before this change keeps returning its `global`
-matrix whatever selector is passed. The figures above were produced by going
-through `_compute_distance_matrix` directly. The `[data]` check's cross-taxonomy
-table still prints the cached 0.382 for the same reason. `build_taxonomy_artifacts`
-already documents this caveat for `behavioral_config_hash`; it now bites harder,
-since the *default* changed underneath the cached entries. **Worth fixing** —
-folding the selector into `collection_hash` is the obvious move, and it is not
-done here because it invalidates every stored collection.
+✅ **`CollectionCache` now sees the selector — this caveat is closed (item 14).**
+It read: `collection_hash()` keys on `(model_ids, taxonomy, metric)`, so the
+draw, layers, view and normalization are not in it, and a collection built before
+the normalization change keeps returning its `global` matrix whatever selector is
+passed. The figures above were therefore produced by going through
+`_compute_distance_matrix` directly, which is still the right call for a sweep
+you do not want cached (or pass `use_cache=False`).
+
+The key is now `{taxonomy}/{collection_key}/{metric}_{surrogate_key}`, so the two
+normalizations are two directories. The `global`/`layer` pair in the table above
+was re-derived through the new key as part of that work and reproduces to
+**4.088e-10** and **1.126e-03** respectively — i.e. the numbers in this section
+stand, and the stored entry they came from was intact all along.
 
 **The caveat worth carrying forward: the absolute distances are tiny.** A CKA
 distance of 0.011 is a CKA *similarity* of 0.989 — all five models are nearly

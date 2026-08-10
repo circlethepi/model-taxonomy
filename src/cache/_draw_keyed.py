@@ -147,6 +147,21 @@ class DrawKeyedCache:
             / self.draw_name(query_key)
         )
 
+    def artifact_path(
+        self, base_model_id: str, adapter_id: str, query_key: dict
+    ) -> str:
+        """:meth:`draw_dir`, expressed **relative to the cache root**.
+
+        This is what identifies a model's stored artifact in a collection key
+        (``06_collections``).  It must stay relative: an absolute path keys a
+        collection to one working directory, which is the failure item 13
+        records, where every stored ``model_id`` was a path resolved against the
+        wrong root and ``behavioral_repr`` found 0 of 25 adapters.
+        """
+        return self.draw_dir(base_model_id, adapter_id, query_key).relative_to(
+            self.root
+        ).as_posix()
+
     @staticmethod
     def mode_token(mode: str, max_new_tokens: int | None = None) -> str:
         """The stored-mode component of an artifact filename.

@@ -481,17 +481,22 @@ class GeneratedTextCache(DrawKeyedCache):
             replicates, sampling_hash, embedder_hash,
         )
 
+        # Computed unconditionally: it is a pure function of the request, and it
+        # names the view even for the identity triple below, which is stored as
+        # the base artifact rather than as a surrogate.  CollectionCache needs a
+        # view identifier in both cases.
+        spec = {
+            "kind": "behavioral_surrogate",
+            "query_key": query_key,
+            "mode": self.variant_token(max_new_tokens, replicates, sampling_hash),
+            "embedder_hash": embedder_hash,
+            "view": view,
+            "normalize": normalize,
+            "replicate_reduction": replicate_reduction,
+        }
+
         cached = None
         if view != "matrix" or normalize != "none" or replicate_reduction != "all":
-            spec = {
-                "kind": "behavioral_surrogate",
-                "query_key": query_key,
-                "mode": self.variant_token(max_new_tokens, replicates, sampling_hash),
-                "embedder_hash": embedder_hash,
-                "view": view,
-                "normalize": normalize,
-                "replicate_reduction": replicate_reduction,
-            }
             got = self.load_surrogate(base_model_id, adapter_id, query_key, spec)
             cached = got is not None
             if got is None:
@@ -527,6 +532,10 @@ class GeneratedTextCache(DrawKeyedCache):
                 else (n_rows if replicate_reduction == "mean" else n_rows // int(replicates))
             ),
             is_kernel=view in self.KERNEL_VIEWS,
+            # What identifies this read to CollectionCache — see the matching
+            # note in ActivationCache.load.
+            artifact_path=self.artifact_path(base_model_id, adapter_id, query_key),
+            surrogate_hash=self.config_hash(spec),
         )
         if cached is not None:
             metadata["surrogate_cached"] = cached

@@ -361,23 +361,41 @@ def t_dcor_unsigned():
     )
 
 
-@check("dcor: U-centring adds symmetry at n=5, penalising exact agreement")
+@check("dcor: the reference's symmetry floors the p-value at n=5")
 def t_dcor_u_centering_symmetry():
-    """The bias correction costs resolution at five models.
+    """The permutation p-value cannot go below the reference matrix's symmetry.
 
-    U-centring gives the evenly-spaced 1-D truth matrix 8 automorphisms where
-    the raw and doubly-centred matrices have 2 -- it can no longer tell either
-    endpoint from its neighbour.  All 8 tie at dCor = 1 and ties count toward a
-    one-sided p-value, so an *exact* match scores 8/120 while a merely good one
-    scores lower (functional reaches 4/120 on the real slice).
+    If `pi` relabels the U-centred reference `B` onto itself, then
+    `dcor(A, B[pi, pi]) == dcor(A, B)` for *every* `A` -- the two calls receive
+    the same pair of matrices.  So each automorphism contributes a null value
+    tied with the observed one, ties count toward a one-sided p, and
 
-    This was recorded after an earlier draft of this check asserted the
-    opposite -- that 8/120 was a floor nothing could beat.  It is not: p < 0.05
-    is attainable.  The statistic, not the p-value, is what ranks the levels.
+        p >= #Aut(B) / n!
+
+    holds for any `A` whatsoever.  It is a property of the reference alone, not
+    of how well the taxonomy did.
+
+    That bites here because U-centring *adds* symmetry: the evenly-spaced 1-D
+    truth has 2 automorphisms raw and 2 doubly-centred, but 8 U-centred -- it
+    can no longer tell either endpoint from its neighbour.  And the ground truth
+    on the real slices is exactly that matrix (five mixtures at 0, .25, .5, .75,
+    1), so 8/120 ~ 0.067 is a hard floor there and no level can reach p < 0.05
+    however well it recovers the geometry.  `functional` sits on it exactly:
+    dCor* = 0.928 with ge = 8, eq = 8, the automorphism orbit and nothing else.
+
+    Not a universal n=5 floor, though, which is the second half of this check:
+    an unevenly-spaced truth has 4 U-centred automorphisms and reaches 4/120 =
+    0.033.  Escaping the floor needs a less symmetric design or more adapters --
+    it is not something a better taxonomy can do.  Rank the levels by the
+    statistic, not the p-value.
+
+    An earlier draft asserted the opposite -- that some perturbed matrix would
+    beat the exact match's p-value.  The argument above shows that is
+    impossible; it is asserted the other way round below.
     """
     from itertools import permutations
 
-    from src.analysis.matrices import _center, _clean
+    from src.analysis.matrices import _center, _clean, _dcor_from_centered
 
     w = np.array([1.0, 0.75, 0.5, 0.25, 0.0])
     truth = np.abs(w[:, None] - w[None, :])
@@ -399,22 +417,43 @@ def t_dcor_u_centering_symmetry():
     assert abs(res.statistic - 1.0) < 1e-9, res.statistic
     assert abs(res.p_value - u / 120) < 1e-12, res.p_value
 
-    # ...and a *less* perfect match scores strictly better, which is the part
-    # that makes the p-value non-monotone in agreement near the top.
+    # The null it is measured against takes only four distinct values, which is
+    # the same symmetry seen from the other side.
+    B = _center(_clean(truth), True)
+    null = np.unique(np.round(
+        [_dcor_from_centered(B, B[np.ix_(p, p)], True) for p in perms], 9))
+    assert len(null) == 4, (len(null), null)
+
+    # Nothing beats the floor, however the taxonomy is perturbed.  This is the
+    # assertion an earlier draft had backwards.
     rng = np.random.default_rng(4)
-    better = 0
     for _ in range(40):
         noise = rng.normal(scale=0.3, size=(5, 5))
         perturbed = truth + np.abs(0.5 * (noise + noise.T))
         r = dcor_test(as_distance_matrix(ids, perturbed, "euclidean", "synthetic"),
                       dm, n_permutations=999)
-        if r.p_value < res.p_value:
-            better += 1
-    assert better > 0, "expected some perturbed matrix to beat the exact match's p"
+        assert r.p_value >= u / 120 - 1e-12, (
+            f"p={r.p_value} beat the {u}/120 symmetry floor, which is impossible "
+            f"unless dcor stopped being invariant under automorphisms of the "
+            f"reference"
+        )
+
+    # A less symmetric truth has a lower floor, so p < 0.05 *is* reachable at
+    # n=5 -- by changing the design, not by recovering the geometry better.
+    uneven = np.array([1.0, 0.8, 0.45, 0.15, 0.0])
+    t2 = np.abs(uneven[:, None] - uneven[None, :])
+    u2 = autos(_center(_clean(t2), True))
+    dm2 = as_distance_matrix(ids, t2, "euclidean", "synthetic")
+    res2 = dcor_test(dm2, dm2, n_permutations=999)
+    assert u2 < u, (u2, u)
+    assert abs(res2.p_value - u2 / 120) < 1e-12, res2.p_value
+    assert res2.p_value < 0.05, res2.p_value
 
     return (
         f"automorphisms raw={raw} doubled={doubled} u-centred={u}; exact match "
-        f"p={res.p_value:.4f}, beaten by {better}/40 perturbed matrices"
+        f"p={res.p_value:.4f} over a null of {len(null)} distinct values, "
+        f"unbeaten by 40 perturbations; unevenly-spaced truth has {u2} "
+        f"automorphisms and reaches p={res2.p_value:.4f}"
     )
 
 

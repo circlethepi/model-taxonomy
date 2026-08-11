@@ -828,10 +828,17 @@ n_permutations` and sets `exact`.
 Two limits that decide how to read the output:
 
 - **dCor is unsigned.** A taxonomy that recovers the ordering exactly backwards
-  scores 1.0, same as a perfect one. Always report `matrix_correlation` beside it.
-- **On a five-model slice, an exact recovery still scores `p = 8/120 ≈ 0.067`**,
-  because the truth matrix has enough symmetry that 8 relabellings tie it. Nothing
-  reaches `p < 0.05` at that size; it is a design limit, not a weak result.
+  scores 1.0, same as a perfect one. Always report `matrix_correlation` beside it
+  — though note that at the matrix level the signed correlation is blind to
+  reversal too. Only the recovery correlation, downstream of the barycentric
+  projection, sees direction.
+- **The reference matrix's symmetry floors the p-value.** Every relabelling that
+  maps the U-centred reference onto itself contributes a tied null value, so
+  `p >= #Aut(B) / n!` for any input. The ground truth on these slices — five
+  evenly-spaced mixtures — has 8 such relabellings, so an exact recovery scores
+  `p = 8/120 ≈ 0.067` and nothing on that slice reaches `p < 0.05`. It is a
+  property of the design, not a weak result, and not a universal `n = 5` limit:
+  an unevenly-spaced truth has 4 and reaches `0.033`. Rank by the statistic.
 
 ### Identifier reconciliation
 

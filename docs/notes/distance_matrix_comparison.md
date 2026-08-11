@@ -61,22 +61,48 @@ Three things, of which the first two change how the output must be read.
 treats dCor as a strictly better matrix-level statistic. It is not a
 *replacement*: it measures dependence, so a taxonomy that recovers the mixing
 order exactly **backwards** scores `dCor = 1.0`, identically to a perfect one
-(verified on the 1-D truth matrix). That is not a hypothetical — the behavioral
-level does exactly this, and it is the whole content of the 2026-08-05 table in
-`TODO.md`. So the reason to keep Mantel is stronger than "existing figures
-reference it": the **sign** is information dCor structurally cannot carry.
-Pinned by `t_dcor_unsigned`.
+(verified on the 1-D truth matrix). So the reason to keep Mantel is stronger
+than "existing figures reference it": the **sign** is information dCor
+structurally cannot carry. Pinned by `t_dcor_unsigned`.
 
-**2. At five models, no matrix-level test can reach p < 0.05, and that is the
+A caution about *where* the sign lives, because an earlier draft of this note
+got it wrong. The behavioral level's `r = −0.9995` in `TODO.md`'s 2026-08-05
+table is the **recovery** correlation, computed downstream of MDS and the
+barycentric projection. Its `matrix_corr_vs_truth` is **+0.7622** — positive,
+and not an inversion at all. The two are different quantities and reading one
+as the other inverts the conclusion about a whole level. At the matrix level
+*no* statistic sees direction, signed or not: reversing the labelling leaves
+the multiset of pairwise distances alone, so the signed correlation is +1 for
+a perfect recovery and a perfectly reversed one alike. Only the recovery
+correlation can tell them apart.
+
+**2. On these slices no matrix-level test can reach p < 0.05, and that is the
 design's fault rather than the data's.** With `n = 5` there are only 120
-relabellings, which would put the floor at 1/120 ≈ 0.008 — but the ground truth
-on these slices is five evenly-spaced points on a 1-D simplex, and that matrix
-is symmetric enough that **8** of the 120 relabellings attain the maximum. A
-taxonomy reproducing the truth *exactly* therefore scores `p = 8/120 ≈ 0.067`,
-and the entire null takes **4 distinct values**. Read the p-values as ordering
-evidence, never against a 0.05 threshold. This is an argument for more adapters
-per slice, and it applies to PROTEST's permutation p-value for the same reason.
-Pinned by `t_dcor_permutation_floor`.
+relabellings, which would put the floor at 1/120 ≈ 0.008. The real floor is
+higher, and it is set by the *reference* matrix rather than by the taxonomy: if
+a relabelling `π` maps the U-centred truth `B` onto itself, then
+`dcor(A, B[π,π]) = dcor(A, B)` for **every** `A`, so each such automorphism
+contributes a null value tied with the observed one and
+
+```
+p >= #Aut(B) / n!
+```
+
+for any taxonomy whatsoever. The ground truth here is five evenly-spaced points
+on a 1-D simplex (mixture weights 0, .25, .5, .75, 1), which has 2 automorphisms
+raw and 2 doubly-centred — but **8** after U-centring, which can no longer tell
+either endpoint from its neighbour. So the floor is `8/120 ≈ 0.067`, the entire
+null takes **4 distinct values**, and `functional` sits on the floor exactly:
+`dCor* = 0.9285` with 8 null values ≥ observed, all 8 of them ties, i.e. the
+automorphism orbit and nothing else.
+
+This is a property of the reference, not a universal `n = 5` limit: an
+unevenly-spaced truth has 4 U-centred automorphisms and reaches `4/120 = 0.033`.
+Escaping the floor needs more adapters or a less symmetric spacing — it is not
+something a better taxonomy can do. Read the p-values as ordering evidence,
+never against a 0.05 threshold, and rank the levels by the statistic. The same
+argument applies to PROTEST's permutation p-value. Pinned by
+`t_dcor_u_centering_symmetry`.
 
 **3. The bias correction is not optional at this scale.** Measured over 2,000
 draws of two *independent* five-model matrices, the classical V-statistic dCor
@@ -90,22 +116,30 @@ and CKA distances used here are not known to.
 
 ### First numbers on the real slice
 
-Same slice as everything else — 5 adapters, `n_samples=1000, seed=0`, cosine —
-with the two existing columns for comparison:
+Same slice as everything else — 5 adapters, `n_samples=1000, seed=0`, cosine,
+layer 27 — with the two existing columns for comparison. Behavioral reads the
+greedy `1r` variant (`generation128_1r_6f000f01`); since the item-16 replicates
+work there is also an `8r` sampled variant on disk, and the two are not
+comparable, so the row is meaningless without naming which.
 
-| taxonomy | matrix corr | PROTEST p | dCor* | dCor p |
-|---|---|---|---|---|
-| dataset_embedding | 1.0000 | 0.005 | 0.9667 | 0.0667 |
-| functional | 1.0000 | 0.015 | 0.9285 | 0.0667 |
-| structural | 1.0000 | 0.754 → see note | 0.7537 | 0.1000 |
-| behavioral | −1.0000 | 0.955 | 0.3870 | 0.2667 |
+| taxonomy | matrix corr | PROTEST p | dCor* | dCor p | exact |
+|---|---|---|---|---|---|
+| dataset_embedding | 0.8842 | 0.005 | 0.9667 | 0.0667 | yes (120) |
+| functional | 0.7866 | 0.015 | 0.9285 | 0.0667 | yes (120) |
+| structural | 0.7073 | 0.015 | 0.7537 | 0.1000 | yes (120) |
+| behavioral | 0.7622 | 0.955 | 0.3870 | 0.2667 | yes (120) |
 
-Three of the four sit at the 0.0667 floor, so the p-values rank the levels but
-do not test them. The informative column is `dCor*` itself: it separates
-dataset_embedding and functional (≈0.93–0.97) from structural (0.75) and
-behavioral (0.39) — and note that behavioral's 0.39 is *unsigned*, so it is
-weak dependence, not merely inverted dependence. A perfect reversal would have
-scored 1.0.
+Every p-value is exact — `5! = 120 <= n_permutations`, so the null is
+enumerated rather than sampled. Two of the four sit on the 0.0667 symmetry
+floor, so the p-values rank the levels but do not test them.
+
+The informative column is `dCor*` itself: it separates dataset_embedding and
+functional (≈0.93–0.97) from structural (0.75) and behavioral (0.39). Note that
+behavioral's 0.39 is *unsigned*, so it is weak dependence — a perfect reversal
+would have scored 1.0, so this is not "inverted but strong". The `matrix corr`
+column ranks the levels differently from `dCor*` (it puts behavioral above
+functional), which is the practical reason to report both: they are sensitive to
+different departures from the truth.
 
 ---
 

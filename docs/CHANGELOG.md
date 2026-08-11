@@ -30,6 +30,12 @@ training length would otherwise collide on one directory and the second would be
 as already-trained. Epoch-mode adapters keep exactly the names they have, so nothing on
 disk moves.
 
+**`training.n_epochs` now records passes actually made, not the configured value** — under
+a budget `max_steps` overrides `num_train_epochs`, so a run configured for 3 epochs that
+made 10 recorded 3. The request survives as `n_epochs_configured`, and `_build_entry`
+derives the count from `samples_seen / n_samples` rather than trusting the field, which
+reproduces the stored value exactly in epoch mode and corrects it under a budget.
+
 **`CacheEntry` gained `samples_seen` and `n_epochs`**, so `index.filter(samples_seen=…)`
 and `index.slices(by=("samples_seen", "seed"))` work at every taxonomy level — there is
 one `CacheIndex`, narrowed per level by `with_available(...)`. Adapters trained before

@@ -227,7 +227,14 @@ def _finetune_one(
             # in dataset_name still does, but that is a convention, not a guarantee, and
             # CacheIndex has no other fallback for seed.
             "seed": ft_cfg.get("seed", 42),
-            "n_epochs": n_epochs,
+            # Passes actually made over the dataset.  Under a budget this is *not*
+            # the configured n_epochs — max_steps overrides it — so recording the
+            # config value here would claim 3 for a run that made 10, and would
+            # break the n_samples * n_epochs identity that older adapters rely on.
+            "n_epochs": (
+                n_epochs if budget is None
+                else round(samples_seen / len(hf_dataset), 6) if len(hf_dataset) else None
+            ),
             "learning_rate": ft_cfg.get("learning_rate", 2e-4),
             # How much training this adapter actually got, which n_samples and
             # n_epochs together no longer determine once a budget is in play.
@@ -236,6 +243,10 @@ def _finetune_one(
             # differ from the request by up to one optimizer step.
             "total_train_samples": ft_cfg.get("total_train_samples"),
             "total_train_samples_resolved": budget,
+            # The configured value, kept because n_epochs above now reports what
+            # happened rather than what was asked for, and under a budget the two
+            # differ.
+            "n_epochs_configured": n_epochs,
             "max_steps": max_steps,
             "effective_batch_size": eff_batch,
             "samples_seen": samples_seen,

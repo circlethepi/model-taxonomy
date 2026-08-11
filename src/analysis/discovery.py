@@ -479,7 +479,11 @@ def _build_entry(adapter_dir: Path, base_id: str, meta: dict) -> CacheEntry:
         m = _ADAPTER_DIR_RE.match(adapter_dir.name)
         if m and m.group("budget") is not None:
             samples_seen = int(m.group("budget"))
-    if n_epochs is None and samples_seen is not None and n_samples:
+    # Derived, not read, whenever it can be: `max_steps` overrides `num_train_epochs`,
+    # so an adapter trained under a budget may carry a configured n_epochs it never
+    # ran.  samples_seen / n_samples is the count that actually happened, and in
+    # epoch mode it reproduces the stored value exactly.
+    if samples_seen is not None and n_samples:
         n_epochs = samples_seen / n_samples
 
     rank = lora_cfg.get("lora_rank")

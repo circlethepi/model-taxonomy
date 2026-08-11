@@ -785,8 +785,14 @@ def make_metric(name: str):
     elif name == "dot_product":
         from src.metrics.vector import DotProductDistanceMetric
         return DotProductDistanceMetric()
+    elif name == "bures_wasserstein":
+        from src.metrics.bures_wasserstein import BuresWassersteinDistanceMetric
+        return BuresWassersteinDistanceMetric()
     else:
-        raise ValueError(f"Unknown metric: {name!r}. Choose from cka, frobenius, cosine, dot_product.")
+        raise ValueError(
+            f"Unknown metric: {name!r}. Choose from cka, frobenius, cosine, "
+            f"dot_product, bures_wasserstein."
+        )
 
 
 def make_geometry(name: str, n_components: int = 2):

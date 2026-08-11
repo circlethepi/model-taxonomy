@@ -329,6 +329,7 @@ def _resolve_metric(metric: Any):
         return metric
 
     from src.metrics import (
+        BuresWassersteinDistanceMetric,
         CKADistanceMetric,
         CosineDistanceMetric,
         DotProductDistanceMetric,
@@ -340,6 +341,11 @@ def _resolve_metric(metric: Any):
         "frobenius": FrobeniusDistanceMetric,
         "cosine": CosineDistanceMetric,
         "dot_product": DotProductDistanceMetric,
+        # Selectable on the representation path as well as the structural one.
+        # `_structural_matrix` gates on the *reported* name, which is the same
+        # string, so a structural comparison still routes to the low-rank builder
+        # in `src.notebook.structure` rather than through this class.
+        "bures_wasserstein": BuresWassersteinDistanceMetric,
     }
     if metric in table:
         return table[metric]()

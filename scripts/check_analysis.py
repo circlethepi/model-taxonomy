@@ -820,6 +820,132 @@ def t_cosine_equivalence():
     return f"max |low-rank - metric| = {delta:.2e}; padding inert to {abs(d2 - direct[0, 1]):.1e}"
 
 
+@check("bures-wasserstein: metric class equals the low-rank structural builder")
+def t_bures_wasserstein_equivalence():
+    """The port is exact, and this is where that is cheap to show.
+
+    ``bures_wasserstein_distance_matrix`` builds ``M = R A`` from ``B = QR`` and
+    stacks it across blocks; the representation path stacks ``B @ A`` instead.
+    Both are factors of the same covariance — ``MᵀM = AᵀBᵀBA = (BA)ᵀ(BA)`` — and
+    BW depends on the factor only through that covariance, so the identity is
+    exact.
+
+    Checked in two stages, because they have different error floors.  In float64
+    the agreement is at the 1e-13 level, which is the identity itself.  Through
+    ``ModelRepresentation`` it is ~1e-9 relative, and that is not the algorithm:
+    ``__post_init__`` (``src/core/representation.py:37``) coerces every stored
+    matrix to float32, so the metric sees a rounded copy of the factors the
+    structural builder reads at full precision.  Asserting one tolerance for both
+    would either hide the exactness or fail on the storage dtype.
+    """
+    from src.core.representation import ModelRepresentation
+    from src.metrics import BuresWassersteinDistanceMetric
+    from src.notebook.structure import bures_wasserstein_distance_matrix
+
+    weights, blocks = _synthetic_lora(n_adapters=4, d_out=48, d_in=64, rank=4)
+    layers = sorted({l for l, _ in blocks})
+    projs = sorted({p for _, p in blocks})
+    names, low_rank = bures_wasserstein_distance_matrix(
+        weights, layers=layers, projections=projs
+    )
+
+    # One factor per adapter: the dense blocks stacked, which is what the
+    # behavioral/functional levels hand the metric.
+    factors = [
+        np.vstack([weights[name].product(l, p) for l in layers for p in projs])
+        for name in names
+    ]
+    n = len(names)
+    scale = float(np.asarray(low_rank).max())
+
+    def _pairwise(fn):
+        out = np.zeros((n, n))
+        for i in range(n):
+            for j in range(i + 1, n):
+                out[i, j] = out[j, i] = fn(i, j)
+        return out
+
+    # Stage 1: the identity itself, at full precision.
+    def _bw64(i, j):
+        cross = np.linalg.svd(factors[i] @ factors[j].T, compute_uv=False)
+        d2 = np.sum(factors[i] ** 2) + np.sum(factors[j] ** 2) - 2.0 * cross.sum()
+        return float(np.sqrt(max(float(d2), 0.0)))
+
+    exact = _pairwise(_bw64)
+    d_exact = float(np.abs(np.asarray(low_rank) - exact).max()) / scale
+    assert d_exact < 1e-10, f"float64 relative difference {d_exact:.3e} exceeds 1e-10"
+
+    # Stage 2: through the metric class, i.e. through float32 storage.
+    metric = BuresWassersteinDistanceMetric()
+    reps = [
+        ModelRepresentation(model_id=name, taxonomy="structural", matrix=f)
+        for name, f in zip(names, factors)
+    ]
+    assert reps[0].matrix.dtype == np.float32, "storage dtype assumption broke"
+    direct = _pairwise(lambda i, j: metric.compute(reps[i], reps[j]))
+    d_stored = float(np.abs(np.asarray(low_rank) - direct).max()) / scale
+    assert d_stored < 1e-6, f"stored relative difference {d_stored:.3e} exceeds 1e-6"
+
+    return (
+        f"relative to low-rank over {n} adapters: float64 {d_exact:.1e}, "
+        f"float32-stored {d_stored:.1e}"
+    )
+
+
+@check("bures-wasserstein: permutation invariant, scale equivariant")
+def t_bures_wasserstein_invariance():
+    """The property that distinguishes BW from CKA and Frobenius.
+
+    Those two compare row *i* of one model against row *i* of the other and raise
+    if the counts differ.  BW compares Σ = XᵀX, which does not know the row order
+    — so a shuffled copy of a representation is at distance zero from it, and two
+    models may be compared at different row counts.  Both are asserted here
+    because both are load-bearing when the rows are sampled generations rather
+    than an aligned query list.
+    """
+    from src.core.representation import ModelRepresentation
+    from src.metrics import BuresWassersteinDistanceMetric
+
+    rng = np.random.default_rng(11)
+    X = rng.normal(size=(30, 12))
+    metric = BuresWassersteinDistanceMetric()
+
+    def rep(m, mid="m"):
+        return ModelRepresentation(model_id=mid, taxonomy="functional", matrix=m)
+
+    assert metric.compute(rep(X), rep(X)) < 1e-9, "distance to self is not zero"
+
+    shuffled = X[rng.permutation(len(X))]
+    d_perm = metric.compute(rep(X), rep(shuffled, "shuf"))
+    assert d_perm < 1e-9, f"row permutation moved the distance: {d_perm:.3e}"
+
+    # Scale equivariance: X -> cX must scale the distance by |c|.  Tolerance is
+    # relative and set for float32 storage (`ModelRepresentation.__post_init__`
+    # coerces), not for the arithmetic, which is exact in the ideal.
+    Y = rng.normal(size=(30, 12))
+    base = metric.compute(rep(X), rep(Y, "y"))
+    scaled = metric.compute(rep(3.0 * X), rep(3.0 * Y, "y"))
+    rel = abs(scaled - 3.0 * base) / (3.0 * base)
+    assert rel < 1e-6, (
+        f"scaling by 3 gave {scaled:.8f}, expected {3.0 * base:.8f} "
+        f"(relative {rel:.2e})"
+    )
+
+    # Different row counts are allowed, where CKA and Frobenius raise.
+    d_ragged = metric.compute(rep(X), rep(rng.normal(size=(7, 12)), "short"))
+    assert np.isfinite(d_ragged) and d_ragged > 0, d_ragged
+
+    # A mismatched feature dimension is not, and must say so.
+    try:
+        metric.compute(rep(X), rep(rng.normal(size=(30, 5)), "narrow"))
+    except ValueError as exc:
+        assert "feature dimension" in str(exc), str(exc)
+    else:
+        raise AssertionError("mismatched feature dimension did not raise")
+
+    return f"perm {d_perm:.1e}; scale rel {rel:.1e}; ragged {d_ragged:.4f}"
+
+
 @check("[data] cosine: low-rank matrix is well formed on real adapters")
 def t_cosine_real_adapters():
     """Plumbing check on the real cache — deliberately low-rank only.
@@ -3190,6 +3316,7 @@ SYNTHETIC = [
     t_mantel, t_procrustes, t_procrustes_vs_scipy, t_per_point_residuals,
     t_dispersion, t_quality, t_correlation_table, t_match_models, t_fit_geometry,
     t_similarity_conversion, t_simplex_roundtrip, t_cosine_equivalence,
+    t_bures_wasserstein_equivalence, t_bures_wasserstein_invariance,
     t_relabel_collision,
     # ground truth from recipes, and the storage it needs
     t_mixture_weights, t_split_and_whole_rejected, t_simplex_geometry,

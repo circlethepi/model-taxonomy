@@ -172,6 +172,93 @@ def compute_recipe_capacity(recipe, hf_token: str | None = None) -> int:
     return int(effective) if effective != float("inf") else 0
 
 
+# Source sizes are a property of the recipe's content, so one scan per recipe hash
+# serves every adapter trained on it — five in a typical sweep.
+_source_size_cache: dict[str, int] = {}
+
+
+def compute_recipe_source_size(recipe, hf_token: str | None = None) -> int:
+    """Return the total number of rows behind this recipe: one epoch of the
+    constituent data.
+
+    Deliberately a *sum*, not the ``min_c(size_c / w_c)`` that
+    :func:`compute_recipe_capacity` computes.  Capacity answers "how large a draw can
+    this recipe deliver while holding its ratios?"; this answers "how much data is
+    there in total behind it?", which is the natural default training budget:
+
+    * simple entry — the length of its source split;
+    * class-aware entry — the summed full size of every class used, whether or not
+      the draw actually took that many rows from each.
+
+    Weights are ignored on purpose.  This is a size, not a draw.
+    """
+    from collections import Counter
+
+    from src.datasets import source_registry
+    from src.datasets.class_recipe import ClassDatasetEntry
+
+    recipe_hash = recipe.recipe_hash()
+    if recipe_hash in _source_size_cache:
+        return _source_size_cache[recipe_hash]
+
+    total = 0
+    for entry in recipe.datasets:
+        ds = source_registry.get(
+            entry.dataset_id,
+            getattr(entry, "subset", None),
+            getattr(entry, "split", "train"),
+            token=hf_token,
+        )
+
+        if isinstance(entry, ClassDatasetEntry):
+            # One Arrow column scan for every class size, as in
+            # ClassMixedDataset._load_entry — no filter needed, since the classes
+            # that are not used are simply not summed.
+            class_sizes: Counter = Counter(ds[entry.class_field])
+            class_norm_w = entry.normalized_class_weights
+            if class_norm_w is None:
+                # No filter and no weights: every class present is in play.
+                classes_used = list(class_sizes)
+            else:
+                classes_used = [c for c, w in class_norm_w.items() if w > 0]
+            total += sum(class_sizes.get(c, 0) for c in classes_used)
+        else:
+            total += len(ds)
+
+    _source_size_cache[recipe_hash] = total
+    return total
+
+
+def resolve_sample_budget(value, recipe, hf_token: str | None = None) -> int | None:
+    """Resolve ``fine_tuning.total_train_samples`` to a sample count, or None.
+
+    ``None`` means epoch mode — train for ``n_epochs`` passes, as before.  ``"auto"``
+    resolves to :func:`compute_recipe_source_size`.  An integer is taken as given.
+
+    Anything else raises: a typo'd value silently falling back to epoch mode would
+    quietly train a model for a length nobody asked for.
+    """
+    if value is None:
+        return None
+    if isinstance(value, str):
+        if value.lower() != "auto":
+            raise ValueError(
+                f"fine_tuning.total_train_samples must be null, 'auto', or a positive "
+                f"integer; got {value!r}."
+            )
+        return compute_recipe_source_size(recipe, hf_token=hf_token)
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(
+            f"fine_tuning.total_train_samples must be null, 'auto', or a positive "
+            f"integer; got {value!r}."
+        )
+    if value <= 0:
+        raise ValueError(
+            f"fine_tuning.total_train_samples must be positive; got {value}."
+        )
+    return value
+
+
 def load_recipe(path: Path | str):
     """Load DatasetRecipe or ClassAwareDatasetRecipe by inspecting recipe_type."""
     import json as _json
@@ -370,8 +457,54 @@ def get_adapter_root(cfg: dict) -> Path:
     return Path(cfg["output_dir"]) / "adapters"
 
 
-def adapter_dir(adapter_root: Path, base_model_id: str, dataset_name: str, lora_rank: int, lora_init_seed: int = 0) -> Path:
-    return adapter_root / _model_slug(base_model_id) / f"{dataset_name}_r{lora_rank}_i{lora_init_seed:02d}"
+def adapter_dir(
+    adapter_root: Path,
+    base_model_id: str,
+    dataset_name: str,
+    lora_rank: int,
+    lora_init_seed: int = 0,
+    samples_seen: int | None = None,
+) -> Path:
+    """Directory for one adapter: ``{dataset_name}_r{rank}_i{init}[_b{samples_seen}]``.
+
+    The ``_b`` segment appears only when training ran under a sample budget.  Two
+    runs that differ only in budget would otherwise land on the same directory and
+    the second would be skipped as already-trained; adapters trained in epoch mode
+    keep exactly the name they have always had.
+    """
+    name = f"{dataset_name}_r{lora_rank}_i{lora_init_seed:02d}"
+    if samples_seen is not None:
+        name = f"{name}_b{samples_seen}"
+    return adapter_root / _model_slug(base_model_id) / name
+
+
+def retag_adapter_dir(out_dir: Path, samples_seen: int) -> Path:
+    """Rewrite the ``_b{...}`` segment of an adapter directory to *samples_seen*.
+
+    The name has to be chosen before the model is loaded (it is what the
+    already-trained check looks at), but the realized sample count is only known
+    once the Trainer exists — ``n_gpu`` is rewritten during its construction when
+    ``device_map="auto"`` shards the model across devices.  So the name is written
+    from a prediction and corrected here if the prediction was off.
+    """
+    name = re.sub(r"_b\d+$", f"_b{samples_seen}", out_dir.name)
+    return out_dir.with_name(name)
+
+
+def predicted_effective_batch(ft_cfg: dict) -> int:
+    """Effective batch as best it can be known before the Trainer is built.
+
+    ``max(1, device_count)`` is the rule ``TrainingArguments.train_batch_size``
+    applies; the case it cannot anticipate is a model sharded across devices, where
+    Trainer forces ``n_gpu`` back to 1.  Used for the directory name and for
+    ``--dry-run``; the trained adapter is named from what actually happened.
+    """
+    n_gpu = torch.cuda.device_count() if torch.cuda.is_available() else 0
+    return (
+        ft_cfg.get("per_device_train_batch_size", 4)
+        * max(1, n_gpu)
+        * ft_cfg.get("gradient_accumulation_steps", 4)
+    )
 
 
 def discover_adapter_paths(adapter_root: Path) -> list[str]:

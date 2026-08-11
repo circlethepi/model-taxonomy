@@ -54,6 +54,17 @@ fine_tuning:
   target_modules: [q_proj, v_proj]  # transformer sub-modules to apply LoRA to
   lora_dropout: 0.05           # dropout on LoRA weights; 0.0 to disable
   n_epochs: 1                  # number of full passes over the training set
+  # Total samples the model sees during training, decoupled from dataset size: a
+  # 1000-sample dataset with a 10000 budget trains for 10 epochs, a 10-sample one
+  # for 1000.  Overrides n_epochs when set, and may also be set per dataset block.
+  #   null    → off; train for n_epochs, as before
+  #   "auto"  → one epoch of the full source data behind the recipe (the summed
+  #             length of each entry's split, or the summed full size of every
+  #             class used — note this can be far larger than n_samples)
+  #   <int>   → exactly this many samples, rounded to the nearest optimizer step
+  # Adapters trained with a budget get a _b{samples_seen} suffix on their directory,
+  # recording what they actually saw (the budget rounded to a whole optimizer step).
+  total_train_samples: null
   learning_rate: 2.0e-4        # AdamW learning rate
   per_device_train_batch_size: 4
   gradient_accumulation_steps: 4   # effective batch = per_device × accum

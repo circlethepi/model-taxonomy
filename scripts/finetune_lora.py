@@ -5,10 +5,15 @@ Produces one adapter per (base_model, dataset) pair, saved to:
 
 The ``_s{seed}`` suffix in dataset names encodes the data-sampling seed;
 the ``_i{seed}`` suffix in the adapter directory encodes the LoRA init seed.
+A trailing ``_b{samples_seen}`` appears only when ``fine_tuning.total_train_samples``
+set a sample budget, so that two runs differing only in training length do not
+collide.  It records what the model actually saw — the budget rounded to a whole
+optimizer step — not what was requested.
 
 Usage:
     python scripts/finetune_lora.py experiments/example.yaml
     python scripts/finetune_lora.py experiments/example.yaml --force  # overwrite existing
+    python scripts/finetune_lora.py experiments/example.yaml --dry-run  # resolve only
 """
 
 from __future__ import annotations
@@ -32,6 +37,9 @@ from scripts._utils import (
     load_recipe,
     make_mixed_dataset,
     make_sampled_dataset_cache,
+    resolve_sample_budget,
+    predicted_effective_batch,
+    retag_adapter_dir,
 )
 
 
@@ -44,7 +52,12 @@ def _finetune_one(
     token: str | None,
     force: bool = False,
     sample_cache=None,
-) -> None:
+    budget: int | None = None,
+) -> Path | None:
+    """Train one adapter.  Returns the directory it was written to — which is not
+    necessarily *out_dir*, since a budgeted run is named for the samples it actually
+    saw and that is only known once the Trainer exists.  None if it was skipped.
+    """
     import torch
     from datasets import Dataset
     from peft import LoraConfig, get_peft_model, TaskType
@@ -53,9 +66,8 @@ def _finetune_one(
 
     if not force and out_dir.exists() and (out_dir / "adapter_config.json").exists():
         print(f"    Already trained — skipping (use --force to retrain).")
-        return
+        return None
 
-    out_dir.mkdir(parents=True, exist_ok=True)
     torch_dtype = getattr(torch, ft_cfg.get("torch_dtype", "float16"))
 
     print(f"    Loading tokenizer and model...")
@@ -115,9 +127,10 @@ def _finetune_one(
 
     hf_dataset = Dataset.from_list(rows)
 
+    n_epochs = ft_cfg.get("n_epochs", 3)
     sft_cfg = SFTConfig(
         output_dir=str(out_dir),
-        num_train_epochs=ft_cfg.get("n_epochs", 3),
+        num_train_epochs=n_epochs,
         learning_rate=ft_cfg.get("learning_rate", 2e-4),
         per_device_train_batch_size=ft_cfg.get("per_device_train_batch_size", 4),
         gradient_accumulation_steps=ft_cfg.get("gradient_accumulation_steps", 4),
@@ -135,7 +148,55 @@ def _finetune_one(
         args=sft_cfg,
     )
 
-    print(f"    Training ({ft_cfg.get('n_epochs', 3)} epoch(s))...")
+    # Sample budget: how many samples the model sees in total, independent of how
+    # many distinct samples the dataset holds.  Expressed to the Trainer as a step
+    # budget, because that is the only unit it accepts — which means the realized
+    # count quantizes to the effective batch.  Trainer loops the dataloader across
+    # as many epochs as max_steps needs, reshuffling each pass, so a budget far
+    # larger than the dataset simply becomes many epochs.
+    #
+    # Read off trainer.args, not sft_cfg, and only after construction: Trainer
+    # rewrites n_gpu (to 1) when device_map="auto" shards the model, and n_gpu is a
+    # factor of train_batch_size.  This is the true effective batch, so this is the
+    # number the adapter gets named for.  trainer.args *is* sft_cfg, so setting
+    # max_steps here still reaches train().
+    eff_batch = trainer.args.train_batch_size * trainer.args.gradient_accumulation_steps
+    if budget is not None:
+        max_steps = max(1, round(budget / eff_batch))
+        trainer.args.max_steps = max_steps
+        samples_seen = max_steps * eff_batch
+
+        final_dir = retag_adapter_dir(out_dir, samples_seen)
+        if final_dir != out_dir:
+            print(
+                f"    Effective batch is {eff_batch}, not the {predicted_effective_batch(ft_cfg)} "
+                f"assumed when the directory was named; writing to {final_dir.name} instead."
+            )
+            # Trainer creates output_dir on construction; drop the empty one it made
+            # for the name we are no longer using.
+            if out_dir.is_dir() and not any(out_dir.iterdir()):
+                out_dir.rmdir()
+            out_dir = final_dir
+            trainer.args.output_dir = str(out_dir)
+            if not force and (out_dir / "adapter_config.json").exists():
+                print(f"    Already trained at that budget — skipping (use --force to retrain).")
+                return None
+    else:
+        max_steps = None
+        samples_seen = len(hf_dataset) * n_epochs
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    if budget is None:
+        print(f"    Training ({n_epochs} epoch(s), ~{samples_seen} samples seen)...")
+    else:
+        implied_epochs = samples_seen / len(hf_dataset) if len(hf_dataset) else 0.0
+        note = "" if samples_seen == budget else f" (budget {budget} rounded to a step boundary)"
+        print(
+            f"    Training ({max_steps} steps x effective batch {eff_batch} = "
+            f"{samples_seen} samples seen, {implied_epochs:.2f} epoch(s) over "
+            f"{len(hf_dataset)} rows){note}..."
+        )
     trainer.train()
     trainer.save_model(str(out_dir))
 
@@ -166,19 +227,35 @@ def _finetune_one(
             # in dataset_name still does, but that is a convention, not a guarantee, and
             # CacheIndex has no other fallback for seed.
             "seed": ft_cfg.get("seed", 42),
-            "n_epochs": ft_cfg.get("n_epochs", 3),
+            "n_epochs": n_epochs,
             "learning_rate": ft_cfg.get("learning_rate", 2e-4),
+            # How much training this adapter actually got, which n_samples and
+            # n_epochs together no longer determine once a budget is in play.
+            # samples_seen is recorded on both paths so it is a uniform axis to
+            # select models on; under a budget it is the realized count, which may
+            # differ from the request by up to one optimizer step.
+            "total_train_samples": ft_cfg.get("total_train_samples"),
+            "total_train_samples_resolved": budget,
+            "max_steps": max_steps,
+            "effective_batch_size": eff_batch,
+            "samples_seen": samples_seen,
         },
         "trained_at": datetime.now(timezone.utc).isoformat(),
     }
     (out_dir / "experiment_meta.json").write_text(json.dumps(meta, indent=2))
     print(f"    Saved adapter to {out_dir}")
+    return out_dir
 
 
-def finetune_all(cfg: dict, force: bool = False) -> list[Path]:
+def finetune_all(cfg: dict, force: bool = False, dry_run: bool = False) -> list[Path]:
     """Fine-tune all configured (base_model, dataset) pairs.
 
-    Returns a list of adapter directory paths that were produced.
+    Returns a list of adapter directory paths that were produced.  With *dry_run*,
+    resolves each pair's sample budget and output path and prints them without
+    loading a model — the cheap way to check a budget before spending GPU hours on
+    it.  Its step counts come from :func:`predicted_effective_batch`, so on a node
+    where the model ends up sharded across devices the real run uses a different
+    effective batch and lands on a different directory.
     """
     ft_cfg = cfg.get("fine_tuning", {})
     if not ft_cfg.get("enabled", True):
@@ -226,27 +303,66 @@ def finetune_all(cfg: dict, force: bool = False) -> list[Path]:
             **ft_cfg,
             "n_samples": ds_block.get("n_samples", ft_cfg.get("n_samples", 1000)),
             "seed": ds_block.get("seed", ft_cfg.get("seed", 42)),
+            "total_train_samples": ds_block.get(
+                "total_train_samples", ft_cfg.get("total_train_samples")
+            ),
         }
-        out_dir = adapter_dir(adapter_root, base_model_id, dataset_name, ft_cfg["lora_rank"], ft_cfg.get("lora_init_seed", 0))
         recipe_path = datasets_dir / f"{dataset_name}.recipe.json"
         if not recipe_path.exists():
             raise FileNotFoundError(
                 f"Recipe '{dataset_name}' not found at {recipe_path}. "
                 "Run build_datasets.py first."
             )
+        # Resolved here rather than inside _finetune_one because the budget is part
+        # of the adapter's identity: it goes in the directory name.
+        recipe = load_recipe(recipe_path)
+        budget = resolve_sample_budget(
+            merged_ft_cfg["total_train_samples"], recipe, hf_token=token
+        )
+        # The adapter is named for the samples it saw, which quantizes the budget to
+        # the effective batch — predicted here so the already-trained check can run
+        # before a model is loaded, and corrected inside _finetune_one on the rare
+        # setup where the prediction is wrong.
+        eff = predicted_effective_batch(merged_ft_cfg)
+        steps = None if budget is None else max(1, round(budget / eff))
+        out_dir = adapter_dir(
+            adapter_root, base_model_id, dataset_name,
+            ft_cfg["lora_rank"], ft_cfg.get("lora_init_seed", 0),
+            samples_seen=None if steps is None else steps * eff,
+        )
+
+        if dry_run:
+            n = merged_ft_cfg["n_samples"]
+            n_epochs = ft_cfg.get("n_epochs", 3)
+            if budget is None:
+                plan = f"epoch mode, {n_epochs} epoch(s) → ~{n * n_epochs} samples"
+            else:
+                seen = steps * eff
+                rounded = "" if seen == budget else f" (budget {budget} rounded to a step boundary)"
+                plan = (
+                    f"budget {budget} → {steps} step(s) x {eff} = {seen} samples, "
+                    f"{seen / n:.2f} epoch(s){rounded}"
+                )
+            print(f"  {base_model_id}  x  {dataset_name}  (n_samples={n})")
+            print(f"      {plan}")
+            print(f"      → {out_dir}")
+            produced.append(out_dir)
+            continue
+
         print(f"  {base_model_id}  x  {dataset_name}")
-        _finetune_one(base_model_id, dataset_name, recipe_path, out_dir, merged_ft_cfg, token, force,
-                      sample_cache=sample_cache)
-        produced.append(out_dir)
+        written = _finetune_one(base_model_id, dataset_name, recipe_path, out_dir, merged_ft_cfg,
+                               token, force, sample_cache=sample_cache, budget=budget)
+        produced.append(written or out_dir)
 
     return produced
 
 
-def main(cfg: dict, force: bool = False) -> None:
+def main(cfg: dict, force: bool = False, dry_run: bool = False) -> None:
     print("=== Step 2: Fine-tune LoRA adapters ===")
-    paths = finetune_all(cfg, force=force)
+    paths = finetune_all(cfg, force=force, dry_run=dry_run)
     if paths:
-        print(f"Done. {len(paths)} adapter(s).")
+        verb = "would be trained" if dry_run else "trained"
+        print(f"Done. {len(paths)} adapter(s) {verb}.")
 
 
 if __name__ == "__main__":
@@ -257,5 +373,14 @@ if __name__ == "__main__":
         action="store_true",
         help="Retrain even if an adapter already exists at the output directory.",
     )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Resolve sample budgets and output paths and print them; train nothing.",
+    )
     args = parser.parse_args()
-    main(expand_dataset_seeds(expand_dataset_n_samples(load_config(args.config))), force=args.force)
+    main(
+        expand_dataset_seeds(expand_dataset_n_samples(load_config(args.config))),
+        force=args.force,
+        dry_run=args.dry_run,
+    )

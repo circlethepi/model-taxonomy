@@ -65,9 +65,11 @@ ADAPTERS_DIR = "03_adapters"
 _LEGACY_DRAW_RE = re.compile(r"^(?P<n>\d+)_(?P<seed>\d+)$")
 # Expanded config-block name, which is what the old recipe name was.
 _NAME_RE = re.compile(r"^(?P<mixture>.+?)(?:_n(?P<n>\d+))?_s(?P<seed>\d+)$")
-# Adapter directory: {expanded_block_name}_r{rank}[_i{init}].  Mirrors
+# Adapter directory: {expanded_block_name}_r{rank}[_i{init}][_b{samples_seen}].  Mirrors
 # src.analysis.discovery._ADAPTER_DIR_RE.
-_ADAPTER_DIR_RE = re.compile(r"^(?P<name>.+?)_r(?P<rank>\d+)(?:_i(?P<init>\d+))?$")
+_ADAPTER_DIR_RE = re.compile(
+    r"^(?P<name>.+?)_r(?P<rank>\d+)(?:_i(?P<init>\d+))?(?:_b(?P<budget>\d+))?$"
+)
 
 
 # ── Phase 1: the hash map ─────────────────────────────────────────────────────

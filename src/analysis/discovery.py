@@ -41,9 +41,12 @@ __all__ = ["CacheEntry", "CacheIndex", "scan_cache"]
 # and it is deliberately not yahoo-specific.
 _DATASET_NAME_RE = re.compile(r"^(?P<mixture>.+?)_n(?P<n>\d+)_s(?P<seed>\d+)$")
 
-# scripts/_utils.adapter_dir: "{dataset_name}_r{rank}_i{init_seed:02d}", with the
-# _i suffix absent on adapters trained before it was introduced.
-_ADAPTER_DIR_RE = re.compile(r"^(?P<name>.+?)_r(?P<rank>\d+)(?:_i(?P<init>\d+))?$")
+# scripts/_utils.adapter_dir: "{dataset_name}_r{rank}_i{init_seed:02d}[_b{samples_seen}]",
+# with the _i suffix absent on adapters trained before it was introduced and the _b
+# suffix present only on adapters trained under a sample budget.
+_ADAPTER_DIR_RE = re.compile(
+    r"^(?P<name>.+?)_r(?P<rank>\d+)(?:_i(?P<init>\d+))?(?:_b(?P<budget>\d+))?$"
+)
 
 # Order is load-bearing: summary() builds its per-model flag string by walking this
 # tuple and emitting each name's first letter, so position i here is position i in
@@ -90,6 +93,12 @@ class CacheEntry:
     mixture: str | None = None        # recipe_id minus the _n{n}_s{seed} suffix
     n_samples: int | None = None
     seed: int | None = None
+    # How much training the adapter got, as distinct from how large its dataset was.
+    # Under a sample budget the two come apart: n_samples is the draw, samples_seen is
+    # the total the model was shown, and n_epochs is the ratio (fractional when the
+    # budget does not land on a whole pass).
+    samples_seen: int | None = None
+    n_epochs: float | None = None
     lora_rank: int | None = None
     lora_init_seed: int | None = None
 
@@ -118,11 +127,13 @@ class CacheIndex:
 
     def __repr__(self) -> str:  # pragma: no cover - display only
         mixtures = sorted({e.mixture for e in self.entries if e.mixture})
+        seen = sorted({e.samples_seen for e in self.entries if e.samples_seen})
         return (
             f"CacheIndex(n_entries={len(self.entries)}, "
             f"n_mixtures={len(mixtures)}, "
             f"n_values={sorted({e.n_samples for e in self.entries if e.n_samples})}, "
-            f"seeds={sorted({e.seed for e in self.entries if e.seed is not None})})"
+            f"seeds={sorted({e.seed for e in self.entries if e.seed is not None})}, "
+            f"samples_seen={seen})"
         )
 
     # ── views ─────────────────────────────────────────────────────────────────
@@ -226,7 +237,7 @@ class CacheIndex:
         """Filesystem-safe label for a slice key, e.g. ``n1000_s00`` or ``pooled``."""
         if not key:
             return "pooled"
-        abbrev = {"n_samples": "n", "seed": "s"}
+        abbrev = {"n_samples": "n", "seed": "s", "samples_seen": "b", "n_epochs": "e"}
         parts = []
         for name, value in zip(by, key):
             prefix = abbrev.get(name, f"{name}-")
@@ -261,13 +272,16 @@ class CacheIndex:
                     e.mixture or e.adapter_name,
                     "-" if e.n_samples is None else str(e.n_samples),
                     "-" if e.seed is None else f"{e.seed:02d}",
+                    # Two adapters differing only in training length are otherwise
+                    # indistinguishable here, and look like duplicates.
+                    "-" if e.samples_seen is None else str(e.samples_seen),
                     "-" if e.lora_rank is None else str(e.lora_rank),
                     flags,
                     "yes" if e.recipe is not None else "no",
                 )
             )
 
-        headers = ("mixture", "n", "seed", "rank", _AVAILABILITY_HEADER, "recipe")
+        headers = ("mixture", "n", "seed", "seen", "rank", _AVAILABILITY_HEADER, "recipe")
         widths = [
             max(len(h), max(len(r[i]) for r in rows)) for i, h in enumerate(headers)
         ]
@@ -453,6 +467,21 @@ def _build_entry(adapter_dir: Path, base_id: str, meta: dict) -> CacheEntry:
             n_samples = n_samples if n_samples is not None else dir_n
             seed = seed if seed is not None else dir_seed
 
+    # Training length.  samples_seen is written directly by adapters trained after the
+    # sample budget existed; for every adapter predating it, n_samples * n_epochs is
+    # exactly the same quantity, so the axis is populated for the whole cache without a
+    # migration or a retrain.  The directory suffix is the last resort.
+    n_epochs = training.get("n_epochs")
+    samples_seen = training.get("samples_seen")
+    if samples_seen is None and n_samples is not None and n_epochs is not None:
+        samples_seen = int(n_samples * n_epochs)
+    if samples_seen is None:
+        m = _ADAPTER_DIR_RE.match(adapter_dir.name)
+        if m and m.group("budget") is not None:
+            samples_seen = int(m.group("budget"))
+    if n_epochs is None and samples_seen is not None and n_samples:
+        n_epochs = samples_seen / n_samples
+
     rank = lora_cfg.get("lora_rank")
     init_seed = lora_cfg.get("lora_init_seed")
     if rank is None:
@@ -471,6 +500,8 @@ def _build_entry(adapter_dir: Path, base_id: str, meta: dict) -> CacheEntry:
         mixture=mixture,
         n_samples=n_samples,
         seed=seed,
+        samples_seen=samples_seen,
+        n_epochs=n_epochs,
         lora_rank=rank,
         lora_init_seed=init_seed,
     )

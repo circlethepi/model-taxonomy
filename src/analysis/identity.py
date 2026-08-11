@@ -19,7 +19,7 @@ an ``experiment_meta.json`` beside every adapter recording the exact
 ``dataset_name`` it was trained on, which *is* the recipe ID.  Only when that
 file is missing (an adapter moved out of its experiment tree, say) do we fall
 back to parsing the directory name, which ``scripts/_utils.adapter_dir`` builds
-as ``{dataset_name}_r{lora_rank}_i{lora_init_seed:02d}``.
+as ``{dataset_name}_r{lora_rank}_i{lora_init_seed:02d}[_b{samples_seen}]``.
 
 Typical use::
 
@@ -50,8 +50,12 @@ from src.core.protocols import ModelID
 __all__ = ["recipe_id_for", "relabel", "id_overlap"]
 
 # scripts/_utils.adapter_dir: f"{dataset_name}_r{lora_rank}_i{lora_init_seed:02d}",
-# with the _i suffix absent in adapters trained before it was introduced.
-_ADAPTER_DIR_RE = re.compile(r"^(?P<name>.+?)_r\d+(?:_i\d+)?$")
+# with the _i suffix absent in adapters trained before it was introduced and a
+# trailing _b{samples_seen} present only on adapters trained under a sample budget.
+# The
+# _b group has to be stripped here too: a budget changes how long a model trained,
+# not which dataset it trained on, so it must not leak into the recipe ID.
+_ADAPTER_DIR_RE = re.compile(r"^(?P<name>.+?)_r\d+(?:_i\d+)?(?:_b\d+)?$")
 
 
 def recipe_id_for(model_id: ModelID) -> str:
@@ -65,7 +69,7 @@ def recipe_id_for(model_id: ModelID) -> str:
 
     1. ``experiment_meta.json`` in the adapter directory, field ``dataset_name``.
        This is what the fine-tuning script recorded, so it is exact.
-    2. The directory basename with the ``_r{rank}_i{seed}`` suffix removed.
+    2. The directory basename with the ``_r{rank}_i{seed}[_b{samples_seen}]`` suffix removed.
     3. The input, unchanged.
 
     Note this is deliberately many-to-one: two adapters trained on the same

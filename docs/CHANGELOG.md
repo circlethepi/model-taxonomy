@@ -4,6 +4,38 @@
 
 ## Unreleased
 
+### Training length is settable as a total sample budget, and is a selection axis
+
+**`fine_tuning.total_train_samples`** sets how many samples a model sees in total,
+independent of how many distinct samples its dataset holds. A 1000-sample dataset with
+a 10000 budget trains for 10 epochs; a 10-sample dataset for 1000. Previously training
+length was only `n_epochs`, so across an `n_samples` sweep dataset size and optimizer-step
+count were confounded and nothing could be attributed to the data alone.
+
+Three values: `null` (off — train for `n_epochs`, exactly as before), an integer, or
+`"auto"`, which resolves to one epoch of the full source data behind the recipe — the
+summed split length for a simple recipe, the summed full size of every class used for a
+class-aware one. `"auto"` is often far larger than `n_samples` (~280k against 1000 for the
+two-topic Yahoo mixes), which is why the feature is opt-in for now; `--dry-run` on
+`finetune_lora.py` prints the resolved budget, step count, and implied epochs per pair
+without loading a model.
+
+The budget is expressed to `SFTTrainer` as `max_steps`, the only unit it takes, so the
+realized count quantizes to the effective batch (16 by default) and the log line reports
+what was actually trained.
+
+**Budgeted adapters get a `_b{samples_seen}` directory suffix**, recording what the model
+actually saw rather than what was asked for. Two runs differing only in
+training length would otherwise collide on one directory and the second would be skipped
+as already-trained. Epoch-mode adapters keep exactly the names they have, so nothing on
+disk moves.
+
+**`CacheEntry` gained `samples_seen` and `n_epochs`**, so `index.filter(samples_seen=…)`
+and `index.slices(by=("samples_seen", "seed"))` work at every taxonomy level — there is
+one `CacheIndex`, narrowed per level by `with_available(...)`. Adapters trained before
+this change fall back to `n_samples * n_epochs`, which is the same quantity, so the axis
+is populated across the whole existing cache without a retrain or a migration.
+
 ### Behavioral generation samples, and stores several continuations per query
 
 **`replicates`.** `BehavioralTaxonomy` draws `R` continuations per query via

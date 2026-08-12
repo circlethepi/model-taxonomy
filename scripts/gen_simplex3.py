@@ -82,6 +82,20 @@ QUERY_N, QUERY_SEED = 100, 1
 REPLICATES = 16
 MAX_NEW_TOKENS = 128
 
+#: Sampled runs hold batch_size at 2 because one RNG stream serves a whole
+#: generate() call, so batch shape determines the text (first-order) and the value
+#: is excluded from the cache key.  **Greedy is not subject to that**: no RNG is
+#: seeded at all (`src/taxonomy/behavioral.py:304`), and batch size only flips
+#: argmax on fp16 near-ties -- a last-bit effect, measured at 6/8 sequences
+#: byte-identical between batch 1 and batch 8.
+#:
+#: That freedom is the whole cost argument. Decode time is dominated by the number
+#: of generate() calls x max_new_tokens sequential steps, not by how wide each
+#: batch is, so greedy at batch_size 2 would cost nearly what R=16 costs while
+#: producing a sixteenth of the text. At 16 it is ~7 calls per adapter instead of
+#: 50, which is what makes this job cheap.
+GREEDY_BATCH_SIZE = 16
+
 TRAIN_SHARDS = 4
 BEHAVIORAL_SHARDS = 8
 
@@ -361,6 +375,28 @@ def write_extract(level: str, query: str, shard: int | None, names: list[str]) -
             "# swaps adapters onto it, so 16 models amortize a single 8B load, and\n"
             "# input-mode extraction is one forward pass per query with no decoding.\n\n"
         )
+    elif level == "greedy":
+        body += (
+            f"# The DETERMINISTIC control for the sampled runs: one continuation per\n"
+            f"# query, no sampling variance, exactly reproducible. It is also the mode\n"
+            f"# the pre-replicates measurements used, so it is directly comparable to\n"
+            f"# the 2026-08-05 table in docs/notes/TODO.md.\n"
+            f"#\n"
+            f"# replicates MUST be 1. BehavioralTaxonomy raises on replicates > 1 with\n"
+            f"# do_sample: false rather than storing R copies of one greedy continuation\n"
+            f"# (src/taxonomy/behavioral.py:110-114).\n"
+            f"#\n"
+            f"# temperature / top_p / top_k / generation_seed are deliberately ABSENT.\n"
+            f"# Under greedy they are nulled in the sampling hash (GREEDY_SAMPLING,\n"
+            f"# behavioral.py:150-151) so a temperature that was never applied cannot\n"
+            f"# change the digest; writing them here would only imply they matter.\n"
+            f"# This also means greedy lands in its own cache entry and cannot collide\n"
+            f"# with the R={REPLICATES} runs over the same adapters and draw.\n"
+            f"#\n"
+            f"# One job, unsharded: {QUERY_N} queries at batch {GREEDY_BATCH_SIZE} is ~7 generate()\n"
+            f"# calls per adapter against ~50 for the sampled runs, so all 16 adapters\n"
+            f"# finish in well under an hour.\n\n"
+        )
     else:
         body += (
             f"# Sharded because this is the expensive half: 16 adapters x {QUERY_N} queries\n"
@@ -387,6 +423,16 @@ def write_extract(level: str, query: str, shard: int | None, names: list[str]) -
             "  # a correct entry rather than fail. Do not retune per GPU.\n"
             "  batch_size: 2\n"
         )
+    elif level == "greedy":
+        body += (
+            f"  # Raised to {GREEDY_BATCH_SIZE}, which is safe here and NOT safe for the sampled\n"
+            f"  # runs. Greedy seeds no RNG at all, so batch size only flips argmax on\n"
+            f"  # fp16 near-ties -- measured at 6/8 sequences byte-identical between\n"
+            f"  # batch 1 and batch 8. Decode cost is driven by the number of generate()\n"
+            f"  # calls, not their width, so this is the difference between ~7 calls per\n"
+            f"  # adapter and ~50. Lower it if an 8B at {GREEDY_BATCH_SIZE} x (prompt + {MAX_NEW_TOKENS}) OOMs.\n"
+            f"  batch_size: {GREEDY_BATCH_SIZE}\n"
+        )
     body += "\n  taxonomies:\n" + LEVEL_DEFAULTS_NOTE
     if level == "functional":
         body += f"""    functional:
@@ -401,6 +447,17 @@ def write_extract(level: str, query: str, shard: int | None, names: list[str]) -
     dataset_embedding:
       enabled: false
 """
+    elif level == "greedy":
+        body += f"""    functional:
+      enabled: false
+    dataset_embedding:
+      enabled: false
+    behavioral:
+      enabled: true
+      max_new_tokens: {MAX_NEW_TOKENS}
+      replicates: 1               # enforced: >1 with do_sample:false raises
+      do_sample: false            # THE difference from the sampled runs
+{EMBEDDER}"""
     else:
         body += f"""    functional:
       enabled: false
@@ -557,6 +614,17 @@ def main() -> None:
                 logs,
             ))
 
+    # 8. Greedy, one unsharded job per query set. ~7 generate() calls per adapter
+    #    against ~50 for the sampled runs, so 16 adapters fit comfortably in an hour.
+    for q in ("a", "b"):
+        emit(exp / f"greedy_{q}.yaml", write_extract("greedy", q, None, names))
+        emit(jobs / f"08_greedy_{q}.sh", sbatch(
+            f"s3_greedy_{q}", GPU_PARTITIONS, True, 64, "1:30:00",
+            f"python scripts/run_experiment.py experiments/simplex3/greedy_{q}.yaml"
+            f" --steps build extract --taxonomy behavioral",
+            logs,
+        ))
+
     emit(jobs / "submit_all.sh", submit_all())
     (jobs / "submit_all.sh").chmod(0o755)
 
@@ -627,6 +695,14 @@ J=$(sb --dependency=afterok:$TRAIN 06_functional_b.sh); echo "func    B     $J"
 for i in {' '.join(str(i) for i in range(BEHAVIORAL_SHARDS))}; do
   J=$(sb --dependency=afterok:$TRAIN 07_behavioral_b_shard$i.sh)
   echo "behav   B$i    $J"
+done
+
+# Greedy: the deterministic control, one job per query set, ~45 min each. Its
+# own cache entries (GREEDY_SAMPLING nulls the sampling fields), so it cannot
+# collide with the R={REPLICATES} runs over the same adapters and draw.
+for q in a b; do
+  J=$(sb --dependency=afterok:$TRAIN 08_greedy_$q.sh)
+  echo "greedy  ${{q^^}}     $J"
 done
 
 echo

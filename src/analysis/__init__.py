@@ -50,8 +50,11 @@ from .ground_truth import (
 )
 from .identity import id_overlap, recipe_id_for, relabel
 from .matrices import (
+    DcorResult,
     MantelResult,
     correlation_table,
+    dcor_test,
+    distance_correlation,
     mantel_test,
     match_models,
     matrix_correlation,
@@ -83,6 +86,9 @@ __all__ = [
     "matrix_correlation",
     "mantel_test",
     "MantelResult",
+    "distance_correlation",
+    "dcor_test",
+    "DcorResult",
     "correlation_table",
     # configurations
     "procrustes_compare",

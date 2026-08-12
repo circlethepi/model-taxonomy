@@ -800,6 +800,9 @@ offdiag(matrix) -> np.ndarray
 matrix_correlation(dm_a, dm_b, method="spearman", key=None) -> float
 mantel_test(dm_a, dm_b, n_permutations=9999, method="spearman",
             random_state=0, key=None) -> MantelResult
+distance_correlation(dm_a, dm_b, bias_corrected=True, key=None) -> float
+dcor_test(dm_a, dm_b, n_permutations=9999, bias_corrected=True,
+          random_state=0, key=None) -> DcorResult
 correlation_table(analyses, method="spearman", min_models=3, key=None)
     -> tuple[list[str], np.ndarray]
 ```
@@ -809,6 +812,33 @@ Procrustes. `correlation_table` reports `nan` for pairs with no models in common
 rather than raising.
 
 `MantelResult`: `statistic`, `p_value`, `n_permutations`, `n_models`, `method`, `null`.
+Quote the statistic; **do not quote the p-value** — the off-diagonal entries are
+dependent and it is not calibrated. Use `dcor_test` or `protest` for inference.
+
+`DcorResult`: `statistic`, `p_value`, `n_permutations`, `n_models`,
+`bias_corrected`, `exact`, `null`.
+
+`distance_correlation` defaults to the bias-corrected `dCor*` of Székely & Rizzo
+(2013), which lives on the squared scale and **may be negative**. The default is
+not cosmetic: between two *independent* five-model matrices the classical
+statistic averages 0.85, so it cannot distinguish signal from nothing at the
+sizes here. `dcor_test` enumerates all `n!` relabellings when `n! <=
+n_permutations` and sets `exact`.
+
+Two limits that decide how to read the output:
+
+- **dCor is unsigned.** A taxonomy that recovers the ordering exactly backwards
+  scores 1.0, same as a perfect one. Always report `matrix_correlation` beside it
+  — though note that at the matrix level the signed correlation is blind to
+  reversal too. Only the recovery correlation, downstream of the barycentric
+  projection, sees direction.
+- **The reference matrix's symmetry floors the p-value.** Every relabelling that
+  maps the U-centred reference onto itself contributes a tied null value, so
+  `p >= #Aut(B) / n!` for any input. The ground truth on these slices — five
+  evenly-spaced mixtures — has 8 such relabellings, so an exact recovery scores
+  `p = 8/120 ≈ 0.067` and nothing on that slice reaches `p < 0.05`. It is a
+  property of the design, not a weak result, and not a universal `n = 5` limit:
+  an unevenly-spaced truth has 4 and reaches `0.033`. Rank by the statistic.
 
 ### Identifier reconciliation
 

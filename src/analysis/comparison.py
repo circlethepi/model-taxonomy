@@ -66,7 +66,7 @@ from .ground_truth import (
     truth_matrix,
 )
 from .identity import recipe_id_for, relabel
-from .matrices import correlation_table, matrix_correlation
+from .matrices import DcorResult, correlation_table, dcor_test, matrix_correlation
 from .quality import kruskal_stress
 from .simplex import (
     RecoveryResult,
@@ -1099,6 +1099,10 @@ class TaxonomyComparison:
     procrustes_vs_truth: dict[str, ProcrustesResult] = field(default_factory=dict)
     protest_vs_truth: dict[str, ProtestResult] = field(default_factory=dict)
     matrix_corr_vs_truth: dict[str, float] = field(default_factory=dict)
+    #: Distance correlation against the ground-truth matrix, with an exact
+    #: permutation p-value.  Unlike ``matrix_corr_vs_truth`` this is a
+    #: calibrated test, and unlike ``protest_vs_truth`` it needs no embedding.
+    dcor_vs_truth: dict[str, DcorResult] = field(default_factory=dict)
 
     pairwise_procrustes: dict[tuple[str, str], ProcrustesResult] = field(default_factory=dict)
     pairwise_simplex: dict[tuple[str, str], SimplexComparison] = field(default_factory=dict)
@@ -1152,6 +1156,12 @@ class TaxonomyComparison:
                         getattr(self.protest_vs_truth.get(t), "p_value", None)
                     ),
                     "matrix_corr_vs_truth": _f(self.matrix_corr_vs_truth.get(t)),
+                    "dcor_vs_truth": _f(
+                        getattr(self.dcor_vs_truth.get(t), "statistic", None)
+                    ),
+                    "dcor_p_value": _f(
+                        getattr(self.dcor_vs_truth.get(t), "p_value", None)
+                    ),
                 }
                 for t in self.taxonomies
             },
@@ -1196,8 +1206,8 @@ class TaxonomyComparison:
             "by construction, so including them measures the projection, not the geometry.",
             "",
             "| taxonomy | stress | recovery r | recovery rho | mean L1 | max residual "
-            "| Procrustes | PROTEST p | matrix corr |",
-            "|---|---|---|---|---|---|---|---|---|",
+            "| Procrustes | PROTEST p | matrix corr | dCor* | dCor p |",
+            "|---|---|---|---|---|---|---|---|---|---|---|",
         ]
         for t in self.taxonomies:
             r = rep["per_taxonomy"][t]
@@ -1206,7 +1216,8 @@ class TaxonomyComparison:
                 f"| {t} | {_fmt(r['stress'])} | {_fmt(e.get('pearson_mean'))} | "
                 f"{_fmt(e.get('spearman_mean'))} | {_fmt(e.get('mean_l1'))} | "
                 f"{_fmt(e.get('max_residual'))} | {_fmt(r['procrustes_vs_truth'])} | "
-                f"{_fmt(r['protest_p_value'])} | {_fmt(r['matrix_corr_vs_truth'])} |"
+                f"{_fmt(r['protest_p_value'])} | {_fmt(r['matrix_corr_vs_truth'])} | "
+                f"{_fmt(r['dcor_vs_truth'])} | {_fmt(r['dcor_p_value'])} |"
             )
 
         if self.eval_points:
@@ -1508,6 +1519,13 @@ def compare_taxonomies(
         result.matrix_corr_vs_truth[tax] = matrix_correlation(
             dm, result.ground_truth_matrix
         )
+        # dCor is the matrix-level test that replaces Mantel's p-value: it reads
+        # the matrices directly, so unlike PROTEST it carries none of the MDS
+        # distortion `stress` measures.  The bias-corrected form needs 4 models.
+        if len(model_ids) >= 4:
+            result.dcor_vs_truth[tax] = dcor_test(
+                dm, result.ground_truth_matrix, n_permutations=n_permutations
+            )
 
     for i, a in enumerate(result.taxonomies):
         for b in result.taxonomies[i + 1 :]:

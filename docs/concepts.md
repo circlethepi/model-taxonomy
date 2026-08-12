@@ -299,9 +299,22 @@ them at three levels.
 **Distance matrices** (`src.analysis.matrices`). Correlate two taxonomies'
 off-diagonal vectors — for five models, two 10-element vectors, one entry per
 model pair — to ask whether they rank model-pair similarity the same way.
-`mantel_test` puts a p-value on it by permuting model labels jointly across rows
-and columns, which destroys the correspondence between the two matrices while
-leaving each one's internal structure untouched.
+`mantel_test` and `dcor_test` both build a null by permuting model labels jointly
+across rows and columns, which destroys the correspondence between the two
+matrices while leaving each one's internal structure untouched.
+
+They differ in what they compute on it, and the difference decides which to
+believe. Mantel correlates the `n(n-1)/2` off-diagonal entries, which are derived
+from `n` points and therefore dependent — its p-value is not calibrated and is
+kept only as a descriptive statistic. `dcor_test` works on the doubly-centred
+matrices instead, so the permutation null is the whole of the inference, and it
+reads the matrices directly rather than an embedding of them (which is what
+separates it from `protest` at the configuration level).
+
+Neither replaces the other. dCor measures *dependence*, so it is blind to
+direction: a taxonomy recovering the mixing order exactly backwards scores 1.0.
+The signed correlation is what tells the two apart, which is why both are
+reported.
 
 **Point configurations** (`src.analysis.configurations`). An embedding fixes
 coordinates only up to rotation, reflection, translation and scale, and picks

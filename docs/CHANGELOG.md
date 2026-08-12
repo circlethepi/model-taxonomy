@@ -4,6 +4,44 @@
 
 ## Unreleased
 
+### Distance correlation replaces Mantel as the matrix-level test
+
+**`distance_correlation` and `dcor_test`** (`src/analysis/matrices.py`) measure
+dependence between two distance matrices directly, without an intermediate
+embedding — which is what distinguishes them from `protest`, and why they can be
+read as a statement about the matrices rather than about an MDS solution.
+`compare_taxonomies` reports `dcor_vs_truth` and `dcor_p_value` beside
+`matrix_corr_vs_truth`, taking the markdown table from 9 to 11 columns, and
+`DcorResult` carries `statistic`, `p_value`, `n_permutations`, `n_models`,
+`bias_corrected`, `exact` and `null`.
+
+**Mantel's p-value is demoted to descriptive.** Its off-diagonal entries are
+derived from `n` points and therefore dependent, so the permutation null is not
+calibrated. The **statistic is untouched** and `mantel_test` is not deprecated —
+existing figures reference it, and it carries the *sign*, which dCor cannot.
+Both the function and `MantelResult` now say so.
+
+**The bias correction is the default, and is not cosmetic.** Between two
+*independent* five-model matrices the classical V-statistic dCor averages
+**0.85** — it cannot distinguish signal from nothing at the sizes here. The
+U-centred `dCor*` of Székely & Rizzo (2013) averages ~0.0. The cost is that it
+lives on the squared scale and may be negative. `dcor_test` enumerates all `n!`
+relabellings when `n! <= n_permutations` and sets `exact`, so at five models the
+p-value is exact rather than sampled.
+
+**Two limits are documented rather than papered over**, because both change how
+the output must be read. dCor is **unsigned**: a taxonomy recovering the mixing
+order exactly backwards scores 1.0. And the p-value has a floor set by the
+*reference* matrix's symmetry — every relabelling mapping the U-centred
+reference onto itself contributes a tied null value, so `p >= #Aut(B) / n!` for
+any input whatsoever. The ground truth on these slices (five evenly-spaced
+mixtures) has 8 such relabellings after U-centring where the raw matrix has 2,
+so an exact recovery scores `8/120 ≈ 0.067` and nothing on that slice reaches
+`p < 0.05`. That is a property of the design, not a weak result, and it applies
+to PROTEST's permutation p-value for the same reason. Rank the levels by the
+statistic. Pinned by `t_dcor_bias`, `t_dcor_test`, `t_dcor_unsigned` and
+`t_dcor_u_centering_symmetry`.
+
 ### Training length is settable as a total sample budget, and is a selection axis
 
 **`fine_tuning.total_train_samples`** sets how many samples a model sees in total,

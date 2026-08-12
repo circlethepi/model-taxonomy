@@ -31,6 +31,8 @@ from src.analysis import (
     correlation_table,
     fit_geometry,
     kruskal_stress,
+    dcor_test,
+    distance_correlation,
     mantel_test,
     matrix_correlation,
     per_point_residuals,
@@ -252,6 +254,207 @@ def t_mantel():
     res2 = mantel_test(dm, shuffled, n_permutations=999, random_state=0)
     assert res2.p_value > 0.05, f"shuffled matrix looked significant: p={res2.p_value}"
     return f"self p={res.p_value:.4f}, shuffled p={res2.p_value:.3f}"
+
+
+@check("dcor: bias correction is what makes it usable at five models")
+def t_dcor_bias():
+    """The classical V-statistic dCor is severely inflated at small n.
+
+    This is the whole reason `distance_correlation` defaults to the
+    bias-corrected form: at the five-model slices this repo actually compares,
+    the classical statistic reports a large value between *independent*
+    matrices, so it could never distinguish signal from nothing.
+    """
+    rng = np.random.default_rng(11)
+    classical, corrected = [], []
+    for _ in range(300):
+        a = _random_dm(5, seed=int(rng.integers(1 << 30)))
+        b = _random_dm(5, seed=int(rng.integers(1 << 30)))
+        classical.append(distance_correlation(a, b, bias_corrected=False))
+        corrected.append(distance_correlation(a, b, bias_corrected=True))
+
+    assert np.mean(classical) > 0.5, np.mean(classical)
+    assert abs(np.mean(corrected)) < 0.15, np.mean(corrected)
+
+    # Self-correlation is exactly 1 under both, which pins the normalisation.
+    dm = _random_dm(9, seed=3)
+    for bc in (False, True):
+        s = distance_correlation(dm, dm, bias_corrected=bc)
+        assert abs(s - 1.0) < 1e-9, (bc, s)
+
+    return (
+        f"n=5 independent: classical mean={np.mean(classical):.3f}, "
+        f"bias-corrected mean={np.mean(corrected):+.3f}; self=1.0 under both"
+    )
+
+
+@check("dcor: exact enumeration, and a calibrated null")
+def t_dcor_test():
+    # 5! = 120 <= 999, so every relabelling is enumerated and p is exact.
+    dm = _random_dm(5, seed=1)
+    res = dcor_test(dm, dm, n_permutations=999)
+    assert res.exact and res.n_permutations == 120, (res.exact, res.n_permutations)
+    assert abs(res.statistic - 1.0) < 1e-9, res.statistic
+    # A perfect match ties only with the relabellings that preserve it.
+    assert res.p_value <= 1.0 / 120 + 1e-12, res.p_value
+
+    # 8! = 40320 > 999, so it falls back to sampling and the +1 correction.
+    big = _random_dm(8, seed=2)
+    sampled = dcor_test(big, big, n_permutations=999)
+    assert not sampled.exact and sampled.n_permutations == 999
+
+    # Unrelated matrices must not look significant.
+    other = _random_dm(5, seed=7)
+    null = dcor_test(dm, other, n_permutations=999)
+    assert null.p_value > 0.05, f"unrelated matrices looked significant: p={null.p_value}"
+
+    return (
+        f"self: stat={res.statistic:.3f} p={res.p_value:.4f} over {res.n_permutations} "
+        f"exact perms; unrelated p={null.p_value:.3f}; n=8 sampled {sampled.n_permutations}"
+    )
+
+
+@check("dcor: unsigned, so it cannot replace the signed correlation")
+def t_dcor_unsigned():
+    """dCor measures dependence, not agreement.
+
+    A taxonomy recovering the mixing order exactly *backwards* scores dCor = 1
+    just as a perfect one does -- and so, importantly, does the *signed*
+    matrix correlation, because a distance matrix carries no direction at all.
+    No matrix-level statistic can see the inversion; only the recovery
+    correlation downstream of the barycentric projection can, which is where
+    the behavioral level's r = -0.9995 shows up on the real cache while its
+    matrix_corr_vs_truth sits at +0.76.
+
+    Recorded so that "dCor and matrix corr agree, so the level is fine" is
+    never read as evidence about direction.
+    """
+    w = np.array([1.0, 0.75, 0.5, 0.25, 0.0])
+    truth = np.abs(w[:, None] - w[None, :])
+    ids = [f"m{i}" for i in range(5)]
+
+    def dm(matrix):
+        return as_distance_matrix(ids, matrix, "euclidean", "synthetic")
+
+    perfect = dm(truth)
+    reversed_ = dm(truth[::-1, ::-1])
+
+    d_perfect = distance_correlation(perfect, perfect)
+    d_reversed = distance_correlation(reversed_, perfect)
+    assert abs(d_perfect - 1.0) < 1e-9, d_perfect
+    assert abs(d_reversed - 1.0) < 1e-9, (
+        f"dCor is expected to be blind to reversal, got {d_reversed}"
+    )
+
+    # The signed matrix correlation does not rescue it: it is +1 for both,
+    # because reversing the labelling leaves the multiset of distances alone.
+    c_perfect = matrix_correlation(perfect, perfect, method="pearson")
+    c_reversed = matrix_correlation(reversed_, perfect, method="pearson")
+    assert c_perfect > 0.99, c_perfect
+    assert c_reversed > 0.99, (
+        f"expected the matrix correlation to be blind to reversal too, got {c_reversed}"
+    )
+
+    return (
+        f"perfect and reversed are indistinguishable at the matrix level "
+        f"(dCor={d_reversed:.4f}, corr={c_reversed:+.4f}) — only recovery sees the sign"
+    )
+
+
+@check("dcor: the reference's symmetry floors the p-value at n=5")
+def t_dcor_u_centering_symmetry():
+    """The permutation p-value cannot go below the reference matrix's symmetry.
+
+    If `pi` relabels the U-centred reference `B` onto itself, then
+    `dcor(A, B[pi, pi]) == dcor(A, B)` for *every* `A` -- the two calls receive
+    the same pair of matrices.  So each automorphism contributes a null value
+    tied with the observed one, ties count toward a one-sided p, and
+
+        p >= #Aut(B) / n!
+
+    holds for any `A` whatsoever.  It is a property of the reference alone, not
+    of how well the taxonomy did.
+
+    That bites here because U-centring *adds* symmetry: the evenly-spaced 1-D
+    truth has 2 automorphisms raw and 2 doubly-centred, but 8 U-centred -- it
+    can no longer tell either endpoint from its neighbour.  And the ground truth
+    on the real slices is exactly that matrix (five mixtures at 0, .25, .5, .75,
+    1), so 8/120 ~ 0.067 is a hard floor there and no level can reach p < 0.05
+    however well it recovers the geometry.  `functional` sits on it exactly:
+    dCor* = 0.928 with ge = 8, eq = 8, the automorphism orbit and nothing else.
+
+    Not a universal n=5 floor, though, which is the second half of this check:
+    an unevenly-spaced truth has 4 U-centred automorphisms and reaches 4/120 =
+    0.033.  Escaping the floor needs a less symmetric design or more adapters --
+    it is not something a better taxonomy can do.  Rank the levels by the
+    statistic, not the p-value.
+
+    An earlier draft asserted the opposite -- that some perturbed matrix would
+    beat the exact match's p-value.  The argument above shows that is
+    impossible; it is asserted the other way round below.
+    """
+    from itertools import permutations
+
+    from src.analysis.matrices import _center, _clean, _dcor_from_centered
+
+    w = np.array([1.0, 0.75, 0.5, 0.25, 0.0])
+    truth = np.abs(w[:, None] - w[None, :])
+    perms = [np.asarray(p) for p in permutations(range(5))]
+
+    def autos(m):
+        return sum(1 for p in perms if np.allclose(m[np.ix_(p, p)], m))
+
+    raw = autos(_clean(truth))
+    doubled = autos(_center(_clean(truth), False))
+    u = autos(_center(_clean(truth), True))
+    assert raw == 2 and doubled == 2, (raw, doubled)
+    assert u == 8, f"U-centring symmetry changed: {u}"
+
+    ids = [f"m{i}" for i in range(5)]
+    dm = as_distance_matrix(ids, truth, "euclidean", "synthetic")
+    res = dcor_test(dm, dm, n_permutations=999)
+    assert res.exact and res.n_permutations == 120
+    assert abs(res.statistic - 1.0) < 1e-9, res.statistic
+    assert abs(res.p_value - u / 120) < 1e-12, res.p_value
+
+    # The null it is measured against takes only four distinct values, which is
+    # the same symmetry seen from the other side.
+    B = _center(_clean(truth), True)
+    null = np.unique(np.round(
+        [_dcor_from_centered(B, B[np.ix_(p, p)], True) for p in perms], 9))
+    assert len(null) == 4, (len(null), null)
+
+    # Nothing beats the floor, however the taxonomy is perturbed.  This is the
+    # assertion an earlier draft had backwards.
+    rng = np.random.default_rng(4)
+    for _ in range(40):
+        noise = rng.normal(scale=0.3, size=(5, 5))
+        perturbed = truth + np.abs(0.5 * (noise + noise.T))
+        r = dcor_test(as_distance_matrix(ids, perturbed, "euclidean", "synthetic"),
+                      dm, n_permutations=999)
+        assert r.p_value >= u / 120 - 1e-12, (
+            f"p={r.p_value} beat the {u}/120 symmetry floor, which is impossible "
+            f"unless dcor stopped being invariant under automorphisms of the "
+            f"reference"
+        )
+
+    # A less symmetric truth has a lower floor, so p < 0.05 *is* reachable at
+    # n=5 -- by changing the design, not by recovering the geometry better.
+    uneven = np.array([1.0, 0.8, 0.45, 0.15, 0.0])
+    t2 = np.abs(uneven[:, None] - uneven[None, :])
+    u2 = autos(_center(_clean(t2), True))
+    dm2 = as_distance_matrix(ids, t2, "euclidean", "synthetic")
+    res2 = dcor_test(dm2, dm2, n_permutations=999)
+    assert u2 < u, (u2, u)
+    assert abs(res2.p_value - u2 / 120) < 1e-12, res2.p_value
+    assert res2.p_value < 0.05, res2.p_value
+
+    return (
+        f"automorphisms raw={raw} doubled={doubled} u-centred={u}; exact match "
+        f"p={res.p_value:.4f} over a null of {len(null)} distinct values, "
+        f"unbeaten by 40 perturbations; unevenly-spaced truth has {u2} "
+        f"automorphisms and reaches p={res2.p_value:.4f}"
+    )
 
 
 @check("procrustes: invariant to rotation, reflection and scale")
@@ -1397,7 +1600,8 @@ def t_comparison_end_to_end():
             f"r={_show(ev.get('pearson_mean'))} rho={_show(ev.get('spearman_mean'))} "
             f"meanL1={_show(ev.get('mean_l1'))} maxres={_show(ev.get('max_residual'))} "
             f"procrustes={_show(rep['procrustes_vs_truth'])} "
-            f"p={_show(rep['protest_p_value'])}"
+            f"p={_show(rep['protest_p_value'])} "
+            f"dcor={_show(rep['dcor_vs_truth'])} dcor_p={_show(rep['dcor_p_value'])}"
         )
     return f"{n} models, {len(result.taxonomies)} taxonomies, report round-tripped"
 
@@ -3313,7 +3517,8 @@ def t_cross_taxonomy_coordinates():
 SYNTHETIC = [
     t_anchor_fixed, t_similarity_invariance, t_affine_invariance_in_hull,
     t_known_mixture, t_simplex_high_dim, t_degenerate_anchors, t_compare_simplices,
-    t_mantel, t_procrustes, t_procrustes_vs_scipy, t_per_point_residuals,
+    t_mantel, t_dcor_bias, t_dcor_test, t_dcor_unsigned, t_dcor_u_centering_symmetry,
+    t_procrustes, t_procrustes_vs_scipy, t_per_point_residuals,
     t_dispersion, t_quality, t_correlation_table, t_match_models, t_fit_geometry,
     t_similarity_conversion, t_simplex_roundtrip, t_cosine_equivalence,
     t_bures_wasserstein_equivalence, t_bures_wasserstein_invariance,

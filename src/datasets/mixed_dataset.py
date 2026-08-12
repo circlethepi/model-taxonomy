@@ -273,10 +273,12 @@ class ClassMixedDataset:
         )
         ds = source_registry.with_row_index(ds)
 
-        # Apply class_filter
+        # Apply class_filter.  Memoised: the same filter recurs across every draw of
+        # every mixture in a sweep, and each one is a full pass over the split.
         if entry.class_filter is not None:
-            allowed = set(entry.class_filter)
-            ds = ds.filter(lambda row: row[entry.class_field] in allowed)
+            ds = source_registry.filtered_by_class(
+                ds, entry.class_field, entry.class_filter
+            )
 
         if len(ds) == 0:
             return [], []

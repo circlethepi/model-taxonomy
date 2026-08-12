@@ -10,6 +10,8 @@ Three jobs:
 - **Load, once per process.**  ``get`` memoises, so a sweep over one mixture's 19
   draws loads the 1.4M-row dataset once instead of 19 times.  Loading is otherwise
   ordinary: a cold HuggingFace cache downloads, exactly as the sampler did before.
+  ``with_row_index`` and ``filtered_by_class`` memoise the two derived views the
+  sampler needs, for the same reason and on the same lifetime.
 - **Describe.**  ``describe`` builds the source descriptor that goes into a draw
   manifest, so writer and reader agree on its shape by construction.
 - **Validate.**  ``validate`` compares a stored descriptor against what is on this
@@ -53,6 +55,8 @@ _datasets: dict[tuple, object] = {}
 _indexed: dict[int, object] = {}
 # (dataset_id, subset, split, revision) -> {row digest: row indices}
 _digest_maps: dict[tuple, dict] = {}
+# (id(source Dataset), class_field, frozenset(class_filter)) -> filtered Dataset
+_filtered: dict[tuple, object] = {}
 
 
 class SourceMismatch(RuntimeError):
@@ -96,6 +100,30 @@ def with_row_index(ds):
         else:
             cached = ds.add_column(ROW_INDEX_COLUMN, list(range(len(ds))))
         _indexed[id(ds)] = cached
+    return cached
+
+
+def filtered_by_class(ds, class_field: str, class_filter) -> object:
+    """*ds* restricted to *class_filter*, memoised on the source dataset's identity.
+
+    A class filter is a full pass over the split — ~1.4M rows for yahoo — and the
+    same handful of filters recur across every draw of every mixture in a sweep.
+    The simplex3 experiment is the case that makes this matter: 640 draws over three
+    group filters would otherwise be up to 1920 full passes, versus three.
+
+    Keyed on ``id(ds)`` for the same reason :func:`with_row_index` is: the caller has
+    already been handed a memoised object from :func:`get`, so object identity is a
+    stable stand-in for ``(dataset_id, subset, split, revision)`` and cannot disagree
+    with it.  ``_datasets`` holds a reference for the life of the process, so the id
+    cannot be recycled under us.  Pass the row-indexed dataset, not the bare one, so
+    the filter is applied on top of :data:`ROW_INDEX_COLUMN` rather than beside it.
+    """
+    key = (id(ds), class_field, frozenset(class_filter))
+    cached = _filtered.get(key)
+    if cached is None:
+        allowed = set(class_filter)
+        cached = ds.filter(lambda row: row[class_field] in allowed)
+        _filtered[key] = cached
     return cached
 
 
@@ -246,3 +274,4 @@ def clear_cache() -> None:
     _datasets.clear()
     _indexed.clear()
     _digest_maps.clear()
+    _filtered.clear()

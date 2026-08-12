@@ -57,5 +57,13 @@ for i in 0 1 2 3 4 5 6 7; do
   echo "behav   B$i    $J"
 done
 
+# Greedy: the deterministic control, one job per query set, ~45 min each. Its
+# own cache entries (GREEDY_SAMPLING nulls the sampling fields), so it cannot
+# collide with the R=16 runs over the same adapters and draw.
+for q in a b; do
+  J=$(sb --dependency=afterok:$TRAIN 08_greedy_$q.sh)
+  echo "greedy  ${q^^}     $J"
+done
+
 echo
 echo "Submitted. Watch with: squeue -u $USER -o '%.10i %.14j %.9P %.2t %.10M %R'"

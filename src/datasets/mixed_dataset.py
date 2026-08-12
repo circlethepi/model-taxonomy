@@ -256,8 +256,12 @@ class ClassMixedDataset:
     def _load_entry(self, entry: ClassDatasetEntry, count: int) -> tuple[list[dict], list[int]]:
         """Load *count* samples from *entry*, respecting class weights/filter.
 
-        If the most-constrained class cannot meet its proportional quota, the
-        effective total is scaled down so that all class ratios are maintained.
+        Under ``class_sampling="stratified"`` (the default) the count is split into
+        exact per-class quotas, and if the most-constrained class cannot meet its
+        proportional quota the effective total is scaled down so that all class
+        ratios are maintained.  Under ``"pooled"`` there are no per-class quotas:
+        the classes are one pool, so per-class counts vary with the seed and no
+        scale-down applies — only the pool as a whole can be short.
 
         Returns the rows and their positions in the *unfiltered* source split.  The
         index column is attached before either filter, so it survives both and still
@@ -282,6 +286,27 @@ class ClassMixedDataset:
 
         if len(ds) == 0:
             return [], []
+
+        # Pooled: the filtered classes are one pool and the entry's quota is drawn
+        # uniformly without replacement from it, so per-class counts are
+        # hypergeometric rather than forced equal.  Mirrors MixedDataset._load —
+        # one shuffle, one select — because that is exactly the semantics wanted,
+        # applied to the filtered view instead of the whole split.
+        if entry.class_sampling == "pooled":
+            if count > len(ds):
+                warnings.warn(
+                    f"ClassMixedDataset: pooled entry '{entry.dataset_id}' has only "
+                    f"{len(ds)} rows in its class pool but {count} were requested; "
+                    f"capping to {len(ds)}.",
+                    UserWarning, stacklevel=4,
+                )
+            pooled = ds.shuffle(seed=self.seed).select(range(min(count, len(ds))))
+            samples, indices = [], []
+            for row in pooled:
+                row = dict(row)
+                indices.append(row.pop(source_registry.ROW_INDEX_COLUMN))
+                samples.append(row)
+            return samples, indices
 
         # Determine per-class normalized weights
         if entry.normalized_class_weights is not None:

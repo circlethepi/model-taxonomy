@@ -13,6 +13,24 @@ from src.datasets._text_projection import (
 )
 
 
+#: The two ways an entry's rows may be spread over its classes.
+CLASS_SAMPLING_MODES = ("stratified", "pooled")
+DEFAULT_CLASS_SAMPLING = "stratified"
+
+
+def class_sampling_dict(class_sampling: str) -> dict:
+    """The ``class_sampling`` key for ``to_dict()``, or nothing at all.
+
+    Empty at the default, for the same reason
+    :func:`src.datasets._text_projection.composition_dict` is: ``to_dict()`` is
+    what ``recipe_hash`` is computed over, so emitting the key unconditionally
+    would move every hash already in ``01_datasets`` at once.
+    """
+    if class_sampling == DEFAULT_CLASS_SAMPLING:
+        return {}
+    return {"class_sampling": class_sampling}
+
+
 @dataclass
 class ClassDatasetEntry:
     """One constituent dataset in a class-aware mixing recipe.
@@ -21,6 +39,34 @@ class ClassDatasetEntry:
     ``"label"``).  ``class_filter`` restricts sampling to a subset of class
     values.  ``class_weights`` controls the proportion drawn from each class;
     if omitted, classes are sampled uniformly.
+
+    ``class_sampling`` decides how the entry's row quota is spread over those
+    classes.  Both modes allocate the *entry's* share of the draw identically —
+    that is the recipe's dataset-level weights — and differ only in the second
+    stage, within the entry:
+
+    ``"stratified"`` (default)
+        Exact per-class quotas: each class gets ``count / n_classes`` rows, or
+        its ``class_weights`` share, by largest-remainder allocation.  Random
+        choice picks *which* rows within a class, never *how many*.  A two-entry
+        recipe over three classes each therefore yields exactly ``n/6`` per
+        class, every time, for every seed.
+    ``"pooled"``
+        The classes are one pool and ``count`` rows are drawn uniformly without
+        replacement from it.  Per-class counts are hypergeometric: they vary with
+        the seed and track the classes' natural sizes rather than being forced
+        equal.  This is what "sample uniformly from the combination of these
+        topics" means, and it is not expressible by any choice of
+        ``class_weights`` — weights move the expectation, not the determinism.
+
+        ``class_weights`` is rejected alongside ``pooled``.  The combination is
+        contradictory, and silently ignoring the weights is exactly the failure
+        this mode exists to remove.
+
+        Note ``pooled`` is meaningful without ``class_filter`` too: it then means
+        "do not stratify at all", which is otherwise unreachable — an entry with
+        neither ``class_filter`` nor ``class_weights`` still gets stratified
+        uniformly over whichever classes happen to be present.
 
     ``text_fields`` composes several columns into the entry's text instead of
     taking one, joined by ``text_separator`` — see
@@ -36,6 +82,7 @@ class ClassDatasetEntry:
     subset: str | None = None
     class_filter: list | None = None
     class_weights: dict | None = None
+    class_sampling: str = DEFAULT_CLASS_SAMPLING
     text_fields: list[str] | None = None
     text_separator: str = DEFAULT_SEPARATOR
 
@@ -43,8 +90,24 @@ class ClassDatasetEntry:
     normalized_class_weights: dict | None = field(init=False, repr=False, default=None)
 
     def __post_init__(self) -> None:
+        if self.class_sampling not in CLASS_SAMPLING_MODES:
+            raise ValueError(
+                f"class_sampling must be one of {CLASS_SAMPLING_MODES}, "
+                f"got {self.class_sampling!r}."
+            )
+
         active_classes = self.class_filter
-        if self.class_weights is not None:
+        if self.class_sampling == "pooled":
+            if self.class_weights is not None:
+                raise ValueError(
+                    "class_sampling='pooled' draws uniformly from the union of the "
+                    "classes, so per-class weights cannot be honoured. Drop "
+                    "class_weights, or use class_sampling='stratified'."
+                )
+            # No per-class quotas at all: the sampler takes the pooled branch and
+            # per-class counts fall out of the draw.
+            self.normalized_class_weights = None
+        elif self.class_weights is not None:
             # If class_filter is set, restrict weights to those classes
             cw = {
                 k: v
@@ -77,8 +140,10 @@ class ClassDatasetEntry:
             "class_filter": self.class_filter,
             "class_weights": self.class_weights,
             "normalized_class_weights": self.normalized_class_weights,
-            # Spliced in only when set: this dict is what recipe_hash is computed
-            # over, so an unconditional key would move every existing hash.
+            # Both spliced in only when non-default: this dict is what recipe_hash
+            # is computed over, so an unconditional key would move every existing
+            # hash.
+            **class_sampling_dict(self.class_sampling),
             **composition_dict(self.text_fields, self.text_separator),
         }
 
@@ -104,6 +169,7 @@ class ClassDatasetEntry:
             subset=d.get("subset"),
             class_filter=class_filter,
             class_weights=class_weights,
+            class_sampling=d.get("class_sampling", DEFAULT_CLASS_SAMPLING),
             text_fields=text_fields,
             text_separator=text_separator,
         )

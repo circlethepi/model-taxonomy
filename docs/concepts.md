@@ -185,6 +185,15 @@ Three things about this layout are worth stating rather than leaving to be disco
   separating seeds once the recipe hash stopped doing it, or a seed sweep would
   silently collapse onto one embedding. That was `DatasetEmbeddingCache.embedder_hash`
   until item 15 moved it into the path, where `01`, `04` and `05` had always kept it.
+- **How a row becomes text is part of the recipe, therefore part of the hash.** An
+  entry names either one column (`text_field`) or several composed with a separator
+  (`text_fields` + `text_separator`), and `text_fields` wins wherever both appear.
+  The same rows projected two different ways are two different training sets, so
+  they must not share a directory — composing gives a new `recipe_hash` and a new
+  draw. The composition keys are omitted from `to_dict()` when unset rather than
+  written as nulls, which is what let this be added without moving the six existing
+  hashes; the cost is that a composed `recipe.json` still carries a stale, unused
+  `text_field`. See [Dataset recipes](api_reference.md#dataset-recipes).
 - **Every stage spells a draw the same way, and `src/cache/_draw.py` owns the
   spelling.** `n{n}_s{seed:02d}`, zero-padded. It has not always been so: `01` wrote
   an unpadded seed while `04`/`05` padded theirs, and `02` wrote no draw at all — so

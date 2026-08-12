@@ -373,6 +373,81 @@ Compares datasets by embedding their text elements with an `Embedder`. Pass `tax
 
 ---
 
+## Dataset recipes
+
+A recipe is a weighted mixture of HuggingFace datasets. `DatasetRecipe` mixes at the
+dataset level; `ClassAwareDatasetRecipe` also weights classes within each dataset.
+Both serialize to the same `.recipe.json` shape and are content-addressed by
+`recipe_hash()`.
+
+```python
+from src.datasets.recipe import DatasetRecipe, DatasetEntry
+from src.datasets.class_recipe import ClassAwareDatasetRecipe, ClassDatasetEntry
+```
+
+| Entry field | Applies to | Description |
+|---|---|---|
+| `dataset_id` | both | HuggingFace dataset ID. |
+| `subset` / `split` | both | Config name and split. `split` defaults to `"train"`. |
+| `weight` | both | Relative weight of this dataset in the mixture; normalized across entries. |
+| `text_field` | both | **Single-column projection.** Name of the column the entry's text is read from. Default `"text"`. **Ignored entirely when `text_fields` is set** — see below. |
+| `text_fields` | both | **Multi-column projection.** List of column names composed into one string. `None` (the default) means use `text_field`. |
+| `text_separator` | both | What joins composed columns. Default `"\n"`. Only meaningful with `text_fields`. |
+| `class_field` | class-aware | Column whose values distinguish classes. Default `"label"`. |
+| `class_filter` | class-aware | Restrict sampling to these class values. |
+| `class_weights` | class-aware | Per-class proportions; normalized into `normalized_class_weights`. Uniform over `class_filter` when omitted. |
+
+### `text_field` vs `text_fields`
+
+These are two spellings of one thing — how a dataset row becomes the single string
+that gets trained on or embedded — and **only one of them is ever live**.
+`src/datasets/_text_projection.py::resolve_text` reads `text_field` *only* when
+`text_fields` is empty or absent:
+
+```python
+text_field="best_answer"                                   # → "42 is the answer."
+text_fields=["question_title", "best_answer"]              # → "What is 6*7?\n42 is the answer."
+text_fields=[...], text_field="best_answer"                # → composed; text_field unused
+```
+
+Every consumer routes through `entry_text` / `row_text` in that module — the
+sampler, `scripts/finetune_lora.py`, and the query builder — so they cannot
+disagree about what a row means. `SFTTrainer` takes one column name, so
+`finetune_lora.py` materializes a composed entry into a synthetic `_composed_text`
+column and passes that as `dataset_text_field`. Composed rows are never written back
+into `01_datasets`, which stores source indices only; the composition is a
+projection of a draw, not a different draw.
+
+**A recipe on disk may legitimately carry both keys, and that is not a conflict.**
+`recipe_hash` is a SHA-256 over `to_dict()` output, so emitting the composition keys
+unconditionally would have moved every pre-existing hash and orphaned the draws,
+adapters and representations keyed on them. `composition_dict()` therefore omits
+them when unset, which leaves `text_field` serialized at whatever value it had —
+frequently a stale one, as in the `yahoo_qa_*` recipes where it still reads
+`best_answer` while the live projection is `["question_title", "best_answer"]`.
+Read `text_fields` first; treat `text_field` as meaningful only in its absence.
+
+**The composition is part of recipe identity.** Two adapters fit on the same rows
+projected two different ways are not the same adapter, so composing changes
+`recipe_hash` and the composed mixture gets its own directory and its own draw.
+`scripts/check_analysis.py` pins the known uncomposed hashes so an accidental
+unconditional emit cannot regress silently.
+
+**Missing columns are skipped, not stringified.** A row whose `best_answer` is
+absent composes to its question alone rather than to the question followed by the
+literal word `None`. A row missing every named column yields `""`, matching the
+single-field path.
+
+**Keep the training and probing projections in the same shape.** An adapter fit on
+bare answer prose and then prompted with a question is being measured out of
+distribution — the failure that motivated `text_fields` in the first place. The
+default separator is a bare newline rather than a template marker for exactly this
+reason: a richer marker (`### Answer:`, a chat template) has to be mirrored on the
+extraction side or it reintroduces the mismatch one level up. See
+[Designing probe sets](guides/behavioral_taxonomy.md#designing-probe-sets).
+
+---
+
 ## Embedders
 
 Both embedders share this interface:

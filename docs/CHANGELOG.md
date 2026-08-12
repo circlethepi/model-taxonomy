@@ -160,6 +160,14 @@ composition is set, so an entry that does not use it serializes byte-identically
 a check pins the six known hashes. The three copies of the row→text loop in
 `mixed_dataset.py` collapsed into `_text_projection.row_text`.
 
+**`text_fields` supersedes `text_field`; it does not merge with it.** `resolve_text`
+reads `text_field` only when `text_fields` is empty, so a composed entry's
+`text_field` is dead weight — and because the composition keys are spliced in rather
+than replacing anything, composed recipes on disk keep whatever `text_field` they
+had. The five `yahoo_qa_*` recipes all still read `text_field: best_answer` while
+training on `["question_title", "best_answer"]`. Read `text_projection` in an
+adapter's `experiment_meta.json` to see which projection it was actually fit on.
+
 `experiments/yahoo_qa_model_train.yaml` retrains the five mixtures on pairs, with
 every LoRA parameter read off the adapters on disk so the projection is the only
 difference, under `yahoo_qa_*` names so nothing is overwritten. The query recipe
@@ -168,6 +176,16 @@ at the same draw coordinates. `02_dataset_embeddings` deliberately still embeds
 `best_answer` — moving it re-embeds 520 entries and is a separate decision, so a
 cross-taxonomy comparison against these adapters scores a QA-trained model
 against a `best_answer`-derived dataset geometry.
+
+**Status of the run.** Training and behavioral extraction have both happened: five
+`yahoo_qa_*_n1000_s00_r16_i00` adapters exist under
+`03_adapters/meta-llama--Llama-3.2-3B/`, each recording the composed projection in
+`experiment_meta.json`, and each has generations and embeddings under
+`05_generated/.../04a65e58df502e45/n64_s00/` — the same query-draw coordinates as the
+original five, as intended. The comparison has **not** been scored; nothing in
+`06_collections` references `yahoo_qa`. Whether pairs actually repair the inverted
+ordering is therefore still open, and item 11 in `docs/notes/TODO.md` stays open
+with it.
 
 ### Every stage now spells a draw the same way, and `02` finally says which one
 
@@ -267,11 +285,14 @@ PEFT adapter name, now `_hf_inference._adapter_name`, where hashing a path is
 harmless because the name never outlives the process.
 
 **No query text is stored at either level.** `(recipe_hash, n_samples, seed)`
-determines it, because `text_field` is part of the recipe and so part of
+determines it, because the text projection is part of the recipe and so part of
 `recipe_hash`. `_replay_queries` stopped guessing the column from a candidate
 list — first-match-wins silently took `text` over `question_title` on rows
-carrying both — and reads `text_field` from `recipe.json`. `source_indices` is
-now populated rather than always empty.
+carrying both — and rehydrates through the recipe from `recipe.json`.
+(It loads the recipe and calls `_text_projection.row_text` rather than reading one
+key, which is what keeps this correct now that an entry may compose several
+columns; a `text_field`-only read would replay a composed draw wrongly.)
+`source_indices` is now populated rather than always empty.
 
 **Consumers** — `scan_cache` takes `behavioral_draw` (the old keyword is removed,
 not aliased, so a stale call fails loudly); `_functional_repr_exists` collapses

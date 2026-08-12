@@ -49,6 +49,19 @@ TEXT_FIELDS = ["question_title", "question_content", "best_answer"]
 #: rather than continue text that already contains the answer.
 QUERY_B_FIELDS = ["question_title", "question_content"]
 
+#: Measured on a 1000-row draw of the even mixture at seed 1:
+#:     question_title      empty in   0.0%
+#:     question_content    empty in  46.3%
+#:     best_answer         empty in   2.2%
+#: So `question_content` is absent from nearly half of yahoo, and query set B is
+#: a bare title for about half its prompts.  That does not invalidate the
+#: ablation -- B is still question-only -- but B's prompts are substantially
+#: shorter than A's and about half carry no body at all, which belongs in any
+#: caption comparing the two.  It also means the three-field training
+#: composition is effectively title+answer for half the corpus, i.e. much closer
+#: to the existing yahoo_qa adapters than the field list suggests.
+FIELD_EMPTINESS_NOTE = "question_content is empty in ~46% of yahoo rows"
+
 BASE_MODEL = "meta-llama/Llama-3.1-8B"
 MODEL_SLUG = BASE_MODEL.replace("/", "--")
 
@@ -332,7 +345,9 @@ LEVEL_DEFAULTS_NOTE = """  # All three levels carry an explicit `enabled`. Omitt
 def write_extract(level: str, query: str, shard: int | None, names: list[str]) -> str:
     qname = QUERY_A_NAME if query == "a" else QUERY_B_NAME
     qdesc = ("title + content + answer, matching the training composition"
-             if query == "a" else "title + content only, question-only ablation")
+             if query == "a" else
+             "title + content only, question-only ablation; note "
+             + FIELD_EMPTINESS_NOTE + ", so ~half these prompts are a bare title")
     label = f"simplex3_{level}_{query}" + ("" if shard is None else f"_shard{shard}")
     body = HEADER + (
         f"# {level.capitalize()} extraction over query set {query.upper()} ({qdesc}).\n"
@@ -475,20 +490,35 @@ def main() -> None:
         logs,
     ))
 
-    # 1-2. Build (CPU) then embed (GPU), one shard per seed, one config for both.
+    # 1. Build, one CPU job for all ten seeds.
+    #
+    #    Always run through run_experiment.py, never build_datasets.py directly:
+    #    build_datasets does NOT expand n_samples_sweep/seeds, so invoked on its own
+    #    it writes one recipe per *base* name and validates at the default n=100
+    #    seed=42 instead of the 64 draws the block actually describes.
+    #    run_experiment expands first (run_experiment.py:81).
+    #
+    #    This step is cheap -- it writes recipe JSON and nothing else. The draws
+    #    themselves are materialised on demand by the sample cache during
+    #    embedding, so this job is a fail-fast gate rather than the sampling work:
+    #    640 recipe blocks are resolved and hashed before any GPU is held.
     for seed in SEEDS:
         emit(exp / f"sweep_s{seed:02d}.yaml", write_sweep(seed))
-        emit(jobs / f"01_build_s{seed:02d}.sh", sbatch(
-            f"s3_build_s{seed:02d}", CPU_PARTITION, False, 96, "4:00:00",
-            f"python scripts/build_datasets.py experiments/simplex3/sweep_s{seed:02d}.yaml",
-            logs,
-        ))
         emit(jobs / f"02_embed_s{seed:02d}.sh", sbatch(
-            f"s3_embed_s{seed:02d}", GPU_PARTITIONS, True, 48, "1:00:00",
-            f"python scripts/extract_reprs.py experiments/simplex3/sweep_s{seed:02d}.yaml"
-            f" --taxonomy dataset_embedding",
+            f"s3_embed_s{seed:02d}", GPU_PARTITIONS, True, 48, "2:00:00",
+            f"python scripts/run_experiment.py experiments/simplex3/sweep_s{seed:02d}.yaml"
+            f" --steps build extract --taxonomy dataset_embedding",
             logs,
         ))
+    emit(jobs / "01_build.sh", sbatch(
+        "s3_build", CPU_PARTITION, False, 32, "1:00:00",
+        "\n".join(
+            f"python scripts/run_experiment.py"
+            f" experiments/simplex3/sweep_s{seed:02d}.yaml --steps build"
+            for seed in SEEDS
+        ),
+        logs,
+    ))
 
     # 3. Training, four adapters per shard.
     names = [n for n, _ in props]
@@ -508,8 +538,12 @@ def main() -> None:
         emit(exp / f"functional_{q}.yaml", write_extract("functional", q, None, names))
         emit(jobs / f"0{num}_functional_{q}.sh", sbatch(
             f"s3_func_{q}", GPU_PARTITIONS, True, 64, "2:00:00",
-            f"python scripts/extract_reprs.py experiments/simplex3/functional_{q}.yaml"
-            f" --taxonomy functional",
+            # --steps build extract, not extract alone: make_queries reads the
+            # query recipe from {output_dir}/datasets/{queries_dataset}.recipe.json,
+            # and this config's query block is named differently from the sweep's
+            # expanded blocks, so nothing else writes that file.
+            f"python scripts/run_experiment.py experiments/simplex3/functional_{q}.yaml"
+            f" --steps build extract --taxonomy functional",
             logs,
         ))
         for i, shard_names in enumerate(bshards):
@@ -517,9 +551,9 @@ def main() -> None:
                  write_extract("behavioral", q, i, shard_names))
             emit(jobs / f"0{num + 1}_behavioral_{q}_shard{i}.sh", sbatch(
                 f"s3_behav_{q}{i}", GPU_PARTITIONS, True, 64, "1:30:00",
-                f"python scripts/extract_reprs.py"
+                f"python scripts/run_experiment.py"
                 f" experiments/simplex3/behavioral_{q}_shard{i}.yaml"
-                f" --taxonomy behavioral",
+                f" --steps build extract --taxonomy behavioral",
                 logs,
             ))
 
@@ -561,13 +595,11 @@ sb() {{ sbatch --parsable "$@"; }}
 PREFETCH=$(sb 00_prefetch.sh)
 echo "prefetch      $PREFETCH"
 
-BUILD=""
-for s in {' '.join(f'{s:02d}' for s in SEEDS)}; do
-  J=$(sb 01_build_s$s.sh)
-  BUILD="$BUILD:$J"
-  echo "build   s$s   $J"
-done
-BUILD=${{BUILD#:}}
+# One cheap CPU job: it writes 640 recipe blocks and nothing else, so it is a
+# fail-fast gate rather than the sampling work. Draws are materialised on demand
+# by the sample cache during embedding.
+BUILD=$(sb 01_build.sh)
+echo "build         $BUILD"
 
 for s in {' '.join(f'{s:02d}' for s in SEEDS)}; do
   J=$(sb --dependency=afterok:$BUILD 02_embed_s$s.sh)

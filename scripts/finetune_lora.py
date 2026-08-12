@@ -355,7 +355,10 @@ def finetune_all(cfg: dict, force: bool = False, dry_run: bool = False) -> list[
                 plan = f"epoch mode, {n_epochs} epoch(s) → ~{n * n_epochs} samples"
             else:
                 seen = steps * eff
-                rounded = "" if seen == budget else f" (budget {budget} rounded to a step boundary)"
+                rounded = (
+                    "" if seen == budget
+                    else f" (budget {budget} rounded up to a step boundary)"
+                )
                 plan = (
                     f"budget {budget} → {steps} step(s) x {eff} = {seen} samples, "
                     f"{seen / n:.2f} epoch(s){rounded}"

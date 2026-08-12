@@ -23,13 +23,11 @@ sb() { sbatch --parsable "$@"; }
 PREFETCH=$(sb 00_prefetch.sh)
 echo "prefetch      $PREFETCH"
 
-BUILD=""
-for s in 00 01 02 03 04 05 06 07 08 09; do
-  J=$(sb 01_build_s$s.sh)
-  BUILD="$BUILD:$J"
-  echo "build   s$s   $J"
-done
-BUILD=${BUILD#:}
+# One cheap CPU job: it writes 640 recipe blocks and nothing else, so it is a
+# fail-fast gate rather than the sampling work. Draws are materialised on demand
+# by the sample cache during embedding.
+BUILD=$(sb 01_build.sh)
+echo "build         $BUILD"
 
 for s in 00 01 02 03 04 05 06 07 08 09; do
   J=$(sb --dependency=afterok:$BUILD 02_embed_s$s.sh)

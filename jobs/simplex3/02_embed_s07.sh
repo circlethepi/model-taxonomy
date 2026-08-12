@@ -5,7 +5,7 @@
 #SBATCH --gres=gpu:1
 #SBATCH --mem=48G
 #SBATCH --cpus-per-task=8
-#SBATCH --time=1:00:00
+#SBATCH --time=2:00:00
 #SBATCH --output=/weka/scratch/cpriebe1/MO/model-taxonomy/results/simplex3/logs/s3_embed_s07-%j.out
 
 set -euo pipefail
@@ -16,4 +16,4 @@ cd /weka/scratch/cpriebe1/MO/model-taxonomy
 export TOKENIZERS_PARALLELISM=false
 export HF_HOME=/weka/home/mohata1/scratchcpriebe1/MO/huggingface_cache
 
-python scripts/extract_reprs.py experiments/simplex3/sweep_s07.yaml --taxonomy dataset_embedding
+python scripts/run_experiment.py experiments/simplex3/sweep_s07.yaml --steps build extract --taxonomy dataset_embedding

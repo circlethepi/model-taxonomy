@@ -2,7 +2,7 @@
 # Re-run the generator instead; hand edits are lost and, worse, silently diverge
 # from the other ~50 files that were meant to agree with this one.
 #
-# Behavioral extraction over query set B (title + content only, question-only ablation).
+# Behavioral extraction over query set B (title + content only, question-only ablation; note question_content is empty in ~46% of yahoo rows, so ~half these prompts are a bare title).
 # 2 adapter(s), shard 2 of 8.
 #
 # Sharded because this is the expensive half: 16 adapters x 100 queries

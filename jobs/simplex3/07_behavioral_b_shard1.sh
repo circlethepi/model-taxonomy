@@ -16,4 +16,4 @@ cd /weka/scratch/cpriebe1/MO/model-taxonomy
 export TOKENIZERS_PARALLELISM=false
 export HF_HOME=/weka/home/mohata1/scratchcpriebe1/MO/huggingface_cache
 
-python scripts/extract_reprs.py experiments/simplex3/behavioral_b_shard1.yaml --taxonomy behavioral
+python scripts/run_experiment.py experiments/simplex3/behavioral_b_shard1.yaml --steps build extract --taxonomy behavioral

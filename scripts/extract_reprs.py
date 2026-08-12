@@ -68,8 +68,12 @@ def extract_representations(cfg: dict, only_taxonomies: list[str] | None = None)
         bcfg.get("enabled", True) and (enabled is None or "behavioral" in enabled)
     )
 
+    # All three are bound before the guard: the consumers below are gated on the
+    # level being enabled, not on model_ids, so an enabled level with an empty
+    # model list would otherwise read an unbound source_indices.
     queries: list[str] = []
     query_key: dict = {}
+    source_indices: list | None = None
     if model_ids and need_queries:
         print("  Loading queries...")
         queries, query_key, source_indices = make_queries(cfg)

@@ -37,7 +37,10 @@ from scripts._utils import load_config
 # ── Defaults ───────────────────────────────────────────────────────────────────
 
 _DEFAULTS: dict = {
-    "partition": "gpu",
+    # This cluster has no partition named "gpu"; a job submitted with the old
+    # default was rejected outright.  The list is ordered by where GPUs are
+    # actually free, and naming several lets the scheduler backfill into any.
+    "partition": "l40s,h100,nvl,a100",
     "gpus_per_node": 1,
     "mem_gb": 80,
     "time": "24:00:00",

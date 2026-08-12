@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 import json
+import math
 import os
 from pathlib import Path
 from typing import Any
@@ -130,6 +131,9 @@ def compute_recipe_capacity(recipe, hf_token: str | None = None) -> int:
     For each entry, finds the most-constrained class (or the dataset itself for
     simple entries) and derives the effective total as ``min_c(size_c / w_c)``.
     Across entries, takes the minimum of ``entry_capacity / entry_weight``.
+
+    A ``class_sampling="pooled"`` entry has no per-class quotas to be constrained
+    by, so its capacity is the size of the filtered pool.
     """
     from collections import Counter
     from datasets import load_dataset  # type: ignore[import]
@@ -154,16 +158,22 @@ def compute_recipe_capacity(recipe, hf_token: str | None = None) -> int:
             if len(ds) == 0:
                 return 0
 
-            class_norm_w = entry.normalized_class_weights
-            if class_norm_w is None:
-                present = list(set(ds[entry.class_field]))
-                class_norm_w = {c: 1.0 / len(present) for c in present}
+            if getattr(entry, "class_sampling", "stratified") == "pooled":
+                # No per-class quota to be constrained by: the pool is the limit.
+                # min_c(size_c / w_c) would understate it by a factor of the class
+                # count and shrink every block name for no reason.
+                entry_cap = float(len(ds))
+            else:
+                class_norm_w = entry.normalized_class_weights
+                if class_norm_w is None:
+                    present = list(set(ds[entry.class_field]))
+                    class_norm_w = {c: 1.0 / len(present) for c in present}
 
-            class_sizes: Counter = Counter(ds[entry.class_field])
-            entry_cap = min(
-                (class_sizes.get(c, 0) / cw for c, cw in class_norm_w.items() if cw > 0),
-                default=0.0,
-            )
+                class_sizes: Counter = Counter(ds[entry.class_field])
+                entry_cap = min(
+                    (class_sizes.get(c, 0) / cw for c, cw in class_norm_w.items() if cw > 0),
+                    default=0.0,
+                )
         else:
             entry_cap = float(len(ds))
 
@@ -505,6 +515,23 @@ def predicted_effective_batch(ft_cfg: dict) -> int:
         * max(1, n_gpu)
         * ft_cfg.get("gradient_accumulation_steps", 4)
     )
+
+
+def steps_for_budget(budget: int, eff_batch: int) -> int:
+    """Optimizer steps that deliver at least *budget* samples at *eff_batch*.
+
+    ``max_steps`` is the only unit the Trainer accepts, so a sample budget has to
+    quantize to a whole step.  It rounds **up**, which makes the budget a floor:
+    a run asking for 5000 samples at effective batch 16 trains for 313 steps and
+    sees 5008, never 312 steps and 4992.
+
+    One function because two callers must agree.  ``finetune_lora.main`` predicts
+    the adapter directory name before loading a model, and ``_finetune_one``
+    recomputes it against the Trainer's real effective batch; if the two rounded
+    differently, the prediction would name one directory and training would write
+    another.
+    """
+    return max(1, math.ceil(budget / eff_batch))
 
 
 def discover_adapter_paths(adapter_root: Path) -> list[str]:

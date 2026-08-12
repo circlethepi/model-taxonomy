@@ -1666,6 +1666,166 @@ def t_recipe_identity():
     return "name excluded, entries and recipe_type included, schema_version=2"
 
 
+@check("class_sampling: default serializes as before, pooled is a distinct recipe")
+def t_class_sampling_hash():
+    """The additive-change guard for ``class_sampling``.
+
+    ``to_dict()`` is what ``recipe_hash`` is computed over, so emitting the new key
+    unconditionally would move every hash in ``01_datasets`` at once, orphaning
+    every cached draw and every adapter keyed on one.  The key is therefore spliced
+    in only when non-default, exactly as ``composition_dict`` is.  This pins that.
+    """
+    from src.datasets.class_recipe import (
+        ClassAwareDatasetRecipe,
+        ClassDatasetEntry,
+        class_sampling_dict,
+    )
+
+    def entry(**kw):
+        return ClassDatasetEntry(
+            "yahoo_answers_topics", text_field="best_answer", class_field="topic",
+            class_filter=[1, 3, 4], **kw,
+        )
+
+    # 1. The default must be invisible in the serialized form.
+    d = entry().to_dict()
+    assert "class_sampling" not in d, (
+        f"a default entry emitted class_sampling — every existing recipe_hash "
+        f"just moved. Keys: {sorted(d)}"
+    )
+    assert class_sampling_dict("stratified") == {}
+    assert class_sampling_dict("pooled") == {"class_sampling": "pooled"}
+
+    # 2. Pooled must be a *different* recipe, or the two draws share a directory.
+    strat = ClassAwareDatasetRecipe(name="m", datasets=[entry()])
+    pooled = ClassAwareDatasetRecipe(name="m", datasets=[entry(class_sampling="pooled")])
+    assert strat.recipe_hash() != pooled.recipe_hash(), (
+        "pooled and stratified collide on one hash — two different draws would "
+        "share a cache directory"
+    )
+    assert pooled.datasets[0].to_dict()["class_sampling"] == "pooled"
+
+    # 3. Round-trips, or a reloaded recipe silently reverts to stratified.
+    back = ClassDatasetEntry.from_dict(pooled.datasets[0].to_dict())
+    assert back.class_sampling == "pooled", back.class_sampling
+    assert ClassDatasetEntry.from_dict(d).class_sampling == "stratified"
+
+    # 4. Pooled clears the per-class quotas; stratified keeps them.
+    assert pooled.datasets[0].normalized_class_weights is None
+    assert strat.datasets[0].normalized_class_weights == {1: 1 / 3, 3: 1 / 3, 4: 1 / 3}
+
+    # 5. The two contradictory configs are rejected, not silently resolved.
+    for bad, why in (
+        ({"class_sampling": "pooled", "class_weights": {1: 2.0, 3: 1.0, 4: 1.0}},
+         "pooled + class_weights"),
+        ({"class_sampling": "uniform"}, "an unknown mode"),
+    ):
+        try:
+            entry(**bad)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"{why} was accepted")
+
+    return "default key absent, pooled hashes apart, round-trips, bad combos raise"
+
+
+@check("class_sampling: pooled draws are hypergeometric, stratified are exact")
+def t_class_sampling_semantics():
+    """The behavioural half of the guard, on synthetic data.
+
+    Asserting the *hash* is not enough: the whole point of the mode is that
+    per-class counts stop being forced equal.  A no-op implementation would pass
+    every check above.  Uses an in-memory dataset so this stays a unit check —
+    the real yahoo draw is exercised separately in the experiment's verification.
+    """
+    from collections import Counter
+
+    from datasets import Dataset  # type: ignore[import]
+
+    from src.datasets import source_registry
+    from src.datasets.class_recipe import ClassAwareDatasetRecipe, ClassDatasetEntry
+    from src.datasets.mixed_dataset import ClassMixedDataset
+
+    # Three classes, deliberately *unequal* pools: pooled draws should track these
+    # proportions, stratified should ignore them entirely.
+    sizes = {0: 600, 1: 300, 2: 100}
+    rows = [{"text": f"c{c}-{i}", "label": c} for c, n in sizes.items() for i in range(n)]
+    ds = Dataset.from_list(rows)
+
+    key = ("__synthetic__", None, "train", None)
+    source_registry._datasets[key] = ds
+    try:
+        def counts(mode, seed):
+            e = ClassDatasetEntry(
+                "__synthetic__", text_field="text", class_field="label",
+                class_filter=[0, 1, 2], class_sampling=mode,
+            )
+            recipe = ClassAwareDatasetRecipe(name="m", datasets=[e])
+            drawn = ClassMixedDataset(recipe, total_samples=300, seed=seed)._ensure_loaded()
+            assert len(drawn) == 300, f"{mode} drew {len(drawn)}, not 300"
+            return Counter(r["label"] for r in drawn)
+
+        # Stratified: exact, and identical across seeds.
+        s0, s1 = counts("stratified", 0), counts("stratified", 1)
+        assert set(s0.values()) == {100}, f"stratified was not exact: {dict(s0)}"
+        assert s0 == s1, "stratified counts moved with the seed"
+
+        # Pooled: not equal, seed-dependent, and tracking the 6:3:1 pool.
+        p0, p1 = counts("pooled", 0), counts("pooled", 1)
+        assert set(p0.values()) != {100}, (
+            f"pooled produced exactly equal counts {dict(p0)} — the branch is a no-op"
+        )
+        assert p0 != p1, f"pooled counts did not move with the seed: {dict(p0)}"
+        for cls, expected in ((0, 180), (1, 90), (2, 30)):
+            assert abs(p0[cls] - expected) < 40, (
+                f"pooled class {cls} drew {p0[cls]}, nowhere near its pool share "
+                f"{expected} — the draw is not uniform over the union"
+            )
+    finally:
+        source_registry.clear_cache()
+
+    return (
+        f"stratified 100/100/100 for every seed; "
+        f"pooled {dict(sorted(p0.items()))} then {dict(sorted(p1.items()))} on 600/300/100"
+    )
+
+
+@check("sample budget: quantizes up, so the realized count is never short")
+def t_steps_for_budget():
+    """The budget is a floor, and both callers must agree on where it lands.
+
+    ``max_steps`` is the only unit the Trainer accepts, so a sample budget has to
+    quantize to a whole step.  Rounding to *nearest* silently trained a 5000-sample
+    budget on 4992 samples.  Rounding up is also the reason this lives in one
+    function: ``finetune_lora.main`` predicts the ``_b{samples_seen}`` directory
+    name before a model is loaded and ``_finetune_one`` recomputes it against the
+    Trainer's real effective batch, so a divergence would name one directory and
+    train into another.
+    """
+    from scripts._utils import steps_for_budget
+
+    # The case that motivated the change.
+    assert steps_for_budget(5000, 16) == 313, "5000/16 must round up to 313 steps"
+    assert 313 * 16 == 5008 >= 5000
+
+    # Never short, for any budget/batch pair.
+    for budget in (1, 7, 16, 17, 160, 3000, 4999, 5000, 5001):
+        for eff in (1, 2, 8, 16, 32):
+            steps = steps_for_budget(budget, eff)
+            assert steps * eff >= budget, (
+                f"budget {budget} at effective batch {eff} realized "
+                f"{steps * eff} samples — short of what was asked"
+            )
+            # ...but never more than one step's worth over, or it is not tight.
+            assert (steps - 1) * eff < budget or steps == 1
+
+    # Exact division is unaffected, which is why no adapter on disk is renamed.
+    assert steps_for_budget(3008, 16) == 188
+    assert steps_for_budget(1, 64) == 1, "a sub-batch budget must still train a step"
+    return "5000/16 -> 313 steps = 5008 seen; never short, never more than one step over"
+
+
 @check("draw name: every stage spells one draw exactly one way")
 def t_one_draw_name():
     """The regression guard for item 15.
@@ -3528,7 +3688,8 @@ SYNTHETIC = [
     t_simplex_dimension_requirement, t_projection_dimension_matters,
     t_procrustes_transform, t_collection_multidim, t_analysis_geometries,
     # content-addressed recipe identity, and the draw storage it enables
-    t_recipe_identity, t_one_draw_name, t_embedder_hash_seed, t_surrogate_hash_shared,
+    t_recipe_identity, t_class_sampling_hash, t_class_sampling_semantics,
+    t_steps_for_budget, t_one_draw_name, t_embedder_hash_seed, t_surrogate_hash_shared,
     t_dataset_embedding_layout,
     t_draw_schema_roundtrip,
     t_names_merge,

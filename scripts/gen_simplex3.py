@@ -491,7 +491,13 @@ def sbatch(job: str, partition: str, gpu: bool, mem_gb: int, time: str,
 #SBATCH --output={log_dir}/{job}-%j.out
 
 set -euo pipefail
-source ~/.bashrc
+
+# Source conda's profile script directly, NOT ~/.bashrc. A non-interactive shell
+# -- which is what SLURM gives a batch script -- returns early from ~/.bashrc, so
+# the `conda` shell function is never defined and `conda activate` dies with
+# "Run 'conda init' before 'conda activate'". This is the incantation the
+# existing jobs use (jobs/qa_pairs_train.sh:22).
+source "$(conda info --base)/etc/profile.d/conda.sh"
 conda activate taxonomy-env
 cd {REPO}
 

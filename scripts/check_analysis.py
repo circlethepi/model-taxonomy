@@ -1587,6 +1587,41 @@ def t_class_sampling_semantics():
     )
 
 
+@check("sample budget: quantizes up, so the realized count is never short")
+def t_steps_for_budget():
+    """The budget is a floor, and both callers must agree on where it lands.
+
+    ``max_steps`` is the only unit the Trainer accepts, so a sample budget has to
+    quantize to a whole step.  Rounding to *nearest* silently trained a 5000-sample
+    budget on 4992 samples.  Rounding up is also the reason this lives in one
+    function: ``finetune_lora.main`` predicts the ``_b{samples_seen}`` directory
+    name before a model is loaded and ``_finetune_one`` recomputes it against the
+    Trainer's real effective batch, so a divergence would name one directory and
+    train into another.
+    """
+    from scripts._utils import steps_for_budget
+
+    # The case that motivated the change.
+    assert steps_for_budget(5000, 16) == 313, "5000/16 must round up to 313 steps"
+    assert 313 * 16 == 5008 >= 5000
+
+    # Never short, for any budget/batch pair.
+    for budget in (1, 7, 16, 17, 160, 3000, 4999, 5000, 5001):
+        for eff in (1, 2, 8, 16, 32):
+            steps = steps_for_budget(budget, eff)
+            assert steps * eff >= budget, (
+                f"budget {budget} at effective batch {eff} realized "
+                f"{steps * eff} samples — short of what was asked"
+            )
+            # ...but never more than one step's worth over, or it is not tight.
+            assert (steps - 1) * eff < budget or steps == 1
+
+    # Exact division is unaffected, which is why no adapter on disk is renamed.
+    assert steps_for_budget(3008, 16) == 188
+    assert steps_for_budget(1, 64) == 1, "a sub-batch budget must still train a step"
+    return "5000/16 -> 313 steps = 5008 seen; never short, never more than one step over"
+
+
 @check("draw name: every stage spells one draw exactly one way")
 def t_one_draw_name():
     """The regression guard for item 15.
@@ -3449,7 +3484,7 @@ SYNTHETIC = [
     t_procrustes_transform, t_collection_multidim, t_analysis_geometries,
     # content-addressed recipe identity, and the draw storage it enables
     t_recipe_identity, t_class_sampling_hash, t_class_sampling_semantics,
-    t_one_draw_name, t_embedder_hash_seed, t_surrogate_hash_shared,
+    t_steps_for_budget, t_one_draw_name, t_embedder_hash_seed, t_surrogate_hash_shared,
     t_dataset_embedding_layout,
     t_draw_schema_roundtrip,
     t_names_merge,

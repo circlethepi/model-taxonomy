@@ -7,8 +7,10 @@ The ``_s{seed}`` suffix in dataset names encodes the data-sampling seed;
 the ``_i{seed}`` suffix in the adapter directory encodes the LoRA init seed.
 A trailing ``_b{samples_seen}`` appears only when ``fine_tuning.total_train_samples``
 set a sample budget, so that two runs differing only in training length do not
-collide.  It records what the model actually saw — the budget rounded to a whole
-optimizer step — not what was requested.
+collide.  It records what the model actually saw — the budget rounded *up* to a
+whole optimizer step — not what was requested.  Rounding up rather than to
+nearest keeps the budget a floor: a run asking for 5000 samples is never trained
+on fewer.
 
 Usage:
     python scripts/finetune_lora.py experiments/example.yaml
@@ -40,6 +42,7 @@ from scripts._utils import (
     resolve_sample_budget,
     predicted_effective_batch,
     retag_adapter_dir,
+    steps_for_budget,
 )
 
 
@@ -162,7 +165,7 @@ def _finetune_one(
     # max_steps here still reaches train().
     eff_batch = trainer.args.train_batch_size * trainer.args.gradient_accumulation_steps
     if budget is not None:
-        max_steps = max(1, round(budget / eff_batch))
+        max_steps = steps_for_budget(budget, eff_batch)
         trainer.args.max_steps = max_steps
         samples_seen = max_steps * eff_batch
 
@@ -191,7 +194,10 @@ def _finetune_one(
         print(f"    Training ({n_epochs} epoch(s), ~{samples_seen} samples seen)...")
     else:
         implied_epochs = samples_seen / len(hf_dataset) if len(hf_dataset) else 0.0
-        note = "" if samples_seen == budget else f" (budget {budget} rounded to a step boundary)"
+        note = (
+            "" if samples_seen == budget
+            else f" (budget {budget} rounded up to a step boundary)"
+        )
         print(
             f"    Training ({max_steps} steps x effective batch {eff_batch} = "
             f"{samples_seen} samples seen, {implied_epochs:.2f} epoch(s) over "
@@ -335,7 +341,7 @@ def finetune_all(cfg: dict, force: bool = False, dry_run: bool = False) -> list[
         # before a model is loaded, and corrected inside _finetune_one on the rare
         # setup where the prediction is wrong.
         eff = predicted_effective_batch(merged_ft_cfg)
-        steps = None if budget is None else max(1, round(budget / eff))
+        steps = None if budget is None else steps_for_budget(budget, eff)
         out_dir = adapter_dir(
             adapter_root, base_model_id, dataset_name,
             ft_cfg["lora_rank"], ft_cfg.get("lora_init_seed", 0),

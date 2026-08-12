@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 import json
+import math
 import os
 from pathlib import Path
 from typing import Any
@@ -514,6 +515,23 @@ def predicted_effective_batch(ft_cfg: dict) -> int:
         * max(1, n_gpu)
         * ft_cfg.get("gradient_accumulation_steps", 4)
     )
+
+
+def steps_for_budget(budget: int, eff_batch: int) -> int:
+    """Optimizer steps that deliver at least *budget* samples at *eff_batch*.
+
+    ``max_steps`` is the only unit the Trainer accepts, so a sample budget has to
+    quantize to a whole step.  It rounds **up**, which makes the budget a floor:
+    a run asking for 5000 samples at effective batch 16 trains for 313 steps and
+    sees 5008, never 312 steps and 4992.
+
+    One function because two callers must agree.  ``finetune_lora.main`` predicts
+    the adapter directory name before loading a model, and ``_finetune_one``
+    recomputes it against the Trainer's real effective batch; if the two rounded
+    differently, the prediction would name one directory and training would write
+    another.
+    """
+    return max(1, math.ceil(budget / eff_batch))
 
 
 def discover_adapter_paths(adapter_root: Path) -> list[str]:

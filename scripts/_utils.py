@@ -474,17 +474,28 @@ def adapter_dir(
     lora_rank: int,
     lora_init_seed: int = 0,
     samples_seen: int | None = None,
+    prompt_format_id: str | None = None,
 ) -> Path:
-    """Directory for one adapter: ``{dataset_name}_r{rank}_i{init}[_b{samples_seen}]``.
+    """Directory for one adapter: ``{dataset_name}_r{rank}_i{init}[_b{seen}][_f{fmt}]``.
 
     The ``_b`` segment appears only when training ran under a sample budget.  Two
     runs that differ only in budget would otherwise land on the same directory and
     the second would be skipped as already-trained; adapters trained in epoch mode
     keep exactly the name they have always had.
+
+    The ``_f`` segment appears only under a non-raw prompt format, for the same
+    reason one step up: an adapter fit on chat-templated text and one fit on raw
+    text are different adapters, and the already-trained check would otherwise
+    skip the second as though it were the first.  Absent for every existing
+    adapter, so no stored path moves.  ``scripts/gen_simplex3.adapter_name``
+    builds the same name for the extraction configs; the two must agree or
+    extraction looks for adapters that training never wrote.
     """
     name = f"{dataset_name}_r{lora_rank}_i{lora_init_seed:02d}"
     if samples_seen is not None:
         name = f"{name}_b{samples_seen}"
+    if prompt_format_id:
+        name = f"{name}_f{prompt_format_id}"
     return adapter_root / _model_slug(base_model_id) / name
 
 
@@ -496,8 +507,12 @@ def retag_adapter_dir(out_dir: Path, samples_seen: int) -> Path:
     once the Trainer exists — ``n_gpu`` is rewritten during its construction when
     ``device_map="auto"`` shards the model across devices.  So the name is written
     from a prediction and corrected here if the prediction was off.
+
+    The lookahead is what lets a ``_f{fmt}`` suffix follow ``_b{n}``: anchoring
+    on ``$`` alone would silently fail to retag a chat adapter, leaving it named
+    for a predicted batch size rather than the realized one.
     """
-    name = re.sub(r"_b\d+$", f"_b{samples_seen}", out_dir.name)
+    name = re.sub(r"_b\d+(?=(?:_f[0-9a-f]+)?$)", f"_b{samples_seen}", out_dir.name)
     return out_dir.with_name(name)
 
 
@@ -701,12 +716,52 @@ def make_queries(cfg: dict) -> tuple[list[str], dict, list | None]:
         sample_cache=sample_cache,
         name=dataset_name,
     )
+    import src.datasets._chat_projection as cp
+
+    fmt = cp.PromptFormat.from_config(cfg.get("prompt_format"))
+    format_id = fmt.format_id()
+
     query_key = {
         "recipe_hash": recipe.recipe_hash(),
         "n_samples": n_queries,
         "seed": seed,
     }
-    queries = mixed.to_queries(n=n_queries)
+    if format_id is not None:
+        # Two keys, doing two different jobs.  `prompt_format_id` is a path
+        # component (DrawKeyedCache.draw_name reads it), which is what keeps a
+        # chat run's artifacts beside rather than on top of a raw run over the
+        # same draw -- every save in 04/05 is idempotent on filename, so without
+        # it the second run silently returns the first one's numbers.
+        # `prompt_format` is the readable expansion, and rides along into every
+        # config_dict so the provenance record is self-describing.
+        query_key["prompt_format_id"] = format_id
+        query_key["prompt_format"] = fmt.to_dict()
+
+    if fmt.format == "raw":
+        queries = mixed.to_queries(n=n_queries)
+    else:
+        # The queries must be in *generation* format -- the exact string, cut at
+        # the exact point, that training used as its prompt.  render_prompt is
+        # the single definition of that, shared with render_pair on the training
+        # side, so the two cannot drift.  This is the item-11 guarantee.
+        from transformers import AutoTokenizer
+
+        from src.models.profile import assert_compatible, resolve as resolve_profile
+
+        base_models = cfg.get("base_models") or []
+        if len(base_models) != 1:
+            raise ValueError(
+                "prompt_format.format='chat' needs exactly one entry in "
+                f"base_models to resolve a chat template; found {len(base_models)}. "
+                "Split the config: two base models mean two different templates "
+                "and therefore two different query sets."
+            )
+        tokenizer = AutoTokenizer.from_pretrained(
+            base_models[0], token=hf_token(cfg), trust_remote_code=True
+        )
+        assert_compatible(resolve_profile(base_models[0]), tokenizer)
+        rows = list(mixed.for_finetuning())[:n_queries]
+        queries = [cp.render_prompt(tokenizer, row, fmt, recipe=recipe) for row in rows]
     # Truncated to match: to_queries(n) is a prefix, and source_indices is only
     # as long as the loaded sample list, so slice rather than assume equality.
     indices = list(mixed.source_indices or [])[:n_queries] or None

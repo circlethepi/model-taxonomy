@@ -23,6 +23,33 @@ class _InferenceOutput:
     generated_text: str | None
 
 
+#: The token a reasoning model emits to end its thinking block.  Spelled once
+#: here rather than in a per-model profile: it is derivable from any tokenizer
+#: that has one, so a new reasoning model is instrumented without a config edit,
+#: and every model without one yields None and disables the whole code path.
+_THINK_CLOSE_TOKEN = "</think>"
+
+
+def _think_close_token_id(tokenizer) -> int | None:
+    """The id of ``</think>``, or None if this tokenizer has no such token.
+
+    Guarded against ``unk``: ``convert_tokens_to_ids`` maps anything it does not
+    know to the unknown-token id rather than failing, and treating that as a real
+    match would make every generation look like it closed a reasoning block on
+    whatever token unk happens to be.
+    """
+    convert = getattr(tokenizer, "convert_tokens_to_ids", None)
+    if convert is None:
+        return None
+    try:
+        tid = convert(_THINK_CLOSE_TOKEN)
+    except Exception:
+        return None
+    if tid is None or tid == getattr(tokenizer, "unk_token_id", None):
+        return None
+    return int(tid)
+
+
 class BehavioralTaxonomy(HFInferenceTaxonomy, Taxonomy):
     """Extracts behavioral representations of HuggingFace language models.
 
@@ -227,16 +254,25 @@ class BehavioralTaxonomy(HFInferenceTaxonomy, Taxonomy):
         model, shared = self._get_model(model_id)
         tokenizer = self._load_tokenizer(model_id, self._resolve_base_model_id(model_id))
 
+        # Resolved once per extraction, from the tokenizer rather than from a
+        # per-model table: a model that grows a thinking mode gets instrumented
+        # without a config edit, and every model that has no such token gets
+        # None, which makes the whole block below a no-op.  That is what keeps
+        # the existing Llama suite bit-identical.
+        self._think_close_id = _think_close_token_id(tokenizer)
+
         vectors: list[np.ndarray] = []
         all_generated_texts: list[list[str]] = []
+        all_closed_at: list[list[int | None]] = []
         try:
             for i in range(0, len(self.queries), self.batch_size):
                 batch_queries = self.queries[i : i + self.batch_size]
-                batch_vectors, batch_texts = self._process_batch(
+                batch_vectors, batch_texts, batch_closed = self._process_batch(
                     model, tokenizer, batch_queries, batch_start=i
                 )
                 vectors.extend(batch_vectors)
                 all_generated_texts.extend(batch_texts)
+                all_closed_at.extend(batch_closed)
         finally:
             if not shared:
                 del model
@@ -267,6 +303,11 @@ class BehavioralTaxonomy(HFInferenceTaxonomy, Taxonomy):
                 # a batch_size that fit before may not at R > 1, and the KV-cache
                 # reasoning in the experiment YAMLs is about this number.
                 "effective_batch": self.batch_size * self.replicates,
+                # Validity statistic for reasoning models; None-valued and inert
+                # for every other model.  Outside config_dict() for the same
+                # reason device_name is: a diagnostic must never fragment the
+                # cache.  See _think_closure_summary for what it is for.
+                "think_closure": self._think_closure_summary(all_closed_at),
             },
         )
 
@@ -330,17 +371,52 @@ class BehavioralTaxonomy(HFInferenceTaxonomy, Taxonomy):
         # continuations of query 0, then those of query 1, and so on. That is
         # exactly the row order GeneratedTextCache stores, so no regrouping is
         # needed here beyond nesting the text.
-        flat_texts = tokenizer.batch_decode(
-            output_ids[:, input_len:],
-            skip_special_tokens=True,
-        )
+        gen_ids = output_ids[:, input_len:]
+        think_close_id = getattr(self, "_think_close_id", None)
+
+        if think_close_id is None:
+            flat_closed: list[int | None] = [None] * gen_ids.shape[0]
+            flat_texts = tokenizer.batch_decode(gen_ids, skip_special_tokens=True)
+        else:
+            # Two jobs, both done on raw ids before decoding.
+            #
+            # 1. Record *where* the model closed its reasoning block, if it did.
+            #    Read off ids rather than matched in text because it is exact and
+            #    needs no string search, and because it is the statistic that
+            #    says whether this level measured answers or reasoning traces.
+            #
+            # 2. Embed the answer, not the reasoning.  `</think>` is in the added
+            #    vocabulary but NOT in all_special_tokens, so skip_special_tokens
+            #    does not remove it: without this split every stored generation
+            #    would carry a "</think>" preamble into the embedder, identical
+            #    across all adapters and absent from the raw-prompted suites.
+            #    A sequence that never closed is kept whole — reasoning is all it
+            #    produced, and silently emitting an empty string would be worse
+            #    than a low closure_rate that says so.
+            flat_closed = []
+            pieces = []
+            hits = gen_ids == think_close_id
+            for row in range(gen_ids.shape[0]):
+                nz = hits[row].nonzero()
+                if nz.numel():
+                    k = int(nz[0, 0])
+                    flat_closed.append(k)
+                    pieces.append(gen_ids[row, k + 1 :])
+                else:
+                    flat_closed.append(None)
+                    pieces.append(gen_ids[row])
+            flat_texts = [
+                tokenizer.decode(p, skip_special_tokens=True).strip() for p in pieces
+            ]
 
         R = self.replicates
         vectors = []
         generated_texts: list[list[str]] = []
+        closed_at: list[list[int | None]] = []
         for q_index, query in enumerate(queries):
             per_query = flat_texts[q_index * R : (q_index + 1) * R]
             generated_texts.append(per_query)
+            closed_at.append(flat_closed[q_index * R : (q_index + 1) * R])
             for gen_text in per_query:
                 output_obj = _InferenceOutput(
                     hidden_states=None,  # behavioral is output-only; no hidden states collected
@@ -349,4 +425,36 @@ class BehavioralTaxonomy(HFInferenceTaxonomy, Taxonomy):
                 )
                 vectors.append(self.embedder.embed(output_obj, query))
 
-        return vectors, generated_texts
+        return vectors, generated_texts, closed_at
+
+    def _think_closure_summary(self, closed_at: list[list[int | None]]) -> dict | None:
+        """Did the model finish reasoning inside its token budget?
+
+        ``None`` for every model without a ``</think>`` token, which keeps this
+        absent from the existing suites' metadata entirely.
+
+        Why it matters: the behavioral representation is the *embedding of the
+        generated text*.  If a sequence spends its whole budget reasoning, what
+        nomic embeds is a reasoning trace, not an answer — a coherent thing to
+        measure, but a different construct from the one the raw-prompted suites
+        measured, so a mixture of the two averages two constructs together and
+        the cross-suite comparison stops being like-for-like.  This is therefore
+        a validity statistic for the level, not a performance metric, and it is
+        reported rather than enforced.
+
+        ``closed_at`` is nested exactly like ``generated_texts`` — one list per
+        query, one entry per replicate — so the two can be read side by side.
+        """
+        if getattr(self, "_think_close_id", None) is None:
+            return None
+        flat = [c for per_query in closed_at for c in per_query]
+        closed = [c for c in flat if c is not None]
+        return {
+            "token_id": self._think_close_id,
+            "closed_at": closed_at,
+            "closure_rate": (len(closed) / len(flat)) if flat else None,
+            "median_close_index": (
+                float(np.median(closed)) if closed else None
+            ),
+            "max_new_tokens": self.max_new_tokens,
+        }

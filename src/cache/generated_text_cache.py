@@ -44,6 +44,18 @@ _GEN_RE = re.compile(
 )
 
 
+def _closure_scalars(closure: dict | None) -> dict | None:
+    """The summary half of a think-closure record, without the per-row detail.
+
+    The run record is a provenance side file that someone reads to answer "what
+    happened in this run"; the full ``closed_at`` nesting is as long as the
+    generations themselves and belongs beside them, not here.
+    """
+    if not closure:
+        return None
+    return {k: v for k, v in closure.items() if k != "closed_at"}
+
+
 class GeneratedTextCache(DrawKeyedCache):
     """Cache for behavioral representations: generated text and its embeddings.
 
@@ -335,6 +347,14 @@ class GeneratedTextCache(DrawKeyedCache):
                         # not fragment the cache; see BehavioralTaxonomy.
                         "device_name": metadata.get("device_name"),
                         "batch_size": metadata.get("batch_size"),
+                        # Scalars only here; the per-replicate detail lives in
+                        # the generations file next to the text it describes.
+                        # None for every model without a reasoning block, which
+                        # is why the key can be added without touching existing
+                        # run records' meaning.
+                        "think_closure": _closure_scalars(
+                            metadata.get("think_closure")
+                        ),
                     },
                 )
 
@@ -348,13 +368,19 @@ class GeneratedTextCache(DrawKeyedCache):
                 _atomic_write_json(
                     gen_path,
                     {
+                        # 4 = think_closure may be present alongside the texts;
                         # 3 = generated_texts is nested per query; 1-2 were flat
-                        # lists from before replicates existed.
-                        "schema_version": "3",
+                        # lists from before replicates existed.  load_generations
+                        # reads only "generated_texts", so 3-era files still load
+                        # and this bump costs no migration.
+                        "schema_version": "4",
                         "model_id": rep.model_id,
                         "replicates": replicates,
                         "sampling": dict(sampling),
                         "generated_texts": _nest_texts(generated_texts, replicates),
+                        # Nested exactly like generated_texts, so a reader can
+                        # zip the two.  None for models with no reasoning block.
+                        "think_closure": metadata.get("think_closure"),
                     },
                 )
 

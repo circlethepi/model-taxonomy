@@ -1826,6 +1826,107 @@ def t_steps_for_budget():
     return "5000/16 -> 313 steps = 5008 seen; never short, never more than one step over"
 
 
+@check("prompt format: the raw path is byte-identical to no prompt format at all")
+def t_prompt_format_raw_is_inert():
+    """The whole change is additive or it is a migration.
+
+    Every existing adapter, draw and dataset embedding was produced with no
+    prompt format in play.  If ``PromptFormat()`` renders one byte differently
+    from the old ``row_text`` path, or contributes anything to a serialized
+    config or a cache path, then adding the chat layer silently orphaned all of
+    it.  Assert instead of hoping.
+    """
+    from src.cache._draw import draw_format_id, draw_name, parse_draw_name
+    from src.cache._draw_keyed import DrawKeyedCache
+    from src.datasets._chat_projection import PromptFormat
+
+    raw = PromptFormat()
+    assert raw.format == "raw"
+    assert raw.to_dict() == {}, "a raw format must serialize to nothing"
+    assert raw.format_id() is None, "a raw format must not qualify any name"
+    assert PromptFormat.from_config(None).to_dict() == {}
+    assert PromptFormat.from_config({}).to_dict() == {}
+
+    # ...and therefore no path moves.
+    assert draw_name(1000, 0) == draw_name(1000, 0, None) == "n1000_s00"
+    assert DrawKeyedCache.draw_name({"n_samples": 100, "seed": 1}) == "n100_s01"
+
+    # A qualified name still parses to the same coordinates, so `draw_name(*parse(...))`
+    # -- the idiom the migration scripts use -- cannot silently drop a format.
+    assert parse_draw_name("n100_s01_fdeadbeef") == (100, 1)
+    assert draw_format_id("n100_s01_fdeadbeef") == "deadbeef"
+    assert draw_format_id("n100_s01") is None
+    assert DrawKeyedCache.draw_name(
+        {"n_samples": 100, "seed": 1, "prompt_format_id": "deadbeef"}
+    ) == "n100_s01_fdeadbeef"
+    return "raw renders, serializes and names exactly as before; format only ever adds"
+
+
+@check("prompt format: the generator and the trainer name an adapter identically")
+def t_adapter_name_agreement():
+    """Two places build the adapter leaf, and they must not drift.
+
+    ``gen_simplex3.adapter_name`` writes the paths into the extraction configs'
+    model list; ``_utils.adapter_dir`` decides where training actually writes.
+    If they disagree, training succeeds, extraction finds nothing, and the only
+    symptom is an empty result — which is exactly what happened here once
+    already, when the format suffix was added to the generator and not to the
+    trainer.
+    """
+    import importlib
+
+    from scripts._utils import adapter_dir, retag_adapter_dir
+
+    gen = importlib.import_module("scripts.gen_simplex3")
+    checked = []
+    for suite_name, suite in gen.SUITES.items():
+        gen.SUITE = suite
+        # The generator names from the proportion and appends the draw itself;
+        # the trainer is handed the already-expanded block name.  Same leaf.
+        want = gen.adapter_name("yahoo_000g1_000g2_100g3")
+        got = adapter_dir(
+            Path("/root"), suite.base_model, "yahoo_000g1_000g2_100g3_n1000_s00",
+            gen.LORA_RANK, gen.LORA_INIT_SEED,
+            samples_seen=gen.SAMPLES_SEEN,
+            prompt_format_id=gen.format_id(),
+        ).name
+        assert want == got, f"{suite_name}: generator says {want!r}, trainer says {got!r}"
+        # The realized-sample retag has to survive whatever suffix follows it.
+        assert retag_adapter_dir(Path("/root") / got, gen.SAMPLES_SEEN).name == got
+        assert retag_adapter_dir(Path("/root") / got, 99).name == got.replace(
+            f"_b{gen.SAMPLES_SEEN}", "_b99"
+        )
+        checked.append(f"{suite_name}={want}")
+    gen.SUITE = gen.SUITES["llama"]
+    return "; ".join(checked)
+
+
+@check("prompt format: apply_chat_template has exactly one call site")
+def t_one_chat_template_call_site():
+    """One renderer, or the item-11 bug comes back one level up.
+
+    ``_text_projection`` exists because the training text and the extraction
+    prompt drifted apart and the behavioral level recovered the mixing order
+    backwards.  A chat template is the same hazard with more surface: any second
+    place that wraps a row can wrap it differently.  So there is exactly one
+    ``apply_chat_template`` in the repo, and this is what keeps it that way.
+    """
+    root = Path(__file__).resolve().parent.parent
+    hits = []
+    for path in list((root / "src").rglob("*.py")) + list((root / "scripts").rglob("*.py")):
+        if "__pycache__" in str(path) or path.name == "check_analysis.py":
+            continue
+        for i, line in enumerate(path.read_text().splitlines(), 1):
+            if "apply_chat_template(" in line and not line.lstrip().startswith("#"):
+                hits.append(f"{path.relative_to(root)}:{i}")
+    assert hits == ["src/datasets/_chat_projection.py:203",
+                    "src/datasets/_chat_projection.py:227"] or all(
+        h.startswith("src/datasets/_chat_projection.py") for h in hits
+    ), f"apply_chat_template called outside _chat_projection: {hits}"
+    assert hits, "expected at least one call site in _chat_projection"
+    return f"{len(hits)} call site(s), all in src/datasets/_chat_projection.py"
+
+
 @check("draw name: every stage spells one draw exactly one way")
 def t_one_draw_name():
     """The regression guard for item 15.
@@ -3690,6 +3791,9 @@ SYNTHETIC = [
     # content-addressed recipe identity, and the draw storage it enables
     t_recipe_identity, t_class_sampling_hash, t_class_sampling_semantics,
     t_steps_for_budget, t_one_draw_name, t_embedder_hash_seed, t_surrogate_hash_shared,
+    # the prompt-format layer: additive by construction, and rendered in one place
+    t_prompt_format_raw_is_inert, t_one_chat_template_call_site,
+    t_adapter_name_agreement,
     t_dataset_embedding_layout,
     t_draw_schema_roundtrip,
     t_names_merge,

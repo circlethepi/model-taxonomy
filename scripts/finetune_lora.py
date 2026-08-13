@@ -67,7 +67,28 @@ def _finetune_one(
     from transformers import AutoModelForCausalLM, AutoTokenizer
     from trl import SFTTrainer, SFTConfig
 
+    import src.datasets._chat_projection as cp
+    from src.models.profile import assert_compatible, resolve as resolve_profile
+
+    fmt = cp.PromptFormat.from_config(ft_cfg.get("_prompt_format"))
+    format_id = fmt.format_id()
+
     if not force and out_dir.exists() and (out_dir / "adapter_config.json").exists():
+        # An adapter directory carries its prompt format in its name (see
+        # gen_simplex3.adapter_name), so reaching here with a different format
+        # should be impossible.  Raise rather than skip anyway: if it ever does
+        # happen, silently reusing an adapter fit on a different input shape is
+        # the item-11 failure, and a skipped job looks exactly like a successful
+        # one in sacct.
+        meta_path = out_dir / "experiment_meta.json"
+        if meta_path.exists():
+            prior = json.loads(meta_path.read_text()).get("prompt_format_id")
+            if prior != format_id:
+                raise ValueError(
+                    f"{out_dir} was trained with prompt_format_id={prior!r} but this "
+                    f"run asks for {format_id!r}. These are different adapters that "
+                    f"landed on the same path; fix the naming rather than overwriting."
+                )
         print(f"    Already trained — skipping (use --force to retrain).")
         return None
 
@@ -77,8 +98,18 @@ def _finetune_one(
     tokenizer = AutoTokenizer.from_pretrained(
         base_model_id, token=token, trust_remote_code=True
     )
+    # Only fires for base models: Llama-3.1-8B ships no pad token, so the whole
+    # simplex3 suite trained with pad == eos.  Instruct checkpoints generally
+    # declare one (Qwen3.5 sets <|endoftext|>, distinct from <|im_end|>), which
+    # is the better arrangement -- with pad == eos, anything masking on pad id
+    # also masks a genuine end-of-turn.
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
+
+    # Fails here, before a GPU is held, if the checkpoint is not the one this
+    # model's profile was written against -- a revised chat template upstream,
+    # or a base model about to be chat-wrapped by mistake.
+    assert_compatible(resolve_profile(base_model_id), tokenizer)
 
     model = AutoModelForCausalLM.from_pretrained(
         base_model_id,
@@ -116,19 +147,64 @@ def _finetune_one(
                                sample_cache=sample_cache, name=dataset_name)
     rows = list(mixed.for_finetuning())
 
-    if text_fields:
-        # SFTTrainer takes ONE column name, so a composition has to become a
-        # column.  Synthesized here rather than in the sampler so that what is
-        # cached in 01_datasets stays the raw rows: the composition is a
-        # projection of them, recorded in the recipe, not a different draw.
-        #
-        # This is the item 11 fix. Training on the bare answer column while
-        # extraction prompts with a question is what put the behavioral level
-        # out of distribution; the composed column is the shape both sides mean.
-        text_field = "_composed_text"
-        rows = [{**row, text_field: row_text(recipe, row)} for row in rows]
+    max_len = ft_cfg.get("max_seq_length", 512)
+    truncation_meta = None
 
-    hf_dataset = Dataset.from_list(rows)
+    if fmt.format == "chat":
+        # Tokenize here rather than handing trl two strings.  trl's
+        # prompt/completion path uses the *joint* tokenization as input_ids and
+        # only warns when the separately-tokenized prompt is not a prefix of it,
+        # which would leave the training prompt ending in a token generate()
+        # never produces.  encode_pair owns the split and asserts the two agree;
+        # see src/datasets/_chat_projection for why the cut lands where it does.
+        enc = [cp.encode_pair(tokenizer, row, fmt, max_len, recipe=recipe) for row in rows]
+        n_trunc = sum(1 for e in enc if e["truncated"])
+        n_empty = sum(1 for e in enc if e["n_completion_tokens"] == 0)
+        if n_empty:
+            # Truncation is keep_start, so what a long row loses is its answer.
+            # Under completion-only loss a row with no answer left contributes
+            # no supervised token at all; dropping it explicitly is honest,
+            # where handing the trainer an all-masked example is not.
+            print(f"    WARNING: {n_empty}/{len(enc)} rows have zero completion tokens "
+                  f"at max_seq_length={max_len}; dropping them.")
+        kept = [e for e in enc if e["n_completion_tokens"] > 0]
+        truncation_meta = {
+            "max_length": max_len,
+            "mode": "keep_start",
+            "rows_truncated": n_trunc,
+            "rows_dropped_zero_completion": n_empty,
+        }
+        mean_sup = (sum(e["n_completion_tokens"] for e in kept) / len(kept)) if kept else 0
+        hf_dataset = Dataset.from_list(
+            [{"input_ids": e["input_ids"], "completion_mask": e["completion_mask"]}
+             for e in kept]
+        )
+        # Must be explicit.  trl infers completion_only_loss from
+        # ("prompt" in sample and "completion" in sample); a pre-tokenized
+        # dataset has neither key, so the inference yields False and the run
+        # would train full-sequence without saying so.
+        sft_kwargs = dict(completion_only_loss=True)
+        print(f"    Loss scope: COMPLETION ONLY (assistant turn) -- "
+              f"prompt_format.format=chat, completion_only_loss=True; "
+              f"{len(kept)} rows, mean {mean_sup:.0f} supervised tokens, "
+              f"{n_trunc} truncated at {max_len}")
+    else:
+        if text_fields:
+            # SFTTrainer takes ONE column name, so a composition has to become a
+            # column.  Synthesized here rather than in the sampler so that what is
+            # cached in 01_datasets stays the raw rows: the composition is a
+            # projection of them, recorded in the recipe, not a different draw.
+            #
+            # This is the item 11 fix. Training on the bare answer column while
+            # extraction prompts with a question is what put the behavioral level
+            # out of distribution; the composed column is the shape both sides mean.
+            text_field = "_composed_text"
+            rows = [{**row, text_field: row_text(recipe, row)} for row in rows]
+
+        hf_dataset = Dataset.from_list(rows)
+        sft_kwargs = dict(dataset_text_field=text_field)
+        print(f"    Loss scope: FULL SEQUENCE -- prompt_format absent (raw), "
+              f"dataset_text_field={text_field}; {len(hf_dataset)} rows")
 
     n_epochs = ft_cfg.get("n_epochs", 3)
     sft_cfg = SFTConfig(
@@ -137,11 +213,12 @@ def _finetune_one(
         learning_rate=ft_cfg.get("learning_rate", 2e-4),
         per_device_train_batch_size=ft_cfg.get("per_device_train_batch_size", 4),
         gradient_accumulation_steps=ft_cfg.get("gradient_accumulation_steps", 4),
-        max_length=ft_cfg.get("max_seq_length", 512),
-        dataset_text_field=text_field,
+        max_length=max_len,
+        bf16=(ft_cfg.get("torch_dtype") == "bfloat16"),
         save_strategy="no",
         logging_steps=10,
         report_to="none",
+        **sft_kwargs,
     )
 
     trainer = SFTTrainer(
@@ -218,6 +295,17 @@ def _finetune_one(
             {"text_fields": text_fields, "text_separator": entry.text_separator}
             if text_fields else {"text_field": text_field}
         ),
+        # How the row was wrapped before the model saw it.  Empty dict when raw,
+        # so no existing adapter's metadata changes shape -- the same additive
+        # rule as composition_dict in _text_projection.
+        "prompt_format": fmt.to_dict(),
+        "prompt_format_id": format_id,
+        # Which chat template produced those strings.  HuggingFace revises
+        # templates in place under an unchanged model id, so the model id alone
+        # does not identify what this adapter was fit on.
+        "chat_template_sha": cp.template_sha(tokenizer),
+        "completion_only_loss": fmt.format == "chat",
+        "truncation": truncation_meta,
         "lora_config": {
             "lora_rank": ft_cfg["lora_rank"],
             "lora_alpha": ft_cfg["lora_alpha"],
@@ -323,6 +411,12 @@ def finetune_all(cfg: dict, force: bool = False, dry_run: bool = False) -> list[
             "total_train_samples": ds_block.get(
                 "total_train_samples", ft_cfg.get("total_train_samples")
             ),
+            # Top-level, not under fine_tuning:, because the same block feeds
+            # extraction (scripts/_utils.make_queries).  One key describing both
+            # sides is what makes training shape and query shape structurally
+            # unable to drift -- the docs/notes/TODO.md item 11 lesson.  Passed
+            # down under a private name so _finetune_one's signature is unchanged.
+            "_prompt_format": cfg.get("prompt_format"),
         }
         recipe_path = datasets_dir / f"{dataset_name}.recipe.json"
         if not recipe_path.exists():
@@ -340,12 +434,19 @@ def finetune_all(cfg: dict, force: bool = False, dry_run: bool = False) -> list[
         # the effective batch — predicted here so the already-trained check can run
         # before a model is loaded, and corrected inside _finetune_one on the rare
         # setup where the prediction is wrong.
+        import src.datasets._chat_projection as _chat_projection
+
         eff = predicted_effective_batch(merged_ft_cfg)
         steps = None if budget is None else steps_for_budget(budget, eff)
         out_dir = adapter_dir(
             adapter_root, base_model_id, dataset_name,
             ft_cfg["lora_rank"], ft_cfg.get("lora_init_seed", 0),
             samples_seen=None if steps is None else steps * eff,
+            # Must match scripts/gen_simplex3.adapter_name, which builds the
+            # same leaf for the extraction configs' model list.
+            prompt_format_id=_chat_projection.PromptFormat.from_config(
+                cfg.get("prompt_format")
+            ).format_id(),
         )
 
         if dry_run:

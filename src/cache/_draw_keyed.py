@@ -126,7 +126,7 @@ class DrawKeyedCache:
 
     @staticmethod
     def draw_name(query_key: dict) -> str:
-        """``n{n}_s{seed}`` for a query key, via :func:`src.cache._draw.draw_name`.
+        """``n{n}_s{seed}[_f{fmt}]`` for a query key.
 
         Takes the whole query key rather than two ints because every caller here
         already holds one.  The spelling itself is not decided in this class —
@@ -135,8 +135,17 @@ class DrawKeyedCache:
         documented as "matching the draw filenames in ``01_datasets``" while
         ``01`` was in fact writing an unpadded seed.  Item 15 moved ``01`` onto
         this spelling and made the claim true.
+
+        ``prompt_format_id`` is read off the query key when present, which is
+        how a chat-templated run lands beside — rather than on top of — the raw
+        run over the same draw.  Absent for every raw run, so existing paths are
+        unchanged; see :func:`src.cache._draw.draw_name`.
         """
-        return _draw_name(query_key["n_samples"], query_key["seed"])
+        return _draw_name(
+            query_key["n_samples"],
+            query_key["seed"],
+            query_key.get("prompt_format_id"),
+        )
 
     def draw_dir(self, base_model_id: str, adapter_id: str, query_key: dict) -> Path:
         return (

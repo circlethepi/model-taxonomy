@@ -16,16 +16,32 @@ Transposing two group weights in one of them would be invisible on review and wo
 silently mislabel a point of the simplex.  Here the group definitions and the
 simplex enumeration exist once, and the whole tree is reproducible with one command.
 
+One generator, several suites: what the experiment *is* lives here, and what one
+*run* of it is configured as lives in :class:`src.experiments.suite.Suite`.  A
+second base model is a Suite entry plus a model profile, not a forked copy of
+this file -- forking would duplicate the simplex enumeration and the level
+defaults, and the copies would drift the first time a shard count changed.
+
+The default suite must regenerate byte-for-byte::
+
+    python scripts/gen_simplex3.py && git diff --exit-code experiments/simplex3 jobs/simplex3
+
 Usage:
     python scripts/gen_simplex3.py                 # write experiments/simplex3/, jobs/simplex3/
+    python scripts/gen_simplex3.py --suite qwen    # write experiments/simplex3_qwen/, jobs/simplex3_qwen/
     python scripts/gen_simplex3.py --list          # enumerate the proportions and exit
 """
 
 from __future__ import annotations
 
 import argparse
+import sys
 from math import gcd
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from src.experiments.suite import Suite  # noqa: E402
 
 # ── The experiment's fixed parameters ──────────────────────────────────────────
 
@@ -45,9 +61,19 @@ CLASS_FIELD = "topic"
 #: level projects the same text.  See docs/notes/TODO.md item 11 for what the
 #: alternative cost last time.
 TEXT_FIELDS = ["question_title", "question_content", "best_answer"]
-#: The query-set-B projection: question only, so the model must actually answer
+#: The question-only projection: question only, so the model must actually answer
 #: rather than continue text that already contains the answer.
-QUERY_B_FIELDS = ["question_title", "question_content"]
+#:
+#: Named rather than lettered.  The two query sets' *roles* invert between a raw
+#: suite and a chat suite -- under a chat template with completion-only loss the
+#: training prompt is the question, so the question-only set becomes the
+#: in-distribution probe and the full-context one the contaminated one, the
+#: reverse of the raw suite -- and a positional letter cannot carry that.
+#:
+#: Still needed on the raw path even though a chat suite expresses the same list
+#: as ``prompt_format.user_fields``: this is what renders the Llama suite's
+#: ``text_fields``, and that output must stay byte-identical.
+QUERY_QUESTION_ONLY_FIELDS = ["question_title", "question_content"]
 
 #: Measured on a 1000-row draw of the even mixture at seed 1:
 #:     question_title      empty in   0.0%
@@ -62,14 +88,21 @@ QUERY_B_FIELDS = ["question_title", "question_content"]
 #: to the existing yahoo_qa adapters than the field list suggests.
 FIELD_EMPTINESS_NOTE = "question_content is empty in ~46% of yahoo rows"
 
-BASE_MODEL = "meta-llama/Llama-3.1-8B"
-MODEL_SLUG = BASE_MODEL.replace("/", "--")
-
 #: Absolute, so a job started from a worktree still writes into the one shared
 #: cache rather than growing a second copy that disappears with the worktree.
 REPO = "/weka/scratch/cpriebe1/MO/model-taxonomy"
+#: Not a Suite field: the cache is shared *between* suites on purpose.  Draws and
+#: dataset embeddings are model-free, so a second base model reuses them rather
+#: than re-deriving 640 centroids.
 CACHE_DIR = f"{REPO}/results/shared_cache"
-OUTPUT_DIR = f"{REPO}/results/simplex3"
+
+#: Which configuration is being generated.  Rebound by ``main()`` from --suite;
+#: the default is the Llama run, whose emitted files must not change.
+SUITE = Suite()
+
+
+def output_dir() -> str:
+    return f"{REPO}/results/simplex3{SUITE.suffix}"
 
 SEEDS = list(range(10))
 N_SWEEP = "tens 3"          # -> [1, 10, 100, 1000]
@@ -99,7 +132,9 @@ GREEDY_BATCH_SIZE = 16
 TRAIN_SHARDS = 4
 BEHAVIORAL_SHARDS = 8
 
-GPU_PARTITIONS = "nvl,h100,l40s,a100"
+#: GPU partition order is a Suite field -- it is a property of what the run needs
+#: from the hardware, not of the experiment.  CPU stays here: nothing about it
+#: varies by model.
 CPU_PARTITION = "cpu"
 
 
@@ -190,8 +225,8 @@ def dataset_block(name: str, pct: tuple[int, int, int], *,
 
 
 EVEN = (33, 33, 33)
-QUERY_A_NAME = name_for(EVEN)
-QUERY_B_NAME = QUERY_A_NAME + "_qtc"
+QUERY_FULL_CONTEXT_NAME = name_for(EVEN)
+QUERY_QUESTION_ONLY_NAME = QUERY_FULL_CONTEXT_NAME + "_qtc"
 
 
 def query_blocks(which: str) -> str:
@@ -201,20 +236,82 @@ def query_blocks(which: str) -> str:
     mixture and reuses the draw the build step already made -- naming it here does
     not create a second sample.  Requested at ``n_samples == n_queries`` because n
     enters the sampler: a 100-row draw is not the first 100 rows of a 1000-row one.
+
+    Under a chat suite the ``text_fields`` here stop deciding the prompt -- the
+    prompt is rendered from ``prompt_format.user_fields`` -- but the block still
+    selects the rows, so it stays as it is.
     """
-    if which == "a":
-        return dataset_block(QUERY_A_NAME, EVEN, n_samples=QUERY_N, seed=QUERY_SEED)
-    return dataset_block(QUERY_B_NAME, EVEN, n_samples=QUERY_N, seed=QUERY_SEED,
-                         text_fields=QUERY_B_FIELDS)
+    if which == "full_context":
+        return dataset_block(QUERY_FULL_CONTEXT_NAME, EVEN, n_samples=QUERY_N, seed=QUERY_SEED)
+    return dataset_block(QUERY_QUESTION_ONLY_NAME, EVEN, n_samples=QUERY_N, seed=QUERY_SEED,
+                         text_fields=QUERY_QUESTION_ONLY_FIELDS)
 
 
 def adapter_name(name: str) -> str:
-    return (f"{name}_n{TRAIN_N}_s{TRAIN_SEED:02d}"
+    """The adapter's directory leaf.
+
+    The ``_f{format_id}`` suffix appears only for a non-raw prompt format, so
+    every existing adapter name is unchanged, and two suites that wrap the same
+    base model differently cannot land on the same path.  Downstream joins strip
+    it the way they already strip the ``_b{samples}`` budget token.
+    """
+    stem = (f"{name}_n{TRAIN_N}_s{TRAIN_SEED:02d}"
             f"_r{LORA_RANK}_i{LORA_INIT_SEED:02d}_b{SAMPLES_SEEN}")
+    return f"{stem}_f{format_id()}" if format_id() else stem
+
+
+def format_id() -> str | None:
+    """The current suite's prompt-format id, or None when raw."""
+    from src.datasets._chat_projection import PromptFormat
+
+    return PromptFormat.from_config(prompt_format_block()).format_id()
+
+
+def prompt_format_block() -> dict | None:
+    """The suite's ``prompt_format`` mapping, with the field lists filled in.
+
+    The user fields are the question-only projection and the answer field is the
+    answer column, so a chat suite's training prompt is the same text the
+    question-only query set is -- which is what makes the training shape and the
+    extraction shape the same shape.
+    """
+    if not SUITE.prompt_format:
+        return None
+    return {
+        **SUITE.prompt_format,
+        "user_fields": list(QUERY_QUESTION_ONLY_FIELDS),
+        "answer_fields": [TEXT_FIELDS[-1]],
+    }
 
 
 def adapter_path(name: str) -> str:
-    return f"{CACHE_DIR}/03_adapters/{MODEL_SLUG}/{adapter_name(name)}"
+    return f"{CACHE_DIR}/03_adapters/{SUITE.model_slug}/{adapter_name(name)}"
+
+
+def prompt_format_yaml() -> str:
+    """The ``prompt_format:`` block, or nothing at all for a raw suite.
+
+    Emitting nothing is what keeps the Llama YAML byte-identical; an absent block
+    reads as ``PromptFormat()`` on both the training and the extraction side.
+    """
+    block = prompt_format_block()
+    if not block:
+        return ""
+    kwargs = block.get("chat_template_kwargs") or {}
+    rendered = (
+        "{}" if not kwargs
+        else "{" + ", ".join(f"{k}: {str(v).lower()}" for k, v in sorted(kwargs.items())) + "}"
+    )
+    return (
+        "# How a row becomes model input. Top-level, not under fine_tuning:, because\n"
+        "# the SAME block builds the extraction prompts -- one key describing both\n"
+        "# sides is what makes the training shape and the query shape unable to drift.\n"
+        "prompt_format:\n"
+        f"  format: {block['format']}\n"
+        f"  user_fields: [{', '.join(block['user_fields'])}]\n"
+        f"  answer_fields: [{', '.join(block['answer_fields'])}]\n"
+        f"  chat_template_kwargs: {rendered}   # {{}} = the template's own defaults\n\n"
+    )
 
 
 HEADER = """# GENERATED BY scripts/gen_simplex3.py -- do not edit by hand.
@@ -227,7 +324,7 @@ HEADER = """# GENERATED BY scripts/gen_simplex3.py -- do not edit by hand.
 def preamble(name: str) -> str:
     return (
         f"name: {name}\n"
-        f"output_dir: {OUTPUT_DIR}\n"
+        f"output_dir: {output_dir()}\n"
         f"cache_dir: {CACHE_DIR}\n\n"
     )
 
@@ -254,11 +351,11 @@ def write_sweep(seed: int) -> str:
     )
     if seed == QUERY_SEED:
         body += (
-            f"# This shard also builds query set B ({QUERY_B_NAME}), the question-only\n"
-            f"# ablation. Composition feeds recipe_hash, so it is a distinct recipe -- but\n"
+            f"# This shard also builds the question-only query set ({QUERY_QUESTION_ONLY_NAME}).\n"
+            f"# Composition feeds recipe_hash, so it is a distinct recipe -- but\n"
             f"# text_fields never touches the sampler's RNG and the seed is not derived\n"
-            f"# from the hash, so it selects the SAME {QUERY_N} rows as query set A. The two\n"
-            f"# are the same questions projected two ways, which is what makes the\n"
+            f"# from the hash, so it selects the SAME {QUERY_N} rows as the full-context set.\n"
+            f"# The two are the same questions projected two ways, which is what makes the\n"
             f"# ablation controlled rather than two different samples.\n#\n"
         )
     body += "\n" + preamble(f"simplex3_sweep_s{seed:02d}")
@@ -268,10 +365,10 @@ def write_sweep(seed: int) -> str:
         for name, pct in proportions()
     )
     if seed == QUERY_SEED:
-        body += "\n" + query_blocks("b")
+        body += "\n" + query_blocks("question_only")
     body += f"""
 base_models:
-  - {BASE_MODEL}
+  - {SUITE.base_model}
 
 fine_tuning:
   enabled: false
@@ -314,9 +411,9 @@ def write_train(shard: int, names: list[str]) -> str:
     )
     body += f"""
 base_models:
-  - {BASE_MODEL}
+  - {SUITE.base_model}
 
-fine_tuning:
+{prompt_format_yaml()}fine_tuning:
   enabled: true
   datasets:
 """
@@ -325,14 +422,14 @@ fine_tuning:
   seed: {TRAIN_SEED}
   lora_rank: {LORA_RANK}
   lora_alpha: 32
-  target_modules: [q_proj, k_proj, v_proj, o_proj]
+  target_modules: [{', '.join(SUITE.target_modules)}]
   lora_dropout: 0.05
   lora_init_seed: {LORA_INIT_SEED}
   learning_rate: 2.0e-4
-  per_device_train_batch_size: 4
-  gradient_accumulation_steps: 4
+  per_device_train_batch_size: {SUITE.per_device_train_batch_size}
+  gradient_accumulation_steps: {SUITE.gradient_accumulation_steps}
   max_seq_length: 512
-  torch_dtype: float16
+  torch_dtype: {SUITE.torch_dtype}
   total_train_samples: {TOTAL_TRAIN_SAMPLES}
 
 extraction:
@@ -357,14 +454,23 @@ LEVEL_DEFAULTS_NOTE = """  # All three levels carry an explicit `enabled`. Omitt
 
 
 def write_extract(level: str, query: str, shard: int | None, names: list[str]) -> str:
-    qname = QUERY_A_NAME if query == "a" else QUERY_B_NAME
-    qdesc = ("title + content + answer, matching the training composition"
-             if query == "a" else
-             "title + content only, question-only ablation; note "
-             + FIELD_EMPTINESS_NOTE + ", so ~half these prompts are a bare title")
-    label = f"simplex3_{level}_{query}" + ("" if shard is None else f"_shard{shard}")
+    qname = QUERY_FULL_CONTEXT_NAME if query == "full_context" else QUERY_QUESTION_ONLY_NAME
+    if SUITE.prompt_format:
+        # Under a chat template with completion-only loss the training prompt IS
+        # the question, so the roles are the reverse of the raw suite's.  Saying
+        # so here rather than carrying the raw suite's phrasing forward, which
+        # would be actively wrong.
+        qdesc = ("title + content only, matching the training prompt; note "
+                 + FIELD_EMPTINESS_NOTE + ", so ~half these prompts are a bare title")
+    else:
+        qdesc = ("title + content + answer, matching the training composition"
+                 if query == "full_context" else
+                 "title + content only, question-only ablation; note "
+                 + FIELD_EMPTINESS_NOTE + ", so ~half these prompts are a bare title")
+    token = SUITE.job_token(query)
+    label = f"simplex3_{level}_{token}" + ("" if shard is None else f"_shard{shard}")
     body = HEADER + (
-        f"# {level.capitalize()} extraction over query set {query.upper()} ({qdesc}).\n"
+        f"# {level.capitalize()} extraction over the {query} query set ({qdesc}).\n"
         f"# {len(names)} adapter(s)"
         + ("" if shard is None else f", shard {shard} of {BEHAVIORAL_SHARDS}")
         + ".\n#\n"
@@ -406,13 +512,15 @@ def write_extract(level: str, query: str, shard: int | None, names: list[str]) -
         )
     body += preamble(label)
     body += "datasets:\n" + query_blocks(query)
-    body += f"\nbase_models:\n  - {BASE_MODEL}\n\nfine_tuning:\n  enabled: false\n\n"
+    body += f"\nbase_models:\n  - {SUITE.base_model}\n\n"
+    body += prompt_format_yaml()
+    body += "fine_tuning:\n  enabled: false\n\n"
     body += "extraction:\n  models:\n"
     body += "".join(f"    - {adapter_path(n)}\n" for n in names)
     body += f"""  queries_dataset: {qname}
   n_queries: {QUERY_N}
   device: cuda
-  torch_dtype: float16
+  torch_dtype: {SUITE.torch_dtype}
 """
     if level == "behavioral":
         body += (
@@ -508,13 +616,74 @@ export HF_HOME=/weka/home/mohata1/scratchcpriebe1/MO/huggingface_cache
 """
 
 
+#: The configurations this generator knows how to emit.  ``llama`` is the suite
+#: that already ran and must regenerate unchanged; ``qwen`` is the instruct run.
+#: Per-model values are not restated here -- ``for_model`` reads them from the
+#: model's profile, so a third base model is a profile file plus one line.
+SUITES = {
+    "llama": Suite(),
+    "qwen": Suite(
+        tag="qwen",
+        query_sets=("question_only",),
+        job_tokens={"question_only": "qonly"},
+        # The build job gates the embedding sweeps, and this suite emits none:
+        # dataset embeddings are model-free and the 640 centroids already exist.
+        # Every remaining job runs `--steps build ...` and writes its own recipe.
+        emit_embed_jobs=False,
+        emit_build_job=False,
+        job_prefix="s3q",
+        # Roughly per-token parity with the 8B despite half the parameters: no
+        # flash-linear-attention in the env, so 24 of 32 layers take the slow
+        # torch fallback.  Behavioral is up most because thinking-on means every
+        # sequence runs the full 128 decode steps.
+        train_time="3:00:00",
+        behav_time="2:30:00",
+        func_time="1:30:00",
+        greedy_time="2:00:00",
+        # Host RAM. The 248,320-vocab tied lm_head is 15% of the model and
+        # materializes a (4, 512, 248320) logits tensor; nothing at Llama's 128k
+        # vocab needed this much headroom.
+        train_mem_gb=96,
+        extract_mem_gb=96,
+        # bf16 throughput and HBM headroom first.
+        gpu_partitions="h100,nvl,a100,l40s",
+    ).for_model("Qwen/Qwen3.5-4B"),
+}
+
+
 def main() -> None:
+    global SUITE
+
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--suite", default="llama", choices=sorted(SUITES),
+                        help="Which configuration to emit (default: llama).")
+    parser.add_argument("--base-model", help="Override the suite's base model.")
+    parser.add_argument("--tag", help="Override the suite's directory suffix.")
+    parser.add_argument("--torch-dtype", help="Override the suite's dtype.")
+    parser.add_argument("--target-modules",
+                        help="Override the LoRA targets, comma-separated.")
     parser.add_argument("--list", action="store_true",
                         help="Print the proportions and their weights, write nothing.")
     parser.add_argument("--root", default=".", help="Repository root to write into.")
     args = parser.parse_args()
+
+    from dataclasses import replace
+
+    SUITE = SUITES[args.suite]
+    if args.base_model:
+        SUITE = SUITE.for_model(args.base_model)
+    overrides = {}
+    if args.tag is not None:
+        overrides["tag"] = args.tag
+    if args.torch_dtype:
+        overrides["torch_dtype"] = args.torch_dtype
+    if args.target_modules:
+        overrides["target_modules"] = tuple(
+            m.strip() for m in args.target_modules.split(",") if m.strip()
+        )
+    if overrides:
+        SUITE = replace(SUITE, **overrides)
 
     props = proportions()
     if args.list:
@@ -528,9 +697,10 @@ def main() -> None:
         return
 
     root = Path(args.root)
-    exp = root / "experiments" / "simplex3"
-    jobs = root / "jobs" / "simplex3"
-    logs = f"{OUTPUT_DIR}/logs"
+    slug = f"simplex3{SUITE.suffix}"
+    exp = root / "experiments" / slug
+    jobs = root / "jobs" / slug
+    logs = f"{output_dir()}/logs"
     exp.mkdir(parents=True, exist_ok=True)
     jobs.mkdir(parents=True, exist_ok=True)
 
@@ -542,12 +712,18 @@ def main() -> None:
 
     # 0. Prefetch the base model. CPU, first in the chain, so the one genuinely
     #    unknown dependency fails fast and fails cheap.
+    #
+    #    '*.jinja' is in the pattern list for models that ship their chat template
+    #    as a standalone file. Qwen3.5 publishes it BOTH ways -- chat_template.jinja
+    #    and the chat_template key of tokenizer_config.json, byte-identical -- so
+    #    the tokenizer loads either way; fetching both keeps a prefetched cache
+    #    resolving the template from the same file a fresh download would.
     emit(jobs / "00_prefetch.sh", sbatch(
-        "s3_prefetch", CPU_PARTITION, False, 32, "1:00:00",
+        f"{SUITE.job_prefix}_prefetch", CPU_PARTITION, False, 32, "1:00:00",
         f'python -c "\n'
         f'from huggingface_hub import snapshot_download\n'
-        f"p = snapshot_download('{BASE_MODEL}', allow_patterns=["
-        f"'*.json','*.safetensors','*.model','tokenizer*'])\n"
+        f"p = snapshot_download('{SUITE.base_model}', allow_patterns=["
+        f"'*.json','*.safetensors','*.model','tokenizer*','*.jinja','merges.txt'])\n"
         f"print('cached at', p)\n"
         f'"',
         logs,
@@ -565,23 +741,26 @@ def main() -> None:
     #    themselves are materialised on demand by the sample cache during
     #    embedding, so this job is a fail-fast gate rather than the sampling work:
     #    640 recipe blocks are resolved and hashed before any GPU is held.
-    for seed in SEEDS:
-        emit(exp / f"sweep_s{seed:02d}.yaml", write_sweep(seed))
-        emit(jobs / f"02_embed_s{seed:02d}.sh", sbatch(
-            f"s3_embed_s{seed:02d}", GPU_PARTITIONS, True, 48, "2:00:00",
-            f"python scripts/run_experiment.py experiments/simplex3/sweep_s{seed:02d}.yaml"
-            f" --steps build extract --taxonomy dataset_embedding",
+    if SUITE.emit_embed_jobs:
+        for seed in SEEDS:
+            emit(exp / f"sweep_s{seed:02d}.yaml", write_sweep(seed))
+            emit(jobs / f"02_embed_s{seed:02d}.sh", sbatch(
+                f"{SUITE.job_prefix}_embed_s{seed:02d}", SUITE.gpu_partitions, True,
+                48, "2:00:00",
+                f"python scripts/run_experiment.py experiments/{slug}/sweep_s{seed:02d}.yaml"
+                f" --steps build extract --taxonomy dataset_embedding",
+                logs,
+            ))
+    if SUITE.emit_build_job:
+        emit(jobs / "01_build.sh", sbatch(
+            f"{SUITE.job_prefix}_build", CPU_PARTITION, False, 32, "1:00:00",
+            "\n".join(
+                f"python scripts/run_experiment.py"
+                f" experiments/{slug}/sweep_s{seed:02d}.yaml --steps build"
+                for seed in SEEDS
+            ),
             logs,
         ))
-    emit(jobs / "01_build.sh", sbatch(
-        "s3_build", CPU_PARTITION, False, 32, "1:00:00",
-        "\n".join(
-            f"python scripts/run_experiment.py"
-            f" experiments/simplex3/sweep_s{seed:02d}.yaml --steps build"
-            for seed in SEEDS
-        ),
-        logs,
-    ))
 
     # 3. Training, four adapters per shard.
     names = [n for n, _ in props]
@@ -589,44 +768,51 @@ def main() -> None:
     for i, shard_names in enumerate(shards):
         emit(exp / f"train_shard{i}.yaml", write_train(i, shard_names))
         emit(jobs / f"03_train_shard{i}.sh", sbatch(
-            f"s3_train{i}", GPU_PARTITIONS, True, 80, "2:00:00",
-            f"python scripts/run_experiment.py experiments/simplex3/train_shard{i}.yaml"
+            f"{SUITE.job_prefix}_train{i}", SUITE.gpu_partitions, True,
+            SUITE.train_mem_gb, SUITE.train_time,
+            f"python scripts/run_experiment.py experiments/{slug}/train_shard{i}.yaml"
             f" --steps build finetune",
             logs,
         ))
 
-    # 4-7. Extraction, both query sets.
+    # 4-7. Extraction, one pair of stages per query set.
     bshards = [names[i::BEHAVIORAL_SHARDS] for i in range(BEHAVIORAL_SHARDS)]
-    for q, num in (("a", 4), ("b", 6)):
-        emit(exp / f"functional_{q}.yaml", write_extract("functional", q, None, names))
-        emit(jobs / f"0{num}_functional_{q}.sh", sbatch(
-            f"s3_func_{q}", GPU_PARTITIONS, True, 64, "2:00:00",
+    for k, q in enumerate(SUITE.query_sets):
+        tok = SUITE.job_token(q)
+        num = 4 + 2 * k
+        emit(exp / f"functional_{tok}.yaml", write_extract("functional", q, None, names))
+        emit(jobs / f"0{num}_functional_{tok}.sh", sbatch(
+            f"{SUITE.job_prefix}_func_{tok}", SUITE.gpu_partitions, True,
+            SUITE.extract_mem_gb, SUITE.func_time,
             # --steps build extract, not extract alone: make_queries reads the
             # query recipe from {output_dir}/datasets/{queries_dataset}.recipe.json,
             # and this config's query block is named differently from the sweep's
             # expanded blocks, so nothing else writes that file.
-            f"python scripts/run_experiment.py experiments/simplex3/functional_{q}.yaml"
+            f"python scripts/run_experiment.py experiments/{slug}/functional_{tok}.yaml"
             f" --steps build extract --taxonomy functional",
             logs,
         ))
         for i, shard_names in enumerate(bshards):
-            emit(exp / f"behavioral_{q}_shard{i}.yaml",
+            emit(exp / f"behavioral_{tok}_shard{i}.yaml",
                  write_extract("behavioral", q, i, shard_names))
-            emit(jobs / f"0{num + 1}_behavioral_{q}_shard{i}.sh", sbatch(
-                f"s3_behav_{q}{i}", GPU_PARTITIONS, True, 64, "1:30:00",
+            emit(jobs / f"0{num + 1}_behavioral_{tok}_shard{i}.sh", sbatch(
+                f"{SUITE.job_prefix}_behav_{tok}{i}", SUITE.gpu_partitions, True,
+                SUITE.extract_mem_gb, SUITE.behav_time,
                 f"python scripts/run_experiment.py"
-                f" experiments/simplex3/behavioral_{q}_shard{i}.yaml"
+                f" experiments/{slug}/behavioral_{tok}_shard{i}.yaml"
                 f" --steps build extract --taxonomy behavioral",
                 logs,
             ))
 
     # 8. Greedy, one unsharded job per query set. ~7 generate() calls per adapter
     #    against ~50 for the sampled runs, so 16 adapters fit comfortably in an hour.
-    for q in ("a", "b"):
-        emit(exp / f"greedy_{q}.yaml", write_extract("greedy", q, None, names))
-        emit(jobs / f"08_greedy_{q}.sh", sbatch(
-            f"s3_greedy_{q}", GPU_PARTITIONS, True, 64, "1:30:00",
-            f"python scripts/run_experiment.py experiments/simplex3/greedy_{q}.yaml"
+    for q in SUITE.query_sets:
+        tok = SUITE.job_token(q)
+        emit(exp / f"greedy_{tok}.yaml", write_extract("greedy", q, None, names))
+        emit(jobs / f"08_greedy_{tok}.sh", sbatch(
+            f"{SUITE.job_prefix}_greedy_{tok}", SUITE.gpu_partitions, True,
+            SUITE.extract_mem_gb, SUITE.greedy_time,
+            f"python scripts/run_experiment.py experiments/{slug}/greedy_{tok}.yaml"
             f" --steps build extract --taxonomy behavioral",
             logs,
         ))
@@ -662,13 +848,48 @@ def submit_all() -> str:
 
 set -euo pipefail
 cd "$(dirname "$0")"
-mkdir -p {OUTPUT_DIR}/logs
+mkdir -p {output_dir()}/logs
 
 sb() {{ sbatch --parsable "$@"; }}
 
 PREFETCH=$(sb 00_prefetch.sh)
 echo "prefetch      $PREFETCH"
+{_submit_build()}
+TRAIN=""
+for i in {' '.join(str(i) for i in range(TRAIN_SHARDS))}; do
+  J=$(sb --dependency=afterok:$PREFETCH{'':s}{_train_dep()} 03_train_shard$i.sh)
+  TRAIN="$TRAIN:$J"
+  echo "train   $i     $J"
+done
+TRAIN=${{TRAIN#:}}
 
+# Extraction depends only on training, so every extraction job is eligible at
+# once and the queue orders them.
+{_submit_extract()}
+# Greedy: the deterministic control, one job per query set. Its own cache entries
+# (GREEDY_SAMPLING nulls the sampling fields), so it cannot collide with the
+# R={REPLICATES} runs over the same adapters and draw.
+for q in {' '.join(SUITE.job_token(q) for q in SUITE.query_sets)}; do
+  J=$(sb --dependency=afterok:$TRAIN 08_greedy_$q.sh)
+  echo "greedy  $q     $J"
+done
+
+echo
+echo "Submitted. Watch with: squeue -u $USER -o '%.10i %.14j %.9P %.2t %.10M %R'"
+"""
+
+
+def _submit_build() -> str:
+    """The build + embed stanza, or nothing when this suite reuses them."""
+    if not SUITE.emit_build_job:
+        return (
+            "\n# No build or embed jobs: dataset embeddings are model-free "
+            "(DatasetEmbeddingCache\n# is keyed on recipe and embedder, never on "
+            "the model), so this suite reuses the\n# 640 cached centroids. Every "
+            "job below runs `--steps build ...` and writes the\n# handful of "
+            "recipes it needs itself.\n"
+        )
+    return f"""
 # One cheap CPU job: it writes 640 recipe blocks and nothing else, so it is a
 # fail-fast gate rather than the sampling work. Draws are materialised on demand
 # by the sample cache during embedding.
@@ -679,41 +900,27 @@ for s in {' '.join(f'{s:02d}' for s in SEEDS)}; do
   J=$(sb --dependency=afterok:$BUILD 02_embed_s$s.sh)
   echo "embed   s$s   $J"
 done
-
-TRAIN=""
-for i in {' '.join(str(i) for i in range(TRAIN_SHARDS))}; do
-  J=$(sb --dependency=afterok:$PREFETCH:$BUILD 03_train_shard$i.sh)
-  TRAIN="$TRAIN:$J"
-  echo "train   $i     $J"
-done
-TRAIN=${{TRAIN#:}}
-
-# Query set A is the primary result; B is the ablation. Both depend only on
-# training, so all 18 extraction jobs are eligible at once and the queue orders
-# them. If capacity is tight, the B behavioral shards are the drop candidate --
-# they are half the GPU time here, and functional B still costs ~15 minutes.
-J=$(sb --dependency=afterok:$TRAIN 04_functional_a.sh); echo "func    A     $J"
-for i in {' '.join(str(i) for i in range(BEHAVIORAL_SHARDS))}; do
-  J=$(sb --dependency=afterok:$TRAIN 05_behavioral_a_shard$i.sh)
-  echo "behav   A$i    $J"
-done
-J=$(sb --dependency=afterok:$TRAIN 06_functional_b.sh); echo "func    B     $J"
-for i in {' '.join(str(i) for i in range(BEHAVIORAL_SHARDS))}; do
-  J=$(sb --dependency=afterok:$TRAIN 07_behavioral_b_shard$i.sh)
-  echo "behav   B$i    $J"
-done
-
-# Greedy: the deterministic control, one job per query set, ~45 min each. Its
-# own cache entries (GREEDY_SAMPLING nulls the sampling fields), so it cannot
-# collide with the R={REPLICATES} runs over the same adapters and draw.
-for q in a b; do
-  J=$(sb --dependency=afterok:$TRAIN 08_greedy_$q.sh)
-  echo "greedy  ${{q^^}}     $J"
-done
-
-echo
-echo "Submitted. Watch with: squeue -u $USER -o '%.10i %.14j %.9P %.2t %.10M %R'"
 """
+
+
+def _train_dep() -> str:
+    return ":$BUILD" if SUITE.emit_build_job else ""
+
+
+def _submit_extract() -> str:
+    out = []
+    for k, q in enumerate(SUITE.query_sets):
+        tok = SUITE.job_token(q)
+        num = 4 + 2 * k
+        out.append(
+            f'J=$(sb --dependency=afterok:$TRAIN 0{num}_functional_{tok}.sh); '
+            f'echo "func    {tok}     $J"\n'
+            f"for i in {' '.join(str(i) for i in range(BEHAVIORAL_SHARDS))}; do\n"
+            f"  J=$(sb --dependency=afterok:$TRAIN 0{num + 1}_behavioral_{tok}_shard$i.sh)\n"
+            f'  echo "behav   {tok}$i    $J"\n'
+            f"done\n"
+        )
+    return "".join(out)
 
 
 if __name__ == "__main__":

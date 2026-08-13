@@ -7,11 +7,11 @@
 # three group filters -- source_registry memoises them, so that is three
 # filter passes per shard instead of one per draw.
 #
-# This shard also builds query set B (yahoo_033g1_033g2_033g3_qtc), the question-only
-# ablation. Composition feeds recipe_hash, so it is a distinct recipe -- but
+# This shard also builds the question-only query set (yahoo_033g1_033g2_033g3_qtc).
+# Composition feeds recipe_hash, so it is a distinct recipe -- but
 # text_fields never touches the sampler's RNG and the seed is not derived
-# from the hash, so it selects the SAME 100 rows as query set A. The two
-# are the same questions projected two ways, which is what makes the
+# from the hash, so it selects the SAME 100 rows as the full-context set.
+# The two are the same questions projected two ways, which is what makes the
 # ablation controlled rather than two different samples.
 #
 

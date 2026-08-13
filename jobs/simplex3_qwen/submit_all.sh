@@ -16,27 +16,21 @@
 
 set -euo pipefail
 cd "$(dirname "$0")"
-mkdir -p /weka/scratch/cpriebe1/MO/model-taxonomy/results/simplex3/logs
+mkdir -p /weka/scratch/cpriebe1/MO/model-taxonomy/results/simplex3_qwen/logs
 
 sb() { sbatch --parsable "$@"; }
 
 PREFETCH=$(sb 00_prefetch.sh)
 echo "prefetch      $PREFETCH"
 
-# One cheap CPU job: it writes 640 recipe blocks and nothing else, so it is a
-# fail-fast gate rather than the sampling work. Draws are materialised on demand
-# by the sample cache during embedding.
-BUILD=$(sb 01_build.sh)
-echo "build         $BUILD"
-
-for s in 00 01 02 03 04 05 06 07 08 09; do
-  J=$(sb --dependency=afterok:$BUILD 02_embed_s$s.sh)
-  echo "embed   s$s   $J"
-done
+# No build or embed jobs: dataset embeddings are model-free (DatasetEmbeddingCache
+# is keyed on recipe and embedder, never on the model), so this suite reuses the
+# 640 cached centroids. Every job below runs `--steps build ...` and writes the
+# handful of recipes it needs itself.
 
 TRAIN=""
 for i in 0 1 2 3; do
-  J=$(sb --dependency=afterok:$PREFETCH:$BUILD 03_train_shard$i.sh)
+  J=$(sb --dependency=afterok:$PREFETCH 03_train_shard$i.sh)
   TRAIN="$TRAIN:$J"
   echo "train   $i     $J"
 done
@@ -44,21 +38,16 @@ TRAIN=${TRAIN#:}
 
 # Extraction depends only on training, so every extraction job is eligible at
 # once and the queue orders them.
-J=$(sb --dependency=afterok:$TRAIN 04_functional_a.sh); echo "func    a     $J"
+J=$(sb --dependency=afterok:$TRAIN 04_functional_qonly.sh); echo "func    qonly     $J"
 for i in 0 1 2 3 4 5 6 7; do
-  J=$(sb --dependency=afterok:$TRAIN 05_behavioral_a_shard$i.sh)
-  echo "behav   a$i    $J"
-done
-J=$(sb --dependency=afterok:$TRAIN 06_functional_b.sh); echo "func    b     $J"
-for i in 0 1 2 3 4 5 6 7; do
-  J=$(sb --dependency=afterok:$TRAIN 07_behavioral_b_shard$i.sh)
-  echo "behav   b$i    $J"
+  J=$(sb --dependency=afterok:$TRAIN 05_behavioral_qonly_shard$i.sh)
+  echo "behav   qonly$i    $J"
 done
 
 # Greedy: the deterministic control, one job per query set. Its own cache entries
 # (GREEDY_SAMPLING nulls the sampling fields), so it cannot collide with the
 # R=16 runs over the same adapters and draw.
-for q in a b; do
+for q in qonly; do
   J=$(sb --dependency=afterok:$TRAIN 08_greedy_$q.sh)
   echo "greedy  $q     $J"
 done

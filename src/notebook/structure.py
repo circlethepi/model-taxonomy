@@ -39,6 +39,34 @@ def _normalize_projections(weights, projections: str | list[str] | None) -> list
     return sorted({_PROJ_LONG.get(p.lower(), p.lower()) for p in raw})
 
 
+def _resolve_blocks(weights, _layers: list[int], _projs: list[str]) -> list[tuple[int, str]]:
+    """(layer, proj) pairs from the cross product that every adapter actually has.
+
+    On a hybrid-attention model most of the cross product does not exist: a
+    softmax layer has no ``in_proj_qkv`` and a linear-attention layer has no
+    ``q_proj``, so taking the product unfiltered raises ``KeyError`` on the first
+    missing cell.
+
+    The intersection across adapters matters and is not paranoia: every caller
+    below builds per-adapter lists and then indexes them positionally
+    (``As[i][k]`` against ``As[j][k]``), so a block present for one adapter and
+    absent for another would silently pair up mismatched matrices rather than
+    fail. Requiring presence everywhere keeps block ``k`` meaning one thing.
+    """
+    names = weights.keys()
+    blocks = []
+    for layer in _layers:
+        for proj in _projs:
+            if all((layer, proj) in weights[name].cells for name in names):
+                blocks.append((layer, proj))
+    if not blocks:
+        raise ValueError(
+            f"No (layer, projection) block is present in every adapter for "
+            f"layers={_layers}, projections={_projs}."
+        )
+    return blocks
+
+
 # ---------------------------------------------------------------------------
 # Procrustes alignment helpers
 # ---------------------------------------------------------------------------
@@ -201,7 +229,7 @@ def frobenius_distance_matrix(
 
     _layers = _normalize_layers(weights, layers)
     _projs = _normalize_projections(weights, projections)
-    blocks = [(layer, proj) for layer in _layers for proj in _projs]
+    blocks = _resolve_blocks(weights, _layers, _projs)
 
     if align and len(blocks) != 1:
         raise ValueError(
@@ -363,7 +391,7 @@ def bures_wasserstein_distance_matrix(
 
     _layers = _normalize_layers(weights, layers)
     _projs = _normalize_projections(weights, projections)
-    blocks = [(layer, proj) for layer in _layers for proj in _projs]
+    blocks = _resolve_blocks(weights, _layers, _projs)
 
     if align and len(blocks) != 1:
         raise ValueError(
@@ -469,6 +497,7 @@ def cosine_similarity_matrix(
 
     _layers = _normalize_layers(weights, layers)
     _projs = _normalize_projections(weights, projections)
+    blocks = _resolve_blocks(weights, _layers, _projs)
 
     As: list[list[np.ndarray]] = []
     Bs: list[list[np.ndarray]] = []
@@ -477,13 +506,12 @@ def cosine_similarity_matrix(
         adapter_As: list[np.ndarray] = []
         adapter_Bs: list[np.ndarray] = []
         total = 0.0
-        for layer in _layers:
-            for proj in _projs:
-                A = weights[name].matrix(layer, proj, "A").astype(np.float64)
-                B = weights[name].matrix(layer, proj, "B").astype(np.float64)
-                adapter_As.append(A)
-                adapter_Bs.append(B)
-                total += _frob_sq(A, B)
+        for layer, proj in blocks:
+            A = weights[name].matrix(layer, proj, "A").astype(np.float64)
+            B = weights[name].matrix(layer, proj, "B").astype(np.float64)
+            adapter_As.append(A)
+            adapter_Bs.append(B)
+            total += _frob_sq(A, B)
         As.append(adapter_As)
         Bs.append(adapter_Bs)
         norm_sq.append(total)

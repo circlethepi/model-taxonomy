@@ -6,12 +6,47 @@ from typing import Literal
 
 import numpy as np
 
-# Matches: ...layers.{i}.self_attn.{proj}.lora_{A|B}.weight
+# Matches: ...layers.{i}.{family}.{proj}.lora_{A|B}.weight
+#
+# Two attention families, because hybrid models carry both.  Qwen3.5 sets
+# `full_attention_interval: 4`, so 3 of every 4 layers are `linear_attn`
+# (a gated-delta-rule recurrence) and the 4th is ordinary softmax `self_attn`.
+# Matching only `self_attn` — as this pattern did until now — silently sees
+# 64 of a Qwen adapter's 208 tensors and drops the three largest matrices.
+# Llama-style models have only `self_attn`, so nothing about them changes.
 _KEY_RE = re.compile(
-    r"\.layers\.(\d+)\.self_attn\.(k_proj|q_proj|v_proj|o_proj)\.lora_(A|B)\.weight$"
+    r"\.layers\.(\d+)\.(self_attn|linear_attn)\."
+    r"(k_proj|q_proj|v_proj|o_proj|in_proj_qkv|in_proj_z|out_proj)"
+    r"\.lora_(A|B)\.weight$"
 )
-_PROJ_SHORT = {"k": "k_proj", "q": "q_proj", "v": "v_proj", "o": "o_proj"}
-_PROJ_LONG  = {v: k for k, v in _PROJ_SHORT.items()}
+
+#: short name -> (family, tensor name, row-slice kind)
+#:
+#: The slice kind is None for a whole tensor.  ``q_query``/``q_gate`` are
+#: *pseudo-projections*: on a model with `attn_output_gate: true` the single
+#: `q_proj` tensor carries the queries and an output gate fused together, and
+#: these two names address the halves separately.  Plain ``q`` remains the
+#: whole tensor on every model, so existing callers are unaffected.
+_PROJ_SPECS: dict[str, tuple[str, str, str | None]] = {
+    "k":       ("self_attn",   "k_proj",      None),
+    "q":       ("self_attn",   "q_proj",      None),
+    "v":       ("self_attn",   "v_proj",      None),
+    "o":       ("self_attn",   "o_proj",      None),
+    "q_query": ("self_attn",   "q_proj",      "query"),
+    "q_gate":  ("self_attn",   "q_proj",      "gate"),
+    "qkv":     ("linear_attn", "in_proj_qkv", None),
+    "z":       ("linear_attn", "in_proj_z",   None),
+    "out":     ("linear_attn", "out_proj",    None),
+}
+
+#: short -> long, for the whole-tensor names only (the pseudo-projections have
+#: no distinct tensor of their own).
+_PROJ_SHORT = {s: t for s, (_, t, sl) in _PROJ_SPECS.items() if sl is None}
+#: long -> short.  ``q_proj`` maps back to ``q``, never to a gated half.
+_PROJ_LONG  = {t: s for s, t in _PROJ_SHORT.items()}
+
+#: pseudo-projections, which need `attn_num_heads` to be resolvable
+_GATED_PROJS = {s for s, (_, _, sl) in _PROJ_SPECS.items() if sl is not None}
 
 MatrixChoice = Literal["A", "B", "both"]
 
@@ -70,6 +105,15 @@ class AdapterWeights:
     @property
     def projections(self) -> list[str]:
         return sorted({k[1] for k in self._data})
+
+    @property
+    def cells(self) -> set[tuple[int, str]]:
+        """The (layer, proj_short) pairs actually held.
+
+        On a hybrid model this is a strict subset of ``layers × projections``,
+        since each layer carries only its own family's projections.
+        """
+        return set(self._data)
 
     # --- access ---
 
@@ -186,6 +230,7 @@ def load_lora_weights(
     layer_indices: int | list[int] | Literal["last"] = "last",
     projections: str | list[str] = "o",
     matrices: MatrixChoice = "both",
+    attn_num_heads: int | None = None,
 ) -> LoRAWeightCollection:
     """Load raw LoRA A/B weight tensors from PEFT adapter safetensors files.
 
@@ -202,10 +247,23 @@ def load_lora_weights(
         Transformer layer index/indices to extract. ``"last"`` picks the highest
         layer index found in the file.
     projections:
-        Which attention projections to include: ``"k"``, ``"q"``, ``"v"``, ``"o"``
-        (short form) or ``"k_proj"`` etc. (long form). Default ``"o"``.
+        Which projections to include. Softmax-attention blocks: ``"k"``, ``"q"``,
+        ``"v"``, ``"o"`` (or the long forms ``"k_proj"`` etc.). Linear-attention
+        blocks: ``"qkv"`` (``in_proj_qkv``), ``"z"`` (``in_proj_z``), ``"out"``
+        (``out_proj``). Default ``"o"``.
+
+        ``"q_query"`` and ``"q_gate"`` address the two halves of a fused, gated
+        ``q_proj`` separately and require *attn_num_heads*; plain ``"q"`` is
+        always the whole tensor.
+
+        A hybrid model carries both families on different layers, so a
+        (layer, projection) pair that does not exist is simply absent from the
+        result rather than an error.
     matrices:
         Which PEFT matrices to load: ``"A"``, ``"B"``, or ``"both"``.
+    attn_num_heads:
+        Number of attention heads, needed only to resolve ``"q_query"`` /
+        ``"q_gate"``, whose halves are interleaved per head.
 
     Returns
     -------
@@ -217,6 +275,21 @@ def load_lora_weights(
     adapter_root = Path(adapter_root)
     names  = [model_names] if isinstance(model_names, str) else list(model_names)
     projs  = _normalise_projections(projections)
+
+    gated = projs & _GATED_PROJS
+    if gated and attn_num_heads is None:
+        raise ValueError(
+            f"{sorted(gated)} address halves of a fused gated q_proj, whose rows "
+            "are interleaved per head, so attn_num_heads must be given."
+        )
+
+    # Which underlying tensor each requested short name reads from.  Several
+    # short names can share one tensor (q_query and q_gate both read q_proj),
+    # so this is a tensor -> [(short, slice_kind)] fan-out.
+    wanted: dict[str, list[tuple[str, str | None]]] = {}
+    for short in projs:
+        _family, tensor, slice_kind = _PROJ_SPECS[short]
+        wanted.setdefault(tensor, []).append((short, slice_kind))
 
     loaded: dict[str, AdapterWeights] = {}
     for name in names:
@@ -235,23 +308,43 @@ def load_lora_weights(
                 if m is None:
                     continue
                 layer_idx = int(m.group(1))
-                proj_long = m.group(2)
-                ab        = m.group(3)
-                proj_short = _PROJ_LONG[proj_long]
-                if layer_idx not in indices or proj_short not in projs:
+                tensor    = m.group(3)
+                ab        = m.group(4)
+                if layer_idx not in indices or tensor not in wanted:
                     continue
                 if matrices == "A" and ab != "A":
                     continue
                 if matrices == "B" and ab != "B":
                     continue
-                cell_key = (layer_idx, proj_short)
-                if cell_key not in data:
-                    data[cell_key] = LayerMatrices(layer_idx, proj_short, None, None)
                 arr = f.get_tensor(key)
-                if ab == "A":
-                    data[cell_key].A = arr
-                else:
-                    data[cell_key].B = arr
+                for proj_short, slice_kind in wanted[tensor]:
+                    # Only B carries output features, so only B is sliced; A is
+                    # shared between the query and gate halves.
+                    value = arr
+                    if slice_kind is not None and ab == "B":
+                        value = _split_gated_q(arr, slice_kind, attn_num_heads)
+                    cell_key = (layer_idx, proj_short)
+                    if cell_key not in data:
+                        data[cell_key] = LayerMatrices(layer_idx, proj_short, None, None)
+                    if ab == "A":
+                        data[cell_key].A = value
+                    else:
+                        data[cell_key].B = value
+        if not data:
+            # An empty result is almost always a family mismatch — asking for a
+            # linear-attention projection at a layer that runs softmax attention,
+            # or vice versa.  Silently returning nothing would surface much later
+            # as an unexplained empty distance matrix.
+            present = sorted({
+                (int(mm.group(1)), mm.group(3))
+                for k in all_keys if (mm := _KEY_RE.search(k))
+            })
+            raise ValueError(
+                f"No LoRA tensors matched for adapter {name!r}: "
+                f"layers={sorted(indices)}, projections={sorted(projs)}.\n"
+                f"That adapter has {len(present)} (layer, tensor) pairs, e.g. "
+                f"{present[:6]}."
+            )
         loaded[name] = AdapterWeights(name, data)
 
     return LoRAWeightCollection(loaded)
@@ -284,14 +377,14 @@ def _normalise_projections(projections: str | list[str]) -> set[str]:
     out = set()
     for p in raw:
         p = p.lower()
-        if p in _PROJ_SHORT:
+        if p in _PROJ_SPECS:
             out.add(p)
         elif p in _PROJ_LONG:
             out.add(_PROJ_LONG[p])
         else:
             raise ValueError(
-                f"Unknown projection {p!r}. Use 'k', 'q', 'v', 'o' "
-                "(or 'k_proj', 'q_proj', 'v_proj', 'o_proj')."
+                f"Unknown projection {p!r}. Use one of {sorted(_PROJ_SPECS)} "
+                f"or a long form in {sorted(_PROJ_LONG)}."
             )
     return out
 
@@ -316,8 +409,37 @@ def _resolve_layer_indices(
 
 def _resolve_proj_key(layer: int, proj: str) -> tuple[int, str]:
     p = proj.lower()
-    if p in _PROJ_SHORT:        # short form: "k", "q", "v", "o"
+    if p in _PROJ_SPECS:        # short form: "k", "q", "qkv", "q_gate", ...
         return (layer, p)
     if p in _PROJ_LONG:         # long form: "k_proj" -> "k"
         return (layer, _PROJ_LONG[p])
     raise ValueError(f"Unknown projection {proj!r}")
+
+
+def _split_gated_q(arr: np.ndarray, which: str, n_heads: int) -> np.ndarray:
+    """Take the query or gate half of a fused, gated ``q_proj`` tensor.
+
+    With ``attn_output_gate: true`` the model computes
+
+        query, gate = torch.chunk(q_proj(x).view(..., n_heads, head_dim * 2), 2, dim=-1)
+
+    (`transformers/models/qwen3_5/modeling_qwen3_5.py:683`), so the two halves are
+    **interleaved per head** — each head owns ``head_dim`` query rows followed by
+    ``head_dim`` gate rows — and a contiguous top/bottom split would mix them.
+
+    Only the ``B`` factor is split: it is the one whose rows are output features.
+    ``A`` is shared by both halves and is returned unchanged by the caller.
+    """
+    if which not in ("query", "gate"):
+        raise ValueError(f"which must be 'query' or 'gate', got {which!r}")
+    out_features = arr.shape[0]
+    if out_features % (2 * n_heads) != 0:
+        raise ValueError(
+            f"q_proj has {out_features} output rows, which is not divisible by "
+            f"2 * attn_num_heads ({2 * n_heads}). Either this model is not "
+            f"output-gated, or attn_num_heads is wrong."
+        )
+    head_dim = out_features // (2 * n_heads)
+    reshaped = arr.reshape(n_heads, 2 * head_dim, *arr.shape[1:])
+    part = reshaped[:, :head_dim] if which == "query" else reshaped[:, head_dim:]
+    return part.reshape(n_heads * head_dim, *arr.shape[1:])

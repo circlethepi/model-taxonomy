@@ -4,6 +4,57 @@
 
 ## Unreleased
 
+### A visualization suite for 3-group simplex experiments, and the hybrid-attention fixes it needed
+
+**`src/plots/simplex.py`** carries a colour system for experiments that mix three
+groups. Every earlier suite mixed *two*, so composition was a scalar and a `plasma`
+ramp keyed to `% topic 0` could carry it; a 3-group mixture is a point in a
+2-simplex and no single ramp represents it without dropping an axis. A model's
+colour is now a **barycentric blend** of three anchors — `g1 #1F5FA9`,
+`g2 #C13B3B`, `g3 #E3A21A` — mixed in **Oklab**, so equal weight steps look like
+equal colour steps and a 50/50 blend does not go muddy the way an sRGB average
+does. Pure vertices reproduce their anchors exactly, so `ternary_legend` (the
+filled simplex, which replaces the colourbar) and the points agree by construction.
+`mixture_weights` normalizes, which is not cosmetic: the centre is spelled
+`033g1_033g2_033g3` and sums to 99, so the raw integers would place it off-centre.
+Distance matrices keep `copper_r`.
+
+`dm_grid` and `mds_grid` render a rung × metric panel grid where a cell is either a
+distance matrix or a **string saying why it is absent**. Absence is common and is
+information, not failure: CKA needs more than one row, and Bures-Wasserstein is
+rank-1 on a single row and cannot stack blocks of differing input dim. Printing the
+reason in place keeps the constraint visible where a blank panel would read as a
+bug and a dropped column would hide it.
+
+**`scripts/make_simplex3_figures.py`** regenerates the suite for the
+simplex3_qwen experiment across all four levels. The rendered PNGs are *not*
+tracked — `figures/simplex3_qwen/*.png` is gitignored, since the suite is 27 MB
+and this script reproduces it from the cached results. `crosslevel_agreement.md`
+is tracked, because it is the numeric result rather than a rendering of one.
+
+**`lora_weights` now reads hybrid-attention adapters.** `_KEY_RE` matched only
+`self_attn.{q,k,v,o}_proj`, which on Qwen3.5 — `full_attention_interval: 4`, so 24
+of 32 layers are `linear_attn` — claimed **64 of 208 tensors** and silently dropped
+the three largest matrices, while `_max_layer` returned 31 though only 8 layers
+carried q/k/v/o, so any contiguous range raised `KeyError`. The pattern and the
+projection vocabulary now cover `linear_attn.{in_proj_qkv,in_proj_z,out_proj}`, and
+`AdapterWeights.cells` reports the (layer, projection) pairs that actually exist.
+Llama adapters have only `self_attn` and are unaffected.
+
+**`q_proj` can be split into its query and gate halves.** With
+`attn_output_gate: true` half of `q_proj`'s output rows are a gate rather than
+queries, so a distance over the whole tensor averages two unrelated roles. The new
+`q_query` / `q_gate` pseudo-projections address the halves; plain `q` is still the
+whole tensor everywhere. The halves are **interleaved per head** — the model does
+`chunk(q_proj(x).view(..., n_heads, head_dim * 2), 2, dim=-1)` — so a contiguous
+top/bottom split would silently mix them, which is why this needs `attn_num_heads`.
+
+**`structure.py` no longer assumes the layer × projection cross product exists.**
+`_resolve_blocks` keeps only pairs present in **every** adapter. The intersection is
+load-bearing: each builder assembles per-adapter lists and then indexes them
+positionally (`As[i][k]` against `As[j][k]`), so a block present for one adapter and
+missing for another would pair up mismatched matrices rather than fail.
+
 ### Distance correlation replaces Mantel as the matrix-level test
 
 **`distance_correlation` and `dcor_test`** (`src/analysis/matrices.py`) measure

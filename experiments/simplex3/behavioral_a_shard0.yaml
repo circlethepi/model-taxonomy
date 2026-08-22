@@ -2,7 +2,7 @@
 # Re-run the generator instead; hand edits are lost and, worse, silently diverge
 # from the other ~50 files that were meant to agree with this one.
 #
-# Behavioral extraction over query set A (title + content + answer, matching the training composition).
+# Behavioral extraction over the full_context query set (title + content + answer, matching the training composition).
 # 2 adapter(s), shard 0 of 8.
 #
 # Sharded because this is the expensive half: 16 adapters x 100 queries

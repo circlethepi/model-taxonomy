@@ -42,27 +42,25 @@ for i in 0 1 2 3; do
 done
 TRAIN=${TRAIN#:}
 
-# Query set A is the primary result; B is the ablation. Both depend only on
-# training, so all 18 extraction jobs are eligible at once and the queue orders
-# them. If capacity is tight, the B behavioral shards are the drop candidate --
-# they are half the GPU time here, and functional B still costs ~15 minutes.
-J=$(sb --dependency=afterok:$TRAIN 04_functional_a.sh); echo "func    A     $J"
+# Extraction depends only on training, so every extraction job is eligible at
+# once and the queue orders them.
+J=$(sb --dependency=afterok:$TRAIN 04_functional_a.sh); echo "func    a     $J"
 for i in 0 1 2 3 4 5 6 7; do
   J=$(sb --dependency=afterok:$TRAIN 05_behavioral_a_shard$i.sh)
-  echo "behav   A$i    $J"
+  echo "behav   a$i    $J"
 done
-J=$(sb --dependency=afterok:$TRAIN 06_functional_b.sh); echo "func    B     $J"
+J=$(sb --dependency=afterok:$TRAIN 06_functional_b.sh); echo "func    b     $J"
 for i in 0 1 2 3 4 5 6 7; do
   J=$(sb --dependency=afterok:$TRAIN 07_behavioral_b_shard$i.sh)
-  echo "behav   B$i    $J"
+  echo "behav   b$i    $J"
 done
 
-# Greedy: the deterministic control, one job per query set, ~45 min each. Its
-# own cache entries (GREEDY_SAMPLING nulls the sampling fields), so it cannot
-# collide with the R=16 runs over the same adapters and draw.
+# Greedy: the deterministic control, one job per query set. Its own cache entries
+# (GREEDY_SAMPLING nulls the sampling fields), so it cannot collide with the
+# R=16 runs over the same adapters and draw.
 for q in a b; do
   J=$(sb --dependency=afterok:$TRAIN 08_greedy_$q.sh)
-  echo "greedy  ${q^^}     $J"
+  echo "greedy  $q     $J"
 done
 
 echo

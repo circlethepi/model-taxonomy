@@ -10,3 +10,5 @@ experiments/archive/*
 fonts/
 figures/nosync
 .claude/worktrees/
+figures/simplex3_qwen/*.png
+

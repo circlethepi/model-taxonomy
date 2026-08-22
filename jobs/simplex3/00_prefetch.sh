@@ -23,6 +23,6 @@ export HF_HOME=/weka/home/mohata1/scratchcpriebe1/MO/huggingface_cache
 
 python -c "
 from huggingface_hub import snapshot_download
-p = snapshot_download('meta-llama/Llama-3.1-8B', allow_patterns=['*.json','*.safetensors','*.model','tokenizer*'])
+p = snapshot_download('meta-llama/Llama-3.1-8B', allow_patterns=['*.json','*.safetensors','*.model','tokenizer*','*.jinja','merges.txt'])
 print('cached at', p)
 "

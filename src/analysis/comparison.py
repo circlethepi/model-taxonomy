@@ -44,7 +44,7 @@ the non-anchor evaluation points alone.  The second is the one to quote.
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
@@ -106,6 +106,7 @@ def build_taxonomy_artifacts(
     id_scheme: str = "recipe_id",
     mds_kwargs: Mapping[str, Any] | None = None,
     use_cache: bool = True,
+    transform: Any = None,
 ) -> tuple[DistanceMatrix, dict[str, GeometryResult]]:
     """Distance matrix plus embeddings for one taxonomy over one collection.
 
@@ -183,6 +184,17 @@ def build_taxonomy_artifacts(
         ``layers`` is a read-time choice — a run stores every layer — so changing
         it costs a surrogate build, not a GPU pass.
 
+    transform:
+        An optional fleet-level surrogate transform from
+        :mod:`src.analysis.surrogates` — a callable over the whole list of
+        resolved representations, for operations a pairwise metric cannot express
+        (centering on the fleet mean, whitening against the fleet covariance).
+        It runs after resolution and before any distance is taken, and its
+        :func:`~src.analysis.surrogates.transform_key` joins the collection key,
+        so a centered collection and a raw one over the same tensors cannot
+        collide in ``06_collections``.  Not available for ``structural``, which
+        never materializes the representations a transform would act on.
+
     use_cache:
         ``False`` skips ``06_collections`` entirely — nothing is read and nothing
         is written.  ``cache_root=None`` does **not** do this: it falls back to
@@ -232,6 +244,27 @@ def build_taxonomy_artifacts(
     )
     model_entries = [{**ident, "model_id": i} for i, ident in zip(ids, identity)]
 
+    from .surrogates import transform_key
+    tkey = transform_key(transform)
+    if transform is not None:
+        if reps is None:
+            raise ValueError(
+                "transform is not supported for the structural taxonomy: its "
+                "distances come from the low-rank LoRA builders in "
+                "src.notebook.structure, which never materialize the "
+                "ModelRepresentation a transform would act on."
+            )
+        if tkey == "custom":
+            raise ValueError(
+                "an anonymous transform has no stable name, so a collection "
+                "built with it cannot be keyed apart from one built with a "
+                "different anonymous transform — a later call would silently "
+                "read back the wrong matrix. Use a helper from "
+                "src.analysis.surrogates (centered(), whitened()), a named "
+                "function, or pass use_cache=False."
+            )
+        reps = list(transform(reps))
+
     dm: DistanceMatrix | None = None
     handle: str | None = None
     if cache is not None:
@@ -240,11 +273,23 @@ def build_taxonomy_artifacts(
         # such a collection was stored where it was never sought, so it never hit
         # and rewrote its directory on every run.
         metric_name = _resolve_metric(metric).metric_name
+        # The transform joins the surrogate key rather than the metric name: it
+        # is a property of the *representations*, not of how two of them are
+        # compared, and the metric name is a directory component. Tagged so a
+        # transform key can never be mistaken for a model's surrogate hash.
+        #
+        # Appended only when there *is* a transform, so the untransformed key is
+        # bit-identical to what it was before this argument existed. Adding a
+        # "transform:raw" element unconditionally would have been tidier and
+        # would have orphaned every collection already in 06_collections.
+        surrogates = [e["surrogate_hash"] for e in model_entries]
+        if transform is not None:
+            surrogates = surrogates + [f"transform:{tkey}"]
         handle = cache.handle(
             taxonomy,
             cache.collection_key(model_entries),
             metric_name,
-            cache.surrogate_key([e["surrogate_hash"] for e in model_entries]),
+            cache.surrogate_key(surrogates),
         )
         if cache.exists(handle):
             dm = cache.load_distance_matrix(handle)
@@ -297,7 +342,8 @@ def _leaf_config(taxonomy, reps, model_entries, **selectors) -> dict:
             # generated text itself) are listed above or are far too large.
             if k in ("mode", "pooling", "layers", "view", "normalize",
                      "replicate_reduction", "embedder_hash", "max_new_tokens",
-                     "replicates", "sampling_hash", "is_kernel")
+                     "replicates", "sampling_hash", "is_kernel",
+                     "surrogate_transform")
         },
     }
 
@@ -333,14 +379,23 @@ def _resolve_metric(metric: Any):
         CKADistanceMetric,
         CosineDistanceMetric,
         DotProductDistanceMetric,
+        EnergyDistanceMetric,
         FrobeniusDistanceMetric,
+        MMDDistanceMetric,
     )
 
     table = {
         "cka": CKADistanceMetric,
         "frobenius": FrobeniusDistanceMetric,
+        # The un-normalized Frobenius, i.e. plain Euclidean distance. Named apart
+        # because it is translation-invariant and the normalized form is not, so
+        # they answer differently on a centered representation.
+        "euclidean": lambda: FrobeniusDistanceMetric(normalize=False),
         "cosine": CosineDistanceMetric,
         "dot_product": DotProductDistanceMetric,
+        # Distributional: row-order invariant, unequal row counts allowed.
+        "mmd": MMDDistanceMetric,
+        "energy": EnergyDistanceMetric,
         # Selectable on the representation path as well as the structural one.
         # `_structural_matrix` gates on the *reported* name, which is the same
         # string, so a structural comparison still routes to the low-rank builder
@@ -422,6 +477,7 @@ def _compute_distance_matrix(
     dataset_selector: dict | None = None,
     behavioral_selector: dict | None = None,
     functional_selector: dict | None = None,
+    transform: Any = None,
 ) -> DistanceMatrix:
     """Distances for one taxonomy, always recomputed.
 
@@ -429,6 +485,56 @@ def _compute_distance_matrix(
     reads or writes ``06_collections``.  :func:`build_taxonomy_artifacts` goes
     through the cache instead; this is what to call to sweep selectors without
     populating it.
+
+    *ids* both **selects and orders** the rows.  It need not match
+    ``index.entries`` order, and need not name every entry; each id is resolved
+    against the index and the representations are permuted to match before any
+    distance is taken.  Ids may be spelled as either ``model_id`` or
+    ``recipe_id``, the two schemes :meth:`CacheIndex.entry_for` accepts.
+
+    *transform* is an optional fleet-level surrogate transform from
+    :mod:`src.analysis.surrogates` — a callable taking the ordered list of
+    representations and returning a new one.  It runs after the reorder, so a
+    fleet mean is taken over exactly the models *ids* names, in the order it
+    names them.
+    """
+    reps, order = resolve_ordered(
+        index, taxonomy, ids, layers=layers, projections=projections,
+        embedder_hash=embedder_hash, dataset_selector=dataset_selector,
+        behavioral_selector=behavioral_selector,
+        functional_selector=functional_selector, transform=transform,
+    )
+    return _distances(index, taxonomy, metric, ids, reps, layers, projections,
+                      order=order)
+
+
+def resolve_ordered(
+    index: CacheIndex,
+    taxonomy: str,
+    ids: Sequence[ModelID],
+    *,
+    layers=None,
+    projections=None,
+    embedder_hash: str | None = None,
+    dataset_selector: dict | None = None,
+    behavioral_selector: dict | None = None,
+    functional_selector: dict | None = None,
+    transform: Any = None,
+) -> tuple[list | None, list[int]]:
+    """Representations for *ids*, in *ids* order, with *transform* applied.
+
+    Returns ``(reps, order)``, where ``order`` is the permutation into
+    ``index.entries`` — structural needs it because it reads the adapter files
+    itself and so has ``reps is None``.
+
+    Split out of :func:`_compute_distance_matrix` so that a **sweep over metrics
+    at one selector resolves once**.  That is the shape of every panel grid: a
+    row fixes the selector and the columns vary the metric, and going back
+    through ``_compute_distance_matrix`` per column re-read the same tensors from
+    disk once per metric.  With seven metric columns that was the dominant cost
+    of the figure suite — far more than any of the distances.
+
+    Pass the result to :func:`_distances` with the same *ids*.
     """
     reps, _ = _resolve_representations(
         index, taxonomy, layers=layers, projections=projections,
@@ -436,7 +542,19 @@ def _compute_distance_matrix(
         behavioral_selector=behavioral_selector,
         functional_selector=functional_selector,
     )
-    return _distances(index, taxonomy, metric, ids, reps, layers, projections)
+    order = _positions_for(index, ids)
+    if reps is not None:
+        reps = [reps[p] for p in order]
+        if transform is not None:
+            reps = list(transform(reps))
+    elif transform is not None:
+        raise ValueError(
+            "transform is not supported for the structural taxonomy: its "
+            "distances come from the low-rank LoRA builders in "
+            "src.notebook.structure, which never materialize the "
+            "ModelRepresentation a transform would act on."
+        )
+    return reps, order
 
 
 #: Selector keys per taxonomy, for resolving one model's representation.
@@ -544,6 +662,58 @@ def _structural_identity(index: CacheIndex, layers, projections) -> list[dict]:
     ]
 
 
+def _positions_for(index: CacheIndex, ids: Sequence[ModelID]) -> list[int]:
+    """Position in ``index.entries`` for each requested id, in *ids* order.
+
+    Representations are resolved one per entry, in entry order, but a caller is
+    free to ask for its own selection and ordering — ``sort_by_mixture`` is the
+    motivating case.  Pairing the two by *position* is what
+    ``docs/notes/row_order_bug.md`` records: the matrix was computed in entry
+    order and labelled in the caller's, so every row carried another model's
+    name whenever the two disagreed.  Resolving by identity is the fix.
+
+    An id is looked up as a ``model_id`` first and a ``recipe_id`` second, the
+    two schemes :meth:`CacheIndex.entry_for` accepts.  A scheme is only consulted
+    when it is unambiguous across the whole index: several adapters can share one
+    recipe (a rank or init-seed sweep), and resolving a recipe id then would pick
+    an arbitrary one of them.
+    """
+    by_model: dict[ModelID, int] = {}
+    by_recipe: dict[ModelID, int] = {}
+    ambiguous_recipes: set[ModelID] = set()
+    for pos, entry in enumerate(index.entries):
+        if entry.model_id is not None:
+            by_model.setdefault(entry.model_id, pos)
+        rid = getattr(entry, "recipe_id", None)
+        if rid is not None:
+            if rid in by_recipe:
+                ambiguous_recipes.add(rid)
+            else:
+                by_recipe[rid] = pos
+
+    out: list[int] = []
+    for mid in ids:
+        if mid in by_model:
+            out.append(by_model[mid])
+            continue
+        if mid in ambiguous_recipes:
+            raise ValueError(
+                f"{mid!r} is a recipe id shared by several entries in this "
+                "index, so it does not name one representation. Pass model ids "
+                "instead (id_scheme='model_id'), or filter the index down to "
+                "one adapter per recipe."
+            )
+        if mid in by_recipe:
+            out.append(by_recipe[mid])
+            continue
+        raise ValueError(
+            f"{mid!r} is not in this index as a model id or a recipe id. "
+            f"The index holds {len(index.entries)} entr(y/ies); e.g. "
+            f"{index.entries[0].model_id!r}."
+        )
+    return out
+
+
 def _distances(
     index: CacheIndex,
     taxonomy: str,
@@ -552,10 +722,23 @@ def _distances(
     reps: Sequence | None,
     layers=None,
     projections=None,
+    order: Sequence[int] | None = None,
 ) -> DistanceMatrix:
-    """Pairwise distances from resolved representations."""
+    """Pairwise distances from resolved representations.
+
+    *reps* must already be in *ids* order; *order* is the same permutation into
+    ``index.entries``, which structural needs because it reads the adapter files
+    itself rather than taking representations.
+    """
     if reps is None:
-        return _structural_matrix(index, metric, ids, layers, projections)
+        return _structural_matrix(index, metric, ids, layers, projections,
+                                  order=order)
+
+    if len(reps) != len(ids):
+        raise ValueError(
+            f"{len(reps)} representation(s) for {len(ids)} id(s); these must "
+            "agree, since row i of the matrix is labelled ids[i]."
+        )
 
     metric_obj = _resolve_metric(metric)
     n = len(reps)
@@ -573,14 +756,23 @@ def _distances(
 
 
 def _structural_matrix(
-    index: CacheIndex, metric: Any, ids: Sequence[ModelID], layers, projections
+    index: CacheIndex,
+    metric: Any,
+    ids: Sequence[ModelID],
+    layers,
+    projections,
+    order: Sequence[int] | None = None,
 ) -> DistanceMatrix:
     """Low-rank distances over the LoRA factors, relabelled into the shared namespace."""
     from src.notebook.lora_weights import load_lora_weights
 
     from .bridge import lora_distance_matrix
 
-    missing = [e.adapter_name for e in index.entries if not e.has("structural_weights")]
+    if order is None:
+        order = _positions_for(index, ids)
+    entries = [index.entries[p] for p in order]
+
+    missing = [e.adapter_name for e in entries if not e.has("structural_weights")]
     if missing:
         raise ValueError(
             f"{len(missing)} adapter(s) have no adapter_model.safetensors, e.g. "
@@ -592,7 +784,7 @@ def _structural_matrix(
         raise ValueError("index has no cache_root; cannot locate adapter weights")
 
     weights = load_lora_weights(
-        [e.adapter_name for e in index.entries],
+        [e.adapter_name for e in entries],
         adapter_root=Path(root) / "03_adapters",
         layer_indices=layers if layers is not None else "last",
         projections=projections if projections is not None else "o",
@@ -607,8 +799,20 @@ def _structural_matrix(
 
     # lora_distance_matrix keys by adapter folder name; map onto the shared
     # namespace using the authoritative record rather than by parsing the name.
-    rename = {e.adapter_name: i for e, i in zip(index.entries, ids)}
-    return relabel(dm, rename)
+    # The adapters were loaded in *ids* order, so this pairing is by identity —
+    # it does not depend on `weights` having preserved that order, and a rename
+    # that lost a model would collide in `relabel` rather than pass silently.
+    rename = {e.adapter_name: i for e, i in zip(entries, ids)}
+    dm = relabel(dm, rename)
+
+    # The builders return rows in `weights` insertion order, which is the order
+    # the adapters were listed in — but that is their contract, not something
+    # visible here, so the caller's order is imposed rather than assumed.
+    if list(dm.model_ids) != list(ids):
+        pos = {m: k for k, m in enumerate(dm.model_ids)}
+        perm = np.array([pos[m] for m in ids])
+        dm = replace(dm, matrix=dm.matrix[np.ix_(perm, perm)], model_ids=list(ids))
+    return dm
 
 
 def _dataset_embedding_reps(

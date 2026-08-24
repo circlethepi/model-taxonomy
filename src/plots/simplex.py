@@ -31,10 +31,18 @@ from src.plots.figures import _add_colorbar, save_figure
 # ── Anchors ───────────────────────────────────────────────────────────────────
 #   Chosen to stay separable under deuteranopia and to share no hue family with
 #   copper_r, so a distance matrix and an embedding can never be confused.
+#
+#   Brightened 2026-08-24 from the original muted set (#1F5FA9 / #C13B3B /
+#   #E3A21A). The hues are unchanged — this is the same blue/red/gold tricolor,
+#   pushed up in chroma and lightness. That matters more here than in a
+#   categorical palette: 13 of the 16 models sit in the *interior* of the
+#   simplex, and an interior point is a three-way blend, which is always less
+#   saturated than any of its parents. Starting from muted anchors left the
+#   interior nearly grey.
 ANCHORS: dict[str, str] = {
-    "g1": "#1F5FA9",   # deep blue
-    "g2": "#C13B3B",   # crimson
-    "g3": "#E3A21A",   # gold
+    "g1": "#1E6FE8",   # blue
+    "g2": "#F02B3A",   # red
+    "g3": "#FFC220",   # gold
 }
 
 GROUP_TOPICS: dict[str, list[int]] = {

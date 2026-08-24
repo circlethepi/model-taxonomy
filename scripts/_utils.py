@@ -861,6 +861,11 @@ def make_metric(name: str):
     elif name == "frobenius":
         from src.metrics.frobenius import FrobeniusDistanceMetric
         return FrobeniusDistanceMetric()
+    elif name == "euclidean":
+        # The un-normalized Frobenius: translation-invariant, so it is the one
+        # that pairs with a centered representation.
+        from src.metrics.frobenius import FrobeniusDistanceMetric
+        return FrobeniusDistanceMetric(normalize=False)
     elif name == "cosine":
         from src.metrics.vector import CosineDistanceMetric
         return CosineDistanceMetric()
@@ -870,10 +875,16 @@ def make_metric(name: str):
     elif name == "bures_wasserstein":
         from src.metrics.bures_wasserstein import BuresWassersteinDistanceMetric
         return BuresWassersteinDistanceMetric()
+    elif name == "mmd":
+        from src.metrics.distributional import MMDDistanceMetric
+        return MMDDistanceMetric()
+    elif name == "energy":
+        from src.metrics.distributional import EnergyDistanceMetric
+        return EnergyDistanceMetric()
     else:
         raise ValueError(
-            f"Unknown metric: {name!r}. Choose from cka, frobenius, cosine, "
-            f"dot_product, bures_wasserstein."
+            f"Unknown metric: {name!r}. Choose from cka, frobenius, euclidean, "
+            f"cosine, dot_product, bures_wasserstein, mmd, energy."
         )
 
 

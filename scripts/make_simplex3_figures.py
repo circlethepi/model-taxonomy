@@ -8,9 +8,10 @@ model's own mixture (see :mod:`src.plots.simplex`).
 Not every (rung, metric) cell exists, and the gaps are structural rather than
 accidental:
 
-* **CKA** needs more than one row, so it cannot run on a ``model mean``
-  representation, and :func:`src.notebook.structure.cka_distance_matrix` takes a
-  single (layer, projection), so it cannot span a layer grouping.
+* **CKA**, **MMD** and **energy** all need more than one row, so none of them can
+  run on a ``model mean`` representation, and
+  :func:`src.notebook.structure.cka_distance_matrix` takes a single
+  (layer, projection), so CKA cannot span a layer grouping.
 * **Bures-Wasserstein** stacks per-block factors before its SVD, so every block
   must share an input dim; a selection mixing 2560-input and 4096-input
   projections has no BW value. It is also rank-1, and so carries nothing cosine
@@ -19,11 +20,22 @@ accidental:
 Absent cells are drawn with the reason in place rather than left blank or
 silently dropped, so the constraint stays visible in the figure.
 
+Surrogate rungs
+---------------
+Several rows apply a *fleet-level* transform from :mod:`src.analysis.surrogates`
+before distancing — centering on the fleet mean, or whitening against the fleet
+covariance. These are not alternative metrics; they change what is being
+compared. Every level here carries a large component shared by all 16 models
+(the same 100 questions, the same Yahoo answer register, the same base model),
+and it is identical by construction, so it can only dilute a similarity. The
+centered rungs measure what is left.
+
 Usage
 -----
     python scripts/make_simplex3_figures.py                  # everything
     python scripts/make_simplex3_figures.py --level functional
     python scripts/make_simplex3_figures.py --skip-sweep     # omit the slow one
+    python scripts/make_simplex3_figures.py --skip-surrogate # raw rungs only
 """
 
 from __future__ import annotations
@@ -59,7 +71,10 @@ import numpy as np  # noqa: E402
 
 from src.analysis import scan_cache  # noqa: E402
 from src.analysis.bridge import as_distance_matrix  # noqa: E402
-from src.analysis.comparison import _compute_distance_matrix  # noqa: E402
+from src.analysis.comparison import (  # noqa: E402
+    _distances, resolve_ordered,
+)
+from src.analysis.surrogates import centered, whitened  # noqa: E402
 from src.plots.config import set_style  # noqa: E402
 from src.plots.figures import save_figure  # noqa: E402
 from src.plots.simplex import (  # noqa: E402
@@ -95,8 +110,25 @@ LINEAR_ATTN_STATES = [L + 1 for L in LINEAR_ATTN_LAYERS]
 N_STATES = N_LAYERS + 1
 
 METRICS = {"cosine": "cosine", "frobenius": "frobenius",
-           "cka": "cka", "bw": "bures_wasserstein"}
+           "euclidean": "euclidean",
+           "cka": "cka", "bw": "bures_wasserstein",
+           "mmd": "mmd", "energy": "energy"}
 METRIC_COLS = list(METRICS)
+
+#: Metrics that discard each row's magnitude. They are the ones a centering
+#: transform interacts with, and not in the direction one might expect: after
+#: centering, a row's magnitude *is* its distance from the fleet centroid, so
+#: normalizing it away discards exactly what centering exposed. `euclidean` is
+#: in the grid to make that visible — it is translation-invariant, so its
+#: centered and raw cells are identical by construction, which is the reference
+#: the scale-invariant columns should be read against.
+SCALE_INVARIANT = ("cosine", "frobenius", "cka")
+
+#: Metrics that read a representation as a *sample* rather than an indexed list.
+#: They need more than one row for the same reason CKA does, but for a different
+#: reason than BW: BW has a rank-1 covariance on one row (degenerate but
+#: defined), whereas a one-point sample has no distribution to estimate.
+DISTRIBUTIONAL = ("mmd", "energy")
 
 #: input dim per projection, which is what constrains a BW selection
 PROJ_DIN = {"q": 2560, "q_query": 2560, "q_gate": 2560, "k": 2560, "v": 2560,
@@ -105,6 +137,73 @@ PROJ_DIN = {"q": 2560, "q_query": 2560, "q_gate": 2560, "k": 2560, "v": 2560,
 NO_CKA_GROUP = "CKA is single-block:\nno layer grouping"
 NO_CKA_ROWS = "CKA needs >1 row"
 NO_BW_ROWS = "BW is rank-1 here\n(same as cosine)"
+NO_DIST_ROWS = "no distribution\nin a single row"
+NO_DIST_STRUCT = "structural has no\nrow sample"
+NO_EUCLID_STRUCT = "structural frobenius\nis already unnormalized"
+
+
+CENTERED_EUCLID = "same as uncentered:\neuclidean is\ntranslation-invariant"
+
+
+def _redundant(col: str, tf) -> str | None:
+    """Why a (metric, transform) cell would duplicate its untransformed twin.
+
+    Both centering modes subtract *one* array from every model, so they are a
+    translation of the whole collection, and a translation cannot change a
+    Euclidean distance. Computing the cell would produce a numerically identical
+    panel under a label implying otherwise, which reads as a coincidence rather
+    than an identity. Whitening is a genuine linear map and is exempt.
+    """
+    from src.analysis.surrogates import transform_key
+    if col == "euclidean" and tf is not None and transform_key(tf).startswith("centered"):
+        return CENTERED_EUCLID
+    return None
+
+
+def _no_rows(col: str) -> str | None:
+    """Why *col* cannot run on a single-row (pooled ``mean``) representation."""
+    if col == "cka":
+        return NO_CKA_ROWS
+    if col == "bw":
+        return NO_BW_ROWS
+    if col in DISTRIBUTIONAL:
+        return NO_DIST_ROWS
+    return None
+
+
+def _blocked(single_row: bool, tf) -> dict[str, str]:
+    """``{column: reason}`` for every cell this (representation, transform) lacks."""
+    out = {}
+    for col in METRIC_COLS:
+        reason = _redundant(col, tf)
+        if reason is None and single_row:
+            reason = _no_rows(col)
+        if reason is not None:
+            out[col] = reason
+    return out
+
+
+def metric_row(idx, taxonomy, ids, tf, blocked=None, **selectors):
+    """One grid row: every metric column at a single fixed selector.
+
+    The representations are resolved **once** and every column is computed from
+    that one list. Calling ``_compute_distance_matrix`` per column instead
+    re-read the same 16 tensors seven times over, which — not any of the
+    distances — was what made the suite slow once the grid widened.
+
+    *blocked* maps a column to the reason it has no value here, so a structural
+    absence is still rendered in place rather than computed and discarded.
+    """
+    blocked = blocked or {}
+    reps, order = resolve_ordered(idx, taxonomy, ids, transform=tf, **selectors)
+    out = {}
+    for col in METRIC_COLS:
+        if col in blocked:
+            out[col] = blocked[col]
+            continue
+        out[col] = _distances(idx, taxonomy, METRICS[col], ids, reps,
+                              order=order)
+    return out
 
 
 def _bw_mixed(projs) -> str:
@@ -121,7 +220,7 @@ def thirds(xs):
 
 # ── Level builders ────────────────────────────────────────────────────────────
 
-def behavioral_cells(idx, ids):
+def behavioral_cells(idx, ids, surrogates=True):
     def sel(replicates, sampling, **over):
         base = {"draw": DRAW, "max_new_tokens": MAX_NEW_TOKENS,
                 "replicates": replicates, "sampling_hash": sampling,
@@ -134,23 +233,42 @@ def behavioral_cells(idx, ids):
     model_mean = {"replicate_reduction": "mean", "representation": "mean",
                   "renormalize": True}
 
+    #: (selector, transform) per row.
     rows = {
         # greedy `per query` is omitted, not forgotten: averaging over a single
         # replicate is the identity, so it would duplicate `per generation`.
-        "greedy · per generation":  sel(1, SAMP_GREEDY),
-        "greedy · model mean":      sel(1, SAMP_GREEDY, **model_mean),
-        "R=16 · per generation":    sel(16, SAMP_SAMPLED),
-        "R=16 · per query":         sel(16, SAMP_SAMPLED, **per_query),
-        "R=16 · model mean":        sel(16, SAMP_SAMPLED, **model_mean),
+        "greedy · per generation":  (sel(1, SAMP_GREEDY), None),
+        "greedy · model mean":      (sel(1, SAMP_GREEDY, **model_mean), None),
+        "R=16 · per generation":    (sel(16, SAMP_SAMPLED), None),
+        "R=16 · per query":         (sel(16, SAMP_SAMPLED, **per_query), None),
+        "R=16 · model mean":        (sel(16, SAMP_SAMPLED, **model_mean), None),
     }
+    if surrogates:
+        rows.update({
+            # `rowwise` on the R=16 matrix subtracts, from each of a model's 1600
+            # rows, the fleet mean of *that* row. Rows are query-major and every
+            # model was run on the same draw in the same order, so row k is the
+            # same (question, replicate index) slot everywhere — which is what
+            # makes the subtraction meaningful. The replicate index is not shared
+            # in any deeper sense (they are independent samples), but averaging
+            # over the 16 models at a fixed slot still estimates that question's
+            # fleet-average answer, which is the nuisance being removed.
+            "R=16 · per generation · centered":
+                (sel(16, SAMP_SAMPLED), centered("rowwise")),
+            "R=16 · per generation · whitened":
+                (sel(16, SAMP_SAMPLED), whitened(0.1, "rowwise")),
+            # The pooled rung has one row per model, so `grand` is the only mode
+            # available and it reduces to subtracting the fleet centroid.
+            "R=16 · model mean · centered":
+                (sel(16, SAMP_SAMPLED, **model_mean), centered("grand")),
+        })
+
     cells = {}
-    for row, selector in rows.items():
-        for col in METRIC_COLS:
-            if selector.get("representation") == "mean" and col in ("cka", "bw"):
-                cells[(row, col)] = NO_CKA_ROWS if col == "cka" else NO_BW_ROWS
-                continue
-            cells[(row, col)] = _compute_distance_matrix(
-                idx, "behavioral", METRICS[col], ids, behavioral_selector=selector)
+    for row, (selector, tf) in rows.items():
+        blocked = _blocked(selector.get("representation") == "mean", tf)
+        got = metric_row(idx, "behavioral", ids, tf, blocked,
+                         behavioral_selector=selector)
+        cells.update({(row, c): v for c, v in got.items()})
     return list(rows), cells
 
 
@@ -172,42 +290,87 @@ def functional_layer_rows():
     }
 
 
-def functional_group_rows():
+def functional_group_rows(surrogates=True):
     early, mid, late = thirds(range(1, N_STATES))
-    return {
-        "all 33 layers (reference)": _fsel(None),
-        "early third":              _fsel(list(early)),
-        "middle third":             _fsel(list(mid)),
-        "late third":               _fsel(list(late)),
-        "full-attn outputs":        _fsel(FULL_ATTN_STATES),
-        "linear-attn outputs":      _fsel(LINEAR_ATTN_STATES),
+    rows = {
+        "all 33 layers (reference)": (_fsel(None), None),
+        "early third":              (_fsel(list(early)), None),
+        "middle third":             (_fsel(list(mid)), None),
+        "late third":               (_fsel(list(late)), None),
+        "full-attn outputs":        (_fsel(FULL_ATTN_STATES), None),
+        "linear-attn outputs":      (_fsel(LINEAR_ATTN_STATES), None),
     }
+    if surrogates:
+        # `rowwise`: row i is query i of the shared draw in every model, so this
+        # subtracts the base model's own reading of each prompt — which is most
+        # of a hidden state, and identical across the 16 by construction since
+        # LoRA only perturbs it.
+        rows["all 33 layers · centered"] = (_fsel(None), centered("rowwise"))
+        rows["late third · centered"] = (_fsel(list(late)), centered("rowwise"))
+    return rows
 
 
 def functional_cells(idx, ids, rows):
     cells = {}
-    for row, selector in rows.items():
-        for col in METRIC_COLS:
-            cells[(row, col)] = _compute_distance_matrix(
-                idx, "functional", METRICS[col], ids, functional_selector=selector)
+    for row, (selector, tf) in rows.items():
+        got = metric_row(idx, "functional", ids, tf, _blocked(False, tf),
+                         functional_selector=selector)
+        cells.update({(row, c): v for c, v in got.items()})
     return list(rows), cells
 
 
-def dataset_cells(idx, ids):
-    row = "dataset text · mean · n1000_s00"
+#: `matrix` keeps all 1000 per-document embeddings; `mean` is the (1, 768)
+#: centroid that was the only stored surrogate until 2026-08-24.
+DATASET_MEAN = {"n_samples": 1000, "seed": 0, "representation": "mean"}
+DATASET_MATRIX = {"n_samples": 1000, "seed": 0, "representation": "matrix"}
+
+
+def dataset_rows(idx, ids, surrogates=True):
+    """(selector, transform) per row, dropping rungs the cache cannot serve.
+
+    The `matrix` surrogate is authored, not derived — see
+    ``docs/notes/dataset_embedding_layout.md`` §4 — so it exists only if the
+    re-embed job has run. Its rows are omitted with a printed note rather than
+    raising, so the no-GPU rungs still render on a cache that predates it.
+    """
+    rows = {"dataset text · mean · n1000_s00": (DATASET_MEAN, None)}
+    if not surrogates:
+        return rows
+    # The 16 centroids share one large "Yahoo answer register" direction, which
+    # puts every raw cosine distance in 0.00-0.03. Removing it makes the mixture
+    # geometry the whole of what is measured rather than a perturbation on it.
+    rows["dataset text · mean · centered"] = (DATASET_MEAN, centered("grand"))
+
+    if _dataset_matrix_available(idx, ids):
+        # `grand`, not `rowwise`: row i is the i-th sampled document of *this*
+        # recipe. Two recipes' row i are unrelated documents, so a per-row fleet
+        # mean would be an average over 16 arbitrary texts.
+        rows["dataset text · matrix · n1000_s00"] = (DATASET_MATRIX, None)
+        rows["dataset text · matrix · centered"] = (DATASET_MATRIX, centered("grand"))
+    else:
+        print("    no 'matrix' dataset surrogate in the cache — skipping those "
+              "rows. Run jobs/simplex3_qwen/02_embed_matrix.sh to author it.")
+    return rows
+
+
+def _dataset_matrix_available(idx, ids) -> bool:
+    from src.analysis.comparison import _dataset_embedding_reps
+    try:
+        _dataset_embedding_reps(idx, DATASET_EMBEDDER, DATASET_MATRIX)
+    except Exception:
+        return False
+    return True
+
+
+def dataset_cells(idx, ids, rows):
     cells = {}
-    for col in METRIC_COLS:
-        if col == "cka":
-            cells[(row, col)] = NO_CKA_ROWS
-        elif col == "bw":
-            cells[(row, col)] = NO_BW_ROWS
-        else:
-            cells[(row, col)] = _compute_distance_matrix(
-                idx, "dataset_embedding", METRICS[col], ids,
-                dataset_selector={"n_samples": 1000, "seed": 0,
-                                  "representation": "mean"},
-                embedder_hash=DATASET_EMBEDDER)
-    return [row], cells
+    for row, (selector, tf) in rows.items():
+        blocked = _blocked(selector["representation"] == "mean", tf)
+        got = metric_row(idx, "dataset_embedding", ids, tf, blocked,
+                         dataset_selector=selector,
+                         embedder_hash=DATASET_EMBEDDER)
+        cells.update({(row, c): v for c, v in got.items()})
+    return list(rows), cells
 
 
 # ── Structural ────────────────────────────────────────────────────────────────
@@ -235,6 +398,16 @@ def _structural_dm(weights, names, layers, projs, metric_tag):
             return NO_CKA_GROUP
         n, D = cka_distance_matrix(weights, layers[0], projs[0])
         return as_distance_matrix(n, D, "cka_linear", "structural")
+    if metric_tag in DISTRIBUTIONAL:
+        # The structural builders work on the LoRA factors and never form the
+        # d x d product, so there is no cloud of feature vectors here to read as
+        # a sample. The rows of A are a basis, not draws from a distribution.
+        return NO_DIST_STRUCT
+    if metric_tag == "euclidean":
+        # `frobenius_distance_matrix` in src.notebook.structure is already the
+        # un-normalized norm of the difference of the two B@A products, so the
+        # structural level has only one of the two forms and it is this one.
+        return NO_EUCLID_STRUCT
     raise ValueError(metric_tag)
 
 
@@ -263,6 +436,12 @@ def _structural_grid(names, specs):
     for row, (layers, projs) in specs.items():
         print(f"    {row}")
         for col in METRIC_COLS:
+            if col in DISTRIBUTIONAL:
+                cells[(row, col)] = NO_DIST_STRUCT
+                continue
+            if col == "euclidean":
+                cells[(row, col)] = NO_EUCLID_STRUCT
+                continue
             if col == "bw" and len({PROJ_DIN[p] for p in projs}) > 1:
                 cells[(row, col)] = _bw_mixed(projs)
                 continue
@@ -373,20 +552,28 @@ def layer_sweep(idx, ids, outdir):
     tdm = truth_dm(ids)
     fig, ax = plt.subplots(figsize=(7.4, 4.2))
     xs = list(range(N_STATES))
-    for col in METRIC_COLS:
-        ys = []
-        for h in xs:
+
+    # Layer-major, not metric-major: one hidden state's tensors are read once and
+    # all seven metrics run off them. The other way round re-read the whole stack
+    # per metric, which is 7x the I/O for identical numbers.
+    scores = {col: [] for col in METRIC_COLS}
+    for h in xs:
+        reps, order = resolve_ordered(idx, "functional", ids,
+                                      functional_selector=_fsel([h]))
+        for col in METRIC_COLS:
             try:
-                dm = _compute_distance_matrix(
-                    idx, "functional", METRICS[col], ids,
-                    functional_selector=_fsel([h]))
-                ys.append(dcor_vs_truth(dm, tdm))
+                dm = _distances(idx, "functional", METRICS[col], ids, reps,
+                                order=order)
+                scores[col].append(dcor_vs_truth(dm, tdm))
             except Exception as exc:
                 # h0 is all-zero by construction, so some metrics legitimately
                 # have nothing to report there. Say which layer and why rather
                 # than letting a NaN propagate silently into the plot.
                 print(f"    {col}: h{h} skipped — {type(exc).__name__}: {exc}")
-                ys.append(np.nan)
+                scores[col].append(np.nan)
+
+    for col in METRIC_COLS:
+        ys = scores[col]
         ax.plot(xs, ys, marker="o", ms=2.6, lw=1.1, label=col)
         if np.isnan(ys).all():
             print(f"    {col}: no finite values across all {len(xs)} layers")
@@ -402,29 +589,76 @@ def layer_sweep(idx, ids, outdir):
     ax.set_xlabel("hidden state (h0 = embeddings)")
     ax.set_ylabel("distance correlation vs ground-truth simplex")
     ax.set_title("Functional level — mixture signal by depth", fontsize=10)
-    ax.legend(fontsize=6, ncol=5)
+    ax.legend(fontsize=6, ncol=4)
     save_figure(fig, str(outdir / "fig_functional_layer_sweep.png"))
     plt.close("all")
 
 
-def cross_level(best, ids, outdir):
-    """One canonical panel per level, plus agreement with the ground truth."""
+def rank_rungs(level_cells, ids):
+    """Every computed (rung, metric) cell of one level, scored against the truth.
+
+    Returns ``[(dcor, row, col, dm), ...]`` best first. Scoring every cell rather
+    than a designated reference rung is the point of the surrogate work: which
+    rung recovers the simplex best is the question, so it cannot be answered by
+    hardcoding one and reporting it.
+    """
     tdm = truth_dm(ids)
-    rows = ["reference rung"]
-    cols = list(best)
-    cells = {("reference rung", lvl): dm for lvl, dm in best.items()}
-    mds_grid(cells, rows, cols, "Cross-level comparison — MDS (cosine)",
+    scored = []
+    for (row, col), cell in level_cells.items():
+        if cell is None or isinstance(cell, str):
+            continue
+        if float(np.max(np.abs(cell.matrix))) <= 1e-6:
+            continue                     # the h0 control: no geometry to score
+        try:
+            scored.append((dcor_vs_truth(cell, tdm), row, col, cell))
+        except Exception as exc:
+            print(f"    scoring {row!r}/{col} skipped — "
+                  f"{type(exc).__name__}: {exc}")
+    return sorted(scored, key=lambda t: -t[0])
+
+
+def cross_level(per_level, ids, outdir):
+    """Each level's best-scoring rung side by side, plus the agreement table."""
+    winners, table_rows = {}, []
+    for lvl, cells in per_level.items():
+        ranked = rank_rungs(cells, ids)
+        if not ranked:
+            print(f"    {lvl}: no scorable cell — omitted from the comparison")
+            continue
+        score, row, col, dm = ranked[0]
+        winners[lvl] = dm
+        table_rows.append((lvl, score, row, col))
+
+    if not winners:
+        return
+
+    cols = list(winners)
+    cells = {("best rung", lvl): dm for lvl, dm in winners.items()}
+    mds_grid(cells, ["best rung"], cols,
+             "Cross-level comparison — MDS, each level's best rung",
              savepath=outdir / "fig_crosslevel_mds.png")
     plt.close("all")
-    dm_grid(cells, rows, cols, "Cross-level comparison — distance matrices (cosine)",
+    dm_grid(cells, ["best rung"], cols,
+            "Cross-level comparison — distance matrices, each level's best rung",
             savepath=outdir / "fig_crosslevel_dm.png")
     plt.close("all")
 
-    lines = ["| level | dCor vs ground truth |", "|---|---|"]
-    for lvl, dm in best.items():
-        lines.append(f"| {lvl} | {dcor_vs_truth(dm, tdm):.4f} |")
+    lines = ["| level | dCor vs ground truth | rung | metric |", "|---|---|---|---|"]
+    for lvl, score, row, col in table_rows:
+        lines.append(f"| {lvl} | {score:.4f} | {row} | {col} |")
     table = "\n".join(lines)
-    (outdir / "crosslevel_agreement.md").write_text(table + "\n")
+
+    # The full ranking beside the winners, so a rung that wins by a hair does not
+    # read as a decisive one, and so a surrogate that helped is visible even when
+    # it did not take first place.
+    detail = ["", "", "## Every rung, per level", ""]
+    for lvl, cells_ in per_level.items():
+        detail += [f"### {lvl}", "", "| dCor | rung | metric |", "|---|---|---|"]
+        detail += [f"| {s:.4f} | {r} | {c} |" for s, r, c, _ in rank_rungs(cells_, ids)]
+        detail.append("")
+
+    (outdir / "crosslevel_agreement.md").write_text(
+        table + "\n" + "\n".join(detail) + "\n")
     print(table)
 
 
@@ -436,12 +670,21 @@ def main() -> None:
                     choices=["behavioral", "functional", "structural",
                              "dataset_embedding"],
                     help="restrict to one or more levels (default: all)")
-    ap.add_argument("--outdir", default=str(REPO_ROOT / "figures" / "simplex3_qwen"))
+    # A new directory rather than overwriting `figures/simplex3_qwen/`: those are
+    # the row-permuted figures (docs/notes/row_order_bug.md), and keeping them
+    # side by side is what lets the correction be checked rather than taken on
+    # trust. The PNGs are gitignored here as they are there; only the agreement
+    # table is tracked.
+    ap.add_argument("--outdir",
+                    default=str(REPO_ROOT / "figures" / "simplex3_qwen_v2"))
     ap.add_argument("--skip-sweep", action="store_true",
                     help="skip the 33-layer functional sweep")
     ap.add_argument("--skip-detail", action="store_true",
                     help="skip the per-metric detail figures")
+    ap.add_argument("--skip-surrogate", action="store_true",
+                    help="omit the centered/whitened rungs, leaving the raw ones")
     args = ap.parse_args()
+    surrogates = not args.skip_surrogate
 
     levels = args.level or ["behavioral", "functional", "structural",
                             "dataset_embedding"]
@@ -463,33 +706,36 @@ def main() -> None:
     save_figure(fig, str(outdir / "fig_ternary_legend.png"))
     plt.close("all")
 
-    best = {}
+    #: level -> every computed cell, for the cross-level ranking at the end
+    per_level = {}
 
     if "behavioral" in levels:
         print("behavioral …")
-        rows, cells = behavioral_cells(idx, ids)
+        rows, cells = behavioral_cells(idx, ids, surrogates)
         emit("behavioral", rows, cells, outdir, "Behavioral level")
         if not args.skip_detail:
             emit_detail("behavioral", rows[0], cells, outdir, "Behavioral")
-        best["behavioral"] = cells[(rows[0], "cosine")]
+        per_level["behavioral"] = cells
 
     if "functional" in levels:
         print("functional (individual layers) …")
-        rows, cells = functional_cells(idx, ids, functional_layer_rows())
+        lrows = {k: (v, None) for k, v in functional_layer_rows().items()}
+        rows, cells = functional_cells(idx, ids, lrows)
         emit("functional_layers", rows, cells, outdir,
              "Functional level — individual layers")
         print("functional (groupings) …")
-        grows, gcells = functional_cells(idx, ids, functional_group_rows())
+        grows, gcells = functional_cells(idx, ids, functional_group_rows(surrogates))
         emit("functional_groups", grows, gcells, outdir,
              "Functional level — layer groupings")
         if not args.skip_detail:
             emit_detail("functional", grows[0], gcells, outdir, "Functional")
-        best["functional"] = gcells[(grows[0], "cosine")]
+        per_level["functional"] = {**cells, **gcells}
         if not args.skip_sweep:
             print("functional layer sweep …")
             layer_sweep(idx, ids, outdir)
 
     if "structural" in levels:
+        structural_cells = {}
         for tag, specs, title in [
             ("structural_layers", structural_layer_specs(),
              "Structural level — individual layers"),
@@ -504,22 +750,22 @@ def main() -> None:
             # the mixture parser and the colour system see what they expect.
             cells = _relabel(cells, names, ids)
             emit(tag, rows, cells, outdir, title)
-            if tag == "structural_groups":
-                if not args.skip_detail:
-                    emit_detail("structural", rows[0], cells, outdir, "Structural")
-                best["structural"] = cells[(rows[0], "cosine")]
+            structural_cells.update(cells)
+            if tag == "structural_groups" and not args.skip_detail:
+                emit_detail("structural", rows[0], cells, outdir, "Structural")
+        per_level["structural"] = structural_cells
 
     if "dataset_embedding" in levels:
         print("dataset_embedding …")
-        rows, cells = dataset_cells(idx, ids)
+        rows, cells = dataset_cells(idx, ids, dataset_rows(idx, ids, surrogates))
         emit("dataset_embedding", rows, cells, outdir, "Dataset-embedding level")
         if not args.skip_detail:
             emit_detail("dataset_embedding", rows[0], cells, outdir, "Dataset embedding")
-        best["dataset_embedding"] = cells[(rows[0], "cosine")]
+        per_level["dataset_embedding"] = cells
 
-    if len(best) > 1:
+    if len(per_level) > 1:
         print("cross-level …")
-        cross_level(best, ids, outdir)
+        cross_level(per_level, ids, outdir)
 
     n = len(list(outdir.glob("*.png")))
     print(f"\nwrote {n} figures to {outdir}")

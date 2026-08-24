@@ -16,6 +16,18 @@ class FrobeniusDistanceMetric(DistanceMetric):
     With normalize=True (default), each row is L2-normalized before subtraction,
     making the metric invariant to embedding scale.
     The result is divided by sqrt(N) so it does not grow with the query set size.
+
+    ``normalize=False`` is plain row-wise Euclidean distance, and reports itself
+    under the separate name ``"euclidean"`` because the two are genuinely
+    different measurements and a stored collection must not be ambiguous about
+    which it holds.  The distinction matters most alongside the centering
+    transforms in :mod:`src.analysis.surrogates`: Euclidean distance is
+    translation-invariant, so centering is exactly a no-op for it, whereas the
+    normalized form discards each row's magnitude — and after centering the
+    magnitude is precisely the *distance from the fleet centroid*, which is
+    usually the largest part of what distinguishes two models.  Pairing a
+    centered representation with a scale-invariant metric therefore throws away
+    what the centering just exposed.
     """
 
     def __init__(self, normalize: bool = True) -> None:
@@ -23,7 +35,7 @@ class FrobeniusDistanceMetric(DistanceMetric):
 
     @property
     def metric_name(self) -> str:
-        return "frobenius"
+        return "frobenius" if self.normalize else "euclidean"
 
     def compute(self, a: ModelRepresentation, b: ModelRepresentation) -> float:
         if a.n_queries != b.n_queries:

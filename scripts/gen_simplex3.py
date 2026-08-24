@@ -391,6 +391,62 @@ extraction:
     return body
 
 
+def write_embed_matrix() -> str:
+    """Re-embed the 16 trained draws, keeping every per-document vector.
+
+    ``write_sweep`` stores only the ``mean`` centroid, and a `02` surrogate is
+    authored rather than derived (``docs/notes/dataset_embedding_layout.md`` §4),
+    so a second representation costs a re-embed.  That note's warning is about
+    the *whole* cache -- 640 draws, 1,984,744 texts, 6.1 GB -- and does not apply
+    here: this is the 16 draws the adapters were actually trained on, at the one
+    size they were trained at, which is 16,000 texts and ~49 MB.
+
+    The point of keeping the matrix is the metrics it unlocks.  A ``(1, 768)``
+    centroid is one point, so CKA, Bures-Wasserstein, MMD and the energy distance
+    all have nothing to work with; the full cloud gives the dataset level the
+    same metric coverage the other three levels already have, and lets a mixture
+    be compared as a *distribution* over documents rather than as its average.
+
+    The draws replay from ``SampledDatasetCache`` -- `01_datasets` holds the
+    source indices for all 16 -- so this touches the embedder and not HuggingFace.
+    The embedder block is the shared ``EMBEDDER`` literal, unchanged, which is
+    what makes the new surrogate land beside the existing ``mean`` under the same
+    ``{embedder_hash}/`` rather than in a directory of its own.
+    """
+    body = HEADER + (
+        f"# Re-embed the {len(proportions())} trained draws at n={TRAIN_N}, "
+        f"seed={TRAIN_SEED},\n"
+        f"# keeping the full (n, 768) matrix instead of the (1, 768) centroid.\n"
+        f"# Adds a second surrogate beside the existing `mean`; nothing is replaced.\n#\n"
+    )
+    body += "\n" + preamble(f"simplex3{SUITE.suffix}_embed_matrix")
+    body += "datasets:\n"
+    body += "\n".join(
+        dataset_block(name, pct, n_samples=TRAIN_N, seed=TRAIN_SEED)
+        for name, pct in proportions()
+    )
+    body += f"""
+base_models:
+  - {SUITE.base_model}
+
+fine_tuning:
+  enabled: false
+
+extraction:
+  models: []
+  device: cuda
+  taxonomies:
+    functional:
+      enabled: false
+    behavioral:
+      enabled: false
+    dataset_embedding:
+      enabled: true
+      representation: matrix
+{EMBEDDER}"""
+    return body
+
+
 def write_train(shard: int, names: list[str]) -> str:
     body = HEADER + (
         f"# Training shard {shard} of {TRAIN_SHARDS}: {len(names)} adapters.\n"
@@ -751,6 +807,23 @@ def main() -> None:
                 f" --steps build extract --taxonomy dataset_embedding",
                 logs,
             ))
+    # 2. The `matrix` re-embed, emitted for every suite.
+    #
+    #    Unlike the sweep above this is *not* gated on emit_embed_jobs. That flag
+    #    exists because the 640 centroids already exist and a second suite must
+    #    not recompute them; this job authors a surrogate that does not exist yet
+    #    under either suite. It is also model-free -- the same 16 recipes hash the
+    #    same way whichever base model is being studied -- so whichever suite is
+    #    run first satisfies both.
+    emit(exp / "embed_matrix.yaml", write_embed_matrix())
+    emit(jobs / "02_embed_matrix.sh", sbatch(
+        f"{SUITE.job_prefix}_embed_matrix", SUITE.gpu_partitions, True,
+        48, "2:00:00",
+        f"python scripts/run_experiment.py experiments/{slug}/embed_matrix.yaml"
+        f" --steps build extract --taxonomy dataset_embedding",
+        logs,
+    ))
+
     if SUITE.emit_build_job:
         emit(jobs / "01_build.sh", sbatch(
             f"{SUITE.job_prefix}_build", CPU_PARTITION, False, 32, "1:00:00",

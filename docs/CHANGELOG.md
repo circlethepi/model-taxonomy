@@ -4,6 +4,77 @@
 
 ## Unreleased
 
+### A log-probability level, and a temperature sweep over it
+
+Nothing in the pipeline read what a model *assigned* to text. Every measurement was
+a hidden state or an embedded generation, and everything behavioral sat at exactly
+two decoding points — greedy, and sampled at `temperature=1.0`. Three things are
+added over the same adapters and the same draw.
+
+**The level.** `LogProbTaxonomy` (`src/taxonomy/logprob.py`) is a third
+`HFInferenceTaxonomy` subclass, so a log-prob entry lands at the same
+`{base}/{adapter}/{recipe_hash}/n{n}_s{seed}` coordinates as the functional and
+behavioral entries for that model. `mode="input"` only: one masked forward pass —
+the same pass the functional level already runs, with no decoding — recording at
+every position the log-probability of the realized next token and the entropy of
+the full next-token distribution. `LogProbCache` (`07_logprobs`) stores them padded
+and query-major, matching the behavioral matrix row for row, with `lengths` and
+`content_start` rather than pre-trimmed rows: the trimmed view is recoverable from
+the full rows and the full rows are not recoverable from the trimmed view.
+
+The cost is **memory, not time**. Per-token log-probs need logits at every
+position and Qwen3.5's vocabulary is 248,320 wide, so the `log_softmax` is chunked
+over the sequence axis and the realized token gathered per chunk — identical
+numbers, bounded memory. `scripts/check_analysis.py` pins the arithmetic against
+`-model(**inputs, labels=input_ids).loss`, which is exactly the mean negative
+log-probability of the realized token with the same shift: an off-by-one, a
+mis-masked pad, or a chunk-boundary bug all show up there as a mismatch and
+nowhere else.
+
+**The ride-along.** `BehavioralTaxonomy` gains `collect_logprobs`, which passes
+`output_scores` and `output_logits` to its existing `generate` call and stores
+**two** distributions. `scores` is temperature- and top-p-warped — what the token
+was actually drawn from — and `logits` is the model's own belief. Across a
+temperature sweep only the second is comparable between settings, and the first is
+not recoverable from it: `log softmax(z/T)[i] = z[i]/T − logsumexp(z/T)` needs the
+whole logit vector, which is discarded. At `T=1.0, top_p=1.0, top_k=null` every
+processor is the identity and the two must coincide, which is a free consistency
+check on the sweep. The unprocessed quantity is the *same* quantity the input mode
+stores, so the two levels sit on one scale.
+
+The cache-hit test changed with it: when collecting, a hit requires the log-prob
+artifact as well as the generations. Without that, an entry written by an earlier
+run would return cached text and silently produce no log-probs. Re-generating on
+that miss is exact — greedy is deterministic, and sampling reproduces at the same
+`generation_seed` **and the same `batch_size`**, which is why that value stays
+pinned in the configs and out of the cache key.
+
+**The jobs.** `Suite` gains `emit_logprob_jobs`, `emit_gen_activation_job`,
+`temperature_sweep`, `sweep_replicates` and `sweep_shards`, all defaulting off —
+that default is the regression test, not a preference: `Suite()` still regenerates
+`experiments/simplex3` and `jobs/simplex3` byte-for-byte. Only the `qwen` suite
+turns them on, emitting 43 configs and 43 scripts: input log-probs (one job), the
+sweep at `T = 0.1 … 1.0` × 4 shards at `R=8` (40), greedy again with log-probs on —
+the `T=0` point of the same surface — and generation-mode activations under greedy.
+
+Two sizing decisions are worth their reasons. **`R=8` uniformly**, including at
+`T=1.0` where an `R=16` entry already exists: replicates are in the filename, so
+that is a different entry, and running it is what keeps one point of a
+variance-vs-temperature curve from having half the sampling noise of the other
+nine. **Four shards, not eight**: halving `R` halves the decode, so four adapters
+at `R=8` lands at the same wall the eight-shard `R=16` runs were sized against — 40
+job files rather than 80, at no change to the slot length the partitions were
+chosen for.
+
+**Generation-mode activations need no new code** — `FunctionalTaxonomy` already
+hardcodes `do_sample=False` — and they write beside the existing `input_*` files in
+the same directory, so `activation_mode: both` becomes a read-time union with no
+further extraction. **Per-temperature generation activations are out of scope**, and
+the reason is recorded so it is not re-derived: `ActivationCache`'s filename carries
+no sampling hash, so two temperatures would silently overwrite each other. Adding
+them means putting a sampling hash into `DrawKeyedCache.mode_token` — a change to a
+key with entries already on disk.
+
 ### The cross-taxonomy figure can pin a level to a metric, and does for the dataset level
 
 **`cross_level`** (`scripts/make_simplex3_figures.py`) takes a `metric_override`

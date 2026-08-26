@@ -52,6 +52,8 @@ __all__ = [
     "simplex_vertices",
     "simplex_geometry",
     "simplex_distance_matrix",
+    "dcor_vs_truth",
+    "disparity_vs_truth",
     "pure_anchors",
     "evaluation_points",
 ]
@@ -387,6 +389,85 @@ def simplex_distance_matrix(
         metric="euclidean",
         taxonomy="ground_truth",
     )
+
+
+# ── scoring a taxonomy against the truth ──────────────────────────────────────
+
+def dcor_vs_truth(dm: DistanceMatrix, truth_dm: DistanceMatrix) -> float:
+    """Bias-corrected distance correlation against the ground-truth simplex.
+
+    :func:`~src.analysis.matrices.distance_correlation` returns a bare float; it
+    is ``dcor_test`` that returns a result object carrying ``.statistic``. Note
+    the U-centred dCor* lives on a squared scale and may legitimately be
+    negative, so do not clip it.
+
+    A *matrix-level* score: it reads the distances and never embeds, so unlike
+    :func:`disparity_vs_truth` it is untouched by MDS distortion. It is also
+    invariant to a constant rescaling of either matrix, which is why
+    :func:`simplex_distance_matrix` and a plain ``pdist`` over the raw weight
+    vectors — which differ by exactly a factor of ``1/√2`` — score identically.
+    """
+    from .matrices import distance_correlation
+
+    return float(distance_correlation(dm, truth_dm))
+
+
+def disparity_vs_truth(
+    dm: DistanceMatrix,
+    truth_geometry: GeometryResult,
+    *,
+    geometry: GeometryResult | None = None,
+    random_state: int = 0,
+    n_components: int = 2,
+) -> float:
+    """Scaled residual Procrustes disparity of *dm*'s embedding against the truth.
+
+    Embeds *dm* with MDS and superimposes it on *truth_geometry*, returning
+    :attr:`~src.analysis.configurations.ProcrustesResult.disparity` — the
+    residual sum of squares as a fraction of total squared coordinate variance,
+    in ``[0, 1]`` with **0 meaning identical shape**. It therefore runs opposite
+    to :func:`dcor_vs_truth`, which is worth saying out loud wherever the two are
+    reported side by side.
+
+    Where ``dcor_vs_truth`` scores the *distances*, this scores the
+    *configuration* — the arrangement of points an embedding actually draws.
+    The two come apart: a taxonomy can reproduce the pairwise distance profile
+    while arranging the points in something that is not the simplex.
+
+    The price of that is a dependency on the embedding. This number is
+    MDS-mediated where ``dcor_vs_truth`` is not, so it inherits whatever
+    distortion the projection introduced — read it beside
+    :func:`~src.analysis.quality.kruskal_stress`, not instead of it. For the same
+    reason *random_state* is an explicit argument rather than a hidden default:
+    :class:`~src.geometry_methods.mds.MDSGeometry` initialises randomly, so a
+    caller wanting this score to describe the configuration it is *plotting*
+    must pass the seed that configuration was fitted under.
+
+    The ground truth goes in as the first argument to
+    :func:`~src.analysis.configurations.procrustes_compare`, matching
+    ``compare_taxonomies``. Disparity is symmetric under the swap, so no number
+    changes; the orientation only fixes the fitted map to run taxonomy →
+    ground-truth frame, which is the useful direction.
+
+    Models are paired by identifier, not by row position: ``procrustes_compare``
+    reindexes both configurations onto their common ``model_ids`` first. So
+    permuting *dm*'s rows together with its ids leaves this unchanged, and
+    mislabelled rows are a genuine disagreement rather than a silent one.
+
+    Pass *geometry* to score an embedding you have already fitted — the one you
+    are plotting, or one you also want the stress of — instead of fitting a
+    second one here. *dm* is then unused, and *random_state* / *n_components*
+    describe nothing, so it is on the caller to pass the geometry that actually
+    came from *dm*.
+    """
+    from .bridge import fit_geometry
+    from .configurations import procrustes_compare
+
+    geo = geometry
+    if geo is None:
+        geo = fit_geometry(dm, method="mds", n_components=n_components,
+                           random_state=random_state)
+    return float(procrustes_compare(truth_geometry, geo).disparity)
 
 
 # ── which models play which role ───────────────────────────────────────────────

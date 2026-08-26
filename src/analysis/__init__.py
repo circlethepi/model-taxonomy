@@ -39,6 +39,8 @@ from .configurations import (
 from .discovery import CacheEntry, CacheIndex, scan_cache
 from .ground_truth import (
     MixtureComponent,
+    dcor_vs_truth,
+    disparity_vs_truth,
     evaluation_points,
     ground_truth_weights,
     mixture_weights,
@@ -121,6 +123,8 @@ __all__ = [
     "simplex_vertices",
     "simplex_geometry",
     "simplex_distance_matrix",
+    "dcor_vs_truth",
+    "disparity_vs_truth",
     "pure_anchors",
     "evaluation_points",
     # comparison

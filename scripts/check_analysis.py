@@ -733,6 +733,91 @@ def t_simplex_geometry():
     return f"regular for k=2,3,4; round-trip error {delta:.1e}"
 
 
+def _mixture_truth():
+    """A small 3-component mixture collection: weights, ids, geometry, matrix."""
+    from src.analysis import simplex_distance_matrix, simplex_geometry
+
+    W = np.array([[1, 0, 0], [0, 1, 0], [0, 0, 1], [.5, .5, 0],
+                  [.34, .33, .33], [0, .5, .5], [.25, .25, .5], [.6, .2, .2]],
+                 dtype=float)
+    ids = [f"m{i}" for i in range(len(W))]
+    vertices = ["g1", "g2", "g3"]
+    return (W, ids,
+            simplex_geometry(W, ids, vertices),
+            simplex_distance_matrix(W, ids, vertices))
+
+
+@check("ground truth: Procrustes disparity vs truth is 0 for the simplex itself")
+def t_disparity_vs_truth_exact():
+    """Pins the direction of the score: **0 is perfect**, not 1.
+
+    It is reported in the same tables as dCor, which runs the other way, so a
+    refactor that quietly flipped the convention would produce a table that
+    still looks plausible. Hence a check on the sign rather than only on the
+    plumbing. The tolerance is loose because SMACOF is iterative — embedding an
+    exactly-simplicial distance matrix recovers the simplex to optimiser
+    tolerance, not to machine epsilon.
+    """
+    from src.analysis import disparity_vs_truth
+    from src.analysis.bridge import as_distance_matrix
+    from scipy.spatial.distance import pdist, squareform
+
+    _, ids, tgeo, tdm = _mixture_truth()
+
+    exact = disparity_vs_truth(tdm, tgeo)
+    assert exact < 1e-3, f"the simplex should score ~0 against itself, got {exact:.4f}"
+
+    rng = np.random.default_rng(0)
+    noise = as_distance_matrix(
+        ids, squareform(pdist(rng.normal(size=(len(ids), 3)))), "euclidean",
+        taxonomy="noise")
+    scrambled = disparity_vs_truth(noise, tgeo)
+    assert scrambled > 0.1, f"random points should score far from 0, got {scrambled:.4f}"
+    return f"exact {exact:.1e}, random {scrambled:.3f}"
+
+
+@check("ground truth: Procrustes pairs models by id, not by row position")
+def t_disparity_vs_truth_label_keyed():
+    """The sanity check that the score reads the labels.
+
+    ``procrustes_compare`` reindexes both configurations onto their common
+    ``model_ids`` before fitting, so row order is bookkeeping and identity is
+    not. Two consequences, both pinned here because the row-order bug
+    (``docs/notes/row_order_bug.md``) is exactly what happens when a matrix and
+    its labels come apart:
+
+    * permuting a matrix **together with** its ids leaves the score unchanged;
+    * permuting the ids **alone** — same numbers, wrong names — changes it.
+
+    The second is the one that matters. If it ever stopped holding, a mislabelled
+    matrix would score as well as a correct one and nothing else would notice.
+    """
+    from src.analysis import disparity_vs_truth
+    from src.core.distance import DistanceMatrix
+
+    _, ids, tgeo, tdm = _mixture_truth()
+    rng = np.random.default_rng(1)
+    perm = rng.permutation(len(ids))
+    assert not np.array_equal(perm, np.arange(len(ids))), "degenerate permutation"
+
+    base = disparity_vs_truth(tdm, tgeo)
+    m = np.asarray(tdm.matrix, dtype=float)
+
+    together = DistanceMatrix(matrix=m[np.ix_(perm, perm)],
+                              model_ids=[ids[i] for i in perm],
+                              metric=tdm.metric, taxonomy=tdm.taxonomy)
+    delta = abs(disparity_vs_truth(together, tgeo) - base)
+    assert delta < 1e-6, f"permuting rows with their ids moved the score by {delta:.2e}"
+
+    mislabelled = DistanceMatrix(matrix=m, model_ids=[ids[i] for i in perm],
+                                 metric=tdm.metric, taxonomy=tdm.taxonomy)
+    wrong = disparity_vs_truth(mislabelled, tgeo)
+    assert wrong > 0.1, (
+        f"mislabelled rows still scored {wrong:.4f} — the comparison is not "
+        "reading model_ids")
+    return f"invariant to {delta:.1e}; mislabelled scores {wrong:.3f}"
+
+
 @check("ground truth: a k-vertex simplex needs k-1 dimensions, and says so")
 def t_simplex_dimension_requirement():
     """The executable form of the dimension question.
@@ -4104,6 +4189,7 @@ SYNTHETIC = [
     t_relabel_collision,
     # ground truth from recipes, and the storage it needs
     t_mixture_weights, t_split_and_whole_rejected, t_simplex_geometry,
+    t_disparity_vs_truth_exact, t_disparity_vs_truth_label_keyed,
     t_simplex_dimension_requirement, t_projection_dimension_matters,
     t_procrustes_transform, t_collection_multidim, t_analysis_geometries,
     # content-addressed recipe identity, and the draw storage it enables

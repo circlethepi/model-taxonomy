@@ -12,5 +12,6 @@ figures/nosync
 .claude/worktrees/
 figures/simplex3_qwen/*.png
 figures/simplex3_qwen_v2/*.png
+figures/simplex3_qwen_v3/*.png
 
 docs/notes/

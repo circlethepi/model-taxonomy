@@ -531,7 +531,7 @@ def mds_grid(
 # ── Cross-taxonomy panel ──────────────────────────────────────────────────────
 
 def crosslevel_mds(
-    panels: Sequence[tuple[str, object, float]],
+    panels: Sequence[tuple[str, object, float] | tuple[str, object, float, float]],
     title: str,
     subtitle: str | None = None,
     savepath=None,
@@ -548,6 +548,15 @@ def crosslevel_mds(
     should appear, left to right, after the ternary legend — which sits **first**
     here rather than last, because it is the key the four panels are read
     through and a reader meets it before the data.
+
+    A panel may carry a fourth element, the scaled residual Procrustes disparity
+    against the ground truth
+    (:func:`~src.analysis.ground_truth.disparity_vs_truth`), which is then named
+    in the panel title between the dCor and the stress. It is passed in rather
+    than computed here on purpose: this function fits its own MDS under
+    *random_state*, and a caller that scored a different fit would have the
+    figure and its own tables reporting two numbers for one configuration. Pass
+    the disparity computed under this same seed, or leave it off.
 
     Three things separate this from :func:`mds_grid`, which stays as it is for
     the dense rung x metric grids:
@@ -592,7 +601,7 @@ def crosslevel_mds(
     gs = fig.add_gridspec(1, n + 1, width_ratios=[1.28] + [1.0] * n)
 
     lax = fig.add_subplot(gs[0, 0])
-    ids = next((dm.model_ids for _, dm, _ in panels), None)
+    ids = next((p[1].model_ids for p in panels), None)
     ternary_legend(lax, ids, anchors, label_models=True,
                    vertex_names=GROUP_DISPLAY, show_topics=False,
                    label_size=7.5, vertex_size=11, marker_size=34,
@@ -600,7 +609,9 @@ def crosslevel_mds(
     lax.set_title("Mixture key", fontsize=13, pad=10, **bold)
 
     keep = set(label_points)
-    for k, (name, dm, dcor) in enumerate(panels):
+    for k, panel in enumerate(panels):
+        name, dm, dcor = panel[:3]
+        procrustes = panel[3] if len(panel) > 3 else None
         ax = fig.add_subplot(gs[0, k + 1])
         geo = fit_geometry(dm, "mds", 2, random_state=random_state)
         xy = align_to_simplex(geo.coordinates, geo.model_ids)
@@ -617,9 +628,19 @@ def crosslevel_mds(
                             textcoords="offset points", ha="center",
                             fontsize=9, color="0.1", zorder=4, **bold)
 
+        # Three scores do not fit on one line of a 3.5" panel — at 13 pt they
+        # run past the axes and collide with the neighbouring panel's title. So
+        # the third one wraps, and the whole block drops a point. The two-score
+        # form is left exactly as it was, on one line at 13 pt.
         stress = kruskal_stress(dm, geo)
-        ax.set_title(f"{name}\ndCor {dcor:.3f}  ·  stress {stress:.3f}",
-                     fontsize=13, pad=10, **bold)
+        if procrustes is None:
+            scores = f"dCor {dcor:.3f}  ·  stress {stress:.3f}"
+            size = 13
+        else:
+            scores = (f"dCor {dcor:.3f}  ·  Procrustes {procrustes:.3f}"
+                      f"\nstress {stress:.3f}")
+            size = 12
+        ax.set_title(f"{name}\n{scores}", fontsize=size, pad=10, **bold)
 
         # Symmetric about the origin, which the frame has already made the
         # centre mixture, so 1:1 scaling does not push the layout off-centre.

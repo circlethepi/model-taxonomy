@@ -4,6 +4,67 @@
 
 ## Unreleased
 
+### A second score for the cross-level figures: Procrustes disparity against the simplex
+
+**`disparity_vs_truth`** (`src/analysis/ground_truth.py`) embeds a distance
+matrix with MDS, superimposes it on the ground-truth simplex, and returns the
+scaled residual Procrustes disparity — `Σᵢ ‖aᵢ − s·bᵢR‖²` in `[0, 1]` after both
+configurations are centred and scaled to unit Frobenius norm, so **0 means
+identical shape**. It runs opposite to dCor, which is why every table and panel
+that reports both says which way each one reads.
+
+The two answer different questions. dCor scores the *distance matrix*; the
+disparity scores the *configuration* — the arrangement of the sixteen adapters
+the MDS panel actually draws. A level can reproduce the pairwise distance
+profile while arranging the points in something that is not a simplex, and the
+panel is what a reader looks at. The cost of asking the second question is that
+the answer is **MDS-mediated where dCor is not**: it inherits whatever the
+projection distorted, so it is reported next to the Kruskal stress rather than
+in place of it, and `random_state` is an explicit argument rather than a hidden
+default — the number is only about the panel if it was fitted under the panel's
+seed. `make_simplex3_figures.py` pins that in one place, `MDS_SEED`, and fits
+each cell once for the disparity, the stress and the figure alike.
+
+Nothing new was needed on the mathematics: `procrustes_compare` already existed
+and `compare_taxonomies` already made this call per taxonomy
+(`comparison.py:1718`). What is new is that the two-line kernel now has one home
+that the per-cell figure suite can also reach. `dcor_vs_truth` moved out of the
+script and into the same module beside it, and the script's hand-rolled
+`truth_dm` is gone in favour of `simplex_distance_matrix` — the two differ by a
+constant factor of `1/√2` and dCor is invariant to a constant rescaling, so the
+ground truth is now one object rather than two conventions, and **no dCor value
+moved**.
+
+`crosslevel_agreement*.md` carries a Procrustes column in the winners table and
+in all four per-rung sections, with the best three per section in bold; the rows
+stay in dCor order, so a disagreement between the two scores is visible rather
+than sorted away. `crosslevel_mds` panel titles read
+`dCor … · Procrustes … · stress …`; the disparity is passed in as an optional
+fourth element of each panel tuple rather than recomputed inside the plot, so
+the figure and the table cannot report two numbers for one configuration.
+Three-element tuples still work unchanged.
+
+`crosslevel_scores*.csv` is new beside the markdown: one row per scored cell
+with `level,rung,metric,dcor,procrustes,stress,n_models,matrix_sha256`, built
+from the same numbers the tables are. It is run output, not cache — nothing keys
+off it and nothing reads it back. The digest column is there for the caching
+work: comparing it across a warm and a cold run is what would show a cached
+matrix is the matrix a cold run produces.
+
+`t_disparity_vs_truth_exact` pins the sign convention, so a refactor cannot
+quietly turn "0 is perfect" into "1 is perfect" and leave a plausible-looking
+table behind. `t_disparity_vs_truth_label_keyed` pins that the comparison reads
+`model_ids`: permuting a matrix together with its ids leaves the score
+unchanged, and permuting the ids alone — same numbers, wrong names — does not.
+That is the row-order defect above, asked of the new score.
+
+Reusing `results/shared_cache/06_collections` instead of recomputing these
+matrices every run was investigated alongside this and deliberately left out;
+`docs/notes/caching_collections.md` records why. The short version is that
+`collection_key` sorts model ids before hashing, so row order is not in the
+handle, and caching without a guard would make the row-order bug permanent
+instead of transient.
+
 ### The cross-taxonomy figure can pin a level to a metric, and does for the dataset level
 
 **`cross_level`** (`scripts/make_simplex3_figures.py`) takes a `metric_override`

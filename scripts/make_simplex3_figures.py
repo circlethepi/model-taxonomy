@@ -41,9 +41,12 @@ Usage
 from __future__ import annotations
 
 import argparse
+import csv
+import hashlib
 import os
 import sys
 from pathlib import Path
+from typing import NamedTuple
 
 # ── BLAS threads, pinned before numpy is imported ────────────────────────────
 #   This is a large, measured effect, not a precaution. The Bures-Wasserstein
@@ -70,10 +73,14 @@ import matplotlib.pyplot as plt  # noqa: E402
 import numpy as np  # noqa: E402
 
 from src.analysis import scan_cache  # noqa: E402
-from src.analysis.bridge import as_distance_matrix  # noqa: E402
+from src.analysis.bridge import as_distance_matrix, fit_geometry  # noqa: E402
 from src.analysis.comparison import (  # noqa: E402
     _distances, resolve_ordered,
 )
+from src.analysis.ground_truth import (  # noqa: E402
+    dcor_vs_truth, disparity_vs_truth, simplex_distance_matrix, simplex_geometry,
+)
+from src.analysis.quality import kruskal_stress  # noqa: E402
 from src.analysis.surrogates import centered, whitened  # noqa: E402
 from src.plots.config import set_style  # noqa: E402
 from src.plots.figures import save_figure  # noqa: E402
@@ -502,22 +509,39 @@ def structural_projection_specs():
 
 # ── Ground truth, for the layer sweep and the cross-level closer ──────────────
 
-def truth_dm(ids):
-    from scipy.spatial.distance import pdist, squareform
-    W = np.vstack([mixture_weights(m) for m in ids])
-    return as_distance_matrix(list(ids), squareform(pdist(W)), "euclidean",
-                              taxonomy="ground_truth")
+#: The three mixture components, as :mod:`src.analysis.ground_truth` names its
+#: simplex vertices. The order fixes which column of the weight array is which
+#: vertex, so it must match ``mixture_weights``.
+VERTICES = ["g1", "g2", "g3"]
 
 
-def dcor_vs_truth(dm, tdm):
-    """Bias-corrected distance correlation against the ground-truth simplex.
+def truth_weights(ids):
+    """The ``(n, 3)`` ground-truth mixture array, in *ids* order.
 
-    `distance_correlation` returns a bare float; it is `dcor_test` that returns a
-    result object carrying `.statistic`. Note the U-centred dCor* lives on a
-    squared scale and may legitimately be negative, so do not clip it.
+    The only experiment-specific part of the ground truth: these adapters carry
+    their recipe in their name, so the weights are parsed rather than read from
+    a recipe file. Everything downstream of this array — the simplex embedding,
+    its distance matrix, and both scores against it — is
+    :mod:`src.analysis.ground_truth`.
     """
-    from src.analysis.matrices import distance_correlation
-    return float(distance_correlation(dm, tdm))
+    return np.vstack([mixture_weights(m) for m in ids])
+
+
+def truth_dm(ids):
+    """Pairwise distances on the ground-truth simplex, in *ids* order.
+
+    Barycentric coordinates ``W @ simplex_vertices(3)``, not the raw weight
+    vectors. Those differ by a constant factor of ``1/√2``, and dCor is
+    invariant to a constant rescaling, so this reports the same numbers as the
+    ``pdist(W)`` this used to compute — while being the same object
+    ``truth_geometry`` embeds, rather than a second convention alongside it.
+    """
+    return simplex_distance_matrix(truth_weights(ids), list(ids), VERTICES)
+
+
+def truth_geometry(ids):
+    """Where each model sits on the ground-truth simplex — the Procrustes target."""
+    return simplex_geometry(truth_weights(ids), list(ids), VERTICES)
 
 
 # ── Figures ───────────────────────────────────────────────────────────────────
@@ -594,15 +618,47 @@ def layer_sweep(idx, ids, outdir):
     plt.close("all")
 
 
-def rank_rungs(level_cells, ids):
+#: The MDS seed every cross-level number is computed under. `MDSGeometry`
+#: initialises randomly, so this is load-bearing: it is the seed
+#: `crosslevel_mds` fits its panels with, and both the Procrustes disparity and
+#: the stress reported beside it describe *that* configuration.
+MDS_SEED = 0
+
+
+class RungScore(NamedTuple):
+    """One scored (rung, metric) cell of one level.
+
+    ``dcor`` runs 0→1 better; ``procrustes`` runs 1→0 better. They are not two
+    readings of one quantity: dCor scores the distance matrix and never embeds,
+    while the disparity scores the configuration the MDS panel actually draws
+    and so inherits the distortion ``stress`` reports.
+    """
+
+    dcor: float
+    procrustes: float
+    stress: float
+    row: str
+    col: str
+    dm: object
+
+
+def rank_rungs(level_cells, ids, tdm=None, tgeo=None):
     """Every computed (rung, metric) cell of one level, scored against the truth.
 
-    Returns ``[(dcor, row, col, dm), ...]`` best first. Scoring every cell rather
-    than a designated reference rung is the point of the surrogate work: which
-    rung recovers the simplex best is the question, so it cannot be answered by
-    hardcoding one and reporting it.
+    Returns ``[RungScore, ...]`` sorted by **dCor** descending. The sort key is
+    deliberately still dCor even though a second score is now reported: the
+    winner each figure draws is the dCor winner, and this is the ranking the
+    tracked tables record. Scoring every cell rather than a designated reference
+    rung is the point of the surrogate work: which rung recovers the simplex
+    best is the question, so it cannot be answered by hardcoding one and
+    reporting it.
+
+    *tdm* and *tgeo* are the ground truth in matrix and configuration form; both
+    are rebuilt from *ids* when omitted. Pass them when scoring several levels
+    against the same models, which is what ``cross_level`` does.
     """
-    tdm = truth_dm(ids)
+    tdm = truth_dm(ids) if tdm is None else tdm
+    tgeo = truth_geometry(ids) if tgeo is None else tgeo
     scored = []
     for (row, col), cell in level_cells.items():
         if cell is None or isinstance(cell, str):
@@ -610,11 +666,58 @@ def rank_rungs(level_cells, ids):
         if float(np.max(np.abs(cell.matrix))) <= 1e-6:
             continue                     # the h0 control: no geometry to score
         try:
-            scored.append((dcor_vs_truth(cell, tdm), row, col, cell))
+            # One embedding, three uses: the disparity, the stress that
+            # qualifies it, and nothing else — fitting it twice under two seeds
+            # would let the reported numbers describe different configurations.
+            geo = fit_geometry(cell, method="mds", n_components=2,
+                               random_state=MDS_SEED)
+            scored.append(RungScore(
+                dcor=dcor_vs_truth(cell, tdm),
+                procrustes=disparity_vs_truth(cell, tgeo, geometry=geo),
+                stress=float(kruskal_stress(cell, geo)),
+                row=row, col=col, dm=cell,
+            ))
         except Exception as exc:
             print(f"    scoring {row!r}/{col} skipped — "
                   f"{type(exc).__name__}: {exc}")
-    return sorted(scored, key=lambda t: -t[0])
+    return sorted(scored, key=lambda s: -s.dcor)
+
+
+def _bold_if(value, flag) -> str:
+    """A 4-decimal markdown cell, bolded when *flag*."""
+    return f"**{value:.4f}**" if flag else f"{value:.4f}"
+
+
+def _matrix_digest(dm) -> str:
+    """Content hash of a distance matrix, for telling two runs apart.
+
+    Rounded before hashing so that a re-run differing only in the last bits of a
+    float still hashes the same — the question this answers is "is this the same
+    matrix", not "is this the same float noise". Truncated to 16 hex characters:
+    this identifies matrices within a run, it does not authenticate them.
+    """
+    m = np.ascontiguousarray(np.round(np.asarray(dm.matrix, dtype=np.float64), 12))
+    return hashlib.sha256(m.tobytes()).hexdigest()[:16]
+
+
+def write_scores_csv(per_level_scores, path) -> None:
+    """One row per scored cell, from the same numbers the tables are built from.
+
+    Run output, not cache: nothing keys off it and nothing reads it back, so it
+    is safe to delete and safe to change. It exists because the markdown tables
+    are for reading and this is for diffing — and because ``matrix_sha256`` is
+    the evidence a later change would need to show that a cached distance matrix
+    is the matrix a cold run produces (see ``docs/notes/caching_collections.md``).
+    """
+    with open(path, "w", newline="") as fh:
+        w = csv.writer(fh)
+        w.writerow(["level", "rung", "metric", "dcor", "procrustes", "stress",
+                    "n_models", "matrix_sha256"])
+        for lvl, ranked in per_level_scores.items():
+            for s in ranked:
+                w.writerow([lvl, s.row, s.col, f"{s.dcor:.6f}",
+                            f"{s.procrustes:.6f}", f"{s.stress:.6f}",
+                            len(s.dm.model_ids), _matrix_digest(s.dm)])
 
 
 #: Display name and left-to-right order for the cross-taxonomy figure. The
@@ -651,12 +754,18 @@ def cross_level(per_level, ids, outdir, metric_override=None, suffix=""):
     beside the unrestricted one rather than overwriting it.
     """
     metric_override = metric_override or {}
+    # Scored once per level and reused for the winners, the detail tables and
+    # the csv. Ranking each level twice used to recompute every dCor; with a
+    # second score and an MDS fit per cell that waste is no longer small.
+    tdm, tgeo = truth_dm(ids), truth_geometry(ids)
+    per_level_scores = {lvl: rank_rungs(cells, ids, tdm=tdm, tgeo=tgeo)
+                        for lvl, cells in per_level.items()}
+
     winners, table_rows = {}, []
-    for lvl, cells in per_level.items():
-        ranked = rank_rungs(cells, ids)
+    for lvl, ranked in per_level_scores.items():
         want = metric_override.get(lvl)
         if want is not None:
-            restricted = [t for t in ranked if t[2] == want]
+            restricted = [s for s in ranked if s.col == want]
             if restricted:
                 ranked = restricted
             else:
@@ -666,9 +775,9 @@ def cross_level(per_level, ids, outdir, metric_override=None, suffix=""):
         if not ranked:
             print(f"    {lvl}: no scorable cell — omitted from the comparison")
             continue
-        score, row, col, dm = ranked[0]
-        winners[lvl] = (dm, score)
-        table_rows.append((lvl, score, row, col))
+        best = ranked[0]
+        winners[lvl] = best
+        table_rows.append((lvl, best))
 
     if not winners:
         return
@@ -687,35 +796,51 @@ def cross_level(per_level, ids, outdir, metric_override=None, suffix=""):
                      for l, m in metric_override.items() if l in winners)
     subtitle = "Mixtures from 3 topic groupings from the Yahoo Answers Dataset"
     crosslevel_mds(
-        [(name, winners[lvl][0], winners[lvl][1]) for name, lvl in ordered],
+        [(name, winners[lvl].dm, winners[lvl].dcor, winners[lvl].procrustes)
+         for name, lvl in ordered],
         "Cross-Taxonomy Simplex — MDS",
         subtitle=subtitle + (f" · {note}" if note else ""),
         savepath=outdir / f"fig_crosslevel_mds{suffix}.png",
+        random_state=MDS_SEED,
     )
     plt.close("all")
-    cells = {("best rung", name): winners[lvl][0] for name, lvl in ordered}
+    cells = {("best rung", name): winners[lvl].dm for name, lvl in ordered}
     dm_grid(cells, ["best rung"], [name for name, _ in ordered],
             "Cross-level comparison — distance matrices, each level's best rung"
             + (f" ({note})" if note else ""),
             savepath=outdir / f"fig_crosslevel_dm{suffix}.png")
     plt.close("all")
 
-    lines = ["| level | dCor vs ground truth | rung | metric |", "|---|---|---|---|"]
-    for lvl, score, row, col in table_rows:
-        lines.append(f"| {lvl} | {score:.4f} | {row} | {col} |")
+    # Two scores in one table, running in opposite directions, so the header
+    # says which way each one reads rather than leaving it to be inferred.
+    header = ["| level | dCor vs ground truth | Procrustes residual (lower=better) "
+              "| rung | metric |", "|---|---|---|---|---|"]
+    best_proc = min((s.procrustes for _, s in table_rows), default=None)
+    lines = list(header)
+    for lvl, s in table_rows:
+        lines.append(f"| {lvl} | {s.dcor:.4f} | {_bold_if(s.procrustes, s.procrustes == best_proc)} "
+                     f"| {s.row} | {s.col} |")
     table = "\n".join(lines)
 
     # The full ranking beside the winners, so a rung that wins by a hair does not
     # read as a decisive one, and so a surrogate that helped is visible even when
     # it did not take first place.
     detail = ["", "", "## Every rung, per level", ""]
-    for lvl, cells_ in per_level.items():
-        detail += [f"### {lvl}", "", "| dCor | rung | metric |", "|---|---|---|"]
-        detail += [f"| {s:.4f} | {r} | {c} |" for s, r, c, _ in rank_rungs(cells_, ids)]
+    for lvl, ranked in per_level_scores.items():
+        # Rows stay in dCor order — the Procrustes bolding marks the best three
+        # of *that* column, which is exactly the interesting case when the two
+        # scores disagree about which rung recovers the simplex.
+        top3 = {id(s) for s in sorted(ranked, key=lambda s: s.procrustes)[:3]}
+        detail += [f"### {lvl}", "",
+                   "| dCor | Procrustes residual (lower=better) | rung | metric |",
+                   "|---|---|---|---|"]
+        detail += [f"| {s.dcor:.4f} | {_bold_if(s.procrustes, id(s) in top3)} "
+                   f"| {s.row} | {s.col} |" for s in ranked]
         detail.append("")
 
     (outdir / f"crosslevel_agreement{suffix}.md").write_text(
         table + "\n" + "\n".join(detail) + "\n")
+    write_scores_csv(per_level_scores, outdir / f"crosslevel_scores{suffix}.csv")
     print(table)
 
 

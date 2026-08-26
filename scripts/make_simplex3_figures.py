@@ -78,8 +78,8 @@ from src.analysis.surrogates import centered, whitened  # noqa: E402
 from src.plots.config import set_style  # noqa: E402
 from src.plots.figures import save_figure  # noqa: E402
 from src.plots.simplex import (  # noqa: E402
-    dm_grid, mds_grid, mixture_label, mixture_weights, sort_by_mixture,
-    ternary_legend,
+    crosslevel_mds, dm_grid, mds_grid, mixture_label, mixture_weights,
+    sort_by_mixture, ternary_legend,
 )
 
 # ── Experiment coordinates ────────────────────────────────────────────────────
@@ -617,30 +617,87 @@ def rank_rungs(level_cells, ids):
     return sorted(scored, key=lambda t: -t[0])
 
 
-def cross_level(per_level, ids, outdir):
-    """Each level's best-scoring rung side by side, plus the agreement table."""
+#: Display name and left-to-right order for the cross-taxonomy figure. The
+#: sequence runs from the level furthest from the model's parameters to the level
+#: closest to its behaviour: what it was trained on, what its weights became,
+#: what its activations do, what it says.
+LEVEL_ORDER = [
+    ("dataset_embedding", "Dataset"),
+    ("structural", "Structural"),
+    ("functional", "Functional"),
+    ("behavioral", "Behavioral"),
+]
+
+
+def cross_level(per_level, ids, outdir, metric_override=None, suffix=""):
+    """Each level's best-scoring rung side by side, plus the agreement table.
+
+    *metric_override* maps a level to a metric name that level must be read
+    under, e.g. ``{"dataset_embedding": "cosine"}``. The rung is still chosen by
+    dCor, but only among that metric's cells. It exists to ask what a level looks
+    like when it is held to the same metric as the rest of the figure, rather
+    than to whichever metric happens to score best on it — a real question here,
+    since the dataset level is the only one whose unrestricted winner is not
+    `cosine`.
+
+    It is a question and not a correction. Pinning the dataset level to `cosine`
+    costs 0.043 dCor and takes that panel's MDS stress from 0.014 to 0.253, so
+    the metric consistency is bought at a visible price. Both variants are
+    written for that reason; see ``docs/CHANGELOG.md`` and
+    ``notebooks/8_crosslevel_dataset_cosine.ipynb`` for the two readings that
+    survive it.
+
+    *suffix* is appended to every output filename, so an override variant sits
+    beside the unrestricted one rather than overwriting it.
+    """
+    metric_override = metric_override or {}
     winners, table_rows = {}, []
     for lvl, cells in per_level.items():
         ranked = rank_rungs(cells, ids)
+        want = metric_override.get(lvl)
+        if want is not None:
+            restricted = [t for t in ranked if t[2] == want]
+            if restricted:
+                ranked = restricted
+            else:
+                # Fall back rather than drop the level: a missing metric should
+                # cost the constraint, not the panel.
+                print(f"    {lvl}: no {want!r} cell — using its overall best rung")
         if not ranked:
             print(f"    {lvl}: no scorable cell — omitted from the comparison")
             continue
         score, row, col, dm = ranked[0]
-        winners[lvl] = dm
+        winners[lvl] = (dm, score)
         table_rows.append((lvl, score, row, col))
 
     if not winners:
         return
 
-    cols = list(winners)
-    cells = {("best rung", lvl): dm for lvl, dm in winners.items()}
-    mds_grid(cells, ["best rung"], cols,
-             "Cross-level comparison — MDS, each level's best rung",
-             savepath=outdir / "fig_crosslevel_mds.png")
+    # LEVEL_ORDER fixes the sequence and the display names; a level it does not
+    # name is appended under its raw key, so adding a taxonomy shows up in the
+    # figure rather than being silently dropped from it.
+    display = dict(LEVEL_ORDER)
+    ordered = [(display[lvl], lvl) for lvl, _ in LEVEL_ORDER if lvl in winners]
+    ordered += [(lvl, lvl) for lvl in winners if lvl not in display]
+
+    # Name the constraint in the figure itself. A reader comparing the two
+    # variants side by side should not have to diff the filenames to find out
+    # which panel was pinned to which metric.
+    note = ", ".join(f"{display.get(l, l)} pinned to {m}"
+                     for l, m in metric_override.items() if l in winners)
+    subtitle = "Mixtures from 3 topic groupings from the Yahoo Answers Dataset"
+    crosslevel_mds(
+        [(name, winners[lvl][0], winners[lvl][1]) for name, lvl in ordered],
+        "Cross-Taxonomy Simplex — MDS",
+        subtitle=subtitle + (f" · {note}" if note else ""),
+        savepath=outdir / f"fig_crosslevel_mds{suffix}.png",
+    )
     plt.close("all")
-    dm_grid(cells, ["best rung"], cols,
-            "Cross-level comparison — distance matrices, each level's best rung",
-            savepath=outdir / "fig_crosslevel_dm.png")
+    cells = {("best rung", name): winners[lvl][0] for name, lvl in ordered}
+    dm_grid(cells, ["best rung"], [name for name, _ in ordered],
+            "Cross-level comparison — distance matrices, each level's best rung"
+            + (f" ({note})" if note else ""),
+            savepath=outdir / f"fig_crosslevel_dm{suffix}.png")
     plt.close("all")
 
     lines = ["| level | dCor vs ground truth | rung | metric |", "|---|---|---|---|"]
@@ -657,7 +714,7 @@ def cross_level(per_level, ids, outdir):
         detail += [f"| {s:.4f} | {r} | {c} |" for s, r, c, _ in rank_rungs(cells_, ids)]
         detail.append("")
 
-    (outdir / "crosslevel_agreement.md").write_text(
+    (outdir / f"crosslevel_agreement{suffix}.md").write_text(
         table + "\n" + "\n".join(detail) + "\n")
     print(table)
 
@@ -766,6 +823,13 @@ def main() -> None:
     if len(per_level) > 1:
         print("cross-level …")
         cross_level(per_level, ids, outdir)
+        # The same comparison with the dataset level read under cosine instead of
+        # its unrestricted frobenius winner — see `cross_level`'s docstring, and
+        # `notebooks/8_crosslevel_dataset_cosine.ipynb` for the standalone build.
+        print("cross-level (dataset · cosine) …")
+        cross_level(per_level, ids, outdir,
+                    metric_override={"dataset_embedding": "cosine"},
+                    suffix="_dataset_cosine")
 
     n = len(list(outdir.glob("*.png")))
     print(f"\nwrote {n} figures to {outdir}")

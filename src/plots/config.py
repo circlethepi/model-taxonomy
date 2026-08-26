@@ -43,6 +43,33 @@ for _fp in _FONT_PATHS:
         logging.getLogger("matplotlib.font_manager").setLevel(logging.ERROR)
         break
 
+
+def bold_capable_family(minimum_weights: int = 2) -> str:
+    """The preferred sans family that actually ships more than one weight.
+
+    Measured, not assumed.  ``LibreFranklin[wght].ttf`` is a *variable* font and
+    matplotlib registers a variable font at exactly one weight — for this file,
+    **100 (Thin)**.  There is no bold face to select, and matplotlib's fallback
+    matches on family before weight, so ``fontweight="bold"`` silently renders
+    the Thin face: the same string at ``normal``, ``bold`` and ``black`` produces
+    a byte-identical raster.
+
+    So a figure that needs real weight contrast has to name a family that has
+    one.  This walks the configured ``font.sans-serif`` stack and returns the
+    first entry with at least *minimum_weights* distinct registered weights,
+    falling back to DejaVu Sans, which ships 400 and 700.
+
+    Drop a static ``LibreFranklin-Bold.ttf`` beside the variable file and this
+    starts returning Libre Franklin without any code change — which is why it
+    probes the font manager rather than hardcoding the answer.
+    """
+    stack = list(mpl.rcParams.get("font.sans-serif", [])) + ["DejaVu Sans"]
+    for family in stack:
+        weights = {f.weight for f in fm.fontManager.ttflist if f.name == family}
+        if len(weights) >= minimum_weights:
+            return family
+    return "DejaVu Sans"
+
 # ── Preset definitions ────────────────────────────────────────────────────────
 #   figsize: (width, height) in inches
 #   font_size: base pt — used for titles + axis labels

@@ -185,6 +185,72 @@ def _bary_to_xy(w: np.ndarray) -> np.ndarray:
     return w @ verts
 
 
+#: The three pure mixtures and the centre, as ``mixture_label`` spells them.
+VERTEX_LABELS = ("100/0/0", "0/100/0", "0/0/100")
+CENTRE_LABEL = "33/33/33"
+
+#: Human-facing names for the three groups, for figures aimed at readers who do
+#: not know the ``g1``/``g2``/``g3`` shorthand.
+GROUP_DISPLAY = {"g1": "Group 1", "g2": "Group 2", "g3": "Group 3"}
+
+
+def align_to_simplex(
+    coords: np.ndarray,
+    model_ids: Sequence[str],
+    centre: str = CENTRE_LABEL,
+    up: str = "100/0/0",
+    right: str = "0/100/0",
+) -> np.ndarray:
+    """Put a 2-D embedding in the simplex's own frame.
+
+    Translates *centre* to the origin and rotates *up* onto the positive y-axis.
+    An MDS solution is determined only up to translation, rotation **and
+    reflection**, so fixing the first two still leaves half the panels mirrored
+    at random; *right* pins the third by requiring that vertex to land at
+    ``x > 0``. Reflecting across the y-axis leaves *up* where it is, so the three
+    constraints are independent and all three are satisfiable at once.
+
+    The convention matches :func:`ternary_legend` — g1 at the top, g2 to the
+    right, g3 to the left — so a scatter and the legend beside it can be read in
+    the same orientation.
+
+    This is a similarity transform: distances, stress and any barycentric
+    projection are unchanged. It only chooses where to stand.
+    """
+    coords = np.asarray(coords, dtype=float)
+    if coords.shape[1] != 2:
+        raise ValueError(f"align_to_simplex needs a 2-D embedding, got {coords.shape}")
+
+    pos = {}
+    for wanted in (centre, up, right):
+        hits = [i for i, m in enumerate(model_ids) if mixture_label(m) == wanted]
+        if not hits:
+            raise ValueError(
+                f"no model with mixture {wanted!r} in this embedding; the frame is "
+                f"defined by {centre!r} (origin), {up!r} (+y) and {right!r} (+x side). "
+                f"Present: {sorted({mixture_label(m) for m in model_ids})}"
+            )
+        pos[wanted] = hits[0]
+
+    x = coords - coords[pos[centre]]
+
+    v = x[pos[up]]
+    if np.linalg.norm(v) < 1e-12:
+        raise ValueError(
+            f"{up!r} sits on top of {centre!r} in this embedding, so there is no "
+            "direction to rotate onto the y-axis."
+        )
+    # Rotate by (pi/2 - theta) so `up` lands on +y.
+    theta = np.arctan2(v[1], v[0])
+    phi = np.pi / 2 - theta
+    c, s = np.cos(phi), np.sin(phi)
+    x = x @ np.array([[c, -s], [s, c]]).T
+
+    if x[pos[right]][0] < 0:
+        x = x * np.array([-1.0, 1.0])
+    return x
+
+
 def ternary_legend(
     ax: plt.Axes,
     model_ids: Sequence[str] | None = None,
@@ -192,12 +258,24 @@ def ternary_legend(
     resolution: int = 220,
     marker_size: int = 26,
     label_models: bool = False,
+    vertex_names: Mapping[str, str] | None = None,
+    show_topics: bool = True,
+    label_size: float = 5,
+    vertex_size: float = 6,
+    fontweight: str = "normal",
+    fontfamily: str | None = None,
 ) -> plt.Axes:
     """Draw the filled simplex that the point colours are read from.
 
     This replaces a colourbar: the bar was legible only because composition used
     to be one number. With *model_ids* given, the sampled mixtures are marked, so
     the legend doubles as a map of which points the experiment actually visits.
+
+    *vertex_names* renames the corners (``{"g1": "Group 1", ...}``); *show_topics*
+    controls whether the topic-index list is printed under each one. Labels for
+    the sampled mixtures are placed **radially outward from the centre** rather
+    than at a fixed offset, which is what keeps sixteen of them legible on a
+    triangle this small.
     """
     # Fill: rasterize the triangle, colouring each pixel by its own barycentric
     # weights, then mask everything outside.
@@ -226,27 +304,54 @@ def ternary_legend(
         closed=True, fill=False, edgecolor="0.35", linewidth=0.8,
     ))
 
+    text_kw = {"fontweight": fontweight}
+    if fontfamily is not None:
+        text_kw["fontfamily"] = fontfamily
+
     if model_ids:
         pts = _bary_to_xy(np.array([mixture_weights(m) for m in model_ids]))
         ax.scatter(pts[:, 0], pts[:, 1], s=marker_size, facecolors="none",
                    edgecolors="white", linewidths=0.9, zorder=3)
         if label_models:
+            # Push each label away from the centroid along its own radius. A
+            # fixed (3, 3) offset stacks the labels of the four points that share
+            # a row of the grid; a radial one fans them out, and the centre point
+            # (whose radius is zero) is nudged straight up.
+            mid_xy = _bary_to_xy(np.array([1 / 3, 1 / 3, 1 / 3]))[0]
             for (x, y), mid in zip(pts, model_ids):
-                ax.annotate(mixture_label(mid), xy=(x, y), xytext=(3, 3),
-                            textcoords="offset points", fontsize=5, color="0.2")
+                d = np.array([x, y]) - mid_xy
+                n = np.linalg.norm(d)
+                dx, dy = (d / n * 9.5) if n > 1e-9 else (0.0, 8.0)
+                ax.annotate(
+                    mixture_label(mid), xy=(x, y), xytext=(dx, dy),
+                    textcoords="offset points", ha="center", va="center",
+                    fontsize=label_size, color="0.15", zorder=4, **text_kw,
+                )
 
+    # Default to the `g1`/`g2`/`g3` shorthand: the dense rung x metric grids have
+    # no room for "Group 1", and only the cross-taxonomy figure is aimed at a
+    # reader who has not seen the shorthand. Pass GROUP_DISPLAY to rename.
+    names = dict(vertex_names or {})
+    # The three corners are also sampled mixtures, so when the points are
+    # labelled the vertex name has to clear that label rather than land on top
+    # of it. The radial offset above is 9.5pt, so the name goes beyond it.
+    up, down = (26, -25) if (model_ids and label_models) else (13, -11)
     for (x, y), key, va, ha in [
         ((0.5, _SQRT3_2), "g1", "bottom", "center"),
         ((1.0, 0.0), "g2", "top", "left"),
         ((0.0, 0.0), "g3", "top", "right"),
     ]:
-        topics = ",".join(str(t) for t in GROUP_TOPICS[key])
-        ax.annotate(f"{key}\n[{topics}]", xy=(x, y),
-                    xytext=(0, 12) if va == "bottom" else (0, -10),
-                    textcoords="offset points", ha=ha, va=va, fontsize=6, color="0.25")
+        label = names.get(key, key)
+        if show_topics:
+            label += "\n[" + ",".join(str(t) for t in GROUP_TOPICS[key]) + "]"
+        ax.annotate(label, xy=(x, y),
+                    xytext=(0, up) if va == "bottom" else (0, down),
+                    textcoords="offset points", ha=ha, va=va,
+                    fontsize=vertex_size, color="0.15", **text_kw)
 
-    ax.set_xlim(-0.14, 1.14)
-    ax.set_ylim(-0.16, _SQRT3_2 + 0.14)
+    pad = 0.30 if (model_ids and label_models) else 0.22
+    ax.set_xlim(-pad, 1.0 + pad)
+    ax.set_ylim(-pad, _SQRT3_2 + pad * 0.9)
     ax.set_aspect("equal")
     ax.axis("off")
     return ax
@@ -418,6 +523,119 @@ def mds_grid(
     ternary_legend(lax, ids, anchors)
 
     fig.suptitle(title, fontsize=12)
+    if savepath is not None:
+        save_figure(fig, str(savepath))
+    return fig
+
+
+# ── Cross-taxonomy panel ──────────────────────────────────────────────────────
+
+def crosslevel_mds(
+    panels: Sequence[tuple[str, object, float]],
+    title: str,
+    subtitle: str | None = None,
+    savepath=None,
+    anchors: Mapping[str, str] = ANCHORS,
+    panel_w: float = 3.5,
+    panel_h: float = 3.5,
+    marker_size: int = 130,
+    random_state: int = 0,
+    label_points: Sequence[str] = VERTEX_LABELS + (CENTRE_LABEL,),
+) -> plt.Figure:
+    """One MDS panel per taxonomy, all in the simplex's own frame.
+
+    *panels* is ``[(display_name, DistanceMatrix, dcor), ...]`` in the order they
+    should appear, left to right, after the ternary legend — which sits **first**
+    here rather than last, because it is the key the four panels are read
+    through and a reader meets it before the data.
+
+    Three things separate this from :func:`mds_grid`, which stays as it is for
+    the dense rung x metric grids:
+
+    * **A shared frame.** Every panel is put through :func:`align_to_simplex`, so
+      the centre mixture is at the origin and the pure-g1 model is straight up in
+      all of them. Without it, four independently-fitted embeddings arrive in
+      four arbitrary orientations and cannot be compared by eye at all. It is a
+      similarity transform, so nothing measurable moves.
+    * **True 1:1 axes.** ``adjustable="box"`` with symmetric limits, rather than
+      ``adjustable="datalim"``, so a unit of x is a unit of y *and* the panel is
+      square. Under ``datalim`` matplotlib satisfies the aspect by stretching the
+      data limits to fit whatever box the layout gives it, which is equal scaling
+      in a non-square frame and reads as a distorted simplex.
+    * **Four labels, not sixteen.** Only the three vertices and the centre are
+      annotated. The interior mixtures are identified by colour, and the legend
+      beside the panels is where they are named — repeating all sixteen labels in
+      each of four panels is 64 pieces of text saying what the colours already
+      say.
+
+    Panel limits are **per panel**: the levels differ by roughly an order of
+    magnitude in absolute MDS scale (structural ~0.6 against dataset ~0.1), so a
+    shared limit would render three of the four as a dot at the origin. What is
+    comparable across panels is the arrangement, not the size.
+    """
+    from src.analysis.bridge import fit_geometry
+    from src.analysis.quality import kruskal_stress
+    from src.plots.config import bold_capable_family
+
+    # Libre Franklin is registered at a single weight (Thin), so `fontweight`
+    # against it is a silent no-op — see `bold_capable_family`. Naming a family
+    # that ships a real bold is the only way to get weight contrast here.
+    family = bold_capable_family()
+    bold = {"fontweight": "bold", "fontfamily": family}
+
+    n = len(panels)
+    fig = plt.figure(figsize=(panel_w * (n + 1) + 0.4, panel_h + 1.15),
+                     layout="constrained")
+    # The legend column is wider than a panel: the triangle carries sixteen
+    # labels plus three vertex names, and it is the key everything else is read
+    # through, so it should not be the smallest thing in the figure.
+    gs = fig.add_gridspec(1, n + 1, width_ratios=[1.28] + [1.0] * n)
+
+    lax = fig.add_subplot(gs[0, 0])
+    ids = next((dm.model_ids for _, dm, _ in panels), None)
+    ternary_legend(lax, ids, anchors, label_models=True,
+                   vertex_names=GROUP_DISPLAY, show_topics=False,
+                   label_size=7.5, vertex_size=11, marker_size=34,
+                   fontweight="bold", fontfamily=family)
+    lax.set_title("Mixture key", fontsize=13, pad=10, **bold)
+
+    keep = set(label_points)
+    for k, (name, dm, dcor) in enumerate(panels):
+        ax = fig.add_subplot(gs[0, k + 1])
+        geo = fit_geometry(dm, "mds", 2, random_state=random_state)
+        xy = align_to_simplex(geo.coordinates, geo.model_ids)
+
+        ax.axhline(0.0, color="0.88", lw=1.0, zorder=0)
+        ax.axvline(0.0, color="0.88", lw=1.0, zorder=0)
+        ax.scatter(xy[:, 0], xy[:, 1], c=model_colors(geo.model_ids, anchors),
+                   s=marker_size, zorder=3, edgecolors="0.2", linewidths=1.0)
+
+        for (x, y), mid in zip(xy, geo.model_ids):
+            label = mixture_label(mid)
+            if label in keep:
+                ax.annotate(label, xy=(x, y), xytext=(0, 11),
+                            textcoords="offset points", ha="center",
+                            fontsize=9, color="0.1", zorder=4, **bold)
+
+        stress = kruskal_stress(dm, geo)
+        ax.set_title(f"{name}\ndCor {dcor:.3f}  ·  stress {stress:.3f}",
+                     fontsize=13, pad=10, **bold)
+
+        # Symmetric about the origin, which the frame has already made the
+        # centre mixture, so 1:1 scaling does not push the layout off-centre.
+        r = float(np.abs(xy).max()) * 1.28
+        ax.set_xlim(-r, r)
+        ax.set_ylim(-r, r)
+        ax.set_aspect("equal", adjustable="box")
+        ax.tick_params(labelsize=8.5)
+        for lbl in ax.get_xticklabels() + ax.get_yticklabels():
+            lbl.set_fontweight("bold")
+            lbl.set_fontfamily(family)
+
+    fig.suptitle(
+        title + (f"\n{subtitle}" if subtitle else ""),
+        fontsize=18, **bold,
+    )
     if savepath is not None:
         save_figure(fig, str(savepath))
     return fig

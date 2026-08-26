@@ -3258,6 +3258,324 @@ def t_functional_mask_pooling():
     return "mean/last_token/cls all mask-aware; unmasked mean provably differs"
 
 
+def _fake_index(n=4, prefix="m"):
+    """A CacheIndex of *n* bare entries, enough to exercise id resolution."""
+    from src.analysis.discovery import CacheEntry, CacheIndex
+
+    return CacheIndex([
+        CacheEntry(
+            model_id=f"/adapters/{prefix}{i}",
+            adapter_name=f"{prefix}{i}",
+            recipe_id=f"recipe{i}",
+            available={"structural_weights": True},
+        )
+        for i in range(n)
+    ])
+
+
+def _fake_reps(n=4, rows=6, d=5, seed=7):
+    from src.core.representation import ModelRepresentation
+
+    rng = np.random.default_rng(seed)
+    return [
+        ModelRepresentation(
+            model_id=f"/adapters/m{i}", taxonomy="functional",
+            matrix=rng.normal(size=(rows, d)).astype(np.float32),
+            metadata={"artifact_path": f"04_activations/m{i}",
+                      "surrogate_hash": f"s{i}"},
+        )
+        for i in range(n)
+    ]
+
+
+@check("comparison: ids reorder the rows instead of relabelling them")
+def t_distance_matrix_row_order():
+    """The bug in ``docs/notes/row_order_bug.md``, pinned.
+
+    ``_resolve_representations`` returns one representation per entry, in entry
+    order.  ``_distances`` used to compute from that list while labelling the
+    result with the caller's ``ids``, so any caller that reordered — the figure
+    suite sorts by mixture — got a matrix whose every row carried another model's
+    name.  Three of four taxonomy levels reported a wrecked simplex for it, and
+    it read as a finding rather than a defect because the fourth level, which
+    takes a different code path, was unaffected.
+
+    The property that must hold: the matrix for a permuted ``ids`` is the matrix
+    for the original ``ids``, permuted the same way.  Checked through
+    ``_compute_distance_matrix`` rather than on ``_positions_for`` alone, because
+    the defect was in how the two halves were joined, not in either half.
+    """
+    from src.analysis import comparison as C
+
+    index = _fake_index(4)
+    reps = _fake_reps(4)
+    ids = [e.model_id for e in index.entries]
+
+    original = C._resolve_representations
+    C._resolve_representations = lambda idx, tax, **kw: (reps, [])
+    try:
+        base = C._compute_distance_matrix(index, "functional", "cosine", ids)
+        rev = C._compute_distance_matrix(index, "functional", "cosine", ids[::-1])
+        # A recipe id must resolve to the same model as its adapter path, so the
+        # two spellings cannot silently produce different matrices.
+        by_recipe = C._compute_distance_matrix(
+            index, "functional", "cosine", [e.recipe_id for e in index.entries])
+    finally:
+        C._resolve_representations = original
+
+    assert list(base.model_ids) == ids, base.model_ids
+    assert list(rev.model_ids) == ids[::-1], rev.model_ids
+    perm = np.arange(4)[::-1]
+    assert np.allclose(base.matrix[np.ix_(perm, perm)], rev.matrix), (
+        "reversing ids did not reverse the matrix — rows are being relabelled "
+        "rather than reordered"
+    )
+    assert np.allclose(base.matrix, by_recipe.matrix), (
+        "the same models addressed by recipe id gave a different matrix"
+    )
+
+    # A subset, and an id the index does not hold.
+    sub = None
+    C._resolve_representations = lambda idx, tax, **kw: (reps, [])
+    try:
+        sub = C._compute_distance_matrix(index, "functional", "cosine", ids[:2])
+        try:
+            C._compute_distance_matrix(index, "functional", "cosine", ["nope"])
+        except ValueError as e:
+            assert "nope" in str(e), e
+        else:
+            raise AssertionError("an unknown id was accepted")
+    finally:
+        C._resolve_representations = original
+
+    assert sub.matrix.shape == (2, 2)
+    assert np.isclose(sub.matrix[0, 1], base.matrix[0, 1])
+    return "reorder, subset and recipe-id spellings all agree"
+
+
+@check("comparison: structural rows follow ids too")
+def t_structural_row_order():
+    """The same property on the one level that does not take representations.
+
+    ``_structural_matrix`` reads the adapter files itself, so it had its own copy
+    of the positional pairing — ``zip(index.entries, ids)`` — and would have
+    mislabelled a reordered caller in exactly the same way.  It escaped the
+    original bug only because the figure suite happens to bypass it.
+    """
+    from src.analysis import comparison as C
+
+    weights, blocks = _synthetic_lora(n_adapters=4, d_out=24, d_in=32, rank=3)
+    names = list(weights.keys())
+    index = _fake_index(4, prefix="syn")
+    index.cache_root = Path("/nonexistent")
+    ids = [e.model_id for e in index.entries]
+    assert [e.adapter_name for e in index.entries] == names, names
+
+    import src.notebook.lora_weights as LW
+    original = LW.load_lora_weights
+
+    def fake(model_names, **kw):
+        # Return only the adapters asked for, in the order asked for — which is
+        # what the real loader does and what the reorder depends on.
+        from src.notebook.lora_weights import LoRAWeightCollection
+        return LoRAWeightCollection({n: weights[n] for n in model_names})
+
+    LW.load_lora_weights = fake
+    try:
+        layers = sorted({l for l, _ in blocks})
+        projs = sorted({p for _, p in blocks})
+        base = C._compute_distance_matrix(index, "structural", "cosine", ids,
+                                          layers=layers, projections=projs)
+        rev = C._compute_distance_matrix(index, "structural", "cosine", ids[::-1],
+                                         layers=layers, projections=projs)
+    finally:
+        LW.load_lora_weights = original
+
+    assert list(base.model_ids) == ids, base.model_ids
+    assert list(rev.model_ids) == ids[::-1], rev.model_ids
+    perm = np.arange(4)[::-1]
+    assert np.allclose(base.matrix[np.ix_(perm, perm)], rev.matrix, atol=1e-6), (
+        "structural rows are relabelled rather than reordered"
+    )
+    return "structural honours the caller's order"
+
+
+@check("metrics: MMD and energy separate distributions, not row orders")
+def t_distributional_metrics():
+    """The two properties that make these worth having beside the row-aligned metrics.
+
+    Row-order invariance is the point: the behavioral level stores
+    ``(n_queries * replicates, d)`` and replicate *k* of two models is two
+    independent draws, so pairing them by index is meaningless.  Unequal row
+    counts follow from the same argument.
+
+    Also pinned: the unbiased estimators land at or below zero under the null and
+    are clamped, so an exact 0.0 means "at the noise floor", not "identical".
+    That is a real property of the estimator and a caller reading 0.0 as
+    identity would be wrong.
+    """
+    from src.core.representation import ModelRepresentation
+    from src.metrics import EnergyDistanceMetric, MMDDistanceMetric
+
+    rng = np.random.default_rng(3)
+
+    def rep(m, name="x"):
+        return ModelRepresentation(model_id=name, taxonomy="behavioral",
+                                   matrix=np.asarray(m, dtype=np.float32))
+
+    a = rep(rng.normal(size=(200, 12)), "a")
+    a2 = rep(rng.normal(size=(200, 12)), "a2")     # same distribution
+    b = rep(rng.normal(size=(200, 12)) + 1.2, "b")  # shifted
+    short = rep(rng.normal(size=(97, 12)), "short")
+    shuffled = rep(a.matrix[rng.permutation(200)], "shuffled")
+
+    notes = []
+    for metric in (EnergyDistanceMetric(), MMDDistanceMetric()):
+        name = metric.metric_name
+        null, shift = metric.compute(a, a2), metric.compute(a, b)
+        assert shift > null, f"{name}: shifted {shift} not above null {null}"
+        assert metric.compute(a, a) == 0.0, f"{name}: nonzero self-distance"
+        assert np.isclose(metric.compute(a, b), metric.compute(b, a)), f"{name}: asymmetric"
+        assert np.isclose(metric.compute(a, b), metric.compute(shuffled, b)), (
+            f"{name}: permuting the rows of one input changed the distance"
+        )
+        assert np.isfinite(metric.compute(a, short)), f"{name}: unequal rows failed"
+        notes.append(f"{name} null {null:.3f} vs shifted {shift:.3f}")
+
+        try:
+            metric.compute(rep(np.ones((1, 12))), rep(np.ones((1, 12))))
+        except ValueError as e:
+            assert "row" in str(e), e
+        else:
+            raise AssertionError(f"{name}: a single-row sample was accepted")
+
+    return "; ".join(notes)
+
+
+@check("surrogates: centering is a translation, whitening is not")
+def t_surrogate_transforms():
+    """What the centered rungs may and may not change.
+
+    Both centering modes subtract one array from every model, so the collection
+    is *translated*: a Euclidean distance cannot move, and a scale-invariant one
+    (cosine, normalized Frobenius) generally does.  That asymmetry is the whole
+    content of a centered rung, and getting it backwards — pairing a centered
+    representation with a translation-invariant metric — produces a panel that
+    duplicates its raw twin under a label implying otherwise.
+    """
+    from src.core.representation import ModelRepresentation
+    from src.analysis.surrogates import (
+        center_representations, centered, transform_key, whiten_representations,
+    )
+    from src.metrics import CosineDistanceMetric, FrobeniusDistanceMetric
+
+    rng = np.random.default_rng(11)
+    reps = [
+        ModelRepresentation(model_id=f"m{i}", taxonomy="behavioral",
+                            matrix=(rng.normal(size=(20, 6)) + 4.0).astype(np.float32))
+        for i in range(5)
+    ]
+
+    euclid, cosine = FrobeniusDistanceMetric(normalize=False), CosineDistanceMetric()
+    assert euclid.metric_name == "euclidean", euclid.metric_name
+
+    for mode in ("grand", "rowwise"):
+        out = center_representations(reps, mode=mode)
+        assert np.isclose(euclid.compute(out[0], out[1]),
+                          euclid.compute(reps[0], reps[1])), (
+            f"{mode} centering moved a Euclidean distance, so it is not a translation"
+        )
+        assert not np.isclose(cosine.compute(out[0], out[1]),
+                              cosine.compute(reps[0], reps[1])), (
+            f"{mode} centering left cosine unchanged; the shared component it "
+            "removes was apparently already absent, so this fixture proves nothing"
+        )
+        assert out[0].metadata["surrogate_transform"][-1]["mode"] == mode
+
+    pooled = np.vstack([r.matrix for r in center_representations(reps, "grand")])
+    assert np.abs(pooled.mean(axis=0)).max() < 1e-4, pooled.mean(axis=0)
+    stacked = np.stack([r.matrix for r in center_representations(reps, "rowwise")])
+    assert np.abs(stacked.mean(axis=0)).max() < 1e-4
+
+    w = whiten_representations(reps, shrinkage=0.1)
+    cov = np.cov(np.vstack([r.matrix for r in w]).T)
+    assert np.abs(np.diag(cov) - 1.0).max() < 0.25, np.diag(cov)
+    assert not np.isclose(euclid.compute(w[0], w[1]),
+                          euclid.compute(reps[0], reps[1])), (
+        "whitening left a Euclidean distance unchanged; it is a linear map, not "
+        "a translation, so this would mean the covariance was already identity"
+    )
+    assert [t["kind"] for t in w[0].metadata["surrogate_transform"]] == ["center", "whiten"]
+
+    # rowwise needs a shared row count; say so rather than broadcasting quietly.
+    ragged = reps[:1] + [ModelRepresentation(
+        model_id="odd", taxonomy="behavioral",
+        matrix=rng.normal(size=(9, 6)).astype(np.float32))]
+    try:
+        center_representations(ragged, mode="rowwise")
+    except ValueError as e:
+        assert "rowwise" in str(e), e
+    else:
+        raise AssertionError("rowwise accepted mismatched row counts")
+
+    assert transform_key(None) == "raw"
+    assert transform_key(centered("grand")) == "centered_grand"
+    return "centering translates, whitening does not; keys are stable"
+
+
+@check("plots: the simplex frame is a similarity transform")
+def t_align_to_simplex():
+    """`align_to_simplex` may choose where to stand and nothing else.
+
+    It exists because an MDS solution is determined only up to translation,
+    rotation *and* reflection, so four independently-fitted panels arrive in four
+    arbitrary orientations. Pinning the frame is what makes them comparable by
+    eye — but only if it moves no distance, since the panels are titled with a
+    stress and a dCor computed before the rotation.
+
+    The reflection is the half that is easy to get wrong: fixing the centre at
+    the origin and one vertex on +y still leaves a mirror free, and an unpinned
+    mirror is exactly the failure the function is supposed to prevent.
+    """
+    from src.plots.simplex import align_to_simplex
+
+    rng = np.random.default_rng(5)
+    ids = [f"yahoo_{a:03d}g1_{b:03d}g2_{c:03d}g3_n1000_s00" for a, b, c in
+           [(100, 0, 0), (0, 100, 0), (0, 0, 100), (33, 33, 33),
+            (50, 25, 25), (25, 50, 25)]]
+
+    notes = []
+    for trial in range(6):
+        coords = rng.normal(size=(len(ids), 2)) * rng.uniform(0.01, 10)
+        # Feed in a deliberately mirrored copy too: both must come out the same
+        # way round, which is the property a fixed rotation alone does not have.
+        for mirror in (False, True):
+            src = coords * np.array([-1.0, 1.0]) if mirror else coords
+            out = align_to_simplex(src, ids)
+
+            d_in = np.linalg.norm(src[:, None] - src[None], axis=-1)
+            d_out = np.linalg.norm(out[:, None] - out[None], axis=-1)
+            assert np.abs(d_in - d_out).max() < 1e-9, (
+                f"trial {trial} mirror={mirror}: distances moved by "
+                f"{np.abs(d_in - d_out).max():.2e}"
+            )
+            assert np.abs(out[3]).max() < 1e-9, f"33/33/33 not at the origin: {out[3]}"
+            assert abs(out[0][0]) < 1e-9 and out[0][1] > 0, f"100/0/0 off +y: {out[0]}"
+            assert out[1][0] > 0, f"0/100/0 on the wrong side: {out[1]}"
+        notes.append(trial)
+
+    # A missing landmark must name itself rather than produce a silently
+    # unaligned panel.
+    try:
+        align_to_simplex(rng.normal(size=(2, 2)), ids[:2])
+    except ValueError as e:
+        assert "33/33/33" in str(e), e
+    else:
+        raise AssertionError("a frame with no centre mixture was accepted")
+
+    return f"{len(notes)} random frames x2 mirrors: distances fixed, landmarks pinned"
+
+
 @check("functional: CKA refuses row counts its estimator cannot support")
 def t_cka_row_guard():
     """The unbiased HSIC estimator divides by n(n-3).
@@ -3810,6 +4128,11 @@ SYNTHETIC = [
     t_activation_view_equivalence, t_activation_layerwise_normalization,
     t_functional_padding_side,
     t_functional_mask_pooling, t_cka_row_guard,
+    # row order: ids select and order the rows, at every level
+    t_distance_matrix_row_order, t_structural_row_order,
+    # the surrogate layer, and the metrics that only make sense with it
+    t_distributional_metrics, t_surrogate_transforms,
+    t_align_to_simplex,
     # the two inference caches are addressed by one piece of code, and the
     # things that used to be spelled twice
     t_draw_keyed_shared_key, t_generated_surrogate_writeback, t_adapter_name_unique,

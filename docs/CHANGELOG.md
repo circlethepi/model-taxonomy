@@ -4,14 +4,176 @@
 
 ## Unreleased
 
+### The cross-taxonomy figure can pin a level to a metric, and does for the dataset level
+
+**`cross_level`** (`scripts/make_simplex3_figures.py`) takes a `metric_override`
+map and a filename `suffix`. A level named in the map still has its rung chosen by
+dCor, but only among that metric's cells; every other level is unrestricted as
+before. The suite now writes both variants — `fig_crosslevel_mds.png` unchanged,
+and `fig_crosslevel_mds_dataset_cosine.png` with the dataset-embedding level read
+under `cosine` — plus their `fig_crosslevel_dm*` matrices and
+`crosslevel_agreement*.md` tables.
+
+The dataset level is the one that needed it. Its unrestricted winner is
+`frobenius` at dCor **0.9800**, against `cosine` at **0.9371**; the other three
+levels all win under `cosine`, so that panel was the only one of four measured
+differently from the rest. That rung compares sixteen `(1, 768)` recipe centroids,
+and on a single row `frobenius` and `euclidean` are reading a vector *difference*
+— direction together with length — where `cosine` reads direction alone.
+`euclidean` at **0.9797** is the same reading twice rather than independent
+corroboration, and with only five scorable cells the whole level rests on the
+metric choice in a way the functional and structural levels, flat across twenty-odd
+near-tied rungs, do not.
+
+**The comparison does not come out in cosine's favour, and that is the result.**
+Pinning the level to `cosine` costs 0.043 dCor and takes the panel's MDS stress
+from **0.014 to 0.253** — from the best fit in the figure to the second-worst,
+behind only the behavioral level. It is visible rather than marginal: `frobenius`
+renders the sixteen mixtures as a clean triangular lattice, `cosine` as a
+compressed, noisy version of the same arrangement with the vertices pulled toward
+the centre. Whatever the centroid norm carries, discarding it costs real simplex
+geometry. Two explanations survive — the norm genuinely tracks the mixture (a
+mixed recipe averages more heterogeneous documents, so its centroid is shorter),
+or `frobenius`/`euclidean` are reading a raw embedding geometry that MDS
+reproduces almost exactly and `cosine`'s projection to the unit sphere is what
+distorts it — and separating them needs centroid norms against mixture entropy,
+which is not built here.
+
+Both figures are kept for that reason. The override is a second figure rather than
+a replacement: which reading is the honest one is the open question, and answering
+it by deleting one of them is not available.
+
+`notebooks/8_crosslevel_dataset_cosine.ipynb` builds the same figure standalone.
+It rebuilds only the four winning cells instead of the full rung × metric sweep —
+about two seconds against the suite's full runtime — and asserts their four dCor
+values against the tracked table, so a cache change that moves a winner fails
+there rather than quietly producing a different figure. It imports its definitions
+from the script rather than copying them (notebook 7 copies, because it had no
+tracked source to import from), and carries the complete dCor ranking for all four
+levels as markdown.
+
+
+### `ids` now orders the rows it labels — three of four taxonomy levels were permuted
+
+**`_distances` computed a matrix in `index.entries` order and labelled it with the
+caller's `ids`.** Nothing checked that the two agreed, and nothing in the
+signature said they had to. Every caller that existed derived `ids` from the index
+itself, so the permutation was the identity and the defect stayed latent — until
+`make_simplex3_figures.py` passed `sort_by_mixture(idx.model_ids)`, which
+disagrees with cache scan order in all 16 positions.
+
+The result was a suite reporting **structural 0.96 and the other three levels
+0.41–0.55** against the ground-truth simplex. Structural was clean only because
+that level bypasses `_compute_distance_matrix` and relabels through a real
+lookup. Corrected: functional **0.5487 → 0.9687**, dataset_embedding
+**0.4122 → 0.9371**, behavioral **0.4177 → 0.7462**, structural unchanged.
+
+One clean level and three muddy ones is also a plausible *finding* — weights
+being the most direct read of a training mixture is what anyone would predict —
+which is why this survived a review of the figures. `docs/notes/row_order_bug.md`
+records the full account. `_positions_for` now resolves each id against the index
+by identity, so `ids` selects and orders rather than merely naming; it accepts a
+subset, accepts either id scheme, and raises on an unknown id.
+`_structural_matrix` carried the same positional `zip` and is fixed with it.
+`build_taxonomy_artifacts` was never exposed — it derives `ids` in entry order —
+so nothing in `06_collections` needed re-deriving.
+
+`t_distance_matrix_row_order` and `t_structural_row_order` pin the property, and
+both were confirmed to fail against the pre-fix code.
+
+### The cross-taxonomy figure gets its own frame, and the house font has no bold
+
+**`crosslevel_mds`** (`src/plots/simplex.py`) replaces the `mds_grid` call the
+cross-level comparison used to borrow. `mds_grid` is right for a dense rung ×
+metric grid and wrong for four panels meant to be read against each other:
+
+* **A shared frame.** `align_to_simplex` puts every panel in the simplex's own
+  coordinates — centre mixture at the origin, pure-g1 straight up, pure-g2 to the
+  right. An MDS solution is determined only up to translation, rotation **and
+  reflection**, so four independently-fitted embeddings otherwise arrive in four
+  arbitrary orientations and cannot be compared by eye at all. Fixing the centre
+  and one vertex still leaves a mirror free, which is why the third landmark is
+  pinned too; the orientation matches `ternary_legend`, so a scatter and the key
+  beside it read the same way round. It is a similarity transform, so the stress
+  and dCor in each panel title are unaffected — `t_align_to_simplex` pins that
+  over random frames and their mirrors.
+* **True 1:1 axes.** `adjustable="box"` with symmetric limits. Under
+  `adjustable="datalim"` matplotlib satisfies an equal aspect by stretching the
+  data limits to whatever box the layout hands it, which is equal *scaling* in a
+  non-square frame and renders a simplex as a distorted one.
+* **Four labels, not sixteen.** Only the three vertices and the centre are
+  annotated in the scatters; the interior mixtures are named once, in the legend,
+  which now sits **first** rather than last and carries all sixteen. Its labels
+  are placed radially outward from the centroid — a fixed offset stacks the four
+  points that share a row of the grid.
+
+**The house font is registered at weight 100 and has no bold.**
+`fonts/LibreFranklin[wght].ttf` is a *variable* font, and matplotlib registers a
+variable font at exactly one weight — for this file, Thin. Matplotlib's fallback
+matches family before weight, so `fontweight="bold"` silently renders the Thin
+face: the same string at `normal`, `bold` and `black` rasterizes byte-identically
+(1365 ink pixels, against DejaVu Sans's 3078 / 5540 / 5540). Every figure in the
+suite has therefore been setting in Thin. `bold_capable_family()`
+(`src/plots/config.py`) walks the configured sans stack and returns the first
+family with more than one registered weight, so the cross-taxonomy figure gets
+real weight contrast; drop a static `LibreFranklin-Bold.ttf` beside the variable
+file and it starts returning Libre Franklin with no code change.
+
+### Fleet-level surrogate transforms, and two distributional metrics
+
+**`src/analysis/surrogates.py`** holds operations a pairwise `DistanceMetric`
+cannot express, because they are defined by the whole collection rather than by
+two members of it. `center_representations` subtracts the fleet mean —
+`mode="grand"` over the pooled rows, `mode="rowwise"` per query, which is the
+stronger transform where rows are a shared draw. `whiten_representations` adds a
+Ledoit-Wolf-shrunk inverse covariance; the shrinkage is not optional at d=768
+with 16 models, where an unshrunk `S^{-1/2}` amplifies the low-variance
+directions that are pure estimation noise. Transforms record themselves in
+`metadata["surrogate_transform"]` and reach `_compute_distance_matrix` and
+`build_taxonomy_artifacts` through a `transform=` argument, whose
+`transform_key` joins the collection key — appended only when a transform is
+present, so untransformed keys are bit-identical to what they were.
+
+The motivation is that every level carries a large component shared by all 16
+models and identical by construction: the same 100 questions at the behavioral
+level, the same base-model reading of each prompt at the functional level, the
+same Yahoo answer register at the dataset level.
+
+**`src/metrics/distributional.py`** adds `EnergyDistanceMetric` and
+`MMDDistanceMetric`, which read a representation as a *sample* rather than an
+indexed list. Both are row-order invariant and accept unequal row counts, which
+is what the behavioral level's `(n_queries * replicates, d)` actually needs —
+replicate *k* of two models is two independent draws, so pairing them by index is
+meaningless. Both use unbiased estimators, so a value of `0.0` means "at or below
+the noise floor", not "identical"; that is documented rather than hidden behind
+the biased estimator, whose positive bias under the null would vary with row
+count across the very models being compared.
+
+**`FrobeniusDistanceMetric(normalize=False)` now reports itself as
+`"euclidean"`,** and is selectable under that name. The distinction was cosmetic
+until centering existed and is now load-bearing: Euclidean distance is
+translation-invariant, so centering is exactly a no-op for it, while the
+normalized form discards each row's magnitude — which after centering *is* the
+distance from the fleet centroid. Measured on the dataset level: raw euclidean
+0.9797, centered euclidean 0.9797 (identical, as it must be), centered cosine
+0.9127. Pairing a centered representation with a scale-invariant metric throws
+away what the centering just exposed, and the grid now renders that cell as a
+stated identity rather than computing a duplicate panel.
+
+**`resolve_ordered()`** is the new seam returning representations already in
+`ids` order. A panel grid fixes a selector per row and varies the metric across
+columns, and going back through `_compute_distance_matrix` per column re-read the
+same 16 tensors once per metric — with seven columns that dominated the runtime
+of the whole figure suite.
+
 ### A visualization suite for 3-group simplex experiments, and the hybrid-attention fixes it needed
 
 **`src/plots/simplex.py`** carries a colour system for experiments that mix three
 groups. Every earlier suite mixed *two*, so composition was a scalar and a `plasma`
 ramp keyed to `% topic 0` could carry it; a 3-group mixture is a point in a
 2-simplex and no single ramp represents it without dropping an axis. A model's
-colour is now a **barycentric blend** of three anchors — `g1 #1F5FA9`,
-`g2 #C13B3B`, `g3 #E3A21A` — mixed in **Oklab**, so equal weight steps look like
+colour is now a **barycentric blend** of three anchors — `g1 #1E6FE8`,
+`g2 #F02B3A`, `g3 #FFC220` — mixed in **Oklab**, so equal weight steps look like
 equal colour steps and a 50/50 blend does not go muddy the way an sRGB average
 does. Pure vertices reproduce their anchors exactly, so `ternary_legend` (the
 filled simplex, which replaces the colourbar) and the points agree by construction.
@@ -26,11 +188,22 @@ rank-1 on a single row and cannot stack blocks of differing input dim. Printing 
 reason in place keeps the constraint visible where a blank panel would read as a
 bug and a dropped column would hide it.
 
+The anchors were **brightened** on 2026-08-24 (from `#1F5FA9` / `#C13B3B` /
+`#E3A21A`). Same three hues, higher chroma and lightness. Chroma matters more
+here than in a categorical palette: 13 of the 16 models sit in the interior of
+the simplex, an interior point is a three-way blend, and a blend is always less
+saturated than any of its parents — so muted anchors left the interior nearly
+grey.
+
 **`scripts/make_simplex3_figures.py`** regenerates the suite for the
 simplex3_qwen experiment across all four levels. The rendered PNGs are *not*
-tracked — `figures/simplex3_qwen/*.png` is gitignored, since the suite is 27 MB
+tracked — `figures/simplex3_qwen*/*.png` is gitignored, since the suite is 27 MB
 and this script reproduces it from the cached results. `crosslevel_agreement.md`
-is tracked, because it is the numeric result rather than a rendering of one.
+is tracked, because it is the numeric result rather than a rendering of one, and
+it now names the winning rung and metric per level rather than assuming cosine at
+a hardcoded reference row. Output goes to `figures/simplex3_qwen_v2/`; the
+row-permuted `figures/simplex3_qwen/` is kept beside it so the correction can be
+checked.
 
 **`lora_weights` now reads hybrid-attention adapters.** `_KEY_RE` matched only
 `self_attn.{q,k,v,o}_proj`, which on Qwen3.5 — `full_attention_interval: 4`, so 24

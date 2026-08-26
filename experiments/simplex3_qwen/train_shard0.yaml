@@ -14,8 +14,8 @@
 # question_title + best_answer runs. Flagged, not changed.
 
 name: simplex3_train_shard0
-output_dir: /weka/scratch/cpriebe1/MO/model-taxonomy/results/simplex3_qwen
-cache_dir: /weka/scratch/cpriebe1/MO/model-taxonomy/results/shared_cache
+output_dir: /weka/scratch/jhu/cpriebe1/MO/model-taxonomy/results/simplex3_qwen
+cache_dir: /weka/scratch/jhu/cpriebe1/MO/model-taxonomy/results/shared_cache
 
 datasets:
   - name: yahoo_000g1_000g2_100g3

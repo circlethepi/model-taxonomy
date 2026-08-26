@@ -11,8 +11,8 @@
 # times buys eight short slots that actually backfill.
 
 name: simplex3_behavioral_qonly_shard2
-output_dir: /weka/scratch/cpriebe1/MO/model-taxonomy/results/simplex3_qwen
-cache_dir: /weka/scratch/cpriebe1/MO/model-taxonomy/results/shared_cache
+output_dir: /weka/scratch/jhu/cpriebe1/MO/model-taxonomy/results/simplex3_qwen
+cache_dir: /weka/scratch/jhu/cpriebe1/MO/model-taxonomy/results/shared_cache
 
 datasets:
   - name: yahoo_033g1_033g2_033g3_qtc
@@ -66,8 +66,8 @@ fine_tuning:
 
 extraction:
   models:
-    - /weka/scratch/cpriebe1/MO/model-taxonomy/results/shared_cache/03_adapters/Qwen--Qwen3.5-4B/yahoo_000g1_050g2_050g3_n1000_s00_r16_i00_b5008_fea27ccee
-    - /weka/scratch/cpriebe1/MO/model-taxonomy/results/shared_cache/03_adapters/Qwen--Qwen3.5-4B/yahoo_050g1_025g2_025g3_n1000_s00_r16_i00_b5008_fea27ccee
+    - /weka/scratch/jhu/cpriebe1/MO/model-taxonomy/results/shared_cache/03_adapters/Qwen--Qwen3.5-4B/yahoo_000g1_050g2_050g3_n1000_s00_r16_i00_b5008_fea27ccee
+    - /weka/scratch/jhu/cpriebe1/MO/model-taxonomy/results/shared_cache/03_adapters/Qwen--Qwen3.5-4B/yahoo_050g1_025g2_025g3_n1000_s00_r16_i00_b5008_fea27ccee
   queries_dataset: yahoo_033g1_033g2_033g3_qtc
   n_queries: 100
   device: cuda

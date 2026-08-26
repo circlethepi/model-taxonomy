@@ -5,7 +5,7 @@
 #SBATCH --mem=32G
 #SBATCH --cpus-per-task=8
 #SBATCH --time=1:00:00
-#SBATCH --output=/weka/scratch/cpriebe1/MO/model-taxonomy/results/simplex3/logs/s3_build-%j.out
+#SBATCH --output=/weka/scratch/jhu/cpriebe1/MO/model-taxonomy/results/simplex3/logs/s3_build-%j.out
 
 set -euo pipefail
 
@@ -16,10 +16,10 @@ set -euo pipefail
 # existing jobs use (jobs/qa_pairs_train.sh:22).
 source "$(conda info --base)/etc/profile.d/conda.sh"
 conda activate taxonomy-env
-cd /weka/scratch/cpriebe1/MO/model-taxonomy
+cd /weka/scratch/jhu/cpriebe1/MO/model-taxonomy
 
 export TOKENIZERS_PARALLELISM=false
-export HF_HOME=/weka/home/mohata1/scratchcpriebe1/MO/huggingface_cache
+export HF_HOME=/weka/scratch/jhu/cpriebe1/MO/huggingface_cache
 
 python scripts/run_experiment.py experiments/simplex3/sweep_s00.yaml --steps build
 python scripts/run_experiment.py experiments/simplex3/sweep_s01.yaml --steps build

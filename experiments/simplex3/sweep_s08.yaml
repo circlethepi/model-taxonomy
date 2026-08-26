@@ -9,8 +9,8 @@
 #
 
 name: simplex3_sweep_s08
-output_dir: /weka/scratch/cpriebe1/MO/model-taxonomy/results/simplex3
-cache_dir: /weka/scratch/cpriebe1/MO/model-taxonomy/results/shared_cache
+output_dir: /weka/scratch/jhu/cpriebe1/MO/model-taxonomy/results/simplex3
+cache_dir: /weka/scratch/jhu/cpriebe1/MO/model-taxonomy/results/shared_cache
 
 datasets:
   - name: yahoo_000g1_000g2_100g3

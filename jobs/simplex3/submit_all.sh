@@ -16,7 +16,7 @@
 
 set -euo pipefail
 cd "$(dirname "$0")"
-mkdir -p /weka/scratch/cpriebe1/MO/model-taxonomy/results/simplex3/logs
+mkdir -p /weka/scratch/jhu/cpriebe1/MO/model-taxonomy/results/simplex3/logs
 
 sb() { sbatch --parsable "$@"; }
 

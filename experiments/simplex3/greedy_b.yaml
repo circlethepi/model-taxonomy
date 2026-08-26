@@ -26,8 +26,8 @@
 # finish in well under an hour.
 
 name: simplex3_greedy_b
-output_dir: /weka/scratch/cpriebe1/MO/model-taxonomy/results/simplex3
-cache_dir: /weka/scratch/cpriebe1/MO/model-taxonomy/results/shared_cache
+output_dir: /weka/scratch/jhu/cpriebe1/MO/model-taxonomy/results/simplex3
+cache_dir: /weka/scratch/jhu/cpriebe1/MO/model-taxonomy/results/shared_cache
 
 datasets:
   - name: yahoo_033g1_033g2_033g3_qtc
@@ -72,22 +72,22 @@ fine_tuning:
 
 extraction:
   models:
-    - /weka/scratch/cpriebe1/MO/model-taxonomy/results/shared_cache/03_adapters/meta-llama--Llama-3.1-8B/yahoo_000g1_000g2_100g3_n1000_s00_r16_i00_b5008
-    - /weka/scratch/cpriebe1/MO/model-taxonomy/results/shared_cache/03_adapters/meta-llama--Llama-3.1-8B/yahoo_000g1_025g2_075g3_n1000_s00_r16_i00_b5008
-    - /weka/scratch/cpriebe1/MO/model-taxonomy/results/shared_cache/03_adapters/meta-llama--Llama-3.1-8B/yahoo_000g1_050g2_050g3_n1000_s00_r16_i00_b5008
-    - /weka/scratch/cpriebe1/MO/model-taxonomy/results/shared_cache/03_adapters/meta-llama--Llama-3.1-8B/yahoo_000g1_075g2_025g3_n1000_s00_r16_i00_b5008
-    - /weka/scratch/cpriebe1/MO/model-taxonomy/results/shared_cache/03_adapters/meta-llama--Llama-3.1-8B/yahoo_000g1_100g2_000g3_n1000_s00_r16_i00_b5008
-    - /weka/scratch/cpriebe1/MO/model-taxonomy/results/shared_cache/03_adapters/meta-llama--Llama-3.1-8B/yahoo_025g1_000g2_075g3_n1000_s00_r16_i00_b5008
-    - /weka/scratch/cpriebe1/MO/model-taxonomy/results/shared_cache/03_adapters/meta-llama--Llama-3.1-8B/yahoo_025g1_025g2_050g3_n1000_s00_r16_i00_b5008
-    - /weka/scratch/cpriebe1/MO/model-taxonomy/results/shared_cache/03_adapters/meta-llama--Llama-3.1-8B/yahoo_025g1_050g2_025g3_n1000_s00_r16_i00_b5008
-    - /weka/scratch/cpriebe1/MO/model-taxonomy/results/shared_cache/03_adapters/meta-llama--Llama-3.1-8B/yahoo_025g1_075g2_000g3_n1000_s00_r16_i00_b5008
-    - /weka/scratch/cpriebe1/MO/model-taxonomy/results/shared_cache/03_adapters/meta-llama--Llama-3.1-8B/yahoo_050g1_000g2_050g3_n1000_s00_r16_i00_b5008
-    - /weka/scratch/cpriebe1/MO/model-taxonomy/results/shared_cache/03_adapters/meta-llama--Llama-3.1-8B/yahoo_050g1_025g2_025g3_n1000_s00_r16_i00_b5008
-    - /weka/scratch/cpriebe1/MO/model-taxonomy/results/shared_cache/03_adapters/meta-llama--Llama-3.1-8B/yahoo_050g1_050g2_000g3_n1000_s00_r16_i00_b5008
-    - /weka/scratch/cpriebe1/MO/model-taxonomy/results/shared_cache/03_adapters/meta-llama--Llama-3.1-8B/yahoo_075g1_000g2_025g3_n1000_s00_r16_i00_b5008
-    - /weka/scratch/cpriebe1/MO/model-taxonomy/results/shared_cache/03_adapters/meta-llama--Llama-3.1-8B/yahoo_075g1_025g2_000g3_n1000_s00_r16_i00_b5008
-    - /weka/scratch/cpriebe1/MO/model-taxonomy/results/shared_cache/03_adapters/meta-llama--Llama-3.1-8B/yahoo_100g1_000g2_000g3_n1000_s00_r16_i00_b5008
-    - /weka/scratch/cpriebe1/MO/model-taxonomy/results/shared_cache/03_adapters/meta-llama--Llama-3.1-8B/yahoo_033g1_033g2_033g3_n1000_s00_r16_i00_b5008
+    - /weka/scratch/jhu/cpriebe1/MO/model-taxonomy/results/shared_cache/03_adapters/meta-llama--Llama-3.1-8B/yahoo_000g1_000g2_100g3_n1000_s00_r16_i00_b5008
+    - /weka/scratch/jhu/cpriebe1/MO/model-taxonomy/results/shared_cache/03_adapters/meta-llama--Llama-3.1-8B/yahoo_000g1_025g2_075g3_n1000_s00_r16_i00_b5008
+    - /weka/scratch/jhu/cpriebe1/MO/model-taxonomy/results/shared_cache/03_adapters/meta-llama--Llama-3.1-8B/yahoo_000g1_050g2_050g3_n1000_s00_r16_i00_b5008
+    - /weka/scratch/jhu/cpriebe1/MO/model-taxonomy/results/shared_cache/03_adapters/meta-llama--Llama-3.1-8B/yahoo_000g1_075g2_025g3_n1000_s00_r16_i00_b5008
+    - /weka/scratch/jhu/cpriebe1/MO/model-taxonomy/results/shared_cache/03_adapters/meta-llama--Llama-3.1-8B/yahoo_000g1_100g2_000g3_n1000_s00_r16_i00_b5008
+    - /weka/scratch/jhu/cpriebe1/MO/model-taxonomy/results/shared_cache/03_adapters/meta-llama--Llama-3.1-8B/yahoo_025g1_000g2_075g3_n1000_s00_r16_i00_b5008
+    - /weka/scratch/jhu/cpriebe1/MO/model-taxonomy/results/shared_cache/03_adapters/meta-llama--Llama-3.1-8B/yahoo_025g1_025g2_050g3_n1000_s00_r16_i00_b5008
+    - /weka/scratch/jhu/cpriebe1/MO/model-taxonomy/results/shared_cache/03_adapters/meta-llama--Llama-3.1-8B/yahoo_025g1_050g2_025g3_n1000_s00_r16_i00_b5008
+    - /weka/scratch/jhu/cpriebe1/MO/model-taxonomy/results/shared_cache/03_adapters/meta-llama--Llama-3.1-8B/yahoo_025g1_075g2_000g3_n1000_s00_r16_i00_b5008
+    - /weka/scratch/jhu/cpriebe1/MO/model-taxonomy/results/shared_cache/03_adapters/meta-llama--Llama-3.1-8B/yahoo_050g1_000g2_050g3_n1000_s00_r16_i00_b5008
+    - /weka/scratch/jhu/cpriebe1/MO/model-taxonomy/results/shared_cache/03_adapters/meta-llama--Llama-3.1-8B/yahoo_050g1_025g2_025g3_n1000_s00_r16_i00_b5008
+    - /weka/scratch/jhu/cpriebe1/MO/model-taxonomy/results/shared_cache/03_adapters/meta-llama--Llama-3.1-8B/yahoo_050g1_050g2_000g3_n1000_s00_r16_i00_b5008
+    - /weka/scratch/jhu/cpriebe1/MO/model-taxonomy/results/shared_cache/03_adapters/meta-llama--Llama-3.1-8B/yahoo_075g1_000g2_025g3_n1000_s00_r16_i00_b5008
+    - /weka/scratch/jhu/cpriebe1/MO/model-taxonomy/results/shared_cache/03_adapters/meta-llama--Llama-3.1-8B/yahoo_075g1_025g2_000g3_n1000_s00_r16_i00_b5008
+    - /weka/scratch/jhu/cpriebe1/MO/model-taxonomy/results/shared_cache/03_adapters/meta-llama--Llama-3.1-8B/yahoo_100g1_000g2_000g3_n1000_s00_r16_i00_b5008
+    - /weka/scratch/jhu/cpriebe1/MO/model-taxonomy/results/shared_cache/03_adapters/meta-llama--Llama-3.1-8B/yahoo_033g1_033g2_033g3_n1000_s00_r16_i00_b5008
   queries_dataset: yahoo_033g1_033g2_033g3_qtc
   n_queries: 100
   device: cuda

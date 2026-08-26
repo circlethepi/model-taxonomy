@@ -16,7 +16,7 @@
 
 set -euo pipefail
 cd "$(dirname "$0")"
-mkdir -p /weka/scratch/cpriebe1/MO/model-taxonomy/results/simplex3_qwen/logs
+mkdir -p /weka/scratch/jhu/cpriebe1/MO/model-taxonomy/results/simplex3_qwen/logs
 
 sb() { sbatch --parsable "$@"; }
 
@@ -50,6 +50,39 @@ done
 for q in qonly; do
   J=$(sb --dependency=afterok:$TRAIN 08_greedy_$q.sh)
   echo "greedy  $q     $J"
+done
+
+# The log-probability level: what each adapter BELIEVES about the shared
+# draw, as against what it says. Nothing here disturbs an existing entry.
+for q in qonly; do
+  J=$(sb --dependency=afterok:$TRAIN 09_logprob_input_$q.sh)
+  echo "lp-in   $q     $J"
+done
+
+# The sweep: 10 temperatures x 4 shards at R=8. Each point is
+# its own cache entry -- temperature is in the sampling hash and so in the
+# filename -- so none of these can silently reuse another's numbers.
+for t in t01 t02 t03 t04 t05 t06 t07 t08 t09 t10; do
+  for q in qonly; do
+    for i in 0 1 2 3; do
+      J=$(sb --dependency=afterok:$TRAIN 10_behavioral_${q}_${t}_shard$i.sh)
+      echo "sweep   $q $t $i  $J"
+    done
+  done
+done
+
+# T=0 of the same surface. Re-decodes rather than skipping: a hit needs
+# the log-prob file too, and greedy re-decodes exactly.
+for q in qonly; do
+  J=$(sb --dependency=afterok:$TRAIN 11_greedy_logprob_$q.sh)
+  echo "lp-gr   $q     $J"
+done
+
+# Generation-mode activations. Writes beside the input-mode files in the
+# same directory; save_activations skips paths that exist.
+for q in qonly; do
+  J=$(sb --dependency=afterok:$TRAIN 12_functional_gen_$q.sh)
+  echo "func-gen $q    $J"
 done
 
 echo

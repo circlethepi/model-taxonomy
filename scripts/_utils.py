@@ -636,6 +636,11 @@ def make_generated_text_cache(cache_dir: Path):
     return GeneratedTextCache(cache_dir)
 
 
+def make_logprob_cache(cache_dir: Path):
+    from src.cache.logprob_cache import LogProbCache
+    return LogProbCache(cache_dir)
+
+
 # ── Taxonomy / metric / geometry factories ────────────────────────────────────
 
 def resolve_device(cfg: dict, override: str | None = None) -> str:
@@ -802,12 +807,41 @@ def make_functional_taxonomy(
     )
 
 
+def make_logprob_taxonomy(
+    cfg: dict,
+    queries: list[str],
+    query_key: dict | None = None,
+    cache=None,
+    source_indices: list | None = None,
+):
+    from src.taxonomy.logprob import LogProbTaxonomy
+
+    ext_cfg = cfg.get("extraction", {})
+    lcfg = ext_cfg.get("taxonomies", {}).get("logprob", {})
+
+    return LogProbTaxonomy(
+        queries=queries,
+        query_key=query_key,
+        cache=cache,
+        device=ext_cfg.get("device", "cuda"),
+        # Its own default, deliberately below the shared extraction batch_size:
+        # this level's ceiling is the vocabulary-wide log_softmax, not the model.
+        batch_size=lcfg.get("batch_size", 8),
+        torch_dtype=parse_dtype(ext_cfg.get("torch_dtype", "float16")),
+        hf_token=hf_token(cfg),
+        mode=lcfg.get("mode", "input"),
+        seq_chunk=lcfg.get("seq_chunk", 64),
+        source_indices=source_indices,
+    )
+
+
 def make_behavioral_taxonomy(
     cfg: dict,
     queries: list[str],
     query_key: dict | None = None,
     cache=None,
     source_indices: list | None = None,
+    logprob_cache=None,
 ):
     from src.taxonomy.behavioral import BehavioralTaxonomy
     from src.embedders.sentence_transformer import SentenceTransformerEmbedder
@@ -841,6 +875,10 @@ def make_behavioral_taxonomy(
         torch_dtype=parse_dtype(ext_cfg.get("torch_dtype", "float16")),
         hf_token=hf_token(cfg),
         source_indices=source_indices,
+        # Off unless asked for: collecting changes the cache-hit test, so a run
+        # that turns it on re-generates entries an earlier run already has.
+        collect_logprobs=bcfg.get("collect_logprobs", False),
+        logprob_cache=logprob_cache,
     )
 
 

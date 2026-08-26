@@ -90,7 +90,13 @@ FIELD_EMPTINESS_NOTE = "question_content is empty in ~46% of yahoo rows"
 
 #: Absolute, so a job started from a worktree still writes into the one shared
 #: cache rather than growing a second copy that disappears with the worktree.
-REPO = "/weka/scratch/cpriebe1/MO/model-taxonomy"
+#:
+#: The `jhu/` component appeared on 2026-08-26: /weka/scratch/cpriebe1 no longer
+#: resolves, so the pre-existing job scripts died before running a line (SLURM
+#: cannot open --output, exit 53, and no log to say why). The cache under the new
+#: root is the same tree the earlier jobs wrote -- this is a path change, not a
+#: move, so nothing needs re-deriving.
+REPO = "/weka/scratch/jhu/cpriebe1/MO/model-taxonomy"
 #: Not a Suite field: the cache is shared *between* suites on purpose.  Draws and
 #: dataset embeddings are model-free, so a second base model reuses them rather
 #: than re-deriving 640 centroids.
@@ -507,9 +513,29 @@ LEVEL_DEFAULTS_NOTE = """  # All three levels carry an explicit `enabled`. Omitt
   # merely omitted `functional` would re-extract every activation, eight times
   # over, racing the one job that is supposed to do it.
 """
+# Deliberately NOT extended when the logprob level was added, even though the
+# same reasoning covers it: this string is rendered into every config the Llama
+# suite already ran, and `Suite()` must regenerate those byte-for-byte.  The
+# logprob level's own default -- false, for exactly the reason above read the
+# other way -- is documented at its one decision point, extract_reprs.py.
 
 
-def write_extract(level: str, query: str, shard: int | None, names: list[str]) -> str:
+def temp_token(t: float) -> str:
+    """``t05`` for 0.5 — the temperature x10, zero-padded.
+
+    Two digits so the files sort in temperature order, and prefixed so the token
+    is unambiguous inside a job name that already carries a shard number.
+    """
+    return f"t{int(round(float(t) * 10)):02d}"
+
+
+def write_extract(
+    level: str,
+    query: str,
+    shard: int | None,
+    names: list[str],
+    temperature: float | None = None,
+) -> str:
     qname = QUERY_FULL_CONTEXT_NAME if query == "full_context" else QUERY_QUESTION_ONLY_NAME
     if SUITE.prompt_format:
         # Under a chat template with completion-only loss the training prompt IS
@@ -524,11 +550,16 @@ def write_extract(level: str, query: str, shard: int | None, names: list[str]) -
                  "title + content only, question-only ablation; note "
                  + FIELD_EMPTINESS_NOTE + ", so ~half these prompts are a bare title")
     token = SUITE.job_token(query)
-    label = f"simplex3_{level}_{token}" + ("" if shard is None else f"_shard{shard}")
+    n_shards = SUITE.sweep_shards if level == "sweep" else BEHAVIORAL_SHARDS
+    label = (
+        f"simplex3_{level}_{token}"
+        + ("" if temperature is None else f"_{temp_token(temperature)}")
+        + ("" if shard is None else f"_shard{shard}")
+    )
     body = HEADER + (
         f"# {level.capitalize()} extraction over the {query} query set ({qdesc}).\n"
         f"# {len(names)} adapter(s)"
-        + ("" if shard is None else f", shard {shard} of {BEHAVIORAL_SHARDS}")
+        + ("" if shard is None else f", shard {shard} of {n_shards}")
         + ".\n#\n"
     )
     if level == "functional":
@@ -536,6 +567,73 @@ def write_extract(level: str, query: str, shard: int | None, names: list[str]) -
             "# One job for all 16: HFInferenceTaxonomy loads the base model once and\n"
             "# swaps adapters onto it, so 16 models amortize a single 8B load, and\n"
             "# input-mode extraction is one forward pass per query with no decoding.\n\n"
+        )
+    elif level == "functional_gen":
+        body += (
+            f"# GENERATION-mode activations: the hidden states the model occupies while\n"
+            f"# PRODUCING text, as against the ones it occupies while reading it. Same\n"
+            f"# level, same 16 adapters, same draw as 04_functional -- the one axis that\n"
+            f"# level has never been read along.\n"
+            f"#\n"
+            f"# Greedy only, and that is a hard constraint rather than a choice:\n"
+            f"# FunctionalTaxonomy hardcodes do_sample=False (functional.py:353) and\n"
+            f"# ActivationCache's filename carries no sampling hash, so two decoding\n"
+            f"# points would overwrite each other silently. Per-temperature generation\n"
+            f"# activations need a sampling hash in DrawKeyedCache.mode_token first --\n"
+            f"# a change to a key with entries already on disk.\n"
+            f"#\n"
+            f"# Additive: these land beside the existing input_* files in the same\n"
+            f"# directory (generation{MAX_NEW_TOKENS}_* vs input_*) and save_activations skips\n"
+            f"# any path that exists, so this job cannot disturb what is already there.\n"
+            f"# `activation_mode: both` is then a READ-time union with no further work.\n\n"
+        )
+    elif level == "logprob":
+        body += (
+            f"# INPUT log-probabilities: the teacher-forced per-token log-prob and\n"
+            f"# entropy of each query prompt. No generation at all -- this is the same\n"
+            f"# masked forward pass 04_functional runs, read for what the model assigned\n"
+            f"# rather than for where it sat.\n"
+            f"#\n"
+            f"# One job for all 16, like the functional one and for the same reason: the\n"
+            f"# base model is loaded once and adapters are swapped onto it, and there is\n"
+            f"# no decoding to pay for. Minutes of GPU each.\n"
+            f"#\n"
+            f"# The cost here is MEMORY. Per-token log-probs need logits at every\n"
+            f"# position and this vocabulary is 248,320 wide, so the log_softmax is\n"
+            f"# chunked over the sequence axis and the realized token gathered per chunk\n"
+            f"# (src/taxonomy/logprob.py). batch_size and seq_chunk below are that\n"
+            f"# budget; neither changes the stored numbers.\n\n"
+        )
+    elif level == "greedy_logprob":
+        body += (
+            f"# The T=0 point of the log-prob surface: the greedy run again, with\n"
+            f"# collect_logprobs on.\n"
+            f"#\n"
+            f"# It re-generates rather than reusing the cached greedy entry, and it must:\n"
+            f"# the generations live in 05_generated and the log-probs in 07_logprobs, so\n"
+            f"# a hit on the first alone would return cached text and write no log-probs\n"
+            f"# at all. BehavioralTaxonomy's hit test requires both when collecting.\n"
+            f"# Re-generation is exact -- greedy is deterministic -- so the existing\n"
+            f"# entry is confirmed rather than replaced.\n\n"
+        )
+    elif level == "sweep":
+        body += (
+            f"# One point of the TEMPERATURE SWEEP: T={temperature}, R={SUITE.sweep_replicates}.\n"
+            f"#\n"
+            f"# The sweep resolves the log-prob surface along the decoding axis instead\n"
+            f"# of at the single T=1.0 the R={REPLICATES} runs measured. Each point is its own\n"
+            f"# cache entry -- temperature is inside the sampling hash and therefore\n"
+            f"# inside the filename -- so ten temperatures are ten entries, not one\n"
+            f"# silently reused.\n"
+            f"#\n"
+            f"# R={SUITE.sweep_replicates}, not {REPLICATES}, and uniformly so across all ten points. The cached\n"
+            f"# R={REPLICATES} entry at T=1.0 is a DIFFERENT entry (replicates are in the\n"
+            f"# filename), so this does not collide with it; re-running T=1.0 here is\n"
+            f"# what keeps one point of a variance-vs-temperature curve from having half\n"
+            f"# the sampling noise of the other nine.\n"
+            f"#\n"
+            f"# {SUITE.sweep_shards} shards of {len(names)} adapters: halving R halves the decode, so this\n"
+            f"# lands at the same wall the {BEHAVIORAL_SHARDS}-shard R={REPLICATES} runs were sized against.\n\n"
         )
     elif level == "greedy":
         body += (
@@ -578,7 +676,18 @@ def write_extract(level: str, query: str, shard: int | None, names: list[str]) -
   device: cuda
   torch_dtype: {SUITE.torch_dtype}
 """
-    if level == "behavioral":
+    if level == "functional_gen":
+        body += (
+            f"  # THIS is the batch size the functional level actually reads --\n"
+            f"  # make_functional_taxonomy takes extraction.batch_size, not the one\n"
+            f"  # nested under the level (scripts/_utils.py). Held at 8 because\n"
+            f"  # generate() retains the hidden states of EVERY decode step: step 0\n"
+            f"  # carries the full prompt across 33 layers, steps 1-{MAX_NEW_TOKENS - 1} one position\n"
+            f"  # each, ~107 MB per sequence. Wider buys nothing -- decode cost is the\n"
+            f"  # number of generate() calls, not their width.\n"
+            f"  batch_size: 8\n"
+        )
+    elif level in ("behavioral", "sweep"):
         body += (
             "  # Held at 2, and this is not cosmetic: one RNG generator serves a whole\n"
             "  # generate() call, so under sampling a different batch_size gives\n"
@@ -587,7 +696,7 @@ def write_extract(level: str, query: str, shard: int | None, names: list[str]) -
             "  # a correct entry rather than fail. Do not retune per GPU.\n"
             "  batch_size: 2\n"
         )
-    elif level == "greedy":
+    elif level in ("greedy", "greedy_logprob"):
         body += (
             f"  # Raised to {GREEDY_BATCH_SIZE}, which is safe here and NOT safe for the sampled\n"
             f"  # runs. Greedy seeds no RNG at all, so batch size only flips argmax on\n"
@@ -597,6 +706,12 @@ def write_extract(level: str, query: str, shard: int | None, names: list[str]) -
             f"  # adapter and ~50. Lower it if an 8B at {GREEDY_BATCH_SIZE} x (prompt + {MAX_NEW_TOKENS}) OOMs.\n"
             f"  batch_size: {GREEDY_BATCH_SIZE}\n"
         )
+        if level == "greedy_logprob":
+            body += (
+                f"  # At R=1 that is {GREEDY_BATCH_SIZE} rows, the same row count the sweep runs at\n"
+                f"  # batch 2 x R={SUITE.sweep_replicates}, so the two logit stacks generate() accumulates\n"
+                f"  # ({GREEDY_BATCH_SIZE} x {MAX_NEW_TOKENS} x 248,320 x 4 B each) cost the same ~4 GB here.\n"
+            )
     body += "\n  taxonomies:\n" + LEVEL_DEFAULTS_NOTE
     if level == "functional":
         body += f"""    functional:
@@ -611,7 +726,33 @@ def write_extract(level: str, query: str, shard: int | None, names: list[str]) -
     dataset_embedding:
       enabled: false
 """
-    elif level == "greedy":
+    elif level == "functional_gen":
+        body += f"""    functional:
+      enabled: true
+      activation_mode: generation   # decode-phase states, not input-phase
+      max_new_tokens: {MAX_NEW_TOKENS}          # in the filename: generation{MAX_NEW_TOKENS}_mean_layerNNN
+      layer_indices: null           # every hidden state
+      pooling: mean
+      normalize_activations: true
+    behavioral:
+      enabled: false
+    dataset_embedding:
+      enabled: false
+"""
+    elif level == "logprob":
+        body += """    logprob:
+      enabled: true
+      mode: input                 # teacher-forced scoring; no decoding
+      batch_size: 8               # bounded by the 248,320-way log_softmax
+      seq_chunk: 64               # positions per softmax chunk; memory only
+    functional:
+      enabled: false
+    behavioral:
+      enabled: false
+    dataset_embedding:
+      enabled: false
+"""
+    elif level in ("greedy", "greedy_logprob"):
         body += f"""    functional:
       enabled: false
     dataset_embedding:
@@ -621,6 +762,38 @@ def write_extract(level: str, query: str, shard: int | None, names: list[str]) -
       max_new_tokens: {MAX_NEW_TOKENS}
       replicates: 1               # enforced: >1 with do_sample:false raises
       do_sample: false            # THE difference from the sampled runs
+"""
+        if level == "greedy_logprob":
+            body += (
+                "      # Adds the 07_logprobs half of this entry. It also changes the\n"
+                "      # cache-hit test -- a hit now requires the log-prob file too -- so\n"
+                "      # this job re-decodes the cached greedy text rather than skipping.\n"
+                "      # Greedy is deterministic, so that re-decode confirms the existing\n"
+                "      # entry rather than replacing it.\n"
+                "      collect_logprobs: true\n"
+            )
+        body += EMBEDDER
+    elif level == "sweep":
+        body += f"""    functional:
+      enabled: false
+    dataset_embedding:
+      enabled: false
+    behavioral:
+      enabled: true
+      max_new_tokens: {MAX_NEW_TOKENS}
+      replicates: {SUITE.sweep_replicates}
+      do_sample: true
+      temperature: {temperature}             # THE swept axis; inside the sampling hash
+      top_p: 1.0
+      top_k: null
+      generation_seed: 0
+      # Both distributions are stored: the warped one the sampler drew from, and
+      # the model's own unprocessed one. Only the second is comparable across
+      # temperatures, and the first is not recoverable from it -- see
+      # src/taxonomy/behavioral.py. At T=1.0 with top_p 1.0 and no top_k every
+      # processor is the identity and the two must coincide, which is a free
+      # consistency check on this sweep.
+      collect_logprobs: true
 {EMBEDDER}"""
     else:
         body += f"""    functional:
@@ -666,7 +839,7 @@ conda activate taxonomy-env
 cd {REPO}
 
 export TOKENIZERS_PARALLELISM=false
-export HF_HOME=/weka/home/mohata1/scratchcpriebe1/MO/huggingface_cache
+export HF_HOME=/weka/scratch/jhu/cpriebe1/MO/huggingface_cache
 
 {command}
 """
@@ -702,7 +875,13 @@ SUITES = {
         train_mem_gb=96,
         extract_mem_gb=96,
         # bf16 throughput and HBM headroom first.
-        gpu_partitions="h100,nvl,a100,l40s",
+        gpu_partitions="h100,h200,a100,l40s",
+        # The log-prob level and everything built on it. Only this suite asks for
+        # them: turning them on for the Llama suite would regenerate 43 files
+        # into a tree whose jobs have already run.
+        emit_logprob_jobs=True,
+        emit_gen_activation_job=True,
+        temperature_sweep=tuple(round(0.1 * i, 1) for i in range(1, 11)),
     ).for_model("Qwen/Qwen3.5-4B"),
 }
 
@@ -890,6 +1069,74 @@ def main() -> None:
             logs,
         ))
 
+    # 9. Input log-probabilities, one unsharded job per query set. Nothing is
+    #    decoded, so this is the cheapest GPU job in the suite.
+    if SUITE.emit_logprob_jobs:
+        for q in SUITE.query_sets:
+            tok = SUITE.job_token(q)
+            emit(exp / f"logprob_input_{tok}.yaml",
+                 write_extract("logprob", q, None, names))
+            emit(jobs / f"09_logprob_input_{tok}.sh", sbatch(
+                f"{SUITE.job_prefix}_lp_input", SUITE.gpu_partitions, True,
+                SUITE.extract_mem_gb, SUITE.logprob_time,
+                f"python scripts/run_experiment.py"
+                f" experiments/{slug}/logprob_input_{tok}.yaml"
+                f" --steps build extract --taxonomy logprob",
+                logs,
+            ))
+
+    # 10. The temperature sweep: one job per (temperature, shard). This is the
+    #     expensive half of the addition -- ten decoding points over 16 adapters.
+    if SUITE.temperature_sweep:
+        sshards = [names[i::SUITE.sweep_shards] for i in range(SUITE.sweep_shards)]
+        for q in SUITE.query_sets:
+            tok = SUITE.job_token(q)
+            for t in SUITE.temperature_sweep:
+                tt = temp_token(t)
+                for i, shard_names in enumerate(sshards):
+                    emit(exp / f"behavioral_{tok}_{tt}_shard{i}.yaml",
+                         write_extract("sweep", q, i, shard_names, temperature=t))
+                    emit(jobs / f"10_behavioral_{tok}_{tt}_shard{i}.sh", sbatch(
+                        f"{SUITE.job_prefix}_behav_{tok}_{tt}_{i}",
+                        SUITE.gpu_partitions, True,
+                        SUITE.extract_mem_gb, SUITE.behav_time,
+                        f"python scripts/run_experiment.py"
+                        f" experiments/{slug}/behavioral_{tok}_{tt}_shard{i}.yaml"
+                        f" --steps build extract --taxonomy behavioral",
+                        logs,
+                    ))
+
+    # 11. Greedy again, with log-probs on: the T=0 point of the same surface.
+    if SUITE.emit_logprob_jobs:
+        for q in SUITE.query_sets:
+            tok = SUITE.job_token(q)
+            emit(exp / f"greedy_logprob_{tok}.yaml",
+                 write_extract("greedy_logprob", q, None, names))
+            emit(jobs / f"11_greedy_logprob_{tok}.sh", sbatch(
+                f"{SUITE.job_prefix}_greedy_lp_{tok}", SUITE.gpu_partitions, True,
+                SUITE.extract_mem_gb, SUITE.greedy_time,
+                f"python scripts/run_experiment.py"
+                f" experiments/{slug}/greedy_logprob_{tok}.yaml"
+                f" --steps build extract --taxonomy behavioral",
+                logs,
+            ))
+
+    # 12. Generation-mode activations, greedy, all 16 in one job. No new code:
+    #     these are the functional level read along the one axis it never was.
+    if SUITE.emit_gen_activation_job:
+        for q in SUITE.query_sets:
+            tok = SUITE.job_token(q)
+            emit(exp / f"functional_gen_{tok}.yaml",
+                 write_extract("functional_gen", q, None, names))
+            emit(jobs / f"12_functional_gen_{tok}.sh", sbatch(
+                f"{SUITE.job_prefix}_func_gen_{tok}", SUITE.gpu_partitions, True,
+                SUITE.extract_mem_gb, SUITE.func_gen_time,
+                f"python scripts/run_experiment.py"
+                f" experiments/{slug}/functional_gen_{tok}.yaml"
+                f" --steps build extract --taxonomy functional",
+                logs,
+            ))
+
     emit(jobs / "submit_all.sh", submit_all())
     (jobs / "submit_all.sh").chmod(0o755)
 
@@ -946,7 +1193,7 @@ for q in {' '.join(SUITE.job_token(q) for q in SUITE.query_sets)}; do
   J=$(sb --dependency=afterok:$TRAIN 08_greedy_$q.sh)
   echo "greedy  $q     $J"
 done
-
+{_submit_logprob()}
 echo
 echo "Submitted. Watch with: squeue -u $USER -o '%.10i %.14j %.9P %.2t %.10M %R'"
 """
@@ -974,6 +1221,69 @@ for s in {' '.join(f'{s:02d}' for s in SEEDS)}; do
   echo "embed   s$s   $J"
 done
 """
+
+
+def _submit_logprob() -> str:
+    """The log-prob, sweep and generation-activation stanzas, or nothing.
+
+    Empty for a suite that emits none of them, which is what keeps the Llama
+    suite's ``submit_all.sh`` byte-identical.
+
+    Everything here is ``afterok:$TRAIN`` like the rest of extraction. Training
+    is long since complete, so in practice these are submitted with no dependency
+    at all -- but the dependency stays in the generated script because it is the
+    record of what the chain requires, and re-running the suite from scratch has
+    to work.
+    """
+    if not (SUITE.emit_logprob_jobs or SUITE.temperature_sweep
+            or SUITE.emit_gen_activation_job):
+        return ""
+    toks = " ".join(SUITE.job_token(q) for q in SUITE.query_sets)
+    out = ["\n# The log-probability level: what each adapter BELIEVES about the shared\n"
+           "# draw, as against what it says. Nothing here disturbs an existing entry.\n"]
+    if SUITE.emit_logprob_jobs:
+        out.append(
+            f"for q in {toks}; do\n"
+            f"  J=$(sb --dependency=afterok:$TRAIN 09_logprob_input_$q.sh)\n"
+            f'  echo "lp-in   $q     $J"\n'
+            f"done\n"
+        )
+    if SUITE.temperature_sweep:
+        tts = " ".join(temp_token(t) for t in SUITE.temperature_sweep)
+        out.append(
+            f"\n# The sweep: {len(SUITE.temperature_sweep)} temperatures x "
+            f"{SUITE.sweep_shards} shards at R={SUITE.sweep_replicates}. Each point is\n"
+            f"# its own cache entry -- temperature is in the sampling hash and so in the\n"
+            f"# filename -- so none of these can silently reuse another's numbers.\n"
+            f"for t in {tts}; do\n"
+            f"  for q in {toks}; do\n"
+            f"    for i in {' '.join(str(i) for i in range(SUITE.sweep_shards))}; do\n"
+            f"      J=$(sb --dependency=afterok:$TRAIN"
+            f" 10_behavioral_${{q}}_${{t}}_shard$i.sh)\n"
+            f'      echo "sweep   $q $t $i  $J"\n'
+            f"    done\n"
+            f"  done\n"
+            f"done\n"
+        )
+    if SUITE.emit_logprob_jobs:
+        out.append(
+            f"\n# T=0 of the same surface. Re-decodes rather than skipping: a hit needs\n"
+            f"# the log-prob file too, and greedy re-decodes exactly.\n"
+            f"for q in {toks}; do\n"
+            f"  J=$(sb --dependency=afterok:$TRAIN 11_greedy_logprob_$q.sh)\n"
+            f'  echo "lp-gr   $q     $J"\n'
+            f"done\n"
+        )
+    if SUITE.emit_gen_activation_job:
+        out.append(
+            f"\n# Generation-mode activations. Writes beside the input-mode files in the\n"
+            f"# same directory; save_activations skips paths that exist.\n"
+            f"for q in {toks}; do\n"
+            f"  J=$(sb --dependency=afterok:$TRAIN 12_functional_gen_$q.sh)\n"
+            f'  echo "func-gen $q    $J"\n'
+            f"done\n"
+        )
+    return "".join(out)
 
 
 def _train_dep() -> str:

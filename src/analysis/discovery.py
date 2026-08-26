@@ -58,6 +58,7 @@ _TAXONOMY_AVAILABILITY = (
     "sampled_rows",
     "behavioral_repr",
     "functional_repr",
+    "logprob_repr",
 )
 
 #: Flag letter per token, for the compact availability column in summary().
@@ -73,6 +74,7 @@ _AVAILABILITY_LETTERS = {
     "sampled_rows": "S",
     "behavioral_repr": "B",
     "functional_repr": "F",
+    "logprob_repr": "L",
 }
 _AVAILABILITY_HEADER = "".join(_AVAILABILITY_LETTERS[n] for n in _TAXONOMY_AVAILABILITY)
 
@@ -311,6 +313,7 @@ def scan_cache(
     scan_all_recipes: bool = False,
     behavioral_draw: dict | None = None,
     functional_draw: dict | None = None,
+    logprob_draw: dict | None = None,
 ) -> CacheIndex:
     """Walk the shared cache and join adapters to the recipes they were trained on.
 
@@ -347,6 +350,13 @@ def scan_cache(
         exists to remove.
     functional_draw:
         The same, for ``functional_repr``, with the same caveat.
+    logprob_draw:
+        The same, for ``logprob_repr``.  Note the token is coarser than the other
+        two even when given a draw: one draw directory can hold an input entry
+        and one entry per temperature of a sweep, and the flag says only that
+        *something* is stored there.  Read the entries themselves — the
+        filenames are a complete description — when the answer has to name a
+        decoding point.
     """
     root = Path(cache_root)
     adapters_root = root / "03_adapters"
@@ -359,12 +369,14 @@ def scan_cache(
     from src.cache.activation_cache import ActivationCache
     from src.cache.dataset_embedding_cache import DatasetEmbeddingCache
     from src.cache.generated_text_cache import GeneratedTextCache
+    from src.cache.logprob_cache import LogProbCache
     from src.cache.lora_cache import LoRACache
 
     lora_cache = LoRACache(root)
     de_cache = DatasetEmbeddingCache(root)
     gen_cache = GeneratedTextCache(root)
     act_cache = ActivationCache(root)
+    lp_cache = LogProbCache(root)
 
     slugs = (
         [base_model_id.replace("/", "--")]
@@ -428,6 +440,11 @@ def scan_cache(
                 ),
                 "functional_repr": _draw_keyed_repr_exists(
                     act_cache, entry.base_model_id, entry.model_id, functional_draw
+                ),
+                # Same helper again: 07_logprobs is a DrawKeyedCache too, so it
+                # answers the same has_draw/has_any protocol as the other two.
+                "logprob_repr": _draw_keyed_repr_exists(
+                    lp_cache, entry.base_model_id, entry.model_id, logprob_draw
                 ),
             }
             entries.append(entry)

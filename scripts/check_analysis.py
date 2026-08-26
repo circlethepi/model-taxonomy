@@ -2545,6 +2545,306 @@ def t_generated_cache_hash_stable():
     return f"hash stable under reordering; embedder hashes distinct ({e1[:8]} vs {e2[:8]})"
 
 
+@check("logprob: entries join the generations they describe, by name")
+def t_logprob_cache_names_join():
+    """``07_logprobs`` addresses an entry exactly as ``05_generated`` does.
+
+    The two stages are read together — "what did this model say, and how likely
+    did it think it was" is one question — and they are joined by *filename*, not
+    by a lookup table.  That only works while both spell the variant token the
+    same way, so ``LogProbCache`` binds ``GeneratedTextCache.variant_token``
+    rather than respelling it, and this asserts the two are the same function
+    object.  A respelling that drifted would not raise anywhere: the log-prob
+    file would simply never be found beside its generations.
+
+    The temperatures of the sweep are pinned here too.  A sweep whose points
+    collided in the filename would silently store one of them ten times, which is
+    the failure ``sampling_hash`` exists to prevent and is worth checking on the
+    actual values the jobs use.
+    """
+    import tempfile
+
+    from src.cache.generated_text_cache import GeneratedTextCache
+    from src.cache.logprob_cache import LogProbCache
+
+    assert LogProbCache.variant_token is GeneratedTextCache.variant_token, (
+        "LogProbCache respells variant_token instead of sharing it; a log-prob "
+        "file would stop landing at the same token as its generations"
+    )
+
+    with tempfile.TemporaryDirectory() as tmp:
+        lp = LogProbCache(tmp)
+        gen = GeneratedTextCache(tmp)
+        base, adapter = "Qwen/Qwen3.5-4B", "/abs/adapter"
+        draw = {"recipe_hash": "abc", "n_samples": 4, "seed": 1,
+                "prompt_format_id": "ea27ccee"}
+        sampling = {"do_sample": True, "temperature": 0.5, "top_p": 1.0,
+                    "top_k": None, "generation_seed": 0}
+        shash = LogProbCache.sampling_hash(sampling)
+
+        gen_stem = gen.generations_path(base, adapter, draw, 128, 8, shash).stem
+        lp_stem = lp.logprob_path(
+            base, adapter, draw, "generation",
+            max_new_tokens=128, replicates=8, sampling_hash=shash,
+        ).stem
+        assert gen_stem == lp_stem, (
+            f"generation file {gen_stem!r} and log-prob file {lp_stem!r} do not "
+            "share a stem; the two stages no longer join by name"
+        )
+        assert lp.draw_dir(base, adapter, draw).relative_to(lp.root).parts[1:] == (
+            gen.draw_dir(base, adapter, draw).relative_to(gen.root).parts[1:]
+        ), "07_logprobs and 05_generated disagree below the stage directory"
+
+        # The ten sweep points, plus the greedy T=0 entry already on disk.
+        temps = [round(0.1 * i, 1) for i in range(1, 11)]
+        hashes = {
+            t: LogProbCache.sampling_hash(dict(sampling, temperature=t)) for t in temps
+        }
+        hashes["greedy"] = LogProbCache.sampling_hash(
+            dict(GeneratedTextCache.GREEDY_SAMPLING)
+        )
+        assert len(set(hashes.values())) == len(hashes), (
+            f"sweep temperatures collide in the sampling hash: {hashes}"
+        )
+        assert hashes["greedy"] == "6f000f01", hashes["greedy"]
+
+        # Round-trip one entry, and check the padding convention survives it.
+        rows, width = 3, 5
+        arrays = {
+            "logprob": np.linspace(-4, -0.5, rows * width).reshape(rows, width),
+            "entropy": np.abs(np.linspace(0.1, 2.0, rows * width)).reshape(rows, width),
+            "token_id": np.arange(rows * width).reshape(rows, width),
+            "lengths": np.array([5, 3, 1]),
+            "content_start": np.array([2, 0, 0]),
+        }
+        lp.save_logprobs(base, adapter, draw, "input", arrays,
+                         model_id=adapter, config={"taxonomy": "logprob"})
+        got, meta = lp.load_logprobs(base, adapter, draw, "input")
+        assert set(got) == set(arrays), (sorted(got), sorted(arrays))
+        assert np.allclose(got["logprob"], arrays["logprob"], atol=1e-6)
+        assert meta["mode"] == "input" and meta["taxonomy"] == "logprob"
+
+        # masked_mean must ignore padding *and* the scaffolding prefix; row 2
+        # keeps one position, so a mean over the full width would be wrong by
+        # the four zeros after it.
+        m = lp.masked_mean(got["logprob"], got["lengths"], got["content_start"])
+        assert np.isclose(m[2], arrays["logprob"][2, 0]), (m[2], arrays["logprob"][2, 0])
+        assert np.isclose(m[0], arrays["logprob"][0, 2:5].mean()), m[0]
+
+        # Unknown arrays are rejected rather than dropped: a silently missing
+        # array reads as "not measured", which is what a real absence looks like.
+        try:
+            lp.save_logprobs(base, adapter, draw, "input", dict(arrays, logprob_raw=arrays["logprob"]))
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("input mode accepted a '_raw' array")
+
+    return f"stems join ({gen_stem}); 11 decoding points distinct"
+
+
+@check("logprob: stored log-probs equal HF's own causal-LM loss")
+def t_logprob_matches_hf_loss():
+    """The one pin that makes the numbers trustworthy, on CPU in seconds.
+
+    ``model(labels=input_ids).loss`` is exactly the mean negative log-probability
+    of the realized next token, with the same one-position shift.  So the mean of
+    what this level stores must equal it — and every way the scoring can be
+    quietly wrong shows up as a mismatch here: an off-by-one in the shift, a
+    mis-masked pad position, a chunk boundary that drops or double-counts a
+    position.  None of those raise on their own; they produce plausible numbers.
+
+    The chunking is checked against itself too.  It exists only to bound peak
+    memory over a ~250k-wide vocabulary, so a chunked and an unchunked run must
+    agree bit-for-bit modulo float ordering.
+    """
+    try:
+        import torch
+        from transformers import LlamaConfig, LlamaForCausalLM
+    except ImportError as e:  # noqa: F841
+        raise _Skip("transformers/torch not installed")
+
+    from src.taxonomy.logprob import LogProbTaxonomy
+
+    torch.manual_seed(0)
+    cfg = LlamaConfig(
+        vocab_size=97, hidden_size=32, intermediate_size=64,
+        num_hidden_layers=2, num_attention_heads=4, num_key_value_heads=4,
+    )
+    model = LlamaForCausalLM(cfg).eval()
+    ids = torch.randint(0, cfg.vocab_size, (2, 13))
+
+    with torch.no_grad():
+        out = model(input_ids=ids, labels=ids)
+
+    tax = LogProbTaxonomy(queries=[], seq_chunk=3)
+    lp, ent = tax._score_chunked(out.logits[:, :-1, :], ids[:, 1:])
+    assert torch.isfinite(lp).all() and torch.isfinite(ent).all()
+
+    gap = abs(float(-lp.mean()) - float(out.loss))
+    assert gap < 1e-4, (
+        f"mean stored log-prob is {float(-lp.mean()):.6f} but HF's loss is "
+        f"{float(out.loss):.6f} (gap {gap:.2e}); the shift or the masking is wrong"
+    )
+
+    tax.seq_chunk = 10_000
+    lp_whole, ent_whole = tax._score_chunked(out.logits[:, :-1, :], ids[:, 1:])
+    assert torch.allclose(lp, lp_whole, atol=1e-5), "chunking changed the log-probs"
+    assert torch.allclose(ent, ent_whole, atol=1e-5), "chunking changed the entropies"
+
+    # Entropy is bounded by log|V| and is not the entropy of a one-hot: a
+    # freshly initialized model is near-uniform, so this is a live bound.
+    assert float(ent.max()) <= np.log(cfg.vocab_size) + 1e-4, float(ent.max())
+
+    return f"loss gap {gap:.2e}; chunked == whole; max entropy {float(ent.max()):.3f}"
+
+
+@check("logprob: the generation ride-along keeps rows aligned and stops at EOS")
+def t_logprob_ride_along():
+    """Generation log-probs must describe *these* rows, in this order.
+
+    They are collected inside ``BehavioralTaxonomy``'s existing ``generate``
+    call, so the arrays are only meaningful while they stay in the same
+    query-major order as the behavioral matrix and the nested generations.  A
+    batch-offset mistake here would produce full, finite, plausible arrays
+    attached to the wrong queries — the same silent failure the replicate
+    ordering check exists for, one stage over.
+
+    ``lengths`` is the other half.  ``generate`` keeps stepping a finished
+    sequence with pad, and those steps carry a distribution over a choice the
+    model never made; counting them would drag every per-row mean toward
+    whatever the model does after it has stopped.
+    """
+    import tempfile
+
+    import torch
+
+    from src.cache.logprob_cache import LogProbCache
+    from src.taxonomy.behavioral import BehavioralTaxonomy
+
+    # V is wide enough to hold the 100+i prompt ids the stub echoes as each
+    # row's first generated token — that echo is what makes a row identifiable.
+    V, EOS, STEPS = 128, 0, 4
+
+    class StubTok:
+        pad_token_id = EOS
+        eos_token_id = EOS
+
+        def __call__(self, queries, **kw):
+            ids = torch.tensor([[100 + int(q.split()[-1])] for q in queries])
+            return {"input_ids": ids, "attention_mask": torch.ones_like(ids)}
+
+        def batch_decode(self, ids, skip_special_tokens=True):
+            return [f"q{int(r[0]) - 100}" for r in ids]
+
+    class StubOut:
+        def __init__(self, sequences, scores, logits):
+            self.sequences, self.scores, self.logits = sequences, scores, logits
+
+    class StubModel:
+        device = "cpu"
+
+        def generate(self, input_ids=None, attention_mask=None, max_new_tokens=STEPS,
+                     num_return_sequences=1, pad_token_id=EOS, do_sample=True,
+                     return_dict_in_generate=False, output_scores=False,
+                     output_logits=False, **kw):
+            prompts = input_ids.repeat_interleave(num_return_sequences, dim=0)
+            rows = prompts.shape[0]
+            new = torch.full((rows, max_new_tokens), 3, dtype=torch.long)
+            new[:, 0] = prompts[:, 0]
+            # Row 1 of every batch finishes at step 2; the pads after it must not
+            # be counted, and the EOS itself must be.
+            new[1::2, 2] = EOS
+            new[1::2, 3] = EOS
+            seq = torch.cat([prompts, new], dim=1)
+            if not return_dict_in_generate:
+                return seq
+            # Distinguishable per row and per step, so a transposed or offset
+            # gather cannot match by coincidence.
+            scores, logits = [], []
+            for s in range(max_new_tokens):
+                z = torch.zeros(rows, V)
+                z[torch.arange(rows), new[:, s]] = 2.0 + s
+                logits.append(z)
+                scores.append(z * 2.0)  # a "warped" copy, distinct from the raw
+            return StubOut(seq, tuple(scores), tuple(logits))
+
+    class StubEmbedder:
+        def config_dict(self):
+            return {"model_name": "stub"}
+
+        def embed(self, out, query):
+            return np.zeros(3, dtype=np.float32)
+
+    class T(BehavioralTaxonomy):
+        def _get_model(self, model_id):
+            return StubModel(), True
+
+        def _load_tokenizer(self, model_id, base):
+            return StubTok()
+
+        @staticmethod
+        def _resolve_base_model_id(model_id):
+            return None
+
+    n, R = 5, 2
+    with tempfile.TemporaryDirectory() as tmp:
+        lp_cache = LogProbCache(tmp)
+        tax = T(
+            queries=[f"query {i}" for i in range(n)],
+            embedder=StubEmbedder(), cache=None, device="cpu",
+            query_key={"recipe_hash": "abc", "n_samples": n, "seed": 0},
+            batch_size=2, max_new_tokens=STEPS, replicates=R, do_sample=True,
+            temperature=1.0, top_p=1.0, generation_seed=0,
+            torch_dtype=torch.float32,
+            collect_logprobs=True, logprob_cache=lp_cache,
+        )
+        rep = tax.extract("m")
+        arrays = tax._logprob_arrays
+
+        assert arrays is not None, "collect_logprobs=True produced no arrays"
+        assert arrays["logprob"].shape == (n * R, STEPS), arrays["logprob"].shape
+        assert arrays["logprob"].shape[0] == rep.matrix.shape[0], (
+            "the log-prob rows and the behavioral rows disagree in count; they "
+            "are supposed to be the same rows"
+        )
+
+        # token_id must name the tokens actually generated, row for row.
+        assert (arrays["token_id"][:, 0] == 100 + np.repeat(np.arange(n), R)).all(), (
+            "token_id row order does not follow the query-major generations"
+        )
+
+        # Row 1 of each batch stops at its EOS (step 2 → length 3); every other
+        # row runs the full budget.
+        lengths = arrays["lengths"]
+        assert set(lengths.tolist()) == {3, STEPS}, lengths
+        assert (lengths[1::2] == 3).all(), lengths
+
+        # The arithmetic: the stub's logits put mass 2+s on the realized token
+        # and 0 elsewhere, so the raw log-prob is a closed form, and the warped
+        # copy (scores = 2·logits) must differ from it — which is the whole
+        # reason both are stored.
+        want = (2.0 + 0) - np.log(np.exp(2.0 + 0) + (V - 1))
+        assert np.isclose(arrays["logprob_raw"][0, 0], want, atol=1e-5), (
+            arrays["logprob_raw"][0, 0], want
+        )
+        assert not np.isclose(arrays["logprob"][0, 0], arrays["logprob_raw"][0, 0]), (
+            "warped and unprocessed log-probs are identical under a stub that "
+            "warps them; only one distribution is being read"
+        )
+        assert (arrays["entropy_raw"] >= -1e-6).all(), arrays["entropy_raw"].min()
+
+        # And the hit test sees the log-prob artifact, not just the generations.
+        shash = lp_cache.sampling_hash(tax.sampling_config())
+        assert not tax._logprobs_on_disk("b", "a", shash), (
+            "an entry with no stored log-probs reported as complete; a cached "
+            "generation would short-circuit and no log-probs would ever be written"
+        )
+
+    return (f"{n}x{R} rows query-major, EOS rows length 3 of {STEPS}, "
+            f"raw log-prob {arrays['logprob_raw'][0, 0]:.4f} distinct from warped")
+
+
 @check("behavioral: replicate rows stay attached to their own query")
 def t_behavioral_replicate_ordering():
     """The whole replicate scheme rests on one unwritten assumption.
@@ -4120,6 +4420,9 @@ SYNTHETIC = [
     t_generated_sampling_hash_separates,
     t_generated_cache_hash_stable, t_behavioral_replicate_ordering,
     t_behavioral_padding_side,
+    # log-prob level: it joins 05_generated by filename, and its arithmetic is
+    # pinned against HF's own loss
+    t_logprob_cache_names_join, t_logprob_matches_hf_loss, t_logprob_ride_along,
     # embedder task prefixes: the model is misused without them, and the failure is silent
     t_embedder_prefix_resolved, t_embedder_prefix_in_cache_key,
     # functional taxonomy: its cache, the views read off it, and the two

@@ -11,7 +11,9 @@ import torch
 from src.core.protocols import Taxonomy, Embedder, ModelID
 from src.core.representation import ModelRepresentation
 from src.cache.generated_text_cache import GeneratedTextCache
+from src.cache.logprob_cache import LogProbCache
 from src.taxonomy._hf_inference import HFInferenceTaxonomy
+from src.taxonomy.logprob import _pad_rows
 
 
 @dataclass
@@ -58,9 +60,12 @@ class BehavioralTaxonomy(HFInferenceTaxonomy, Taxonomy):
     vector.  The stacked vectors form the (N_queries * replicates, d) matrix
     representation, in query-major order.
 
-    This taxonomy operates **exclusively on generated text output** — it does not
-    collect hidden states or logits during the generation pass.  Use
-    :class:`FunctionalTaxonomy` if you need activation-based comparison.
+    This taxonomy's *representation* is built **exclusively from generated text**
+    — it collects no hidden states.  Use :class:`FunctionalTaxonomy` if you need
+    activation-based comparison.  With ``collect_logprobs=True`` it additionally
+    records the per-token log-probabilities of the text it drew, into
+    ``07_logprobs`` beside the generations; that is a second artifact from the
+    same pass, not a change to what the behavioral matrix contains.
 
     Generated texts are stored in ``ModelRepresentation.metadata["generated_texts"]``
     so you can audit outputs without re-running the model.
@@ -94,6 +99,27 @@ class BehavioralTaxonomy(HFInferenceTaxonomy, Taxonomy):
         are in :meth:`config_dict` *and* in the stored filename, via
         :meth:`GeneratedTextCache.sampling_hash` — two temperatures over one draw
         are two entries, not one entry silently reused.
+    collect_logprobs, logprob_cache:
+        Collect the per-token log-probability and entropy of every generated
+        token and store them in ``07_logprobs`` under the *same* variant token as
+        the generations, so the two files join by name.
+
+        **Two distributions are stored, not one.**  ``generate`` runs the raw
+        logits ``z`` through a chain of ``LogitsProcessor``s before sampling —
+        temperature divides, top-p/top-k mask — so ``scores`` is the distribution
+        the token was actually drawn from and ``logits`` is the model's own
+        belief.  Across a temperature sweep only the second is comparable
+        between settings, and the first is not recoverable from it: recovering
+        ``log softmax(z/T)`` needs ``logsumexp`` over the whole vocabulary, which
+        is discarded.  So both are kept — ``logprob``/``entropy`` from ``scores``,
+        ``logprob_raw``/``entropy_raw`` from ``logits`` — for one extra gather and
+        no extra forward pass.  At ``T=1.0, top_p=1.0, top_k=None`` every
+        processor is the identity and the two must coincide, which is a free
+        consistency check on a sweep.
+
+        The unprocessed quantity is the *same* quantity
+        :class:`~src.taxonomy.logprob.LogProbTaxonomy` stores in input mode, so
+        the two sit on one scale.
 
     **Reproducibility is conditional on ``batch_size``, and this is new.**
     Under greedy decoding, batch size only flipped ``argmax`` on fp16 near-ties —
@@ -125,6 +151,8 @@ class BehavioralTaxonomy(HFInferenceTaxonomy, Taxonomy):
         torch_dtype: torch.dtype = torch.float16,
         hf_token: str | None = None,
         source_indices: list | None = None,
+        collect_logprobs: bool = False,
+        logprob_cache: LogProbCache | None = None,
     ) -> None:
         if max_new_tokens <= 0:
             raise ValueError(
@@ -161,6 +189,17 @@ class BehavioralTaxonomy(HFInferenceTaxonomy, Taxonomy):
         # -- the draw file holds the same list -- and deliberately outside
         # config_dict(), so supplying it does not fragment the cache.
         self.source_indices = source_indices
+        if collect_logprobs and logprob_cache is None:
+            raise ValueError(
+                "collect_logprobs=True requires a logprob_cache. The arrays are "
+                "the whole point of collecting them and there is nowhere else to "
+                "put them; failing here beats discovering it after the decode."
+            )
+        self.collect_logprobs = bool(collect_logprobs)
+        self.logprob_cache = logprob_cache
+        # Filled by _extract_fresh when collecting; read by extract() to write
+        # the 07_logprobs entry beside the generations it describes.
+        self._logprob_arrays: dict[str, np.ndarray] | None = None
 
     @property
     def taxonomy_name(self) -> str:
@@ -222,7 +261,7 @@ class BehavioralTaxonomy(HFInferenceTaxonomy, Taxonomy):
             self.replicates,
             sampling_hash,
             embedder_hash,
-        ):
+        ) and self._logprobs_on_disk(base_model_id, adapter_id, sampling_hash):
             return self.cache.load(
                 base_model_id,
                 adapter_id,
@@ -248,7 +287,60 @@ class BehavioralTaxonomy(HFInferenceTaxonomy, Taxonomy):
             source_indices=self.source_indices,
         )
 
+        if self.collect_logprobs and self._logprob_arrays is not None:
+            self.logprob_cache.save_logprobs(
+                base_model_id,
+                adapter_id,
+                self.query_key,
+                "generation",
+                self._logprob_arrays,
+                max_new_tokens=self.max_new_tokens,
+                replicates=self.replicates,
+                sampling=sampling,
+                model_id=str(model_id),
+                config=config,
+                run_metadata={
+                    "batch_size": self.batch_size,
+                    "effective_batch": self.batch_size * self.replicates,
+                    "device_name": (
+                        torch.cuda.get_device_name(0)
+                        if torch.cuda.is_available()
+                        else "cpu"
+                    ),
+                },
+                source_indices=self.source_indices,
+            )
+
         return rep
+
+    def _logprobs_on_disk(
+        self, base_model_id: str, adapter_id: str, sampling_hash: str
+    ) -> bool:
+        """Whether the log-prob half of this entry is already stored.
+
+        Not collecting log-probs makes this vacuously true, which is what keeps
+        every existing suite's cache hit exactly as it was.  When collecting, it
+        has to be part of the hit test: the generations and their embedding are
+        written by a different cache, so an entry from an earlier run without
+        ``collect_logprobs`` would otherwise short-circuit here, return the
+        cached text and silently produce no log-probs at all.
+
+        Re-generating on that miss is exact rather than approximate — greedy is
+        deterministic, and sampling reproduces at the same ``generation_seed``
+        **and the same ``batch_size``**, which is why that value is pinned in the
+        sweep configs and stays out of the cache key.
+        """
+        if not self.collect_logprobs:
+            return True
+        return self.logprob_cache.exists(
+            base_model_id,
+            adapter_id,
+            self.query_key,
+            "generation",
+            max_new_tokens=self.max_new_tokens,
+            replicates=self.replicates,
+            sampling_hash=sampling_hash,
+        )
 
     def _extract_fresh(self, model_id: ModelID, config_hash: str) -> ModelRepresentation:
         model, shared = self._get_model(model_id)
@@ -264,21 +356,32 @@ class BehavioralTaxonomy(HFInferenceTaxonomy, Taxonomy):
         vectors: list[np.ndarray] = []
         all_generated_texts: list[list[str]] = []
         all_closed_at: list[list[int | None]] = []
+        lp_rows: list[dict[str, np.ndarray]] = []
+        lp_lengths: list[int] = []
         try:
             for i in range(0, len(self.queries), self.batch_size):
                 batch_queries = self.queries[i : i + self.batch_size]
-                batch_vectors, batch_texts, batch_closed = self._process_batch(
-                    model, tokenizer, batch_queries, batch_start=i
+                batch_vectors, batch_texts, batch_closed, batch_lp, batch_lp_len = (
+                    self._process_batch(
+                        model, tokenizer, batch_queries, batch_start=i
+                    )
                 )
                 vectors.extend(batch_vectors)
                 all_generated_texts.extend(batch_texts)
                 all_closed_at.extend(batch_closed)
+                lp_rows.extend(batch_lp)
+                lp_lengths.extend(batch_lp_len)
         finally:
             if not shared:
                 del model
                 gc.collect()
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
+
+        # Padded here rather than per batch: a batch whose sequences all hit EOS
+        # early stops short, so widths differ between batches and only the whole
+        # run knows T_max.  Rows are query-major, the same order as `matrix`.
+        self._logprob_arrays = _pad_rows(lp_rows, lp_lengths) if lp_rows else None
 
         matrix = np.stack(vectors, axis=0)  # (N_queries * replicates, d)
         return ModelRepresentation.create(
@@ -331,7 +434,13 @@ class BehavioralTaxonomy(HFInferenceTaxonomy, Taxonomy):
         tokenizer: Any,
         queries: list[str],
         batch_start: int = 0,
-    ) -> tuple[list[np.ndarray], list[list[str]]]:
+    ) -> tuple[
+        list[np.ndarray],
+        list[list[str]],
+        list[list[int | None]],
+        list[dict[str, np.ndarray]],
+        list[int],
+    ]:
         inputs = tokenizer(
             queries,
             return_tensors="pt",
@@ -358,14 +467,32 @@ class BehavioralTaxonomy(HFInferenceTaxonomy, Taxonomy):
             if self.top_k is not None:
                 sampling_kwargs["top_k"] = self.top_k
 
+        if self.collect_logprobs:
+            # `scores` is what the sampler saw, `logits` what the model emitted.
+            # Both, because they are different quantities under a temperature and
+            # neither is recoverable from the other — see the class docstring.
+            sampling_kwargs.update(
+                return_dict_in_generate=True, output_scores=True, output_logits=True
+            )
+
         with torch.no_grad():
-            output_ids = model.generate(
+            generated = model.generate(
                 **inputs,
                 max_new_tokens=self.max_new_tokens,
                 num_return_sequences=self.replicates,
                 pad_token_id=tokenizer.pad_token_id,
                 **sampling_kwargs,
             )
+
+        if self.collect_logprobs:
+            output_ids = generated.sequences
+            lp_rows, lp_lengths = self._gather_logprobs(
+                generated, output_ids[:, input_len:], tokenizer
+            )
+            del generated
+        else:
+            output_ids = generated
+            lp_rows, lp_lengths = [], []
 
         # `generate` returns (n_queries * R) rows, query-major: the R
         # continuations of query 0, then those of query 1, and so on. That is
@@ -425,7 +552,82 @@ class BehavioralTaxonomy(HFInferenceTaxonomy, Taxonomy):
                 )
                 vectors.append(self.embedder.embed(output_obj, query))
 
-        return vectors, generated_texts, closed_at
+        return vectors, generated_texts, closed_at, lp_rows, lp_lengths
+
+    def _gather_logprobs(
+        self, generated: Any, gen_ids: torch.Tensor, tokenizer: Any
+    ) -> tuple[list[dict[str, np.ndarray]], list[int]]:
+        """Per-token log-probs and entropies of one batch's generated tokens.
+
+        One row per generated sequence, in the query-major order ``generate``
+        returns and the behavioral matrix stores, so row *i* means the same thing
+        in ``05_generated`` and ``07_logprobs``.
+
+        Reduced **step by step**: each step's ``(rows, V)`` distribution is turned
+        into two scalars per row and dropped, so the peak here is one step, not
+        the whole 128-step stack.  ``generate`` has already accumulated both
+        stacks on device — that is the memory the sweep configs budget for — and
+        the point of reducing eagerly is not to add a third copy on top of them.
+
+        ``lengths`` stops at the first pad token.  Once a sequence has finished,
+        ``generate`` keeps stepping it with pad and the distributions from those
+        steps describe nothing the model chose; the EOS that ended it *is* a real
+        choice and is counted.
+        """
+        scores = generated.scores
+        raw = generated.logits
+        n_steps = len(scores)
+        rows = gen_ids.shape[0]
+
+        cols = {
+            "logprob": np.zeros((rows, n_steps), dtype=np.float32),
+            "entropy": np.zeros((rows, n_steps), dtype=np.float32),
+            "logprob_raw": np.zeros((rows, n_steps), dtype=np.float32),
+            "entropy_raw": np.zeros((rows, n_steps), dtype=np.float32),
+            "token_id": np.zeros((rows, n_steps), dtype=np.int64),
+        }
+        for step in range(n_steps):
+            tok = gen_ids[:, step]
+            cols["token_id"][:, step] = tok.cpu().numpy()
+            for src, lp_key, ent_key in (
+                (scores[step], "logprob", "entropy"),
+                (raw[step], "logprob_raw", "entropy_raw"),
+            ):
+                z = src.float()
+                logp = z - torch.logsumexp(z, dim=-1, keepdim=True)
+                cols[lp_key][:, step] = (
+                    logp.gather(-1, tok[:, None]).squeeze(-1).cpu().numpy()
+                )
+                # -inf log-probs are real: top-p/top-k mask tokens out, and a
+                # masked token contributes 0 to the entropy rather than NaN.
+                p = logp.exp()
+                cols[ent_key][:, step] = (
+                    -(torch.where(p > 0, p * logp, torch.zeros_like(p)))
+                    .sum(dim=-1)
+                    .cpu()
+                    .numpy()
+                )
+                del z, logp, p
+
+        # Both ids, because they are usually the same token here (the tokenizer
+        # falls back to eos for pad) but need not be: with a distinct pad, the
+        # terminating eos is a real choice and the run of pads after it is not.
+        stop_ids = {
+            i
+            for i in (tokenizer.pad_token_id, tokenizer.eos_token_id)
+            if i is not None
+        }
+        ids = gen_ids.cpu().numpy()
+        is_stop = np.isin(ids, list(stop_ids)) if stop_ids else np.zeros_like(ids, bool)
+        lengths = []
+        for r in range(rows):
+            hit = np.nonzero(is_stop[r])[0]
+            lengths.append(int(hit[0]) + 1 if hit.size else n_steps)
+
+        per_row = [
+            {k: v[r] for k, v in cols.items()} for r in range(rows)
+        ]
+        return per_row, lengths
 
     def _think_closure_summary(self, closed_at: list[list[int | None]]) -> dict | None:
         """Did the model finish reasoning inside its token budget?

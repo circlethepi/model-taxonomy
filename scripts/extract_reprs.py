@@ -31,9 +31,11 @@ from scripts._utils import (
     resolve_model_ids,
     make_activation_cache,
     make_generated_text_cache,
+    make_logprob_cache,
     make_queries,
     make_functional_taxonomy,
     make_behavioral_taxonomy,
+    make_logprob_taxonomy,
     make_dataset_embedding_cache,
     make_sampled_dataset_cache,
     make_dataset_embedding_taxonomy,
@@ -62,10 +64,19 @@ def extract_representations(cfg: dict, only_taxonomies: list[str] | None = None)
     # dataset_embedding does not use queries.
     fcfg = tax_cfgs.get("functional", {})
     bcfg = tax_cfgs.get("behavioral", {})
+    # Defaults to *disabled*, unlike the two above.  The generated configs carry
+    # an explicit `enabled` on every level precisely because a config that merely
+    # omits a key would re-run that level, and eight concurrent shards racing one
+    # extraction is what the LEVEL_DEFAULTS_NOTE in gen_simplex3.py exists to
+    # prevent.  A level added after those configs were written must therefore
+    # default off, or every existing config would silently acquire it.
+    lcfg = tax_cfgs.get("logprob", {})
     need_queries = (
         fcfg.get("enabled", True) and (enabled is None or "functional" in enabled)
     ) or (
         bcfg.get("enabled", True) and (enabled is None or "behavioral" in enabled)
+    ) or (
+        lcfg.get("enabled", False) and (enabled is None or "logprob" in enabled)
     )
 
     # All three are bound before the guard: the consumers below are gated on the
@@ -99,10 +110,14 @@ def extract_representations(cfg: dict, only_taxonomies: list[str] | None = None)
 
     # ── Behavioral taxonomy ────────────────────────────────────────────────────
     if bcfg.get("enabled", True) and (enabled is None or "behavioral" in enabled):
-        print(f"\n  [behavioral]  max_new_tokens={bcfg.get('max_new_tokens', 64)}")
+        collect_lp = bcfg.get("collect_logprobs", False)
+        print(f"\n  [behavioral]  max_new_tokens={bcfg.get('max_new_tokens', 64)}"
+              f"  T={bcfg.get('temperature', 1.0)}  R={bcfg.get('replicates', 1)}"
+              f"  logprobs={collect_lp}")
         taxonomy = make_behavioral_taxonomy(
             cfg, queries, query_key, cache=make_generated_text_cache(cache_dir),
             source_indices=source_indices,
+            logprob_cache=make_logprob_cache(cache_dir) if collect_lp else None,
         )
         try:
             for model_id in tqdm(model_ids, desc="behavioral", unit="model"):
@@ -111,6 +126,23 @@ def extract_representations(cfg: dict, only_taxonomies: list[str] | None = None)
         finally:
             # The base model is held across extractions and freed once, here — see
             # BehavioralTaxonomy.close.
+            taxonomy.close()
+
+    # ── Log-probability taxonomy ───────────────────────────────────────────────
+    if lcfg.get("enabled", False) and (enabled is None or "logprob" in enabled):
+        print(f"\n  [logprob]  mode={lcfg.get('mode', 'input')}"
+              f"  batch_size={lcfg.get('batch_size', 8)}")
+        taxonomy = make_logprob_taxonomy(
+            cfg, queries, query_key, cache=make_logprob_cache(cache_dir),
+            source_indices=source_indices,
+        )
+        try:
+            for model_id in tqdm(model_ids, desc="logprob", unit="model"):
+                rep = taxonomy.extract(model_id)
+                tqdm.write(
+                    f"    {model_id}  shape={rep.matrix.shape}  key={rep.cache_key}"
+                )
+        finally:
             taxonomy.close()
 
     # ── Dataset Embedding taxonomy ─────────────────────────────────────────────

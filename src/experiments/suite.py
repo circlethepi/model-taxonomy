@@ -74,6 +74,31 @@ class Suite:
         default_factory=lambda: {"full_context": "a", "question_only": "b"}
     )
 
+    #: The log-probability level and the temperature sweep built on it.  All
+    #: four default off, and that is the regression test rather than a
+    #: preference: ``Suite()`` must still regenerate ``experiments/simplex3`` and
+    #: ``jobs/simplex3`` byte-for-byte, so a level added after those files were
+    #: written has to be invisible until a suite asks for it.
+    emit_logprob_jobs: bool = False
+    #: Generation-mode activations, greedy only.  Separate from the flag above
+    #: because it needs no new code at all — ``FunctionalTaxonomy`` already
+    #: hardcodes ``do_sample=False``, so one decoding point cannot collide with
+    #: anything — while the log-prob jobs need the new level.
+    emit_gen_activation_job: bool = False
+    #: The temperatures to sweep, as a tuple.  Empty emits no sweep.  ``T=0`` is
+    #: not in it: greedy is already on disk and is that point of the surface.
+    temperature_sweep: tuple[float, ...] = ()
+    #: Replicates per sweep point.  Half the main run's R, which is what buys the
+    #: sweep ten points for the cost of five of the existing runs.
+    sweep_replicates: int = 8
+    #: Adapters per sweep shard.  Four rather than the main run's eight because
+    #: halving R halves the decode, so four adapters at R=8 lands at the same
+    #: wall the eight-shard R=16 run was sized against — 40 job files instead of
+    #: 80, at no change to the slot length the partitions were chosen for.  Raise
+    #: it and regenerate if the queue is congested; nothing downstream depends on
+    #: the shard count.
+    sweep_shards: int = 4
+
     emit_embed_jobs: bool = True
     #: The standalone build job is a fail-fast gate for the *embedding* sweeps
     #: only.  Every other job runs ``--steps build ...`` and writes the recipes
@@ -86,6 +111,12 @@ class Suite:
     behav_time: str = "1:30:00"
     func_time: str = "2:00:00"
     greedy_time: str = "1:30:00"
+    #: Input log-probs are one forward pass per query with no decoding — the
+    #: same pass the functional job runs — so an hour covers all 16 adapters.
+    logprob_time: str = "1:00:00"
+    #: Generation-mode activations decode like the greedy job and additionally
+    #: retain a hidden state per step, so they take the sampled runs' wall.
+    func_gen_time: str = "2:30:00"
     train_mem_gb: int = 80
     extract_mem_gb: int = 64
 
@@ -95,7 +126,11 @@ class Suite:
     per_device_train_batch_size: int = 4
     gradient_accumulation_steps: int = 4
 
-    gpu_partitions: str = "nvl,h100,l40s,a100"
+    #: `nvl` was here until 2026-08-26, when it stopped existing -- sbatch now
+    #: rejects the whole list with "invalid partition specified: nvl" rather than
+    #: skipping the dead name, so every GPU job in the tree failed at submit.
+    #: h200 took its place as the large-HBM tier.
+    gpu_partitions: str = "h200,h100,l40s,a100"
 
     @property
     def model_slug(self) -> str:

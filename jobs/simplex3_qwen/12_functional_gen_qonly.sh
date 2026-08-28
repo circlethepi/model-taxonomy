@@ -5,7 +5,7 @@
 #SBATCH --gres=gpu:1
 #SBATCH --mem=96G
 #SBATCH --cpus-per-task=8
-#SBATCH --time=2:30:00
+#SBATCH --time=4:00:00
 #SBATCH --output=/weka/scratch/jhu/cpriebe1/MO/model-taxonomy/results/simplex3_qwen/logs/s3q_func_gen_qonly-%j.out
 
 set -euo pipefail

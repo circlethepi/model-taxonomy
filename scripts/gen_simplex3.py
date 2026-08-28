@@ -869,6 +869,10 @@ SUITES = {
         behav_time="2:30:00",
         func_time="1:30:00",
         greedy_time="2:00:00",
+        # The shared default (2:30) was sized against a sampled *shard* --
+        # 4 adapters, ~20 min.  This job decodes all 16 in one process at
+        # ~12 min each, so it needs the full 16-model wall, not a shard's.
+        func_gen_time="4:00:00",
         # Host RAM. The 248,320-vocab tied lm_head is 15% of the model and
         # materializes a (4, 512, 248320) logits tensor; nothing at Llama's 128k
         # vocab needed this much headroom.

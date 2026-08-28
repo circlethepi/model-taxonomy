@@ -2,7 +2,9 @@
 
 The behavioral taxonomy compares models by what they *produce* — specifically, by the semantic geometry of their generated outputs over a shared set of probe inputs. It is the most externally observable taxonomy because it relies only on what a model generates, with no access to internal weights or activations.
 
-> **Scope boundary:** `BehavioralTaxonomy` operates exclusively on generated text. It does not collect hidden states or logits. If you want to compare models by their internal activation structure, use `FunctionalTaxonomy` instead.
+> **Scope boundary:** the *representation* `BehavioralTaxonomy` returns is built exclusively from generated text — it never collects hidden states. If you want to compare models by their internal activation structure, use `FunctionalTaxonomy` instead.
+>
+> It does optionally read the **logits** of the tokens it drew, under `collect_logprobs=True`. That is not part of the behavioral representation: it is a side artifact written to the log-probability stage, because those distributions exist only inside the `generate()` call this class already makes. See [Log-Probability Taxonomy](logprob_taxonomy.md).
 
 ## How it works
 
@@ -49,8 +51,32 @@ BehavioralTaxonomy(
     generation_seed=0,            # reproduces a run at the SAME batch_size
     torch_dtype=torch.float16,    # use bfloat16 for Llama/Gemma
     hf_token=None,                # falls back to HF_TOKEN env var
+    collect_logprobs=False,       # also write generation-mode log-probs
+    logprob_cache=None,           # required when collect_logprobs=True
 )
 ```
+
+### Collecting generation-mode log-probabilities
+
+```python
+from src.cache.logprob_cache import LogProbCache
+
+BehavioralTaxonomy(
+    ...,
+    collect_logprobs=True,
+    logprob_cache=LogProbCache("results/shared_cache"),
+)
+```
+
+This rides along with the generation pass and writes into `07_logprobs` under a filename
+carrying the *same* variant token as the `generations/{token}.json` it describes, so the
+two join by name with no lookup.
+
+Two distributions are stored, not one: `logprob` / `entropy` from the **processed**
+logits — temperature- and top-p-warped, i.e. the distribution the token was actually
+drawn from — and `logprob_raw` / `entropy_raw` from the unprocessed model output. Across
+a temperature sweep only the raw pair is comparable between settings, and the warped pair
+is not recoverable from it, so both are kept.
 
 `max_new_tokens` must be greater than zero — behavioral comparison is defined by what models generate. If you pass `max_new_tokens=0`, a `ValueError` is raised at construction time with a pointer to `FunctionalTaxonomy`.
 

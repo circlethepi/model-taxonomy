@@ -207,17 +207,27 @@ class Taxonomy(ABC):
 ### `BehavioralTaxonomy`
 
 ```python
-class BehavioralTaxonomy(Taxonomy):
+class BehavioralTaxonomy(HFInferenceTaxonomy, Taxonomy):
     def __init__(
         self,
         queries: Sequence[str],
         embedder: Embedder,
-        cache: DiskCache | None = None,
+        query_key: dict | None = None,
+        cache: GeneratedTextCache | None = None,
         device: str = "cuda",
         batch_size: int = 8,
         max_new_tokens: int = 64,        # must be > 0; raises ValueError otherwise
+        replicates: int = 1,             # continuations drawn per probe
+        do_sample: bool = True,          # False = greedy; rejects replicates > 1
+        temperature: float = 1.0,
+        top_p: float = 1.0,
+        top_k: int | None = None,
+        generation_seed: int = 0,
         torch_dtype: torch.dtype = torch.float16,
         hf_token: str | None = None,     # falls back to HF_TOKEN env var
+        source_indices: list | None = None,
+        collect_logprobs: bool = False,  # also write generation-mode log-probs
+        logprob_cache: LogProbCache | None = None,
     )
     taxonomy_name = "behavioral"
 ```
@@ -227,6 +237,15 @@ Compares models by the semantic content of their generated text. `max_new_tokens
 Generated texts are stored in `ModelRepresentation.metadata["generated_texts"]` for auditing.
 
 **`HiddenStateEmbedder` is not compatible with `BehavioralTaxonomy`.** `BehavioralTaxonomy` does not collect hidden states; passing `HiddenStateEmbedder` will raise a `ValueError` when `embed()` is called. Use `SentenceTransformerEmbedder` instead.
+
+The matrix is `(N × R, d)` and **query-major**: rows are `q0r0, q0r1, …, q1r0, …`. At
+`replicates=1` this is the familiar `N × d`. `replicates > 1` with `do_sample=False`
+raises rather than storing R copies of one greedy continuation.
+
+`collect_logprobs=True` (with a `logprob_cache`) additionally records, for the tokens the
+model actually drew, both the *processed* distribution they were drawn from and the
+*unprocessed* model output — only the latter is comparable across a temperature sweep.
+See [Log-Probability Taxonomy](guides/logprob_taxonomy.md).
 
 ---
 
@@ -284,7 +303,49 @@ them. Use `"concat"` with CKA.
 **Note on CKA:** `CKADistanceMetric(unbiased=True)` requires ≥ 4 rows and raises
 below that rather than returning NaN — the estimator divides by `n(n-3)`. Rows
 here are queries, so any realistic query set clears this. Use `unbiased=False`
-otherwise. See [`notes/gram_and_cka.md`](notes/gram_and_cka.md).
+otherwise. The working note `docs/notes/gram_and_cka.md` covers the two CKA
+implementations and how they differ; it is gitignored and not present in a clone.
+
+---
+
+### `LogProbTaxonomy`
+
+```python
+class LogProbTaxonomy(HFInferenceTaxonomy, Taxonomy):
+    def __init__(
+        self,
+        queries: Sequence[str],
+        query_key: dict | None = None,      # REQUIRED in practice
+        cache: LogProbCache | None = None,  # REQUIRED in practice
+        device: str = "cuda",
+        batch_size: int = 8,                # memory only; not in the cache key
+        torch_dtype: torch.dtype = torch.float16,
+        hf_token: str | None = None,
+        mode: str = "input",                # the only accepted value
+        max_length: int = 512,              # IS in the cache key
+        seq_chunk: int = 64,                # memory only; not in the cache key
+        source_indices: list | None = None,
+    )
+    taxonomy_name = "logprob"
+```
+
+Teacher-forces the shared query text through one masked forward pass — the same pass
+`FunctionalTaxonomy` runs, with no decoding — and records, at every position, the
+log-probability of the token that actually came next and the entropy of the full
+next-token distribution.
+
+`extract` returns an `(n_queries, 2)` representation whose columns are the per-query mean
+log-probability and mean entropy over the content positions. The full per-token detail is
+the stored artifact; read it with `LogProbCache.load_logprobs`.
+
+Both `cache` and `query_key` are required — there is no in-memory-only path, because the
+returned representation is a summary of the stored arrays.
+
+`mode="generation"` raises. Generation-mode log-probs are collected by
+`BehavioralTaxonomy(collect_logprobs=True, logprob_cache=...)`, because the distributions
+they need exist only inside the `generate()` call. Both write into `07_logprobs`.
+
+See [Log-Probability Taxonomy](guides/logprob_taxonomy.md).
 
 ---
 
@@ -559,6 +620,75 @@ class DotProductDistanceMetric(DistanceMetric):
 ```
 
 Distance = `1 − dot(a.flatten(), b.flatten())`. Assumes pre-normalized embeddings (e.g. `SentenceTransformerEmbedder(normalize_embeddings=True)`). For unit vectors this is equivalent to cosine distance.
+
+### `BuresWassersteinDistanceMetric`
+
+```python
+class BuresWassersteinDistanceMetric(DistanceMetric):
+    metric_name = "bures_wasserstein"
+```
+
+The 2-Wasserstein distance between two zero-mean Gaussians with the uncentered
+covariances `Σ = XᵀX`, computed without ever forming a `d×d` covariance or a matrix
+square root: `d²(A, B) = ‖A‖_F² + ‖B‖_F² − 2‖A Bᵀ‖_*`.
+
+**The two inputs need not have the same number of rows, and row order does not matter** —
+`Σ = XᵀX` is invariant to permuting the rows of `X`. It is rank-1 on a single-row
+representation and so carries nothing cosine does not; and because it stacks per-block
+factors before its SVD, every block must share an input dimension.
+
+### `EnergyDistanceMetric`
+
+```python
+from src.metrics import EnergyDistanceMetric
+
+class EnergyDistanceMetric(DistanceMetric):
+    metric_name = "energy"
+```
+
+`E(A, B)² = 2·E‖x − y‖ − E‖x − x'‖ − E‖y − y'‖`, estimated by U-statistics with self-pairs
+excluded. Non-negative, and zero exactly when the two distributions coincide, so the
+reported square root is a true metric on distributions.
+
+No bandwidth and no kernel choice, which is the reason to prefer it as the default
+distributional reading. It is equivalent to MMD with the Euclidean-distance kernel, so it
+and `MMDDistanceMetric` are the same family, **not independent evidence**. Scale-sensitive
+by construction.
+
+### `MMDDistanceMetric`
+
+```python
+from src.metrics import MMDDistanceMetric
+
+class MMDDistanceMetric(DistanceMetric):
+    def __init__(
+        self,
+        kernel: Literal["rbf", "linear"] = "rbf",
+        sigma: float | None = None,     # None = median heuristic over the pooled pair
+    )
+    metric_name = "mmd_rbf" | "mmd_linear"
+```
+
+Reported as `sqrt(max(MMD², 0))` using the unbiased estimator. **The clamp is not
+cosmetic**: under the null the unbiased MMD² is centred on zero and negative about half
+the time, so a value of exactly `0.0` should be read as *at or below the noise floor*,
+not as *identical*. The biased estimator would avoid the clamp only by putting a floor
+under every distance that grows as row counts shrink — worse, because it varies across
+the very models being compared.
+
+`kernel="rbf"` is characteristic, so MMD = 0 implies the distributions are equal.
+`kernel="linear"` sees only the difference of means and is the explicit degenerate case —
+what a cosine or Frobenius comparison of pooled centroids already measures.
+
+With `sigma=None` the bandwidth is recomputed per pair, because one derived from a single
+model's scale would make `d(a, b) != d(b, a)`. The consequence: the metric stays symmetric
+but is **not a metric across the collection**, since different pairs are measured with
+different kernels. **Pass an explicit `sigma` when a distance matrix must be internally
+consistent** — an MDS embedding of one is exactly that case.
+
+> `EnergyDistanceMetric` and `MMDDistanceMetric` both require more than one row and reject
+> kernel-matrix representations. See
+> [Cross-Level Comparison](guides/cross_level_comparison.md#distributional-distance-metrics).
 
 ---
 
@@ -846,6 +976,43 @@ representation means re-embedding, not a read-time rebuild.
 
 ---
 
+### `LogProbCache`
+
+```python
+from src.cache.logprob_cache import LogProbCache
+
+class LogProbCache(DrawKeyedCache):
+    _STAGE_DIR = "07_logprobs"
+
+    def exists(base_model_id, adapter_id, query_key, mode, *,
+               max_new_tokens=None, replicates=None, sampling_hash=None) -> bool
+    def save_logprobs(base_model_id, adapter_id, query_key, mode, arrays, *,
+                      max_new_tokens=None, replicates=None, sampling=None,
+                      model_id=None, config=None, run_metadata=None,
+                      source_indices=None) -> None
+    def load_logprobs(base_model_id, adapter_id, query_key, mode, *,
+                      max_new_tokens=None, replicates=None,
+                      sampling_hash=None) -> tuple[dict[str, np.ndarray], dict]
+    def list_entries(base_model_id, adapter_id, query_key) -> list[str]
+
+    @staticmethod
+    def masked_mean(values, lengths, start=None) -> np.ndarray
+```
+
+`save_logprobs` is **idempotent on filename**, like every other stage here — which is safe
+only because every axis that changes the numbers is in the filename. `artifact_name`
+reuses `GeneratedTextCache.variant_token` as the same function object, so a log-prob file
+carries the same token as the generation it describes.
+
+`load_logprobs` returns `(arrays, meta)`. `masked_mean(values, lengths, start=None)` is the
+one reduction every reader of this stage needs, kept here so the padding convention is
+applied in one place; `start` trims leading scaffolding (`content_start`).
+
+`list_entries` is a directory listing with no file opens — the peer of
+`GeneratedTextCache.list_variants`.
+
+---
+
 ## Analysis
 
 Import from `src.analysis` (also re-exported from `src`). Everything here
@@ -993,6 +1160,148 @@ shape `(n,)` or `(n, k)`.
 
 See [Core Concepts](concepts.md) for why barycentric coordinates make two
 geometries comparable without a Procrustes step.
+
+---
+
+### Fleet-level surrogate transforms
+
+```python
+from src.analysis.surrogates import (
+    center_representations, whiten_representations,
+    centered, whitened, transform_key,
+)
+
+center_representations(reps, mode="grand" | "rowwise") -> list[ModelRepresentation]
+whiten_representations(reps, shrinkage=0.1, mode="grand") -> list[ModelRepresentation]
+
+centered(mode="grand") -> Transform
+whitened(shrinkage=0.1, mode="grand") -> Transform
+transform_key(transform) -> str
+```
+
+Collection-level operations a `DistanceMetric` cannot perform, applied between resolution
+and distancing. `centered` / `whitened` return the callable that
+`build_taxonomy_artifacts(..., transform=)` and `resolve_ordered(..., transform=)` accept.
+Results are fresh objects tagged in `metadata["surrogate_transform"]`.
+
+### Scoring a taxonomy against the ground truth
+
+```python
+from src.analysis import dcor_vs_truth, disparity_vs_truth
+
+dcor_vs_truth(dm: DistanceMatrix, truth_dm: DistanceMatrix) -> float
+disparity_vs_truth(dm, truth_geometry, *, geometry=None,
+                   random_state=0, n_components=2) -> float
+```
+
+`dcor_vs_truth` scores the **distances** and never embeds; higher is better, and the
+U-centred dCor\* may legitimately be negative — do not clip it. `disparity_vs_truth`
+scores the **configuration** an embedding draws, in `[0, 1]` with **0 meaning identical
+shape**, so it runs opposite to `dcor_vs_truth`. Pass `geometry=` to score an embedding
+you already fitted, and pass the `random_state` that embedding was fitted under otherwise.
+
+### Collection-level resolution
+
+```python
+build_taxonomy_artifacts(index, taxonomy, metric="cosine", ..., transform=None)
+    -> tuple[DistanceMatrix, dict[str, GeometryResult]]
+
+resolve_ordered(index, taxonomy, ids, *, layers=None, projections=None,
+                embedder_hash=None, dataset_selector=None,
+                behavioral_selector=None, functional_selector=None,
+                transform=None) -> tuple[list | None, list[int]]
+```
+
+`resolve_ordered` exists so a **sweep over metrics at one selector resolves once** — the
+shape of every panel grid. `order` is the permutation into `index.entries`; structural
+returns `reps is None` because it reads the adapter files itself.
+
+---
+
+## Model profiles and prompt formats
+
+```python
+from src.models.profile import ModelProfile, resolve, assert_compatible, template_sha
+
+@dataclass(frozen=True)
+class ModelProfile:
+    match: str                                    # an id PREFIX; longest match wins
+    torch_dtype: str = "float16"
+    lora_target_modules: tuple[str, ...] = ("q_proj", "k_proj", "v_proj", "o_proj")
+    prompt_format: str = "raw"                    # "raw" | "chat"
+    chat_template_sha: str | None = None
+    chat_template_kwargs: dict = field(default_factory=dict)
+    notes: str = ""
+
+resolve(model_id) -> ModelProfile        # falls back to a bare default, never raises
+assert_compatible(profile, tokenizer)    # raises on template drift or a wrong format
+template_sha(tokenizer) -> str | None
+```
+
+```python
+from src.datasets._chat_projection import (
+    PromptFormat, render_prompt, render_pair, encode_pair,
+)
+
+@dataclass
+class PromptFormat:
+    format: str = "raw"                  # "raw" | "chat"
+    user_fields: tuple[str, ...] = ()
+    answer_fields: tuple[str, ...] = ()
+    separator: str = DEFAULT_SEPARATOR
+    answer_separator: str = DEFAULT_SEPARATOR
+    chat_template_kwargs: dict = field(default_factory=dict)
+
+    @classmethod
+    def from_config(cls, block: dict | None) -> PromptFormat
+    def to_dict(self) -> dict                # {} when raw
+    def format_id(self) -> str | None        # 8 hex chars, or None when raw
+```
+
+A profile is a source of **defaults for spec construction** and never a runtime lookup:
+the generator resolves one when it emits YAML and writes every value out explicitly.
+`encode_pair` asserts that tokenizing prompt and completion separately reproduces the
+joint tokenization. See [Model Profiles and Prompt Formats](guides/model_profiles.md).
+
+---
+
+## Experiment suites
+
+```python
+from src.experiments import Suite
+
+@dataclass(frozen=True)
+class Suite:
+    tag: str = ""
+    base_model: str = "meta-llama/Llama-3.1-8B"
+    torch_dtype: str = "float16"
+    target_modules: tuple[str, ...] = ("q_proj", "k_proj", "v_proj", "o_proj")
+    prompt_format: dict = field(default_factory=dict)
+    query_sets: tuple[str, ...] = ("full_context", "question_only")
+    job_tokens: dict = ...
+    emit_logprob_jobs: bool = False
+    emit_gen_activation_job: bool = False
+    temperature_sweep: tuple[float, ...] = ()
+    sweep_replicates: int = 8
+    sweep_shards: int = 4
+    emit_embed_jobs: bool = True
+    emit_build_job: bool = True
+    job_prefix: str = "s3"
+    # walls, memory, partitions, batch — see the guide
+
+    @property
+    def model_slug(self) -> str
+    @property
+    def suffix(self) -> str
+    @property
+    def effective_batch(self) -> int
+    def job_token(self, query_set: str) -> str
+    def for_model(self, base_model: str, **overrides) -> Suite
+```
+
+`for_model` pulls dtype, LoRA targets and prompt-format defaults from the model's profile.
+`Suite()` must regenerate `experiments/simplex3` and `jobs/simplex3` byte-for-byte. See
+[Experiment Suites](guides/experiment_suites.md).
 
 ---
 

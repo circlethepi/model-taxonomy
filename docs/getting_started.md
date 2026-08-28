@@ -99,7 +99,9 @@ result.save("./results/run1")
 |---|---|---|
 | `FunctionalTaxonomy` | Covariance structure of internal activations | Comparing how models *process* inputs internally |
 | `BehavioralTaxonomy` | Semantic content of generated text | Comparing what models *produce* |
+| `LogProbTaxonomy` | Per-token log-probabilities and entropies | Comparing what models find *likely*, with no sampling noise |
 | `StructuralTaxonomy` | LoRA adapter weight geometry | Comparing fine-tuned variants of a shared base model |
+| `DatasetEmbeddingTaxonomy` | Text distribution of the training mixture | Describing the data itself — the natural stand-in for ground truth |
 
 ## Behavioral example (generated output)
 
@@ -150,5 +152,10 @@ Alternatively, set the `HF_TOKEN` environment variable and omit the argument —
 - [Core Concepts](concepts.md) — understand the data model before running larger experiments
 - [Behavioral Taxonomy](guides/behavioral_taxonomy.md) — generated-output comparison and embedder strategies
 - [Functional Taxonomy](guides/functional_taxonomy.md) — activation modes: input, generation, or both
+- [Log-Probability Taxonomy](guides/logprob_taxonomy.md) — teacher-forced and generation-mode log-probs
 - [Structural Taxonomy](guides/structural_taxonomy.md) — LoRA adapter caching and config.json
+- [Model Profiles and Prompt Formats](guides/model_profiles.md) — before adding a new base model
+- [Experiment Suites](guides/experiment_suites.md) — generating and submitting a whole experiment
+- [Cross-Level Comparison](guides/cross_level_comparison.md) — surrogates and ground-truth scoring
+- [Visualization](guides/visualization.md) — regenerating the figure suite
 - [Compute Backends](guides/compute_backends.md) — scaling to a SLURM cluster

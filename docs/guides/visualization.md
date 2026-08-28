@@ -80,11 +80,34 @@ python scripts/make_simplex3_figures.py --skip-sweep     # omit the 33-layer swe
 python scripts/make_simplex3_figures.py --skip-detail    # omit per-metric detail figures
 python scripts/make_simplex3_figures.py --skip-surrogate # raw rungs only
 python scripts/make_simplex3_figures.py --outdir figures/simplex3_qwen_v3
+python scripts/make_simplex3_figures.py --cache-root PATH   # name the shared cache
+python scripts/make_simplex3_figures.py --no-cache          # recompute everything
 ```
 
 Four levels — `dataset_embedding`, `structural`, `functional`, `behavioral` — over the
 16 Qwen3.5-4B adapters spanning the 3-group topic simplex. Distance matrices in
 `copper_r`; MDS embeddings coloured by each model's own mixture.
+
+### Distance matrices and embeddings are reused between runs
+
+Every cell the suite computes is stored in the shared cache's `06_collections` and read
+back on the next run, keyed on the taxonomy, the metric's reported name, each model's
+resolved artifact, its surrogate, the transform and the **resolved selector** of the rung
+— never the row's display label, which is editable prose.
+
+Two things make the reuse safe. `collection_key` sorts the model entries before hashing,
+so row order is *not* part of the key; every read therefore goes through
+`DistanceMatrix.reindex`, which puts the rows back in the caller's order. Without it a
+cache hit would hand back rows in whoever-wrote-it-first's order, reproducing the
+row-permutation bug the `_v2` figures exist to correct — and reproducing it *stably*, on
+every run. Geometries are refitted rather than permuted whenever the ids do not match,
+since restricting an MDS fit is not the same operation as permuting a symmetric matrix.
+
+`--cache-root` names the cache explicitly. It is needed from a git worktree, where the
+default path is derived from the script's own location and resolves inside the worktree,
+so the suite finds no cache at all. `--no-cache` forces a cold run: that is how the reuse
+is checked, since a warm run must reproduce a cold one — compare the `matrix_sha256`
+column of the two runs' `crosslevel_scores.csv`.
 
 ### Output directories are versioned, not overwritten
 

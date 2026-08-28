@@ -272,24 +272,8 @@ def build_taxonomy_artifacts(
         # spelling ("cka") while saving under the metric's own ("cka_linear") meant
         # such a collection was stored where it was never sought, so it never hit
         # and rewrote its directory on every run.
-        metric_name = _resolve_metric(metric).metric_name
-        # The transform joins the surrogate key rather than the metric name: it
-        # is a property of the *representations*, not of how two of them are
-        # compared, and the metric name is a directory component. Tagged so a
-        # transform key can never be mistaken for a model's surrogate hash.
-        #
-        # Appended only when there *is* a transform, so the untransformed key is
-        # bit-identical to what it was before this argument existed. Adding a
-        # "transform:raw" element unconditionally would have been tidier and
-        # would have orphaned every collection already in 06_collections.
-        surrogates = [e["surrogate_hash"] for e in model_entries]
-        if transform is not None:
-            surrogates = surrogates + [f"transform:{tkey}"]
-        handle = cache.handle(
-            taxonomy,
-            cache.collection_key(model_entries),
-            metric_name,
-            cache.surrogate_key(surrogates),
+        handle = collection_handle(
+            cache, taxonomy, metric, model_entries, transform=transform,
         )
         if cache.exists(handle):
             dm = cache.load_distance_matrix(handle)
@@ -315,6 +299,76 @@ def build_taxonomy_artifacts(
 
     geometries = _fit_geometries(dm, n_components, cache, handle, mds_kwargs)
     return dm, geometries
+
+
+def collection_handle(
+    cache,
+    taxonomy: str,
+    metric: Any,
+    model_entries: Sequence[Mapping[str, Any]],
+    *,
+    transform: Any = None,
+    rung: Mapping[str, Any] | None = None,
+) -> str:
+    """The handle one distance matrix is stored under, composed in one place.
+
+    Everything that changes the numbers has to be in the key, and the pieces are
+    not all obvious, so both callers that write into ``06_collections`` —
+    :func:`build_taxonomy_artifacts` and the figure suite — compose it here
+    rather than each assembling their own.
+
+    The parts:
+
+    *taxonomy*, and the metric's **reported** name.  ``"cka"`` resolves to
+    ``"cka_linear"``; looking a collection up under the caller's spelling while
+    saving it under the metric's own is how the cache came to never hit.
+
+    ``collection_key(model_entries)`` over each model's stored ``artifact_path``,
+    and ``surrogate_key`` over the per-model surrogate hashes — the design in
+    :class:`~src.cache.collection_cache.CollectionCache`, which is what makes the
+    key see the selectors *via what they resolve to*.
+
+    *transform* and *rung* are the two things that resolution does **not** show.
+    Both join the surrogate list rather than the metric name: they are properties
+    of the representations, not of how two of them are compared.  Each is tagged,
+    so neither can be mistaken for a model's surrogate hash, and each is appended
+    only when present — so a raw, rung-less key stays bit-identical to what it
+    was before either argument existed, and the collections already on disk are
+    not orphaned.
+
+    *rung* is the **resolved selector dict**, never the display label.  Row names
+    like ``"late third"`` are editable prose: redefining which layers that means
+    without changing the string would have a label-keyed entry serve a matrix
+    built from the old definition.  Two rungs of one level read the same
+    artifacts under the same surrogate — that is the whole reason they are one
+    level — so without this they collide on a single key.
+    """
+    from .surrogates import transform_key
+
+    tkey = transform_key(transform)
+    if transform is not None and tkey == "custom":
+        raise ValueError(
+            "an anonymous transform has no stable name, so a collection built "
+            "with it cannot be keyed apart from one built with a different "
+            "anonymous transform — a later call would silently read back the "
+            "wrong matrix. Use a helper from src.analysis.surrogates "
+            "(centered(), whitened()), a named function, or disable the cache."
+        )
+
+    surrogates = [e["surrogate_hash"] for e in model_entries]
+    if transform is not None:
+        surrogates = surrogates + [f"transform:{tkey}"]
+    if rung:
+        from src.cache._draw_keyed import DrawKeyedCache
+
+        surrogates = surrogates + [f"rung:{DrawKeyedCache.config_hash(dict(rung))}"]
+
+    return cache.handle(
+        taxonomy,
+        cache.collection_key(model_entries),
+        _resolve_metric(metric).metric_name,
+        cache.surrogate_key(surrogates),
+    )
 
 
 def _leaf_config(taxonomy, reps, model_entries, **selectors) -> dict:
@@ -520,12 +574,21 @@ def resolve_ordered(
     behavioral_selector: dict | None = None,
     functional_selector: dict | None = None,
     transform: Any = None,
-) -> tuple[list | None, list[int]]:
+    with_identity: bool = False,
+) -> tuple[list | None, list[int]] | tuple[list | None, list[int], list[dict]]:
     """Representations for *ids*, in *ids* order, with *transform* applied.
 
     Returns ``(reps, order)``, where ``order`` is the permutation into
     ``index.entries`` — structural needs it because it reads the adapter files
     itself and so has ``reps is None``.
+
+    With *with_identity*, returns ``(reps, order, model_entries)`` instead: one
+    identity dict per requested id, **in *ids* order**, carrying the
+    ``artifact_path`` and ``surrogate_hash`` that key a collection.  It is opt-in
+    because it changes the arity of the return, and it exists because a caller
+    that wants to cache what it resolved must not have to resolve twice to find
+    out what it resolved — the reads are the expensive half.  ``model_id`` is
+    filled in from *ids*, which is the caller's own naming.
 
     Split out of :func:`_compute_distance_matrix` so that a **sweep over metrics
     at one selector resolves once**.  That is the shape of every panel grid: a
@@ -536,7 +599,7 @@ def resolve_ordered(
 
     Pass the result to :func:`_distances` with the same *ids*.
     """
-    reps, _ = _resolve_representations(
+    reps, identity = _resolve_representations(
         index, taxonomy, layers=layers, projections=projections,
         embedder_hash=embedder_hash, dataset_selector=dataset_selector,
         behavioral_selector=behavioral_selector,
@@ -554,7 +617,15 @@ def resolve_ordered(
             "src.notebook.structure, which never materialize the "
             "ModelRepresentation a transform would act on."
         )
-    return reps, order
+    if not with_identity:
+        return reps, order
+    # Identity comes back one per index entry; the caller asked in its own order
+    # and possibly for a subset, so it is permuted the same way the
+    # representations were.  Pairing the two by position rather than by name is
+    # the one thing ``docs/notes/row_order_bug.md`` says not to get wrong, and
+    # it is the same permutation both halves use here.
+    entries = [{**identity[p], "model_id": mid} for p, mid in zip(order, ids)]
+    return reps, order, entries
 
 
 #: Selector keys per taxonomy, for resolving one model's representation.

@@ -36,6 +36,17 @@ Usage
     python scripts/make_simplex3_figures.py --level functional
     python scripts/make_simplex3_figures.py --skip-sweep     # omit the slow one
     python scripts/make_simplex3_figures.py --skip-surrogate # raw rungs only
+    python scripts/make_simplex3_figures.py --cache-root PATH  # explicit cache
+    python scripts/make_simplex3_figures.py --no-cache          # force a cold run
+
+Reuse
+-----
+Distance matrices and MDS embeddings are read back from ``06_collections`` in
+the shared cache when a previous run has already computed them, and written
+there when they have not. ``--no-cache`` forces everything to be recomputed,
+which is how a warm run is checked against a cold one: the ``matrix_sha256``
+column of ``crosslevel_scores.csv`` must agree between the two. See
+``docs/notes/caching_collections.md``.
 """
 
 from __future__ import annotations
@@ -90,9 +101,30 @@ from src.plots.simplex import (  # noqa: E402
 )
 
 # ── Experiment coordinates ────────────────────────────────────────────────────
-CACHE_ROOT = REPO_ROOT.parent.parent.parent / "results" / "shared_cache"
-if not CACHE_ROOT.exists():                      # running from the main checkout
-    CACHE_ROOT = REPO_ROOT / "results" / "shared_cache"
+
+def _default_cache_root() -> Path:
+    """Where the shared cache is, when ``--cache-root`` does not say.
+
+    Every candidate is derived from ``Path(__file__)``, which is why the third
+    one is needed: from a git worktree under ``.claude/worktrees/<name>`` the
+    first two both point inside the worktree, where no cache has ever been
+    written, and the suite silently found nothing to read. The worktree is where
+    any work on the caching itself gets done, so that case is resolved here
+    rather than papered over with a symlink.
+    """
+    parts = REPO_ROOT.parts
+    candidates = []
+    if len(parts) >= 3 and parts[-2] == "worktrees" and parts[-3] == ".claude":
+        candidates.append(REPO_ROOT.parents[2] / "results" / "shared_cache")
+    candidates += [REPO_ROOT.parent.parent.parent / "results" / "shared_cache",
+                   REPO_ROOT / "results" / "shared_cache"]
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return REPO_ROOT / "results" / "shared_cache"
+
+
+CACHE_ROOT = _default_cache_root()
 ADAPTER_ROOT = CACHE_ROOT / "03_adapters"
 BASE_MODEL = "Qwen/Qwen3.5-4B"
 BASE_SLUG = "Qwen--Qwen3.5-4B"
@@ -190,7 +222,150 @@ def _blocked(single_row: bool, tf) -> dict[str, str]:
     return out
 
 
-def metric_row(idx, taxonomy, ids, tf, blocked=None, **selectors):
+class SuiteCache:
+    """Read-through access to ``06_collections`` for the figure suite.
+
+    The suite used to recompute every distance matrix and every MDS embedding on
+    every run while the cache that stores exactly those two things sat unused;
+    this is the wiring, and ``docs/notes/caching_collections.md`` is why it took
+    a note first.
+
+    Two rules make it safe to read back:
+
+    **Row order is not in the handle.** ``collection_key`` sorts the model
+    entries before hashing, so a matrix written in ``sort_by_mixture`` order and
+    one written in cache-scan order collide. Every load therefore goes through
+    :meth:`DistanceMatrix.reindex`, which permutes into the caller's order and
+    raises on an id the stored matrix does not hold. Without it the cache would
+    make ``docs/notes/row_order_bug.md`` permanent: the same wrong number every
+    run, which reads as a result rather than as a defect.
+
+    **Geometries are refitted, not permuted.** A stored embedding is served only
+    when its ``model_ids`` match the caller's exactly; otherwise it is refitted.
+    Restricting or reordering a fit is not the same operation as permuting a
+    symmetric matrix, and an MDS fit is only defined up to rotation anyway.
+
+    The handle each matrix came from is kept in ``_handles``, keyed by ``id()``
+    of the matrix and holding a reference to it — the reference is what makes the
+    key safe, since a freed object's ``id()`` can be reused by another.
+    """
+
+    def __init__(self, cache_root, enabled: bool = True) -> None:
+        self.root = Path(cache_root)
+        self.enabled = enabled
+        self._cc = None
+        if enabled:
+            from src.cache import CollectionCache
+            self._cc = CollectionCache(self.root)
+        self._handles: dict[int, tuple[object, str]] = {}
+        self.hits = 0
+        self.misses = 0
+
+    # -- distance matrices --------------------------------------------------
+
+    def distance_matrix(self, compute, *, taxonomy, ids, metric, model_entries,
+                        transform=None, rung=None, label=None):
+        """Read the matrix back if any run has stored it; otherwise *compute* it.
+
+        *rung* is the resolved selector dict, never the row's display label:
+        ``"late third"`` is editable prose, and redefining which layers it names
+        without changing the string would serve a matrix built from the old
+        definition. The label is still recorded in ``index.json``, where it makes
+        an opaque hash directory identifiable but keys nothing.
+        """
+        if self._cc is None:
+            return compute()
+
+        from src.analysis.comparison import collection_handle
+
+        handle = collection_handle(self._cc, taxonomy, metric, model_entries,
+                                   transform=transform, rung=rung)
+        dm = None
+        if self._cc.exists(handle):
+            try:
+                dm = self._cc.load_distance_matrix(handle).reindex(list(ids))
+                self.hits += 1
+            except (ValueError, KeyError, OSError) as exc:
+                # A stored matrix that cannot serve this request is a miss, not a
+                # failure — but say so, because a cache that quietly recomputes
+                # forever looks exactly like a cache that is working.
+                print(f"      cache: recomputing {handle} — "
+                      f"{type(exc).__name__}: {exc}")
+                dm = None
+        if dm is None:
+            self.misses += 1
+            dm = compute()
+            self._cc.save_distance_matrix(
+                dm, handle, model_entries=list(model_entries), label=label,
+                config=self._leaf_config(taxonomy, model_entries, transform, rung),
+            )
+        self._handles[id(dm)] = (dm, handle)
+        return dm
+
+    @staticmethod
+    def _leaf_config(taxonomy, model_entries, transform, rung) -> dict:
+        """What the leaf ``config.json`` records, so a collection stays traceable.
+
+        The directory name is a digest, so the parts that went into it are
+        written out in full: this is the only way back from a stored matrix to
+        the selector and the tensors it was built from.
+        """
+        from src.analysis.surrogates import transform_key
+        return {
+            "taxonomy": taxonomy,
+            "source": "scripts/make_simplex3_figures.py",
+            "selectors": dict(rung or {}),
+            "transform": transform_key(transform),
+            "representations": [
+                {"model_id": e["model_id"], "artifact_path": e["artifact_path"],
+                 "surrogate_hash": e["surrogate_hash"]}
+                for e in model_entries
+            ],
+        }
+
+    # -- geometries ---------------------------------------------------------
+
+    def geometry(self, dm, *, n_components: int, random_state: int):
+        """The MDS embedding of *dm*, read back only if it is the same fit.
+
+        Served from disk only when the stored ``model_ids`` match *dm*'s exactly.
+        A stored fit under another order is left alone rather than permuted: it
+        is valid for the collection it was fitted on, and this caller gets a
+        fresh fit instead.
+        """
+        kwargs = {"random_state": random_state}
+        handle = None
+        if self._cc is not None:
+            entry = self._handles.get(id(dm))
+            handle = entry[1] if entry is not None else None
+
+        if handle is not None:
+            try:
+                geo = self._cc.load_geometry(handle, "mds", n_components,
+                                             mds_kwargs=kwargs)
+                if list(geo.model_ids) == list(dm.model_ids):
+                    return geo
+            except (FileNotFoundError, ValueError, KeyError, OSError):
+                pass
+
+        geo = fit_geometry(dm, method="mds", n_components=n_components, **kwargs)
+        if handle is not None:
+            self._cc.save_geometry(handle, geo, mds_kwargs=kwargs)
+        return geo
+
+    def report(self) -> str:
+        if not self.enabled:
+            return "collection cache: off (--no-cache), everything recomputed"
+        return (f"collection cache: {self.hits} hit(s), {self.misses} miss(es) "
+                f"under {self.root}/06_collections")
+
+
+#: Set in `main()`. Off until then, so importing this module never writes to a
+#: cache and a caller that only wants one function gets no hidden state.
+SUITE_CACHE = SuiteCache(CACHE_ROOT, enabled=False)
+
+
+def metric_row(idx, taxonomy, ids, tf, blocked=None, label=None, **selectors):
     """One grid row: every metric column at a single fixed selector.
 
     The representations are resolved **once** and every column is computed from
@@ -198,18 +373,31 @@ def metric_row(idx, taxonomy, ids, tf, blocked=None, **selectors):
     re-read the same 16 tensors seven times over, which — not any of the
     distances — was what made the suite slow once the grid widened.
 
+    Resolution happens before the cache is consulted, and unconditionally. That
+    is the same order ``build_taxonomy_artifacts`` uses and for the same reason:
+    a collection is keyed on the artifact each model *resolved to*, which is not
+    known until it has been resolved. The cache saves the pairwise computation,
+    which is the expensive half — the seven metric columns share one read either
+    way.
+
     *blocked* maps a column to the reason it has no value here, so a structural
     absence is still rendered in place rather than computed and discarded.
     """
     blocked = blocked or {}
-    reps, order = resolve_ordered(idx, taxonomy, ids, transform=tf, **selectors)
+    reps, order, model_entries = resolve_ordered(
+        idx, taxonomy, ids, transform=tf, with_identity=True, **selectors)
     out = {}
     for col in METRIC_COLS:
         if col in blocked:
             out[col] = blocked[col]
             continue
-        out[col] = _distances(idx, taxonomy, METRICS[col], ids, reps,
-                              order=order)
+        out[col] = SUITE_CACHE.distance_matrix(
+            lambda col=col: _distances(idx, taxonomy, METRICS[col], ids, reps,
+                                       order=order),
+            taxonomy=taxonomy, ids=ids, metric=METRICS[col],
+            model_entries=model_entries, transform=tf, rung=selectors,
+            label=label,
+        )
     return out
 
 
@@ -273,7 +461,7 @@ def behavioral_cells(idx, ids, surrogates=True):
     cells = {}
     for row, (selector, tf) in rows.items():
         blocked = _blocked(selector.get("representation") == "mean", tf)
-        got = metric_row(idx, "behavioral", ids, tf, blocked,
+        got = metric_row(idx, "behavioral", ids, tf, blocked, label=row,
                          behavioral_selector=selector)
         cells.update({(row, c): v for c, v in got.items()})
     return list(rows), cells
@@ -321,7 +509,7 @@ def functional_cells(idx, ids, rows):
     cells = {}
     for row, (selector, tf) in rows.items():
         got = metric_row(idx, "functional", ids, tf, _blocked(False, tf),
-                         functional_selector=selector)
+                         label=row, functional_selector=selector)
         cells.update({(row, c): v for c, v in got.items()})
     return list(rows), cells
 
@@ -373,7 +561,7 @@ def dataset_cells(idx, ids, rows):
     cells = {}
     for row, (selector, tf) in rows.items():
         blocked = _blocked(selector["representation"] == "mean", tf)
-        got = metric_row(idx, "dataset_embedding", ids, tf, blocked,
+        got = metric_row(idx, "dataset_embedding", ids, tf, blocked, label=row,
                          dataset_selector=selector,
                          embedder_hash=DATASET_EMBEDDER)
         cells.update({(row, c): v for c, v in got.items()})
@@ -425,7 +613,7 @@ def _load_weights(names, layers, projs):
         attn_num_heads=ATTN_NUM_HEADS)
 
 
-def _structural_grid(names, specs):
+def _structural_grid(idx, names, ids, specs):
     """specs: {row_label: (layers, projections)} -> (rows, cells).
 
     The weights are read **once** for the union of every row's selection, not once
@@ -433,11 +621,47 @@ def _structural_grid(names, specs):
     loading re-read tens of gigabytes and left the job I/O-bound at single-digit
     CPU. The builders already take `layers`/`projections` and intersect against
     what is present, so one collection serves every row.
+
+    That read is now **deferred** until a cell actually misses the cache. Unlike
+    the other three levels, structural can be keyed without reading anything: its
+    identity is the adapter paths plus the (layers, projections) view, which is
+    what `_structural_identity` hashes. So a fully cached grid touches no adapter
+    file at all, which is the whole point at ~50 MB apiece.
+
+    The rows are relabelled from bare adapter names to the full model ids
+    *before* anything is stored, so a stored structural matrix is addressed in
+    the same namespace as every other level's.
     """
+    from src.analysis.comparison import _positions_for, _structural_identity
+
     all_layers = sorted({int(l) for layers, _ in specs.values() for l in layers})
     all_projs = sorted({p for _, projs in specs.values() for p in projs})
-    print(f"    loading {len(names)} adapters × {len(all_projs)} projections once …")
-    weights = _load_weights(names, all_layers, all_projs)
+    lookup = dict(zip(names, ids))
+    order = _positions_for(idx, ids)
+
+    loaded = None
+
+    def weights():
+        nonlocal loaded
+        if loaded is None:
+            print(f"    loading {len(names)} adapters × {len(all_projs)} "
+                  "projections once …")
+            loaded = _load_weights(names, all_layers, all_projs)
+        return loaded
+
+    def entries_for(layers, projs):
+        """Model entries in *ids* order, keyed on the view this row reads."""
+        identity = _structural_identity(idx, list(layers), list(projs))
+        return [{**identity[p], "model_id": mid} for p, mid in zip(order, ids)]
+
+    def compute(row, layers, projs, col):
+        dm = _structural_dm(weights(), names, list(layers), list(projs), col)
+        # `structure.py` labels its rows with bare adapter names, in the order it
+        # was handed them. Relabelling and then reindexing makes that explicit
+        # rather than incidental, so a cold matrix and a warm one are row-for-row
+        # the same object and their digests in `crosslevel_scores.csv` compare.
+        dm.model_ids = [lookup.get(m, m) for m in dm.model_ids]
+        return dm.reindex(ids)
 
     cells = {}
     for row, (layers, projs) in specs.items():
@@ -452,8 +676,21 @@ def _structural_grid(names, specs):
             if col == "bw" and len({PROJ_DIN[p] for p in projs}) > 1:
                 cells[(row, col)] = _bw_mixed(projs)
                 continue
-            cells[(row, col)] = _structural_dm(
-                weights, names, list(layers), list(projs), col)
+            if col == "cka" and (len(layers) != 1 or len(projs) != 1):
+                # Decided here rather than inside `_structural_dm`, so that what
+                # the cache is handed is always a matrix and never a reason.
+                cells[(row, col)] = NO_CKA_GROUP
+                continue
+            cells[(row, col)] = SUITE_CACHE.distance_matrix(
+                lambda row=row, layers=layers, projs=projs, col=col:
+                    compute(row, layers, projs, col),
+                taxonomy="structural", ids=ids, metric=METRICS[col],
+                # No `rung=`: for structural the view *is* the surrogate —
+                # `_structural_identity` hashes (layers, projections) into
+                # `surrogate_hash` — so passing the selectors again would key the
+                # same collection twice, once per writer.
+                model_entries=entries_for(layers, projs), label=row,
+            )
     return list(specs), cells
 
 
@@ -582,12 +819,20 @@ def layer_sweep(idx, ids, outdir):
     # per metric, which is 7x the I/O for identical numbers.
     scores = {col: [] for col in METRIC_COLS}
     for h in xs:
-        reps, order = resolve_ordered(idx, "functional", ids,
-                                      functional_selector=_fsel([h]))
+        selector = _fsel([h])
+        reps, order, model_entries = resolve_ordered(
+            idx, "functional", ids, functional_selector=selector,
+            with_identity=True)
         for col in METRIC_COLS:
             try:
-                dm = _distances(idx, "functional", METRICS[col], ids, reps,
-                                order=order)
+                dm = SUITE_CACHE.distance_matrix(
+                    lambda col=col: _distances(idx, "functional", METRICS[col],
+                                               ids, reps, order=order),
+                    taxonomy="functional", ids=ids, metric=METRICS[col],
+                    model_entries=model_entries,
+                    rung={"functional_selector": selector},
+                    label=f"sweep · h{h}",
+                )
                 scores[col].append(dcor_vs_truth(dm, tdm))
             except Exception as exc:
                 # h0 is all-zero by construction, so some metrics legitimately
@@ -669,8 +914,8 @@ def rank_rungs(level_cells, ids, tdm=None, tgeo=None):
             # One embedding, three uses: the disparity, the stress that
             # qualifies it, and nothing else — fitting it twice under two seeds
             # would let the reported numbers describe different configurations.
-            geo = fit_geometry(cell, method="mds", n_components=2,
-                               random_state=MDS_SEED)
+            geo = SUITE_CACHE.geometry(cell, n_components=2,
+                                       random_state=MDS_SEED)
             scored.append(RungScore(
                 dcor=dcor_vs_truth(cell, tdm),
                 procrustes=disparity_vs_truth(cell, tgeo, geometry=geo),
@@ -847,6 +1092,8 @@ def cross_level(per_level, ids, outdir, metric_override=None, suffix=""):
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main() -> None:
+    global CACHE_ROOT, ADAPTER_ROOT, SUITE_CACHE
+
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--level", action="append",
                     choices=["behavioral", "functional", "structural",
@@ -865,8 +1112,29 @@ def main() -> None:
                     help="skip the per-metric detail figures")
     ap.add_argument("--skip-surrogate", action="store_true",
                     help="omit the centered/whitened rungs, leaving the raw ones")
+    ap.add_argument("--cache-root", default=None,
+                    help="the shared cache to read models from and to reuse "
+                         f"distance matrices in (default: {CACHE_ROOT})")
+    # A warm run reproducing a cold run exactly is the only real test that the
+    # reuse is correct, and it cannot be run without a supported way to force the
+    # cold one. Compare the `matrix_sha256` column of the two runs'
+    # `crosslevel_scores.csv`.
+    ap.add_argument("--no-cache", action="store_true",
+                    help="recompute every distance matrix and embedding, "
+                         "neither reading nor writing 06_collections")
     args = ap.parse_args()
     surrogates = not args.skip_surrogate
+
+    if args.cache_root:
+        CACHE_ROOT = Path(args.cache_root).expanduser().resolve()
+        ADAPTER_ROOT = CACHE_ROOT / "03_adapters"
+    if not CACHE_ROOT.exists():
+        raise SystemExit(
+            f"no cache at {CACHE_ROOT}. Pass --cache-root; from a git worktree "
+            "the default is derived from this file's location and may not "
+            "resolve to the checkout that holds the cache."
+        )
+    SUITE_CACHE = SuiteCache(CACHE_ROOT, enabled=not args.no_cache)
 
     levels = args.level or ["behavioral", "functional", "structural",
                             "dataset_embedding"]
@@ -879,6 +1147,7 @@ def main() -> None:
     ids = sort_by_mixture(idx.model_ids)
     names = [Path(m).name for m in ids]
     print(f"cache: {CACHE_ROOT}\nmodels: {len(ids)}")
+    print(f"reuse: {'off (--no-cache)' if args.no_cache else '06_collections'}")
     if len(ids) != 16:
         raise SystemExit(f"expected 16 models, found {len(ids)} — cache incomplete?")
 
@@ -927,10 +1196,10 @@ def main() -> None:
              "Structural level — per projection"),
         ]:
             print(f"{tag} …")
-            rows, cells = _structural_grid(names, specs)
-            # structure.py returns bare adapter names; relabel to the full ids so
-            # the mixture parser and the colour system see what they expect.
-            cells = _relabel(cells, names, ids)
+            # `_structural_grid` relabels the bare adapter names structure.py
+            # returns onto the full ids the mixture parser and the colour system
+            # expect, before storing anything.
+            rows, cells = _structural_grid(idx, names, ids, specs)
             emit(tag, rows, cells, outdir, title)
             structural_cells.update(cells)
             if tag == "structural_groups" and not args.skip_detail:
@@ -958,19 +1227,7 @@ def main() -> None:
 
     n = len(list(outdir.glob("*.png")))
     print(f"\nwrote {n} figures to {outdir}")
-
-
-def _relabel(cells, names, ids):
-    """Map bare adapter names back onto the full model ids used everywhere else."""
-    lookup = dict(zip(names, ids))
-    out = {}
-    for key, cell in cells.items():
-        if isinstance(cell, str):
-            out[key] = cell
-            continue
-        cell.model_ids = [lookup.get(m, m) for m in cell.model_ids]
-        out[key] = cell
-    return out
+    print(SUITE_CACHE.report())
 
 
 if __name__ == "__main__":

@@ -27,9 +27,9 @@ surrogate build, not a GPU pass.
 | `"gram"` | `G = H Hᵀ` of that concatenation | `(n_queries, n_queries)` | queries |
 
 **Rows are queries in both.** An earlier version of this taxonomy stacked
-per-layer Gram triangles, making a row a *layer*; that form is gone. See
-[`notes/gram_and_cka.md`](../notes/gram_and_cka.md) for why, and for the trap
-that comes with `gram`.
+per-layer Gram triangles, making a row a *layer*; that form is gone. See the
+working note `docs/notes/gram_and_cka.md` for why, and for the trap that comes
+with `gram`. (That directory is gitignored and is not present in a clone.)
 
 > **`gram` is a kernel, not a feature matrix.** `CKADistanceMetric` forms
 > `K = X Xᵀ` itself, so handing it a stored Gram computes `(H Hᵀ)²` — a different

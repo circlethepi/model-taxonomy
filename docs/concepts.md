@@ -42,7 +42,7 @@ The geometry step is optional — you can analyze the distance matrix directly w
 
 ---
 
-## The three taxonomy levels
+## The taxonomy levels
 
 Each taxonomy captures a distinct level of abstraction:
 
@@ -50,9 +50,21 @@ Each taxonomy captures a distinct level of abstraction:
 |---|---|---|
 | **Structural** | LoRA adapter weight geometry | None (parameters only) |
 | **Functional** | Covariance structure of internal activations | Probe strings |
+| **Log-probability** | Per-token log-probabilities and entropies | Probe strings (teacher-forced; no decoding) |
 | **Behavioral** | Semantic content of generated text | Probe strings + generation |
+| **Dataset Embedding** | Text distribution of the fine-tuning mixture | A dataset recipe (no model) |
 
-**Structural** captures *what was changed* during fine-tuning (the LoRA delta matrices). **Functional** captures *how* a model processes inputs layer by layer. **Behavioral** captures *what* a model produces.
+**Structural** captures *what was changed* during fine-tuning (the LoRA delta matrices).
+**Functional** captures *how* a model processes inputs layer by layer.
+**Log-probability** captures what a model *believes* — the probability it assigned to
+text, on a scale that is defined for every model over every query and needs no sampling.
+**Behavioral** captures *what* a model produces. **Dataset Embedding** is the one level
+that touches no model at all: it describes the training mixture itself, and is therefore
+the natural stand-in for ground truth.
+
+The middle three share one `HFInferenceTaxonomy` base class and one cache key, so a
+model under a given query draw sits at the same coordinates in `04_activations`,
+`05_generated` and `07_logprobs`.
 
 ---
 
@@ -131,7 +143,22 @@ profile.save("./results/full_profile")
 
 ## Caching
 
-Three cache classes cover different storage needs. All tensor data is stored in **safetensors** format — memory-mappable, pickle-free, and fast to load.
+Several cache classes cover different storage needs. All tensor data is stored in **safetensors** format — memory-mappable, pickle-free, and fast to load.
+
+| Class | Stage | Holds |
+|---|---|---|
+| `SampledDatasetCache` | `01_datasets` | Recipes and the source-row indices of each draw |
+| `DatasetEmbeddingCache` | `02_dataset_embeddings` | Dataset-level surrogates |
+| `LoRACache` | `03_adapters` | Raw PEFT weights and structural representations |
+| `ActivationCache` | `04_activations` | Pooled hidden states per layer |
+| `GeneratedTextCache` | `05_generated` | Generated text and its embeddings |
+| `CollectionCache` | `06_collections` | Distance matrices and geometry results |
+| `LogProbCache` | `07_logprobs` | Per-token log-probabilities and entropies |
+| `DiskCache` | — | The general-purpose flat, hash-keyed fallback |
+
+`ActivationCache`, `GeneratedTextCache` and `LogProbCache` all derive from
+`DrawKeyedCache` and so share one key; `SampledDatasetCache` and
+`DatasetEmbeddingCache` are keyed by recipe alone and are model-free.
 
 ### The shared cache layout
 
@@ -144,20 +171,36 @@ results/shared_cache/
     02_dataset_embeddings/       {recipe_hash}/n{n}_s{seed}/{embedder_hash}/surrogates/{hash}/
     03_adapters/                 raw PEFT weights + extracted structural representations
     03A_adapter_alignments/      pairwise Procrustes alignments
-    04_activations/              {base}/{adapter}/{recipe_hash}/n{n}_s{seed}/
-    05_generated/                {base}/{adapter}/{recipe_hash}/n{n}_s{seed}/
+    04_activations/              {base}/{adapter}/{recipe_hash}/n{n}_s{seed}[_f{fmt}]/
+    05_generated/                {base}/{adapter}/{recipe_hash}/n{n}_s{seed}[_f{fmt}]/
     06_collections/              distance matrices, geometries, index.json
+    07_logprobs/                 {base}/{adapter}/{recipe_hash}/n{n}_s{seed}[_f{fmt}]/
 ```
 
-The two inference stages share that key exactly, from
+The three inference stages share that key exactly, from
 `src/cache/_draw_keyed.py::DrawKeyedCache`, so one model under one query draw
-sits at the same coordinates in both and the trees can be read side by side.
-They differ only in the artifact filename: `{mode}_{pooling}_layer{NNN}` for
-activations, `{mode}_{replicates}r_{sampling_hash}_{embedder_hash}` for
-generations. The two extra components on the generation side are what sampling
-cost: a temperature and a replicate count both change the text, and neither
-appears anywhere else in the path, so both are in the name or a second run
-silently reuses the first one's entry.
+sits at the same coordinates in all of them and the trees can be read side by
+side. They differ only in the artifact filename: `{mode}_{pooling}_layer{NNN}`
+for activations, `{mode}_{replicates}r_{sampling_hash}_{embedder_hash}` for
+generations, and `input` or the *same* generation variant token for log-probs —
+`LogProbCache` reuses `GeneratedTextCache.variant_token` as the same function
+object, so a log-prob file and the generation it describes join by name with no
+lookup. The extra components on the generation side are what sampling cost: a
+temperature and a replicate count both change the text, and neither appears
+anywhere else in the path, so both are in the name or a second run silently
+reuses the first one's entry.
+
+The optional `_f{fmt}` suffix is how a **prompt format** enters the path — the
+first eight hex characters of a hash over the `prompt_format:` block. Same
+adapter, same recipe, same `(n, seed)`, but prompts rendered through a different
+chat template is a genuinely different computation, and every save in these
+stages is idempotent on filename, so without it the second run silently no-ops.
+It is omitted by default, which keeps every pre-existing path byte-identical,
+and it is deliberately absent from `01_datasets` and `02_dataset_embeddings`:
+those are keyed by recipe alone and are genuinely model-free, and a chat
+template is a property of a model, not of a draw. It is equally deliberately not
+folded into `recipe_hash`, which would change the identity of every cached draw
+at once. See [Model Profiles and Prompt Formats](guides/model_profiles.md).
 
 Directories sharing a number sit at the same stage. A **letter suffix means analysis
 *of* the objects at that stage** — `03A_adapter_alignments` holds things computed from
@@ -325,6 +368,16 @@ direction: a taxonomy recovering the mixing order exactly backwards scores 1.0.
 The signed correlation is what tells the two apart, which is why both are
 reported.
 
+**Fleet-level surrogates** (`src.analysis.surrogates`). A `DistanceMetric` sees
+exactly two models, so it can never subtract a fleet mean or divide by a fleet
+covariance — those are collection-level operations. `center_representations` and
+`whiten_representations` apply them between resolution and distancing, tagging
+what they did in `metadata["surrogate_transform"]`. Every level here carries a
+large component identical across all models by construction (the same questions,
+the same answer register, the same base model), and removing it is what leaves
+the between-model variation a taxonomy is trying to measure. See
+[Cross-Level Comparison](guides/cross_level_comparison.md).
+
 **Point configurations** (`src.analysis.configurations`). An embedding fixes
 coordinates only up to rotation, reflection, translation and scale, and picks
 among those arbitrarily. Procrustes superposition quotients that out, so
@@ -348,6 +401,14 @@ This is also where the pipeline can be checked against something it never saw.
 Every other measure here compares one derived quantity to another; with adapters
 fine-tuned on known topic mixtures, `anchor_weight_vs_truth` compares the
 recovered mixing proportion against the real one.
+
+`src.analysis.ground_truth` scores a whole taxonomy against that truth two ways.
+`dcor_vs_truth` scores the **distances** and never embeds, so it is untouched by
+MDS distortion; `disparity_vs_truth` scores the **configuration** an embedding
+actually draws, and so inherits whatever distortion the projection introduced.
+The two come apart — a taxonomy can reproduce the distance profile while
+arranging the points in something that is not the simplex — and they run in
+opposite directions: higher dCor is better, lower disparity is better.
 
 Distance matrices computed directly from LoRA factors (`src.notebook.structure`)
 enter the same layer via `src.analysis.lora_distance_matrix`, which returns an

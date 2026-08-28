@@ -4,6 +4,50 @@
 
 ## Unreleased
 
+### Documentation refreshed to cover the work since 2026-08-12
+
+The tracked docs had not moved since the `text_fields` pass, while ~7,500 lines of
+source had. Five subsystems existed only as module docstrings; they now have guides.
+
+New:
+
+- **[Log-Probability Taxonomy](guides/logprob_taxonomy.md)** — the `07_logprobs` stage,
+  the input/generation split (only one of which is a class), the processed vs raw
+  distributions, and why memory rather than time is the cost.
+- **[Model Profiles and Prompt Formats](guides/model_profiles.md)** — `ModelProfile`,
+  longest-prefix resolution, `assert_compatible` and template-drift pinning, `PromptFormat`,
+  the `_f{id}` draw suffix, and the atomic-token rule behind the prompt/completion cut.
+- **[Experiment Suites](guides/experiment_suites.md)** — `Suite`, the generator/suite/profile
+  split, the byte-for-byte regeneration test, the four default-off emission flags, and
+  `smoke_base_model.py`.
+- **[Cross-Level Comparison](guides/cross_level_comparison.md)** — surrogate transforms,
+  `dcor_vs_truth` against `disparity_vs_truth` and the directions they run in, the
+  distributional metrics, and `resolve_ordered`.
+- **[Visualization](guides/visualization.md)** — the barycentric Oklab colour system,
+  what separates `crosslevel_mds` from `mds_grid`, the versioned output directories, and
+  why absent (rung, metric) cells are drawn rather than dropped.
+
+Updated:
+
+- `index.md` — five taxonomy levels, not four. The link to `notes/gram_and_cka.md` is
+  removed: `docs/notes/` is gitignored, so that link was broken in every clone. A short
+  section now says what the notes directory is and that it is not distributed.
+- `concepts.md` — the taxonomy-level table gains log-probability and dataset embedding;
+  the cache layout gains `07_logprobs` and the optional `_f{fmt}` prompt-format suffix;
+  the "three cache classes" line, which had been wrong for a while, becomes a table of
+  all eight; the analysis section gains surrogates and ground-truth scoring.
+- `api_reference.md` — `LogProbTaxonomy`, `LogProbCache`, `BuresWassersteinDistanceMetric`,
+  `EnergyDistanceMetric`, `MMDDistanceMetric`, the surrogate transforms, `dcor_vs_truth` /
+  `disparity_vs_truth`, `resolve_ordered`, and new sections for model profiles and
+  experiment suites. `BehavioralTaxonomy`'s signature was five arguments out of date.
+- `guides/behavioral_taxonomy.md` — the scope boundary said the class does not collect
+  logits, which stopped being true when `collect_logprobs` landed. Corrected, with the
+  processed/raw distinction stated where a temperature sweep would meet it.
+- `getting_started.md` — taxonomy table and next-steps list.
+
+No source changed in this pass.
+
+
 ### A second score for the cross-level figures: Procrustes disparity against the simplex
 
 **`disparity_vs_truth`** (`src/analysis/ground_truth.py`) embeds a distance

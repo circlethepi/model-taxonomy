@@ -52,6 +52,51 @@ def _think_close_token_id(tokenizer) -> int | None:
     return int(tid)
 
 
+def stop_token_ids(model, tokenizer) -> set[int]:
+    """Every id that ends a generated row, as *this* checkpoint defines ending.
+
+    One definition, because two callers have to agree: ``generate`` is invoked
+    without an explicit ``eos_token_id`` and therefore stops on whatever
+    ``model.generation_config.eos_token_id`` names, while the trim below decides
+    where a row *ended*.  Derive them from different places and they disagree by
+    construction -- the same argument :func:`render_prompt` makes for training
+    and extraction prompts.
+
+    Three sources, unioned:
+
+    ``pad_token_id`` and ``tokenizer.eos_token_id`` are the pair this used to
+    consider alone.  They are usually the same token (the tokenizer falls back to
+    eos for pad) but need not be: with a distinct pad, the terminating eos is a
+    real choice and the run of pads after it is not.
+
+    ``generation_config.eos_token_id`` is the addition, and it is what makes this
+    correct for an instruct checkpoint.  A chat model ends a *turn* with one token
+    and a *sequence* with another -- Llama-3.x emits ``<|eot_id|>`` while
+    ``tokenizer.eos_token_id`` is ``<|end_of_text|>`` -- and the generation config
+    lists both.  Without it, a row that ended at its turn boundary is scored as
+    running to the full token budget, silently, in every log-prob-bearing job.
+    HuggingFace allows a scalar or a list here, so both shapes are normalised.
+
+    Nothing model-specific is named: a checkpoint that declares one stop token
+    yields one, and a raw base model with neither pad nor eos yields the empty
+    set, which disables the trim exactly as before.
+    """
+    ids: set[int] = set()
+    for tid in (getattr(tokenizer, "pad_token_id", None),
+                getattr(tokenizer, "eos_token_id", None)):
+        if tid is not None:
+            ids.add(int(tid))
+
+    gen_cfg = getattr(model, "generation_config", None)
+    declared = getattr(gen_cfg, "eos_token_id", None) if gen_cfg is not None else None
+    if declared is not None:
+        if isinstance(declared, (list, tuple, set)):
+            ids.update(int(t) for t in declared if t is not None)
+        else:
+            ids.add(int(declared))
+    return ids
+
+
 class BehavioralTaxonomy(HFInferenceTaxonomy, Taxonomy):
     """Extracts behavioral representations of HuggingFace language models.
 
@@ -487,7 +532,7 @@ class BehavioralTaxonomy(HFInferenceTaxonomy, Taxonomy):
         if self.collect_logprobs:
             output_ids = generated.sequences
             lp_rows, lp_lengths = self._gather_logprobs(
-                generated, output_ids[:, input_len:], tokenizer
+                generated, output_ids[:, input_len:], tokenizer, model
             )
             del generated
         else:
@@ -555,7 +600,7 @@ class BehavioralTaxonomy(HFInferenceTaxonomy, Taxonomy):
         return vectors, generated_texts, closed_at, lp_rows, lp_lengths
 
     def _gather_logprobs(
-        self, generated: Any, gen_ids: torch.Tensor, tokenizer: Any
+        self, generated: Any, gen_ids: torch.Tensor, tokenizer: Any, model: Any
     ) -> tuple[list[dict[str, np.ndarray]], list[int]]:
         """Per-token log-probs and entropies of one batch's generated tokens.
 
@@ -569,10 +614,10 @@ class BehavioralTaxonomy(HFInferenceTaxonomy, Taxonomy):
         stacks on device — that is the memory the sweep configs budget for — and
         the point of reducing eagerly is not to add a third copy on top of them.
 
-        ``lengths`` stops at the first pad token.  Once a sequence has finished,
-        ``generate`` keeps stepping it with pad and the distributions from those
-        steps describe nothing the model chose; the EOS that ended it *is* a real
-        choice and is counted.
+        ``lengths`` stops at the first stop token -- see :func:`stop_token_ids`.
+        Once a sequence has finished, ``generate`` keeps stepping it with pad and
+        the distributions from those steps describe nothing the model chose; the
+        token that ended it *is* a real choice and is counted.
         """
         scores = generated.scores
         raw = generated.logits
@@ -609,14 +654,10 @@ class BehavioralTaxonomy(HFInferenceTaxonomy, Taxonomy):
                 )
                 del z, logp, p
 
-        # Both ids, because they are usually the same token here (the tokenizer
-        # falls back to eos for pad) but need not be: with a distinct pad, the
-        # terminating eos is a real choice and the run of pads after it is not.
-        stop_ids = {
-            i
-            for i in (tokenizer.pad_token_id, tokenizer.eos_token_id)
-            if i is not None
-        }
+        # Whatever this checkpoint says ends a row -- pad, tokenizer eos, and the
+        # turn-end tokens the generation config declares.  See stop_token_ids for
+        # why all three, and why a turn end is not the same thing as a sequence end.
+        stop_ids = stop_token_ids(model, tokenizer)
         ids = gen_ids.cpu().numpy()
         is_stop = np.isin(ids, list(stop_ids)) if stop_ids else np.zeros_like(ids, bool)
         lengths = []

@@ -46,6 +46,22 @@ class ModelProfile:
     #: means "this model has no chat template", which is asserted, not assumed.
     chat_template_sha: str | None = None
     chat_template_kwargs: dict = field(default_factory=dict)
+    #: Trainable LoRA parameter count this checkpoint should produce at the
+    #: repo's rank, or ``None`` to report the count without asserting it.  Not
+    #: derived, because it is a *claim about what the run intends* -- the number
+    #: falls out of the target list, and the point of stating it is to catch a
+    #: target list that silently matched fewer modules than expected.
+    #:
+    #: A bare integer is well defined only because there is exactly one rank in
+    #: the repo: ``LORA_RANK = 16`` in ``scripts/gen_simplex3.py`` is a module
+    #: constant, not a ``Suite`` field.  If rank ever becomes per-suite this has
+    #: to become rank-keyed or move to ``Suite``.
+    expected_lora_params: int | None = None
+    #: Modules that must **not** be matched by ``lora_target_modules``.  Also a
+    #: choice rather than a property: Qwen3.5's ``in_proj_a``/``in_proj_b`` are
+    #: excluded deliberately, and an exclusion nobody checks is an exclusion that
+    #: quietly stops holding when a target list is edited.
+    excluded_lora_modules: tuple[str, ...] = ()
     notes: str = ""
 
 

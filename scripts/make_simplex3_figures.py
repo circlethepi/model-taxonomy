@@ -126,8 +126,11 @@ def _default_cache_root() -> Path:
 
 CACHE_ROOT = _default_cache_root()
 ADAPTER_ROOT = CACHE_ROOT / "03_adapters"
+#: Which *run* these figures are about.  Run identity belongs on the command
+#: line, not in the source: --base-model and the --draw-* flags override both.
+#: The defaults are the qwen suite, which is what this script was written for.
 BASE_MODEL = "Qwen/Qwen3.5-4B"
-BASE_SLUG = "Qwen--Qwen3.5-4B"
+BASE_SLUG = BASE_MODEL.replace("/", "--")
 
 #: the question-only query draw both inference stages used
 DRAW = {"recipe_hash": "6149cf8055bac2c1", "n_samples": 100, "seed": 1,
@@ -137,16 +140,87 @@ DATASET_EMBEDDER = "b37e80a31644dc03"  # authored by the 8B run; recipe-keyed
 SAMP_GREEDY, SAMP_SAMPLED = "6f000f01", "58d3f985"
 MAX_NEW_TOKENS = 128
 
-#: Qwen3.5-4B is hybrid: `full_attention_interval: 4`, so every 4th layer is
-#: softmax attention and the rest are gated-delta-rule linear attention.
+#: Architecture.  Read from the checkpoint's own config by
+#: :func:`architecture`, not spelled here: a hybrid model's layout is something
+#: the config declares (`full_attention_interval`), and hard-coding arithmetic on
+#: a literal 4 makes the whole structural section mean the wrong thing for any
+#: other model.  These module-level names are the defaults for Qwen3.5-4B and are
+#: replaced in ``main`` once the base model is known.
 N_LAYERS = 32
 FULL_ATTN_LAYERS = [i for i in range(N_LAYERS) if i % 4 == 3]
 LINEAR_ATTN_LAYERS = [i for i in range(N_LAYERS) if i % 4 != 3]
 ATTN_NUM_HEADS = 16
+#: q_proj carries a fused output gate on Qwen3.5, so half its rows are not
+#: queries.  Read from the config rather than assumed -- a model without it has
+#: no query/gate split to make.
+ATTN_OUTPUT_GATE = True
 #: hidden state h_{L+1} is the output of transformer layer L; h0 is the embedding
 FULL_ATTN_STATES = [L + 1 for L in FULL_ATTN_LAYERS]
 LINEAR_ATTN_STATES = [L + 1 for L in LINEAR_ATTN_LAYERS]
 N_STATES = N_LAYERS + 1
+
+
+def architecture(base_model: str) -> dict:
+    """Layer count, head count and attention layout, from the checkpoint.
+
+    ``full_attention_interval`` is what makes a Qwen3.5 hybrid: every
+    ``interval``-th layer is softmax attention and the rest are gated-delta-rule
+    linear attention.  A model that does not declare it has no linear-attention
+    layers at all, so ``LINEAR_ATTN_LAYERS`` comes back empty and every
+    ``linear-attn`` spec downstream simply does not exist -- the figure set gets
+    *smaller*, which is the correct degradation rather than a special case.
+    """
+    from transformers import AutoConfig
+
+    cfg = AutoConfig.from_pretrained(base_model, trust_remote_code=True)
+    # Some checkpoints ship a composite config (Qwen3.5 is a
+    # ForConditionalGeneration whose decoder sits under `text_config`), and the
+    # decoder is the part every figure here is about.  get_text_config() is the
+    # transformers-supported way to ask for it and returns the config itself when
+    # there is no nesting.
+    cfg = cfg.get_text_config() if hasattr(cfg, "get_text_config") else cfg
+    return layout(
+        n_layers=int(cfg.num_hidden_layers),
+        n_heads=int(cfg.num_attention_heads),
+        full_attention_interval=getattr(cfg, "full_attention_interval", None),
+        attn_output_gate=bool(getattr(cfg, "attn_output_gate", False)),
+    )
+
+
+def layout(n_layers, n_heads, full_attention_interval=None, attn_output_gate=False):
+    """The attention layout, split out so it can be tested without a checkpoint.
+
+    Everything that can regress lives here; :func:`architecture` is only the part
+    that reads the four values off a config.
+    """
+    if full_attention_interval:
+        iv = int(full_attention_interval)
+        full = [i for i in range(n_layers) if i % iv == iv - 1]
+    else:
+        full = list(range(n_layers))
+    linear = [i for i in range(n_layers) if i not in set(full)]
+    return {"n_layers": n_layers, "n_heads": n_heads, "full": full,
+            "linear": linear, "output_gate": attn_output_gate}
+
+
+def apply_architecture(arch: dict) -> None:
+    """Install *arch* into the module-level names the spec builders read."""
+    global N_LAYERS, FULL_ATTN_LAYERS, LINEAR_ATTN_LAYERS, ATTN_NUM_HEADS
+    global ATTN_OUTPUT_GATE, FULL_ATTN_STATES, LINEAR_ATTN_STATES, N_STATES
+
+    N_LAYERS = arch["n_layers"]
+    FULL_ATTN_LAYERS = list(arch["full"])
+    LINEAR_ATTN_LAYERS = list(arch["linear"])
+    ATTN_NUM_HEADS = arch["n_heads"]
+    ATTN_OUTPUT_GATE = arch["output_gate"]
+    FULL_ATTN_STATES = [L + 1 for L in FULL_ATTN_LAYERS]
+    LINEAR_ATTN_STATES = [L + 1 for L in LINEAR_ATTN_LAYERS]
+    N_STATES = N_LAYERS + 1
+
+
+def _is_hybrid() -> bool:
+    """True when the model has two attention families to contrast."""
+    return bool(LINEAR_ATTN_LAYERS)
 
 METRICS = {"cosine": "cosine", "frobenius": "frobenius",
            "euclidean": "euclidean",
@@ -488,19 +562,22 @@ def functional_layer_rows():
 def functional_group_rows(surrogates=True):
     early, mid, late = thirds(range(1, N_STATES))
     rows = {
-        "all 33 layers (reference)": (_fsel(None), None),
+        f"all {N_STATES} layers (reference)": (_fsel(None), None),
         "early third":              (_fsel(list(early)), None),
         "middle third":             (_fsel(list(mid)), None),
         "late third":               (_fsel(list(late)), None),
-        "full-attn outputs":        (_fsel(FULL_ATTN_STATES), None),
-        "linear-attn outputs":      (_fsel(LINEAR_ATTN_STATES), None),
     }
+    if _is_hybrid():
+        # Only meaningful when there are two families to tell apart; on a
+        # uniform model "full-attn outputs" would just restate the reference row.
+        rows["full-attn outputs"] = (_fsel(FULL_ATTN_STATES), None)
+        rows["linear-attn outputs"] = (_fsel(LINEAR_ATTN_STATES), None)
     if surrogates:
         # `rowwise`: row i is query i of the shared draw in every model, so this
         # subtracts the base model's own reading of each prompt — which is most
         # of a hidden state, and identical across the 16 by construction since
         # LoRA only perturbs it.
-        rows["all 33 layers · centered"] = (_fsel(None), centered("rowwise"))
+        rows[f"all {N_STATES} layers · centered"] = (_fsel(None), centered("rowwise"))
         rows["late third · centered"] = (_fsel(list(late)), centered("rowwise"))
     return rows
 
@@ -698,16 +775,35 @@ def structural_layer_specs():
     # Single (layer, projection) cells, so CKA is available on every one and no
     # BW selection can straddle two input dims. o_proj / out_proj are the two
     # families' output projections, which makes them the comparable pair.
+    def picks(family):
+        """First, middle and last of one attention family."""
+        return [family[0], family[len(family) // 2], family[-1]] if family else []
+
     specs = {}
-    for L in (3, 15, 31):
-        specs[f"full-attn · layer {L} · o_proj"] = ([L], ["o"])
-    for L in (0, 16, 30):
+    prefix = "full-attn · " if _is_hybrid() else ""
+    for L in picks(FULL_ATTN_LAYERS):
+        specs[f"{prefix}layer {L} · o_proj"] = ([L], ["o"])
+    for L in picks(LINEAR_ATTN_LAYERS):
         specs[f"linear-attn · layer {L} · out_proj"] = ([L], ["out"])
     return specs
 
 
 def structural_group_specs():
     se, sm, sl = thirds(FULL_ATTN_LAYERS)
+    if not _is_hybrid():
+        # Uniform attention: one family, so the family contrast rows and the
+        # linear-attn projections do not exist.  What remains is the same set of
+        # questions asked of the only family there is.
+        return {
+            "all layers · all projections": (range(N_LAYERS), ["q", "k", "v", "o"]),
+            "q,k,v,o":                      (FULL_ATTN_LAYERS, ["q", "k", "v", "o"]),
+            "q,k,v (dim-pure)":             (FULL_ATTN_LAYERS, ["q", "k", "v"]),
+            "output projections":           (range(N_LAYERS), ["o"]),
+            "early third":                  (se, ["q", "k", "v"]),
+            "middle third":                 (sm, ["q", "k", "v"]),
+            "late third":                   (sl, ["q", "k", "v"]),
+        }
+
     le, lm, ll = thirds(LINEAR_ATTN_LAYERS)
     return {
         "all layers · all projections": (range(N_LAYERS),
@@ -728,19 +824,21 @@ def structural_group_specs():
 
 
 def structural_projection_specs():
-    specs = {
-        "full-attn · q_proj (whole)": (FULL_ATTN_LAYERS, ["q"]),
+    p = "full-attn · " if _is_hybrid() else ""
+    specs = {f"{p}q_proj (whole)": (FULL_ATTN_LAYERS, ["q"])}
+    if ATTN_OUTPUT_GATE:
         # attn_output_gate fuses a gate into q_proj, so half its rows are not
         # queries at all. The halves are interleaved per head, not stacked.
-        "full-attn · q_proj query half": (FULL_ATTN_LAYERS, ["q_query"]),
-        "full-attn · q_proj gate half":  (FULL_ATTN_LAYERS, ["q_gate"]),
-        "full-attn · k_proj": (FULL_ATTN_LAYERS, ["k"]),
-        "full-attn · v_proj": (FULL_ATTN_LAYERS, ["v"]),
-        "full-attn · o_proj": (FULL_ATTN_LAYERS, ["o"]),
-        "linear-attn · in_proj_qkv": (LINEAR_ATTN_LAYERS, ["qkv"]),
-        "linear-attn · in_proj_z":   (LINEAR_ATTN_LAYERS, ["z"]),
-        "linear-attn · out_proj":    (LINEAR_ATTN_LAYERS, ["out"]),
-    }
+        # Without the flag there is no split to make and q_proj is all queries.
+        specs[f"{p}q_proj query half"] = (FULL_ATTN_LAYERS, ["q_query"])
+        specs[f"{p}q_proj gate half"] = (FULL_ATTN_LAYERS, ["q_gate"])
+    specs[f"{p}k_proj"] = (FULL_ATTN_LAYERS, ["k"])
+    specs[f"{p}v_proj"] = (FULL_ATTN_LAYERS, ["v"])
+    specs[f"{p}o_proj"] = (FULL_ATTN_LAYERS, ["o"])
+    if _is_hybrid():
+        specs["linear-attn · in_proj_qkv"] = (LINEAR_ATTN_LAYERS, ["qkv"])
+        specs["linear-attn · in_proj_z"] = (LINEAR_ATTN_LAYERS, ["z"])
+        specs["linear-attn · out_proj"] = (LINEAR_ATTN_LAYERS, ["out"])
     return specs
 
 
@@ -1093,6 +1191,7 @@ def cross_level(per_level, ids, outdir, metric_override=None, suffix=""):
 
 def main() -> None:
     global CACHE_ROOT, ADAPTER_ROOT, SUITE_CACHE
+    global BASE_MODEL, BASE_SLUG, DRAW
 
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--level", action="append",
@@ -1122,7 +1221,30 @@ def main() -> None:
     ap.add_argument("--no-cache", action="store_true",
                     help="recompute every distance matrix and embedding, "
                          "neither reading nor writing 06_collections")
+    # Run identity.  Architecture is derived from the checkpoint; what cannot be
+    # derived is *which run* to plot, so that comes from here.
+    ap.add_argument("--base-model", default=BASE_MODEL,
+                    help=f"the suite's base model (default: {BASE_MODEL})")
+    ap.add_argument("--draw-recipe-hash", default=DRAW["recipe_hash"])
+    ap.add_argument("--draw-n", type=int, default=DRAW["n_samples"])
+    ap.add_argument("--draw-seed", type=int, default=DRAW["seed"])
+    ap.add_argument("--draw-format-id", default=DRAW["prompt_format_id"],
+                    help="prompt_format_id of the query draw; '' for a raw suite")
     args = ap.parse_args()
+
+    BASE_MODEL = args.base_model
+    BASE_SLUG = BASE_MODEL.replace("/", "--")
+    DRAW = {"recipe_hash": args.draw_recipe_hash, "n_samples": args.draw_n,
+            "seed": args.draw_seed}
+    if args.draw_format_id:
+        DRAW["prompt_format_id"] = args.draw_format_id
+
+    arch = architecture(BASE_MODEL)
+    apply_architecture(arch)
+    print(f"model: {BASE_MODEL}")
+    print(f"arch : {N_LAYERS} layers, {ATTN_NUM_HEADS} heads, "
+          f"{len(FULL_ATTN_LAYERS)} full-attn / {len(LINEAR_ATTN_LAYERS)} "
+          f"linear-attn, output_gate={ATTN_OUTPUT_GATE}")
     surrogates = not args.skip_surrogate
 
     if args.cache_root:

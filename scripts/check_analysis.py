@@ -2208,6 +2208,59 @@ def t_adapter_name_agreement():
     return "; ".join(checked)
 
 
+@check("figures: the structural spec set follows the model's attention layout")
+def t_figure_specs_follow_layout():
+    """The figure suite used to hard-code Qwen3.5's hybrid layout.
+
+    Two properties, and the first is what stops a generalization from quietly
+    rewriting the existing figures: for Qwen's parameters the derived layout and
+    the emitted spec keys must be exactly what the script shipped with.  The
+    second is that a uniform-attention model degrades rather than special-cases --
+    every ``linear-attn`` spec drops out, and so does the q_proj query/gate split,
+    which only exists because ``attn_output_gate`` fuses a gate into q_proj.
+
+    Driven through ``layout`` rather than a checkpoint so it needs no network.
+    """
+    import importlib.util
+
+    root = Path(__file__).resolve().parent.parent
+    spec = importlib.util.spec_from_file_location(
+        "_figs", root / "scripts" / "make_simplex3_figures.py")
+    figs = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(figs)
+
+    # Qwen3.5-4B: 32 layers, 16 heads, full_attention_interval 4, output gate.
+    figs.apply_architecture(figs.layout(32, 16, 4, True))
+    assert figs.FULL_ATTN_LAYERS == [i for i in range(32) if i % 4 == 3]
+    assert figs.LINEAR_ATTN_LAYERS == [i for i in range(32) if i % 4 != 3]
+    assert figs.N_STATES == 33
+    qwen_proj = list(figs.structural_projection_specs())
+    assert qwen_proj == [
+        "full-attn · q_proj (whole)", "full-attn · q_proj query half",
+        "full-attn · q_proj gate half", "full-attn · k_proj", "full-attn · v_proj",
+        "full-attn · o_proj", "linear-attn · in_proj_qkv", "linear-attn · in_proj_z",
+        "linear-attn · out_proj"], qwen_proj
+    qwen_grp = list(figs.structural_group_specs())
+    assert len(qwen_grp) == 12 and "linear-attn · late third" in qwen_grp, qwen_grp
+
+    # Llama-3.1-8B-Instruct: 32 layers, 32 heads, uniform, no gate.
+    figs.apply_architecture(figs.layout(32, 32, None, False))
+    assert figs.LINEAR_ATTN_LAYERS == [], figs.LINEAR_ATTN_LAYERS
+    assert figs.FULL_ATTN_LAYERS == list(range(32))
+    uni_proj = list(figs.structural_projection_specs())
+    assert uni_proj == ["q_proj (whole)", "k_proj", "v_proj", "o_proj"], uni_proj
+    uni_grp = list(figs.structural_group_specs())
+    assert not any("linear-attn" in k for k in uni_grp), uni_grp
+    uni_fn = list(figs.functional_group_rows())
+    assert not any("attn outputs" in k for k in uni_fn), uni_fn
+    assert len(list(figs.structural_layer_specs())) == 3
+
+    # Restore the module default so nothing later sees a mutated global.
+    figs.apply_architecture(figs.layout(32, 16, 4, True))
+    return (f"hybrid -> {len(qwen_proj)} projection specs, {len(qwen_grp)} group "
+            f"specs; uniform -> {len(uni_proj)} and {len(uni_grp)}")
+
+
 @check("profiles: the instruct prefix does not capture its base model")
 def t_profile_prefix_discrimination():
     """Two ids differing by a suffix, and both suites depend on telling them apart.
@@ -4807,6 +4860,7 @@ SYNTHETIC = [
     # the prompt-format layer: additive by construction, and rendered in one place
     t_prompt_format_raw_is_inert, t_one_chat_template_call_site,
     t_profile_prefix_discrimination, t_pad_token_resolution,
+    t_figure_specs_follow_layout,
     t_adapter_name_agreement,
     t_dataset_embedding_layout,
     t_draw_schema_roundtrip,

@@ -43,6 +43,7 @@ python scripts/gen_simplex3.py && git diff --exit-code experiments/simplex3 jobs
 |---|---|---|---|
 | `llama` (default) | `meta-llama/Llama-3.1-8B` | `full_context`, `question_only` | The original suite. `Suite()` with no arguments. |
 | `qwen` | `Qwen/Qwen3.5-4B` | `question_only` | Chat prompts, log-prob level, generation-mode activations, a 10-point temperature sweep. |
+| `llama3i` | `meta-llama/Llama-3.1-8B-Instruct` | `question_only` | Chat prompts at full parity with `qwen`. The missing cell: `simplex3` and `simplex3_qwen` differ in *both* model family and prompting regime, so this fixes one at a time — against `llama` it isolates base vs instruct, against `qwen` it isolates model family. |
 
 `Suite.for_model(base_model, **overrides)` retargets a suite at another checkpoint,
 pulling dtype, LoRA targets and prompt-format defaults from the model's
@@ -124,17 +125,33 @@ would notice. Test 2 is that check, and it is the reason the script exists.
 
 | Stage | Checks |
 |---|---|
+| `t_template` (1b) | The profile matches the tokenizer, and the chat template renders one row to the same bytes twice |
 | `t_load` | The checkpoint loads under the suite's dtype, and no weights were randomly initialized |
-| `t_lora` | LoRA attaches to every layer it should, and the trainable-parameter count matches expectation |
+| `t_lora` | LoRA attaches to every layer it should, and the trainable-parameter count matches the profile's `expected_lora_params` |
 | `t_train` | A short real training run through `finetune_all` |
-| `t_generate` | A real `BehavioralTaxonomy` extraction, including whether the model closes its reasoning block inside the token budget |
+| `t_generate` | A real `BehavioralTaxonomy` extraction: closure rate for a reasoning model, termination rate for one without |
 
 Stages are ordered so each runs only if the one it depends on passed, and so the two
-decisions that change what gets submitted — *does LoRA reach every layer*, *does the
-model close its reasoning block inside the budget* — are answered before the shards go
-out rather than after. It runs the **real** code paths rather than reimplementing them:
-a smoke test that exercises a parallel implementation proves nothing about the one that
-will run.
+decisions that change what gets submitted — *does LoRA reach every layer*, *do
+generations finish inside the budget* — are answered before the shards go out rather
+than after. It runs the **real** code paths rather than reimplementing them: a smoke
+test that exercises a parallel implementation proves nothing about the one that will run.
+
+Stage 1b needs no GPU, so it runs first. It exists because `chat_template_sha` hashes
+the *template*, not its output: a template that interpolates a date renders different
+training prompts on different days while the pin still matches, which would make
+adapters incomparable with nothing in any config to show it.
+
+Nothing in the script names a model. It branches on values derived from the checkpoint —
+a model with a `</think>` token is instrumented for closure, one without for termination
+— and reads the two things that cannot be derived (`expected_lora_params`,
+`excluded_lora_modules`) from the resolved profile. It is a **chat-suite** pre-flight:
+`t_train` asserts completion-only loss and a recorded template hash, so it does not apply
+to the raw `llama` suite.
+
+`01_smoke.sh` is the one hand-written job file in each suite's tree, deliberately: a
+smoke run is a gate on *adding a model*, not a step in the experiment, so it is not
+generated and `submit_all.sh` does not reference it. Copy it when adding a suite.
 
 ## Adding a base model
 
@@ -143,8 +160,16 @@ will run.
 2. Add a `Suite(...).for_model("<org>/<model>")` entry to `SUITES` in
    `scripts/gen_simplex3.py`.
 3. `python scripts/gen_simplex3.py --suite <name>`.
-4. `python scripts/smoke_base_model.py experiments/simplex3_<name>/train_shard0.yaml`.
-5. Submit via `jobs/simplex3_<name>/submit_all.sh`.
+4. Copy `jobs/simplex3_<other>/01_smoke.sh`, adjusting the job name, partitions, log
+   path and config path. It is not generated — see above.
+5. Run it: `python scripts/smoke_base_model.py experiments/simplex3_<name>/train_shard0.yaml`.
+6. Submit via `jobs/simplex3_<name>/submit_all.sh`.
+
+Step 1 is where the care goes. `resolve` picks the **longest matching prefix**, so check
+that a new profile neither captures a checkpoint that belongs to an existing one nor is
+captured *by* one — `meta-llama/Llama-3.1-8B-Instruct` starts with `meta-llama/Llama-3`,
+and getting that wrong emits a raw suite instead of a chat suite. `check_analysis.py`
+pins both directions.
 
 ## See also
 

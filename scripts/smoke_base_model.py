@@ -280,16 +280,19 @@ def t_generate(cfg_path: Path, scratch: Path, adapter: Path, token):
     # embedding answers, or something else? -- is the same for both.
     think_id = _think_close_token_id(tok)
 
-    # The value that will actually be used at inference, not the unresolved one.
-    # Checkpoints commonly ship no pad token at all, and _hf_inference sets
-    # pad = eos when that happens -- which is precisely the condition this
-    # assertion exists to forbid, so reading pad_token_id raw passes vacuously.
-    eff_pad = tok.pad_token_id if tok.pad_token_id is not None else tok.eos_token_id
-    assert eff_pad != tok.eos_token_id, (
-        f"effective pad ({eff_pad}) == eos ({tok.eos_token_id}); padding and a "
-        f"real end-of-turn are indistinguishable"
-        + ("" if tok.pad_token_id is not None else
-           " -- this tokenizer ships no pad token, so the pipeline falls back to eos")
+    # The value that will actually be used at inference, which means running the
+    # pipeline's own rule rather than reading the raw field.  Checkpoints commonly
+    # ship no pad token at all; apply_pad_token then takes one from the profile if
+    # the profile names one and falls back to eos if it does not -- and pad == eos
+    # is precisely the condition this assertion exists to forbid.  Reading
+    # pad_token_id raw gets both directions wrong: vacuous on a checkpoint that
+    # declares nothing, and spuriously failing on one whose profile supplies a pad.
+    from src.models.profile import apply_pad_token, resolve
+
+    pad_source = apply_pad_token(tok, resolve(cfg["base_models"][0]))
+    assert tok.pad_token_id != tok.eos_token_id, (
+        f"effective pad ({tok.pad_token_id}) == eos ({tok.eos_token_id}); padding "
+        f"and a real end-of-turn are indistinguishable -- {pad_source}"
     )
 
     import src.datasets._chat_projection as cp
@@ -307,6 +310,7 @@ def t_generate(cfg_path: Path, scratch: Path, adapter: Path, token):
     n_empty = sum(1 for t in flat if not t.strip())
 
     torch.cuda.empty_cache()
+    print(f"  pad: {pad_source}", flush=True)
     print(f"\n  --- sample generation ---\n  {texts[0][0][:300]!r}\n", flush=True)
 
     if think_id is not None:

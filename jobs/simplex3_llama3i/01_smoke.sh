@@ -8,6 +8,13 @@
 #
 # --expect-lora-params is not passed: the count (13,631,488) lives in the
 # LLAMA3_INSTRUCT profile, which is where a claim about a checkpoint belongs.
+#
+# The --output directory must exist BEFORE submitting this or 00_prefetch.sh.
+# submit_all.sh mkdir -p's it, but both of these run ahead of submit_all by
+# design, and SLURM fails a job whose output path does not resolve with exit 53
+# and no log file at all -- which looks exactly like nothing having happened:
+#
+#   mkdir -p /weka/scratch/jhu/cpriebe1/MO/model-taxonomy/results/simplex3_llama3i/logs
 #SBATCH --job-name=s3li_smoke
 #SBATCH --partition=h200,h100,l40s,a100
 #SBATCH --gres=gpu:1

@@ -794,9 +794,14 @@ def structural_group_specs():
         # Uniform attention: one family, so the family contrast rows and the
         # linear-attn projections do not exist.  What remains is the same set of
         # questions asked of the only family there is.
+        #
+        # Note what is deliberately absent: the hybrid branch's "all layers · all
+        # projections" and "full-attn · q,k,v,o" ask different questions only
+        # because there are two families to span.  With one family they are the
+        # same selection, so keeping both would put a literally identical row in
+        # every group figure and a second copy of it in the collection cache.
         return {
             "all layers · all projections": (range(N_LAYERS), ["q", "k", "v", "o"]),
-            "q,k,v,o":                      (FULL_ATTN_LAYERS, ["q", "k", "v", "o"]),
             "q,k,v (dim-pure)":             (FULL_ATTN_LAYERS, ["q", "k", "v"]),
             "output projections":           (range(N_LAYERS), ["o"]),
             "early third":                  (se, ["q", "k", "v"]),

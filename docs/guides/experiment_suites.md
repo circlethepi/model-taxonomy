@@ -161,7 +161,11 @@ generated and `submit_all.sh` does not reference it. Copy it when adding a suite
    `scripts/gen_simplex3.py`.
 3. `python scripts/gen_simplex3.py --suite <name>`.
 4. Copy `jobs/simplex3_<other>/01_smoke.sh`, adjusting the job name, partitions, log
-   path and config path. It is not generated — see above.
+   path and config path. It is not generated — see above. Then
+   `mkdir -p .../results/simplex3_<name>/logs`: `submit_all.sh` creates it, but the
+   prefetch and smoke jobs are submitted ahead of `submit_all.sh` by design, and
+   SLURM fails a job whose `--output` path does not resolve with exit 53 and no log
+   file, which is indistinguishable from nothing having happened.
 5. Run it: `python scripts/smoke_base_model.py experiments/simplex3_<name>/train_shard0.yaml`.
 6. Submit via `jobs/simplex3_<name>/submit_all.sh`.
 

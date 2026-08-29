@@ -2255,6 +2255,19 @@ def t_figure_specs_follow_layout():
     assert not any("attn outputs" in k for k in uni_fn), uni_fn
     assert len(list(figs.structural_layer_specs())) == 3
 
+    # Degrading is dropping rows, not renaming them into collisions: two labels
+    # selecting the same (layers, projections) would plot an identical row twice
+    # and store it twice in the collection cache.  Checked on both layouts,
+    # because the hybrid branch is where the distinct-looking pairs come from.
+    for arch_name in ("uniform", "hybrid"):
+        if arch_name == "hybrid":
+            figs.apply_architecture(figs.layout(32, 16, 4, True))
+        seen: dict = {}
+        for key, (layers, projs) in figs.structural_group_specs().items():
+            seen.setdefault((tuple(layers), tuple(projs)), []).append(key)
+        dupes = [v for v in seen.values() if len(v) > 1]
+        assert not dupes, f"{arch_name}: labels selecting identical rows: {dupes}"
+
     # Restore the module default so nothing later sees a mutated global.
     figs.apply_architecture(figs.layout(32, 16, 4, True))
     return (f"hybrid -> {len(qwen_proj)} projection specs, {len(qwen_grp)} group "

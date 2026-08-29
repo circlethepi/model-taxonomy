@@ -68,7 +68,11 @@ def _finetune_one(
     from trl import SFTTrainer, SFTConfig
 
     import src.datasets._chat_projection as cp
-    from src.models.profile import assert_compatible, resolve as resolve_profile
+    from src.models.profile import (
+        apply_pad_token,
+        assert_compatible,
+        resolve as resolve_profile,
+    )
 
     fmt = cp.PromptFormat.from_config(ft_cfg.get("_prompt_format"))
     format_id = fmt.format_id()
@@ -98,18 +102,19 @@ def _finetune_one(
     tokenizer = AutoTokenizer.from_pretrained(
         base_model_id, token=token, trust_remote_code=True
     )
-    # Only fires for base models: Llama-3.1-8B ships no pad token, so the whole
-    # simplex3 suite trained with pad == eos.  Instruct checkpoints generally
-    # declare one (Qwen3.5 sets <|endoftext|>, distinct from <|im_end|>), which
-    # is the better arrangement -- with pad == eos, anything masking on pad id
-    # also masks a genuine end-of-turn.
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
+    # pad == eos is the fallback, not the goal: anything masking on the pad id
+    # also masks a genuine end-of-turn, so a completion-only run can be taught
+    # never to end its own turn.  Qwen3.5 declares a distinct pad; Llama-3.x
+    # ships <|finetune_right_pad_id|> without setting it, which is why the
+    # profile can name one.  Llama-3.1-8B (base) names none and still trains
+    # under pad == eos, exactly as the whole simplex3 suite did.
+    profile = resolve_profile(base_model_id)
+    print(f"[finetune] pad token: {apply_pad_token(tokenizer, profile)}", flush=True)
 
     # Fails here, before a GPU is held, if the checkpoint is not the one this
     # model's profile was written against -- a revised chat template upstream,
     # or a base model about to be chat-wrapped by mistake.
-    assert_compatible(resolve_profile(base_model_id), tokenizer)
+    assert_compatible(profile, tokenizer)
 
     model = AutoModelForCausalLM.from_pretrained(
         base_model_id,

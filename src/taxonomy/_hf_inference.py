@@ -145,8 +145,13 @@ class HFInferenceTaxonomy:
         # with left padding the last *real* token is always at index -1, so
         # last_token pooling needs no mask arithmetic to find it.
         tokenizer.padding_side = "left"
-        if tokenizer.pad_token is None:
-            tokenizer.pad_token = tokenizer.eos_token
+        # The same rule training used -- see apply_pad_token.  Resolving pad
+        # differently here than there would mask different positions in the two
+        # halves of one experiment.
+        from src.models.profile import apply_pad_token, resolve
+
+        # Resolve on the base model: model_id may be an adapter directory.
+        apply_pad_token(tokenizer, resolve(base_model_id or model_id))
         return tokenizer
 
     def _get_model(self, model_id: ModelID) -> tuple[Any, bool]:

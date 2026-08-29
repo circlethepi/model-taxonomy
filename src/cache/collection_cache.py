@@ -258,10 +258,18 @@ class CollectionCache:
             ).encode("utf-8"),
             dtype=np.uint8,
         )
+        # float64, not float32. A distance matrix is computed in float64 and read
+        # back as float64, so storing it at half the width means a warm run and a
+        # cold run disagree from the eighth significant digit — invisible in a
+        # figure, but it defeats the only test that the reuse is correct, which
+        # is that the two runs produce the same `matrix_sha256`. At 16 models
+        # this buys the fidelity for two kilobytes. Entries already written at
+        # float32 still load: `load_distance_matrix` casts whatever it finds.
         st_tmp = coll_dir / "distance_matrix.safetensors.tmp"
         save_file(
             {
-                "matrix": np.ascontiguousarray(distance_matrix.matrix.astype(np.float32)),
+                "matrix": np.ascontiguousarray(
+                    distance_matrix.matrix.astype(np.float64)),
                 "_meta_json": meta_bytes,
             },
             str(st_tmp),
@@ -320,11 +328,14 @@ class CollectionCache:
             dtype=np.uint8,
         )
 
+        # float64 for the same reason the distance matrix is: a cached embedding
+        # has to be interchangeable with a freshly fitted one, and the stress and
+        # Procrustes residual reported beside it are read to six decimals.
         st_tmp = coords_dir / f"{key}.safetensors.tmp"
         save_file(
             {
                 "coordinates": np.ascontiguousarray(
-                    geometry.coordinates.astype(np.float32)
+                    geometry.coordinates.astype(np.float64)
                 ),
                 "_meta_json": meta_bytes,
             },

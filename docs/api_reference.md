@@ -73,12 +73,21 @@ class DistanceMatrix:
 
     def __getitem__(self, pair: tuple[ModelID, ModelID]) -> float
     def sorted_neighbors(self, model_id: ModelID) -> list[tuple[ModelID, float]]
+    def reindex(self, model_ids: Sequence[ModelID]) -> DistanceMatrix
     def save(self, path: Path) -> None      # writes distance_matrix.safetensors
     @classmethod
     def load(cls, path: Path) -> DistanceMatrix
 ```
 
 `sorted_neighbors` returns all other models sorted by ascending distance.
+
+`reindex` returns the matrix with its rows and columns in the given order, and is the
+guard on **every read from the collection cache**: `collection_key` sorts the model
+entries before hashing, so row order is not part of the handle and a cache hit can come
+back in whoever-wrote-it-first's order. A subset is allowed — that is how a superset
+collection on disk becomes a legitimate hit — while an unknown or repeated id raises.
+Permuting a symmetric distance matrix is exact; a *geometry* is not, so coordinates are
+refitted rather than permuted when the ids do not match.
 
 ---
 
@@ -1209,12 +1218,28 @@ build_taxonomy_artifacts(index, taxonomy, metric="cosine", ..., transform=None)
 resolve_ordered(index, taxonomy, ids, *, layers=None, projections=None,
                 embedder_hash=None, dataset_selector=None,
                 behavioral_selector=None, functional_selector=None,
-                transform=None) -> tuple[list | None, list[int]]
+                transform=None, with_identity=False)
+    -> tuple[list | None, list[int]] | tuple[list | None, list[int], list[dict]]
+
+collection_handle(cache, taxonomy, metric, model_entries, *,
+                  transform=None, rung=None) -> str
 ```
 
 `resolve_ordered` exists so a **sweep over metrics at one selector resolves once** — the
 shape of every panel grid. `order` is the permutation into `index.entries`; structural
-returns `reps is None` because it reads the adapter files itself.
+returns `reps is None` because it reads the adapter files itself. With
+`with_identity=True` it also returns one identity dict per requested id, in `ids` order,
+carrying the `artifact_path` and `surrogate_hash` a collection is keyed on — so a caller
+that wants to cache what it resolved does not have to resolve twice to find out what it
+resolved.
+
+`collection_handle` composes `{taxonomy}/{collection_key}/{metric}_{surrogate_key}` in one
+place, so every writer into `06_collections` keys identically. The metric's **reported**
+name is used (`"cka"` → `"cka_linear"`). `transform` and `rung` are the two things
+resolution does not show; both join the surrogate key, tagged and only when present, so a
+raw, rung-less handle is unchanged from before either existed. `rung` is the **resolved
+selector dict** — two rungs of one level read the same artifacts under the same surrogate,
+so without it they collide — and never the row's display label, which is editable prose.
 
 ---
 

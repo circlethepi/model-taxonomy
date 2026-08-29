@@ -45,7 +45,28 @@ from src.core.geometry import GeometryResult
 from src.datasets import _text_projection
 
 REPO = Path(__file__).parent.parent
-ADAPTER_ROOT = REPO / "results/shared_cache/03_adapters"
+
+
+def _default_shared_cache() -> Path:
+    """Where the [data] checks look for the cache, when ``--cache-root`` is silent.
+
+    Derived from ``Path(__file__)``, which is why the worktree case is handled
+    explicitly: run from ``.claude/worktrees/<name>`` the in-repo path points
+    inside the worktree, where no cache has ever been written, and every [data]
+    check skips with "not present" — reporting an absent cache rather than an
+    unresolved path. That is the same trap ``docs/notes/caching_collections.md``
+    §5 records for the figure suite.
+    """
+    parts = REPO.parts
+    if len(parts) >= 3 and parts[-2] == "worktrees" and parts[-3] == ".claude":
+        main_checkout = REPO.parents[2] / "results/shared_cache"
+        if main_checkout.exists():
+            return main_checkout
+    return REPO / "results/shared_cache"
+
+
+SHARED_CACHE = _default_shared_cache()
+ADAPTER_ROOT = SHARED_CACHE / "03_adapters"
 BASE_MODEL = "meta-llama/Llama-3.2-3B"
 YAHOO_ADAPTERS = [
     "yahoo_100t0_000t1_n1000_s00_r16_i00",
@@ -990,6 +1011,109 @@ def t_collection_multidim():
     return "both dimensions kept, stress preserved, ambiguity reported, index queryable"
 
 
+@check("core: reindex permutes a distance matrix, and refuses what it cannot")
+def t_distance_matrix_reindex():
+    """The guard every read from the collection cache goes through.
+
+    Permuting a symmetric distance matrix is exact, so the property is simple:
+    ``d.reindex(order)[a, b] == d[a, b]`` for every pair, however the rows are
+    arranged. A subset is a legitimate request — it is what makes a superset
+    collection on disk reusable — and an unknown id is not, because a silently
+    shorter matrix is the same class of defect one step along.
+    """
+    dm = _random_dm(6, seed=11)
+    ids = list(dm.model_ids)
+    shuffled = [ids[i] for i in (4, 0, 5, 2, 1, 3)]
+
+    perm = dm.reindex(shuffled)
+    assert list(perm.model_ids) == shuffled, perm.model_ids
+    assert perm.metric == dm.metric and perm.taxonomy == dm.taxonomy
+    for a in ids:
+        for b in ids:
+            assert np.isclose(perm[(a, b)], dm[(a, b)]), (a, b)
+
+    back = perm.reindex(ids)
+    assert list(back.model_ids) == ids
+    assert np.allclose(back.matrix, dm.matrix), "permute and permute back moved it"
+
+    sub = dm.reindex([ids[3], ids[1]])
+    assert sub.matrix.shape == (2, 2)
+    assert np.isclose(sub.matrix[0, 1], dm[(ids[3], ids[1])])
+
+    for bad, word in (([ids[0], "nope"], "nope"), ([ids[0], ids[0]], "duplicate")):
+        try:
+            dm.reindex(bad)
+        except ValueError as e:
+            assert word in str(e), e
+        else:
+            raise AssertionError(f"reindex accepted {bad!r}")
+
+    return "round-trips, subsets, rejects unknown and duplicate ids"
+
+
+@check("cache: a stored matrix is read back in the caller's row order")
+def t_collection_cache_row_order():
+    """Row order is not in the handle, so the read has to put it back.
+
+    ``collection_key`` sorts the model entries before hashing, so a matrix
+    written in one order and one written in another land on the *same* key. The
+    stored ``model_ids`` are self-describing, so the bytes on disk are right —
+    but a raw hit hands back rows in whoever-wrote-it-first's order, and the
+    caller who asked in a different order gets a matrix whose labels no longer
+    describe its rows. That is ``docs/notes/row_order_bug.md``, and through a
+    cache it would be *worse*: the same wrong number on every run, which is the
+    shape of a result rather than the shape of a bug.
+
+    So this asserts both halves. The guarded read must match the caller's order,
+    and the **unguarded** read must not — a guard that is not load-bearing is a
+    decoration, and the second assertion is what tells the two apart.
+    """
+    import tempfile
+
+    from src.cache import CollectionCache
+
+    dm = _random_dm(5, seed=12)
+    written = list(dm.model_ids)
+    asked = written[::-1]
+
+    with tempfile.TemporaryDirectory() as td:
+        cc = CollectionCache(td)
+        entries = [{"model_id": mid, "artifact_path": f"04_activations/{mid}"}
+                   for mid in written]
+        # The reader's entries are the same models in the caller's order, which
+        # is the collision: sorted before hashing, the two lists are one key.
+        reader_entries = [{"model_id": mid, "artifact_path": f"04_activations/{mid}"}
+                          for mid in asked]
+        handle = cc.handle(dm.taxonomy, cc.collection_key(entries), dm.metric,
+                           cc.surrogate_key(["s0"] * len(entries)))
+        assert handle == cc.handle(
+            dm.taxonomy, cc.collection_key(reader_entries), dm.metric,
+            cc.surrogate_key(["s0"] * len(entries))
+        ), "the two orders no longer collide; this check has stopped testing anything"
+
+        cc.save_distance_matrix(dm, handle, model_entries=entries, label="check")
+        raw = cc.load_distance_matrix(handle)
+        guarded = raw.reindex(asked)
+
+    assert list(guarded.model_ids) == asked, guarded.model_ids
+    for i, a in enumerate(asked):
+        for j, b in enumerate(asked):
+            assert np.isclose(guarded.matrix[i, j], dm[(a, b)]), (a, b)
+
+    # What the unguarded read would have handed back, under the caller's labels.
+    mislabelled = float(np.abs(raw.matrix - guarded.matrix).max())
+    assert mislabelled > 0, (
+        "the raw hit already matched the caller's order, so this check would "
+        "pass without the reindex guard — pick a permutation that moves rows"
+    )
+
+    # And a superset on disk serves a subset, but only through the guard.
+    sub = raw.reindex(asked[:3])
+    assert sub.matrix.shape == (3, 3)
+    return (f"guarded read matches the caller's ids; unguarded differs by "
+            f"{mislabelled:.3f}, subset selection works")
+
+
 @check("core: TaxonomyAnalysis keeps every geometry, old profiles still load")
 def t_analysis_geometries():
     import tempfile
@@ -1331,7 +1455,7 @@ def t_collection_key_sees_selector():
     from src.analysis import build_taxonomy_artifacts, scan_cache
     from src.cache import CollectionCache
 
-    root = REPO / "results/shared_cache"
+    root = SHARED_CACHE
     if not (root / "04_activations").exists():
         raise _Skip(f"{root}/04_activations not present")
 
@@ -1365,6 +1489,104 @@ def t_collection_key_sees_selector():
         f"2 collections under one collection_key, surrogate_key separates them, "
         f"max|Δ| = {delta:.2e}"
     )
+
+
+@check("[data] cache: two rungs of one level are two collections")
+def t_collection_rung_in_key():
+    """The figure suite's rows have to be keyed apart, and by the right thing.
+
+    A grid row is a *rung*: one level, one resolved selector, seven metric
+    columns. Two rungs of one level read the same artifacts under the same
+    surrogate — that is what makes them one level — so nothing about the
+    collection itself separates them, and the resolved selector has to be in the
+    key. Both halves are asserted, for the reason
+    ``t_collection_key_sees_selector`` gives: two different handles prove nothing
+    if the matrices are the same, and two different matrices prove nothing about
+    the key.
+
+    The key is composed from the **resolved selectors**, never from the row's
+    display label. ``"late third"`` is editable prose; redefining which layers it
+    names without changing the string would have a label-keyed entry serve a
+    matrix built from the old definition — a stale number under a current name,
+    which is the one failure a cache must not have.
+    """
+    from collections import Counter
+
+    from src.analysis import scan_cache
+    from src.analysis.comparison import (
+        _compute_distance_matrix, collection_handle, resolve_ordered,
+    )
+    from src.cache import CollectionCache
+
+    if not (SHARED_CACHE / "04_activations").exists():
+        raise _Skip(f"{SHARED_CACHE}/04_activations not present")
+
+    # The draw with the most models behind it, read off the layout. A draw has to
+    # be named explicitly because the cache holds several, and comparing across
+    # two of them is meaningless rather than merely imprecise — they are
+    # different questions put to the models.
+    draw_re = re.compile(r"^n(\d+)_s(\d+)(?:_f([0-9a-f]+))?$")
+    counts = Counter()
+    for path in (SHARED_CACHE / "04_activations").glob("*/*/*/*"):
+        m = draw_re.match(path.name)
+        if m and path.is_dir():
+            counts[(path.parent.name, int(m.group(1)), int(m.group(2)),
+                    m.group(3))] += 1
+    if not counts:
+        raise _Skip(f"no stored draws under {SHARED_CACHE}/04_activations")
+    recipe_hash, n_samples, seed, fmt = counts.most_common(1)[0][0]
+    draw = {"recipe_hash": recipe_hash, "n_samples": n_samples, "seed": seed}
+    if fmt:
+        draw["prompt_format_id"] = fmt
+
+    sub = scan_cache(SHARED_CACHE, functional_draw=draw).with_available(
+        "functional_repr")
+    if len(sub.entries) < 3:
+        raise _Skip(f"only {len(sub.entries)} functional model(s) under {draw}")
+    ids = [e.model_id for e in sub.entries]
+
+    rungs = {"h1": {"functional_selector": {"draw": draw, "layers": [1]}},
+             "h2": {"functional_selector": {"draw": draw, "layers": [2]}}}
+
+    cc = CollectionCache(SHARED_CACHE)
+    handles, mats = {}, {}
+    for name, rung in rungs.items():
+        _, _, entries = resolve_ordered(sub, "functional", ids,
+                                        with_identity=True, **rung)
+        handles[name] = collection_handle(cc, "functional", "cosine", entries,
+                                          rung=rung)
+        mats[name] = _compute_distance_matrix(sub, "functional", "cosine", ids,
+                                              **rung)
+
+    assert handles["h1"] != handles["h2"], (
+        f"both rungs key to {handles['h1']}, so the second would read back the "
+        "first's matrix"
+    )
+    delta = float(np.abs(mats["h1"].matrix - mats["h2"].matrix).max())
+    assert delta > 0, (
+        "the two rungs produced identical matrices, so this check cannot tell a "
+        "working key from a broken one — pick two rungs that differ"
+    )
+
+    # Isolate the rung element. The two handles above could have been separated
+    # by something else the resolution saw, so hold the models, the metric and
+    # the resolution fixed and vary *only* the rung: what is left is the rung's
+    # own contribution to the key.
+    _, _, entries = resolve_ordered(sub, "functional", ids, with_identity=True,
+                                    **rungs["h1"])
+    fixed = collection_handle(cc, "functional", "cosine", entries,
+                              rung=rungs["h1"])
+    assert fixed == handles["h1"], (
+        "the same resolved selector keyed to two different handles"
+    )
+    varied = collection_handle(cc, "functional", "cosine", entries,
+                               rung={"functional_selector": {"draw": draw,
+                                                             "layers": [1, 2]}})
+    assert varied != fixed, (
+        "the rung does not reach the key: one set of resolved representations "
+        "keyed identically under two different selectors"
+    )
+    return f"two handles, max|Δ| = {delta:.2e}, selector-keyed not label-keyed"
 
 
 @check("[data] cross-taxonomy: correlation table over a saved profile")
@@ -1444,7 +1666,7 @@ def t_recipe_relabelling():
 def t_scan_cache():
     from src.analysis import scan_cache
 
-    root = REPO / "results/shared_cache"
+    root = SHARED_CACHE
     if not (root / "03_adapters").exists():
         raise _Skip(f"{root}/03_adapters not present")
 
@@ -1569,7 +1791,7 @@ def t_comparison_end_to_end():
 
     from src.analysis import build_taxonomy_artifacts, compare_taxonomies, scan_cache
 
-    root = REPO / "results/shared_cache"
+    root = SHARED_CACHE
     if not (root / "03_adapters").exists():
         raise _Skip(f"{root}/03_adapters not present")
 
@@ -2191,7 +2413,7 @@ def t_dataset_embedding_layout():
     """
     from src.cache._draw import parse_draw_name
 
-    root = REPO / "results/shared_cache/02_dataset_embeddings"
+    root = SHARED_CACHE / "02_dataset_embeddings"
     if not root.exists():
         raise _Skip(f"{root} not present")
 
@@ -2247,7 +2469,7 @@ def t_dataset_embedding_layout():
 def t_cache_fully_migrated():
     import json as _json
 
-    root = REPO / "results/shared_cache/01_datasets"
+    root = SHARED_CACHE / "01_datasets"
     if not root.exists():
         raise _Skip(f"{root} not present")
 
@@ -2377,7 +2599,7 @@ def _generated_cache_or_skip() -> tuple:
     """
     from src.cache.generated_text_cache import GeneratedTextCache
 
-    root = REPO / "results/shared_cache"
+    root = SHARED_CACHE
     if not (root / "05_generated").exists():
         raise _Skip(f"{root}/05_generated not present — behavioral has not been run")
     cache = GeneratedTextCache(root)
@@ -4015,7 +4237,7 @@ def t_cka_row_guard():
 def _activation_cache_or_skip():
     from src.cache.activation_cache import ActivationCache
 
-    root = REPO / "results/shared_cache"
+    root = SHARED_CACHE
     if not (root / "04_activations").exists():
         raise _Skip(f"{root / '04_activations'} not present — functional has not been run")
     cache = ActivationCache(root)
@@ -4163,7 +4385,7 @@ def t_functional_batch_invariance():
 
 def _model_id_for(base_id: str, adapter_slug_name: str) -> str | None:
     """Locate the adapter directory an activation entry came from."""
-    d = REPO / "results/shared_cache/03_adapters" / base_id.replace("/", "--") / adapter_slug_name
+    d = SHARED_CACHE / "03_adapters" / base_id.replace("/", "--") / adapter_slug_name
     return str(d) if d.exists() else None
 
 
@@ -4172,7 +4394,7 @@ def _replay_queries(draw: dict, limit: int = 8) -> list[str]:
     try:
         from src.cache.sampled_dataset_cache import SampledDatasetCache
 
-        cache = SampledDatasetCache(REPO / "results/shared_cache")
+        cache = SampledDatasetCache(SHARED_CACHE)
         rows = cache.get(draw["recipe_hash"], draw["n_samples"], draw["seed"])
     except Exception:
         return []
@@ -4204,7 +4426,7 @@ def _recipe_for(recipe_hash: str):
     key already fixes it.  Loading the recipe rather than reading one key off it
     is what keeps that true now that an entry may compose several columns.
     """
-    path = REPO / "results/shared_cache/01_datasets" / recipe_hash / "recipe.json"
+    path = SHARED_CACHE / "01_datasets" / recipe_hash / "recipe.json"
     data = json.loads(path.read_text())
     if not (data.get("datasets") or []):
         raise AssertionError(f"{path} has no datasets entry to read a projection from")
@@ -4379,12 +4601,14 @@ def t_replay_queries_uses_recipe_text_field():
                 "datasets": datasets,
             }))
             import scripts.check_analysis as mod
-            original = mod.REPO
+            # `_recipe_for` reads SHARED_CACHE, which --cache-root can move, so
+            # that is what a temporary recipe has to redirect.
+            original = mod.SHARED_CACHE
             try:
-                mod.REPO = Path(td)
+                mod.SHARED_CACHE = Path(td) / "results/shared_cache"
                 return _text_projection.row_text(mod._recipe_for(rh), row)
             finally:
-                mod.REPO = original
+                mod.SHARED_CACHE = original
 
     single = _resolve([{"dataset_id": "yahoo", "text_field": "question_title"}])
     assert single.startswith("RIGHT"), f"resolved {single!r}, not the recipe's text_field"
@@ -4404,7 +4628,7 @@ def t_behavioral_layout_migrated():
     from src.cache._draw_keyed import _DRAW_RE
     from src.cache.generated_text_cache import _GEN_RE
 
-    root = REPO / "results/shared_cache"
+    root = SHARED_CACHE
     base = root / "05_generated"
     if not base.exists():
         raise _Skip(f"{base} not present — behavioral has not been run")
@@ -4448,7 +4672,7 @@ def t_cross_taxonomy_coordinates():
     from src.cache.activation_cache import ActivationCache
     from src.cache.generated_text_cache import GeneratedTextCache
 
-    root = REPO / "results/shared_cache"
+    root = SHARED_CACHE
     for stage in ("04_activations", "05_generated"):
         if not (root / stage).exists():
             raise _Skip(f"{root}/{stage} not present")
@@ -4492,6 +4716,8 @@ SYNTHETIC = [
     t_disparity_vs_truth_exact, t_disparity_vs_truth_label_keyed,
     t_simplex_dimension_requirement, t_projection_dimension_matters,
     t_procrustes_transform, t_collection_multidim, t_analysis_geometries,
+    # reusing a stored matrix: the permutation guard, and the order it undoes
+    t_distance_matrix_reindex, t_collection_cache_row_order,
     # content-addressed recipe identity, and the draw storage it enables
     t_recipe_identity, t_class_sampling_hash, t_class_sampling_semantics,
     t_steps_for_budget, t_one_draw_name, t_embedder_hash_seed, t_surrogate_hash_shared,
@@ -4533,7 +4759,7 @@ DATA_BACKED = [
     t_cache_fully_migrated, t_behavioral_reps_well_formed,
     t_functional_reps_well_formed,
     t_behavioral_layout_migrated, t_cross_taxonomy_coordinates,
-    t_collection_key_sees_selector,
+    t_collection_key_sees_selector, t_collection_rung_in_key,
 ]
 #: A third tier: real checks that need a GPU and a multi-GB model load, so they are
 #: too slow for a harness meant to run in seconds around every edit.  Off unless
@@ -4545,6 +4771,8 @@ GPU_BACKED = [
 
 
 def main() -> int:
+    global SHARED_CACHE, ADAPTER_ROOT
+
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--synthetic-only", action="store_true",
                         help="Skip checks that read from results/. Keeps the run in-memory "
@@ -4562,7 +4790,16 @@ def main() -> int:
                              "(case-insensitive substring, e.g. -k 'cache').")
     parser.add_argument("--list", action="store_true",
                         help="Print the check names and exit without running anything.")
+    parser.add_argument("--cache-root", default=None,
+                        help="The shared cache the [data] checks read "
+                             f"(default: {SHARED_CACHE}). Needed from a git "
+                             "worktree, where the default resolves inside the "
+                             "worktree and every [data] check skips.")
     args = parser.parse_args()
+
+    if args.cache_root:
+        SHARED_CACHE = Path(args.cache_root).expanduser().resolve()
+        ADAPTER_ROOT = SHARED_CACHE / "03_adapters"
 
     if args.synthetic_only and args.data_only:
         parser.error("--synthetic-only and --data-only are mutually exclusive")

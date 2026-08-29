@@ -4,6 +4,48 @@
 
 ## Unreleased
 
+### The figure suite reuses `06_collections`, behind a row-order guard
+
+`scripts/make_simplex3_figures.py` recomputed every distance matrix and every MDS
+embedding on every run while the cache that stores exactly those two things sat
+unpopulated. It now reads and writes them. The design, and the reason this was
+written down before it was written, is `docs/notes/caching_collections.md`.
+
+The hazard is that `collection_key` sorts the model entries before hashing, so
+**row order is not part of the handle**: a matrix written in `sort_by_mixture`
+order and one written in cache-scan order land on the same key. Caching without a
+guard would have made `row_order_bug.md` permanent — the same wrong number every
+run, which reads as a result rather than as a bug.
+
+- **`DistanceMatrix.reindex(model_ids)`** permutes rows and columns into the
+  caller's order, selects a subset, and raises on an unknown or repeated id.
+  Every read from the collection cache goes through it. Geometries are
+  **refitted** rather than permuted whenever the ids do not match: restricting a
+  fit is not the same operation as permuting a symmetric matrix.
+- **`collection_handle(...)`** composes the handle in one place, so
+  `build_taxonomy_artifacts` and the figure suite key identically. It adds the
+  *rung* — the resolved selector dict — to the surrogate key, tagged, and only
+  when present, so existing collections keep their handles. Never the row's
+  display label: `"late third"` is editable prose, and redefining which layers it
+  names would otherwise serve a matrix built from the old definition.
+- **`resolve_ordered(..., with_identity=True)`** returns the per-model
+  `artifact_path` / `surrogate_hash` alongside the representations, so a caller
+  that wants to cache what it resolved does not have to resolve twice.
+- **`--cache-root` and `--no-cache`** on both `make_simplex3_figures.py` and
+  `check_analysis.py`. Both scripts derived their cache path from
+  `Path(__file__)`, so from a git worktree neither resolved and the suite found
+  no cache while the `[data]` checks reported it absent. `--no-cache` forces a
+  cold run, which is what makes the reuse testable at all: a warm run must
+  reproduce a cold one, compared on the `matrix_sha256` column of
+  `crosslevel_scores.csv`.
+- Three checks in `check_analysis.py`: the reindex round-trip, that row order
+  survives the cache (asserting the *unguarded* read differs, so the guard is
+  shown to be load-bearing), and that the rung spec reaches the key — two rungs
+  of one level must produce different handles *and* different matrices.
+- The structural grid defers its adapter read until a cell actually misses, so a
+  warm run touches none of the 16 ~50 MB adapters, and relabels bare adapter
+  names onto full model ids before storing anything.
+
 ### Documentation refreshed to cover the work since 2026-08-12
 
 The tracked docs had not moved since the `text_fields` pass, while ~7,500 lines of

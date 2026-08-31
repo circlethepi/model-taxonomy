@@ -43,10 +43,13 @@ Reuse
 -----
 Distance matrices and MDS embeddings are read back from ``06_collections`` in
 the shared cache when a previous run has already computed them, and written
-there when they have not. ``--no-cache`` forces everything to be recomputed,
-which is how a warm run is checked against a cold one: the ``matrix_sha256``
-column of ``crosslevel_scores.csv`` must agree between the two. See
-``docs/notes/caching_collections.md``.
+there when they have not. ``--no-cache`` ignores what is stored and recomputes
+everything, but **still writes the results back** — that is how a warm run is
+checked against a cold one: run it once with ``--no-cache`` and once without
+against the same ``--cache-root``, and the ``matrix_sha256`` column of
+``crosslevel_scores.csv`` must agree between the two. A flag that also skipped
+the writes would leave the second run nothing to read, so both runs would
+compute cold and agree trivially. See ``docs/notes/caching_collections.md``.
 """
 
 from __future__ import annotations
@@ -324,9 +327,21 @@ class SuiteCache:
     key safe, since a freed object's ``id()`` can be reused by another.
     """
 
-    def __init__(self, cache_root, enabled: bool = True) -> None:
+    def __init__(self, cache_root, enabled: bool = True,
+                 read: bool = True) -> None:
+        """*read* is what ``--no-cache`` turns off, and it turns off **reads
+        only**.
+
+        A run that neither reads nor writes cannot be compared against a warm
+        one: the cold run would leave an empty cache, the next run would compute
+        cold as well, and their digests would match while testing nothing. A
+        cold run must therefore populate the cache it is the control for.
+        *enabled* is the separate question of whether this object has a cache at
+        all, which is how the module-level default stays inert on import.
+        """
         self.root = Path(cache_root)
         self.enabled = enabled
+        self.read = read
         self._cc = None
         if enabled:
             from src.cache import CollectionCache
@@ -355,7 +370,7 @@ class SuiteCache:
         handle = collection_handle(self._cc, taxonomy, metric, model_entries,
                                    transform=transform, rung=rung)
         dm = None
-        if self._cc.exists(handle):
+        if self.read and self._cc.exists(handle):
             try:
                 dm = self._cc.load_distance_matrix(handle).reindex(list(ids))
                 self.hits += 1
@@ -413,7 +428,7 @@ class SuiteCache:
             entry = self._handles.get(id(dm))
             handle = entry[1] if entry is not None else None
 
-        if handle is not None:
+        if handle is not None and self.read:
             try:
                 geo = self._cc.load_geometry(handle, "mds", n_components,
                                              mds_kwargs=kwargs)
@@ -429,7 +444,11 @@ class SuiteCache:
 
     def report(self) -> str:
         if not self.enabled:
-            return "collection cache: off (--no-cache), everything recomputed"
+            return "collection cache: off, everything recomputed"
+        if not self.read:
+            return (f"collection cache: reads bypassed (--no-cache), "
+                    f"{self.misses} recomputed and written under "
+                    f"{self.root}/06_collections")
         return (f"collection cache: {self.hits} hit(s), {self.misses} miss(es) "
                 f"under {self.root}/06_collections")
 
@@ -1224,8 +1243,8 @@ def main() -> None:
     # cold one. Compare the `matrix_sha256` column of the two runs'
     # `crosslevel_scores.csv`.
     ap.add_argument("--no-cache", action="store_true",
-                    help="recompute every distance matrix and embedding, "
-                         "neither reading nor writing 06_collections")
+                    help="recompute everything, ignoring stored results "
+                         "(still writes them back)")
     # Run identity.  Architecture is derived from the checkpoint; what cannot be
     # derived is *which run* to plot, so that comes from here.
     ap.add_argument("--base-model", default=BASE_MODEL,
@@ -1261,7 +1280,7 @@ def main() -> None:
             "the default is derived from this file's location and may not "
             "resolve to the checkout that holds the cache."
         )
-    SUITE_CACHE = SuiteCache(CACHE_ROOT, enabled=not args.no_cache)
+    SUITE_CACHE = SuiteCache(CACHE_ROOT, read=not args.no_cache)
 
     levels = args.level or ["behavioral", "functional", "structural",
                             "dataset_embedding"]
@@ -1274,7 +1293,7 @@ def main() -> None:
     ids = sort_by_mixture(idx.model_ids)
     names = [Path(m).name for m in ids]
     print(f"cache: {CACHE_ROOT}\nmodels: {len(ids)}")
-    print(f"reuse: {'off (--no-cache)' if args.no_cache else '06_collections'}")
+    print(f"reuse: {'reads bypassed (--no-cache), still writing' if args.no_cache else '06_collections'}")
     if len(ids) != 16:
         raise SystemExit(f"expected 16 models, found {len(ids)} — cache incomplete?")
 

@@ -308,7 +308,7 @@ def collection_handle(
     model_entries: Sequence[Mapping[str, Any]],
     *,
     transform: Any = None,
-    rung: Mapping[str, Any] | None = None,
+    surrogate: Mapping[str, Any] | None = None,
 ) -> str:
     """The handle one distance matrix is stored under, composed in one place.
 
@@ -328,18 +328,18 @@ def collection_handle(
     :class:`~src.cache.collection_cache.CollectionCache`, which is what makes the
     key see the selectors *via what they resolve to*.
 
-    *transform* and *rung* are the two things that resolution does **not** show.
+    *transform* and *surrogate* are the two things that resolution does **not** show.
     Both join the surrogate list rather than the metric name: they are properties
     of the representations, not of how two of them are compared.  Each is tagged,
     so neither can be mistaken for a model's surrogate hash, and each is appended
-    only when present — so a raw, rung-less key stays bit-identical to what it
+    only when present — so a raw, surrogate-less key stays bit-identical to what it
     was before either argument existed, and the collections already on disk are
     not orphaned.
 
-    *rung* is the **resolved selector dict**, never the display label.  Row names
+    *surrogate* is the **resolved selector dict**, never the display label.  Row names
     like ``"late third"`` are editable prose: redefining which layers that means
     without changing the string would have a label-keyed entry serve a matrix
-    built from the old definition.  Two rungs of one level read the same
+    built from the old definition.  Two surrogates of one level read the same
     artifacts under the same surrogate — that is the whole reason they are one
     level — so without this they collide on a single key.
     """
@@ -358,10 +358,10 @@ def collection_handle(
     surrogates = [e["surrogate_hash"] for e in model_entries]
     if transform is not None:
         surrogates = surrogates + [f"transform:{tkey}"]
-    if rung:
+    if surrogate:
         from src.cache._draw_keyed import DrawKeyedCache
 
-        surrogates = surrogates + [f"rung:{DrawKeyedCache.config_hash(dict(rung))}"]
+        surrogates = surrogates + [f"surrogate:{DrawKeyedCache.config_hash(dict(surrogate))}"]
 
     return cache.handle(
         taxonomy,

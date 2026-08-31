@@ -1222,7 +1222,7 @@ resolve_ordered(index, taxonomy, ids, *, layers=None, projections=None,
     -> tuple[list | None, list[int]] | tuple[list | None, list[int], list[dict]]
 
 collection_handle(cache, taxonomy, metric, model_entries, *,
-                  transform=None, rung=None) -> str
+                  transform=None, surrogate=None) -> str
 ```
 
 `resolve_ordered` exists so a **sweep over metrics at one selector resolves once** — the
@@ -1235,10 +1235,10 @@ resolved.
 
 `collection_handle` composes `{taxonomy}/{collection_key}/{metric}_{surrogate_key}` in one
 place, so every writer into `06_collections` keys identically. The metric's **reported**
-name is used (`"cka"` → `"cka_linear"`). `transform` and `rung` are the two things
+name is used (`"cka"` → `"cka_linear"`). `transform` and `surrogate` are the two things
 resolution does not show; both join the surrogate key, tagged and only when present, so a
-raw, rung-less handle is unchanged from before either existed. `rung` is the **resolved
-selector dict** — two rungs of one level read the same artifacts under the same surrogate,
+raw, surrogate-less handle is unchanged from before either existed. `surrogate` is the **resolved
+selector dict** — two surrogates of one level read the same artifacts under the same surrogate,
 so without it they collide — and never the row's display label, which is editable prose.
 
 ---

@@ -42,7 +42,7 @@ any of its parents. Muted anchors left the interior nearly grey.
 | `barycentric_color(w)` / `model_colors(ids)` | Oklab blend of the anchors |
 | `ternary_legend(...)` | The filled triangle that is the legend |
 | `align_to_simplex(geometry)` | Put an embedding in the simplex's own frame |
-| `dm_grid(...)` / `mds_grid(...)` | Dense rung × metric grids for one level |
+| `dm_grid(...)` / `mds_grid(...)` | Dense surrogate × metric grids for one level |
 | `crosslevel_mds(...)` | One MDS panel per taxonomy, in a shared frame |
 | `rgb_to_oklab` / `oklab_to_rgb` / `oklab_delta_e` | The colour-space primitives |
 
@@ -78,7 +78,7 @@ python scripts/make_simplex3_figures.py                  # everything
 python scripts/make_simplex3_figures.py --level functional
 python scripts/make_simplex3_figures.py --skip-sweep     # omit the 33-layer sweep
 python scripts/make_simplex3_figures.py --skip-detail    # omit per-metric detail figures
-python scripts/make_simplex3_figures.py --skip-surrogate # raw rungs only
+python scripts/make_simplex3_figures.py --skip-surrogate # raw surrogates only
 python scripts/make_simplex3_figures.py --outdir figures/simplex3_qwen_v3
 python scripts/make_simplex3_figures.py --cache-root PATH   # name the shared cache
 python scripts/make_simplex3_figures.py --no-cache          # recompute everything
@@ -114,7 +114,7 @@ the point of it.
 
 Every cell the suite computes is stored in the shared cache's `06_collections` and read
 back on the next run, keyed on the taxonomy, the metric's reported name, each model's
-resolved artifact, its surrogate, the transform and the **resolved selector** of the rung
+resolved artifact, its surrogate, the transform and the **resolved selector** of the surrogate
 — never the row's display label, which is editable prose.
 
 Two things make the reuse safe. `collection_key` sorts the model entries before hashing,
@@ -144,7 +144,7 @@ above. These tables are *generated artifacts*: edit the script, not the markdown
 
 ### Missing cells are drawn, not dropped
 
-Not every (rung, metric) cell exists, and the gaps are structural rather than accidental:
+Not every (surrogate, metric) cell exists, and the gaps are structural rather than accidental:
 
 - **CKA**, **MMD** and **energy** all need more than one row, so none can run on a
   `model mean` representation; and `cka_distance_matrix` takes a single
@@ -157,7 +157,7 @@ Not every (rung, metric) cell exists, and the gaps are structural rather than ac
 Absent cells are drawn with the reason in place, so the constraint stays visible in the
 figure.
 
-### Surrogate rungs
+### Fleet transforms
 
 Several rows apply a fleet-level transform from `src.analysis.surrogates` before
 distancing. These are not alternative metrics — they change what is being compared. See

@@ -328,7 +328,7 @@ def ternary_legend(
                     fontsize=label_size, color="0.15", zorder=4, **text_kw,
                 )
 
-    # Default to the `g1`/`g2`/`g3` shorthand: the dense rung x metric grids have
+    # Default to the `g1`/`g2`/`g3` shorthand: the dense surrogate x metric grids have
     # no room for "Group 1", and only the cross-taxonomy figure is aimed at a
     # reader who has not seen the shorthand. Pass GROUP_DISPLAY to rename.
     names = dict(vertex_names or {})
@@ -559,7 +559,7 @@ def crosslevel_mds(
     the disparity computed under this same seed, or leave it off.
 
     Three things separate this from :func:`mds_grid`, which stays as it is for
-    the dense rung x metric grids:
+    the dense surrogate x metric grids:
 
     * **A shared frame.** Every panel is put through :func:`align_to_simplex`, so
       the centre mixture is at the origin and the pure-g1 model is straight up in

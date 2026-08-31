@@ -1491,12 +1491,12 @@ def t_collection_key_sees_selector():
     )
 
 
-@check("[data] cache: two rungs of one level are two collections")
-def t_collection_rung_in_key():
+@check("[data] cache: two surrogates of one level are two collections")
+def t_collection_surrogate_in_key():
     """The figure suite's rows have to be keyed apart, and by the right thing.
 
-    A grid row is a *rung*: one level, one resolved selector, seven metric
-    columns. Two rungs of one level read the same artifacts under the same
+    A grid row is a *surrogate*: one level, one resolved selector, seven metric
+    columns. Two surrogates of one level read the same artifacts under the same
     surrogate — that is what makes them one level — so nothing about the
     collection itself separates them, and the resolved selector has to be in the
     key. Both halves are asserted, for the reason
@@ -1545,45 +1545,45 @@ def t_collection_rung_in_key():
         raise _Skip(f"only {len(sub.entries)} functional model(s) under {draw}")
     ids = [e.model_id for e in sub.entries]
 
-    rungs = {"h1": {"functional_selector": {"draw": draw, "layers": [1]}},
+    surrogates = {"h1": {"functional_selector": {"draw": draw, "layers": [1]}},
              "h2": {"functional_selector": {"draw": draw, "layers": [2]}}}
 
     cc = CollectionCache(SHARED_CACHE)
     handles, mats = {}, {}
-    for name, rung in rungs.items():
+    for name, surrogate in surrogates.items():
         _, _, entries = resolve_ordered(sub, "functional", ids,
-                                        with_identity=True, **rung)
+                                        with_identity=True, **surrogate)
         handles[name] = collection_handle(cc, "functional", "cosine", entries,
-                                          rung=rung)
+                                          surrogate=surrogate)
         mats[name] = _compute_distance_matrix(sub, "functional", "cosine", ids,
-                                              **rung)
+                                              **surrogate)
 
     assert handles["h1"] != handles["h2"], (
-        f"both rungs key to {handles['h1']}, so the second would read back the "
+        f"both surrogates key to {handles['h1']}, so the second would read back the "
         "first's matrix"
     )
     delta = float(np.abs(mats["h1"].matrix - mats["h2"].matrix).max())
     assert delta > 0, (
-        "the two rungs produced identical matrices, so this check cannot tell a "
-        "working key from a broken one — pick two rungs that differ"
+        "the two surrogates produced identical matrices, so this check cannot tell a "
+        "working key from a broken one — pick two surrogates that differ"
     )
 
-    # Isolate the rung element. The two handles above could have been separated
+    # Isolate the surrogate element. The two handles above could have been separated
     # by something else the resolution saw, so hold the models, the metric and
-    # the resolution fixed and vary *only* the rung: what is left is the rung's
+    # the resolution fixed and vary *only* the surrogate: what is left is the surrogate's
     # own contribution to the key.
     _, _, entries = resolve_ordered(sub, "functional", ids, with_identity=True,
-                                    **rungs["h1"])
+                                    **surrogates["h1"])
     fixed = collection_handle(cc, "functional", "cosine", entries,
-                              rung=rungs["h1"])
+                              surrogate=surrogates["h1"])
     assert fixed == handles["h1"], (
         "the same resolved selector keyed to two different handles"
     )
     varied = collection_handle(cc, "functional", "cosine", entries,
-                               rung={"functional_selector": {"draw": draw,
+                               surrogate={"functional_selector": {"draw": draw,
                                                              "layers": [1, 2]}})
     assert varied != fixed, (
-        "the rung does not reach the key: one set of resolved representations "
+        "the surrogate does not reach the key: one set of resolved representations "
         "keyed identically under two different selectors"
     )
     return f"two handles, max|Δ| = {delta:.2e}, selector-keyed not label-keyed"
@@ -4210,12 +4210,12 @@ def t_distributional_metrics():
 
 @check("surrogates: centering is a translation, whitening is not")
 def t_surrogate_transforms():
-    """What the centered rungs may and may not change.
+    """What the centered surrogates may and may not change.
 
     Both centering modes subtract one array from every model, so the collection
     is *translated*: a Euclidean distance cannot move, and a scale-invariant one
     (cosine, normalized Frobenius) generally does.  That asymmetry is the whole
-    content of a centered rung, and getting it backwards — pairing a centered
+    content of a centered surrogate, and getting it backwards — pairing a centered
     representation with a translation-invariant metric — produces a panel that
     duplicates its raw twin under a label implying otherwise.
     """
@@ -4910,7 +4910,7 @@ DATA_BACKED = [
     t_cache_fully_migrated, t_behavioral_reps_well_formed,
     t_functional_reps_well_formed,
     t_behavioral_layout_migrated, t_cross_taxonomy_coordinates,
-    t_collection_key_sees_selector, t_collection_rung_in_key,
+    t_collection_key_sees_selector, t_collection_surrogate_in_key,
 ]
 #: A third tier: real checks that need a GPU and a multi-GB model load, so they are
 #: too slow for a harness meant to run in seconds around every edit.  Off unless

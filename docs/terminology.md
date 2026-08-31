@@ -134,12 +134,12 @@ Note the asymmetry with `collection_key`, which sorts: `surrogate_key` does
 share one surrogate hash, and it is recorded rather than relied upon.
 
 **Rung** — one row of a figure grid: a resolved selector over a level, such as a
-layer group or a pooling choice. A grid is **rung × metric**. Two rungs of one
+layer group or a pooling choice. A grid is **surrogate × metric**. Two surrogates of one
 level read the same artifacts under the same surrogate — that is what makes them
-one level — so a rung must reach the cache key explicitly or two rungs collide
+one level — so a surrogate must reach the cache key explicitly or two surrogates collide
 on a single handle.
 
-Key on the **resolved selector dict**, never the rung's display label. Labels
+Key on the **resolved selector dict**, never the surrogate's display label. Labels
 like `"late third"` are editable prose: redefining which layers that names,
 without changing the string, would leave a label-keyed entry serving a matrix
 built from the old definition.
@@ -172,7 +172,7 @@ covariance), from `src/analysis/surrogates.py`. These are **not alternative
 metrics** — they change what is being compared. Every level carries a large
 component shared by all models (the same questions, the same answer register,
 the same base model) which is identical by construction and can only dilute a
-similarity; the centered rungs measure what is left.
+similarity; the centered surrogates measure what is left.
 
 **`transform_key`** — the short stable name a transform keys under. An anonymous
 callable keys as `"custom"` and is rejected for cached collections, since two
@@ -190,11 +190,11 @@ projection and **evaluation points** are those held out from it.
 taxonomy's estimate of them.
 
 **dCor** / **Procrustes** / **stress** — the agreement scores reported per
-(rung, metric) cell in `crosslevel_scores.csv`. Note that `dcor_vs_truth` and
+(surrogate, metric) cell in `crosslevel_scores.csv`. Note that `dcor_vs_truth` and
 `disparity_vs_truth` run in **opposite directions**: higher is better for one,
 lower for the other.
 
-**Absent cell** — a (rung, metric) combination that cannot exist, drawn with its
+**Absent cell** — a (surrogate, metric) combination that cannot exist, drawn with its
 reason in place rather than left blank or dropped, so the constraint stays
 visible in the figure. The gaps are structural: CKA, MMD and energy all need
 more than one row, so none can run on a `model mean` representation, and

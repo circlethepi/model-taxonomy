@@ -1,28 +1,45 @@
-"""One-shot migration: fix the case of the log-prob stage directory.
+"""One-shot migration: move the log-prob stage to ``05A_logprobs``.
 
-    05a_logprobs → 05A_logprobs
+    07_logprobs  → 05A_logprobs      (the original move, from a cold cache root)
+    05a_logprobs → 05A_logprobs      (the case fix, for a root already moved once)
 
-Log-probs are a second artifact of the *generation* pass, written beside the
-generations (``src/taxonomy/behavioral.py``), so they belong at stage 05 rather
-than at a stage of their own — which is why the directory was moved off
-``07_logprobs`` already.  What that move did not settle is the case of the
-suffix.  ``scripts/migrate_cache_layout.py`` defines the convention and the only
-other letter-suffixed stage spells it uppercase (``03A_adapter_alignments``), so
-``05A`` is the spelling that matches.  Two stages disagreeing on the case of a
-suffix is the kind of detail that is free to fix now and permanent later.
+``07`` put the log-probs after the collections in every sorted listing, which
+misdescribes where they come from.  They are not derived from collections: they
+are a ride-along artifact of the same generation pass that writes
+``05_generated``.  ``BehavioralTaxonomy`` with ``collect_logprobs=True`` fills
+both trees in one pass, under the same draw key and the same variant token, so a
+log-prob file and the generations it describes join by *filename* with no lookup.
+``05`` puts the stage next to the generations it annotates, and ahead of the
+collections built on top of the inference stages.
+
+**On the case of the suffix.**  The letter suffix is a mild stretch of the
+convention ``03A_adapter_alignments`` set — there it means "analysis of the
+objects at that stage", and log-probs are a parallel artifact rather than an
+analysis.  The adjacency is worth the stretch.  Given the stretch is being made,
+the suffix is spelled the way the only other letter-suffixed stage spells it:
+**uppercase**.  A first pass of this migration wrote ``05a``, so both source
+spellings are accepted here and a root in either state converges on ``05A``.
+
+There is deliberately no compatibility shim in ``LogProbCache``: ``_STAGE_DIR``
+moves outright.  A cache root that was never migrated finds no entries and
+re-extracts, which is loud and correct; a fallback read would silently split one
+experiment's results across two trees.
+
+The move is a single ``os.rename`` within one filesystem, so it is a metadata
+operation — instant regardless of how large the tree is.
 
 This is **independent** of ``scripts/migrate_pairwise_layout.py``: the two touch
 disjoint directories and disjoint call sites, so either order works and neither
 needs the other to have run.  Kept separate so a failure in either is
 diagnosable without unpicking the other.
 
-Note for anyone running this elsewhere: the rename is case-only, so on a
-case-insensitive filesystem it is a no-op that may appear to succeed while
-changing nothing.  ``--apply`` verifies the resulting name rather than trusting
-``os.rename``.
+Only a shared-cache-shaped root is migrated.  Legacy per-experiment cache trees
+under ``results/<experiment>/cache/`` keep the old names and are not readable by
+current code anyway; none of them contains a log-prob stage.
 
-There is deliberately no compatibility shim in ``src/cache/logprob_cache.py``: a
-missed call site must fail loudly rather than quietly read the old directory.
+Note for anyone running the case fix on another machine: a case-only rename is a
+silent no-op on a case-insensitive filesystem, so ``--apply`` verifies the
+resulting name in a directory listing rather than trusting ``os.rename``.
 
 Usage:
     python scripts/migrate_logprob_stage.py --dry-run
@@ -45,37 +62,57 @@ REPO = Path(__file__).parent.parent
 
 DEFAULT_ROOT = REPO / "results" / "shared_cache"
 
-OLD = "05a_logprobs"
 NEW = "05A_logprobs"
+#: Accepted source spellings, oldest first.  Both converge on NEW.
+OLD = ("07_logprobs", "05a_logprobs")
+#: What ``--revert`` restores: the stage as it was before any of this.
+ORIGINAL = OLD[0]
 
 
 def _names(root: Path) -> list[str]:
     """Directory names as the filesystem actually spells them.
 
     Read by listing the parent rather than by ``Path.exists()``, which on a
-    case-insensitive filesystem answers ``True`` for either spelling and so
-    cannot tell a completed rename from an unstarted one.
+    case-insensitive filesystem answers ``True`` for either spelling of the
+    suffix and so cannot tell a completed rename from an unstarted one.
     """
     return [p.name for p in root.iterdir() if p.is_dir()]
 
 
 def plan(root: Path, revert: bool) -> tuple[Path, Path] | None:
-    src_name, dst_name = (NEW, OLD) if revert else (OLD, NEW)
     names = _names(root)
 
-    if src_name not in names:
-        if dst_name in names:
-            print(f"  skip   {src_name}/ — not present; {dst_name}/ already is")
+    if revert:
+        if NEW not in names:
+            print(f"  skip   {NEW}/ — not present")
+            return None
+        if ORIGINAL in names:
+            raise SystemExit(
+                f"refusing to revert: both {root / NEW} and {root / ORIGINAL} "
+                "exist. Resolve by hand — merging two cache trees silently "
+                "would lose data."
+            )
+        return root / NEW, root / ORIGINAL
+
+    present = [name for name in OLD if name in names]
+    if not present:
+        if NEW in names:
+            print(f"  skip   — already at {NEW}/")
         else:
-            print(f"  skip   {src_name}/ — not present")
+            print(f"  skip   — no log-prob stage under any of {list(OLD)}")
         return None
-    if dst_name in names:
+    if len(present) > 1:
         raise SystemExit(
-            f"refusing to migrate: both {root / src_name} and {root / dst_name} "
+            f"refusing to migrate: {present} both exist under {root}. Resolve "
+            "by hand — merging two cache trees silently would lose data."
+        )
+    if NEW in names:
+        raise SystemExit(
+            f"refusing to migrate: both {root / present[0]} and {root / NEW} "
             "exist. Resolve by hand — merging two cache trees silently would "
             "lose data."
         )
-    return root / src_name, root / dst_name
+    return root / present[0], root / NEW
 
 
 def apply_rename(root: Path, pair: tuple[Path, Path]) -> None:
@@ -96,8 +133,10 @@ def main() -> None:
     mode = ap.add_mutually_exclusive_group(required=True)
     mode.add_argument("--dry-run", action="store_true",
                       help="print what would happen and change nothing")
-    mode.add_argument("--apply", action="store_true", help=f"rename {OLD}/ → {NEW}/")
-    mode.add_argument("--revert", action="store_true", help=f"rename {NEW}/ → {OLD}/")
+    mode.add_argument("--apply", action="store_true",
+                      help=f"rename 07_logprobs/ or 05a_logprobs/ → {NEW}/")
+    mode.add_argument("--revert", action="store_true",
+                      help=f"rename {NEW}/ → {ORIGINAL}/")
     ap.add_argument("--root", type=Path, default=DEFAULT_ROOT,
                     help=f"the shared cache root (default: {DEFAULT_ROOT})")
     args = ap.parse_args()

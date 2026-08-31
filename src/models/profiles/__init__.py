@@ -9,6 +9,7 @@ from __future__ import annotations
 from src.models.profile import ModelProfile
 
 from .llama3 import LLAMA3
+from .llama3_instruct import LLAMA3_INSTRUCT
 from .qwen3_5 import QWEN3_5
 
 #: Order is irrelevant -- :func:`src.models.profile.resolve` picks the longest
@@ -16,7 +17,8 @@ from .qwen3_5 import QWEN3_5
 #: it sits in this list.
 PROFILES: tuple[ModelProfile, ...] = (
     LLAMA3,
+    LLAMA3_INSTRUCT,
     QWEN3_5,
 )
 
-__all__ = ["PROFILES", "LLAMA3", "QWEN3_5"]
+__all__ = ["PROFILES", "LLAMA3", "LLAMA3_INSTRUCT", "QWEN3_5"]

@@ -22,6 +22,9 @@ class ModelProfile:
     prompt_format: str = "raw"                   # "raw" | "chat"
     chat_template_sha: str | None = None
     chat_template_kwargs: dict = field(default_factory=dict)
+    expected_lora_params: int | None = None      # None = report, don't assert
+    excluded_lora_modules: tuple[str, ...] = ()  # must NOT be matched
+    pad_token: str | None = None                 # None = fall back to eos
     notes: str = ""
 ```
 
@@ -50,6 +53,34 @@ Note what is deliberately *not* in a profile: the `</think>` token id. It is der
 generically from the tokenizer at runtime, returning `None` for models that have no such
 token, so a model that grows a thinking mode is instrumented without a profile edit.
 
+The same rule decides the newer fields, and it is worth stating as a rule because it is
+the one that keeps this from becoming a bag of per-model constants:
+
+> **Derive it if the checkpoint declares it. Put it in a profile only if it is a
+> *choice* about the checkpoint that the checkpoint does not declare about itself.**
+
+Derived, therefore *not* profile fields: the turn-end token ids (`stop_token_ids` in
+`src/taxonomy/behavioral.py` unions pad, tokenizer eos, and every id in
+`generation_config.eos_token_id`); the layer count, head count, attention layout and
+`attn_output_gate` the figure suite reads straight off the model config.
+
+Profile fields, because nothing declares them:
+
+- **`expected_lora_params`** — what the target list *should* reach. PEFT matches by name
+  suffix and errors only on *zero* matches, so a list that reaches a quarter of the depth
+  is silent; the count is the check. Well defined as a bare integer only because
+  `LORA_RANK = 16` in `gen_simplex3.py` is a module constant rather than a `Suite` field.
+- **`excluded_lora_modules`** — modules that must stay unadapted. An exclusion nobody
+  checks stops holding the moment a target list is edited.
+- **`pad_token`** — which token to pad with when the checkpoint declares none. With
+  pad == eos, anything masking on the pad id also masks a genuine end-of-turn, so a
+  completion-only run can be taught never to end its own turn. Llama-3.x ships
+  `<|finetune_right_pad_id|>` and then does not set `pad_token`, so the generic fallback
+  fires on exactly the models that supply a better answer. `apply_pad_token` is the single
+  definition, called from both `finetune_lora.py` and `_hf_inference.py` — resolving pad
+  differently in training and extraction would mask different positions in two halves of
+  one experiment. Naming an absent token, or one that *is* eos, raises.
+
 ### `assert_compatible` — template drift, checked before a GPU is held
 
 `assert_compatible(profile, tokenizer)` raises unless the loaded tokenizer is the one the
@@ -73,7 +104,22 @@ is held.
 | Profile | `match` | dtype | Prompt format |
 |---|---|---|---|
 | `LLAMA3` | `meta-llama/Llama-3` | `float16` | `raw` (asserted: no template) |
+| `LLAMA3_INSTRUCT` | `meta-llama/Llama-3.1-8B-Instruct` | `float16` | `chat`, template pinned |
 | `QWEN3_5` | `Qwen/Qwen3.5-` | `bfloat16` | `chat`, template pinned |
+
+The first two are the longest-prefix rule doing real work rather than illustrating
+itself. `meta-llama/Llama-3.1-8B-Instruct` **starts with** `meta-llama/Llama-3`, so
+without the second row an instruct checkpoint resolves to a profile declaring
+`prompt_format='raw'`. `assert_compatible` would catch that loudly — but only *after*
+`Suite.for_model` had emitted a suite with no `prompt_format` block at all, which is a
+raw suite and a different experiment. The instruct profile's `match` is a complete model
+id rather than a family prefix because `expected_lora_params` is a width-specific claim
+and the 3.2 sizes are a different width; a new instruct size gets its own file.
+
+That also explains why `LLAMA3` leaves `expected_lora_params` as `None`. Its match spans
+`Llama-3.1-8B`, `Llama-3.2-1B` and `Llama-3.2-3B`, so any single count would falsely fail
+two models out of three. **A size-specific claim needs a size-specific prefix**; a
+family-wide profile reports the count instead of asserting it.
 
 Each carries a `notes` field with the reasoning behind its values — read it before
 changing one. Two examples of what lives there:

@@ -46,6 +46,33 @@ class ModelProfile:
     #: means "this model has no chat template", which is asserted, not assumed.
     chat_template_sha: str | None = None
     chat_template_kwargs: dict = field(default_factory=dict)
+    #: Trainable LoRA parameter count this checkpoint should produce at the
+    #: repo's rank, or ``None`` to report the count without asserting it.  Not
+    #: derived, because it is a *claim about what the run intends* -- the number
+    #: falls out of the target list, and the point of stating it is to catch a
+    #: target list that silently matched fewer modules than expected.
+    #:
+    #: A bare integer is well defined only because there is exactly one rank in
+    #: the repo: ``LORA_RANK = 16`` in ``scripts/gen_simplex3.py`` is a module
+    #: constant, not a ``Suite`` field.  If rank ever becomes per-suite this has
+    #: to become rank-keyed or move to ``Suite``.
+    expected_lora_params: int | None = None
+    #: Token to use for padding when the checkpoint declares none, spelled as a
+    #: literal so it is visible next to the rest of the checkpoint's description.
+    #: ``None`` keeps the generic fallback (pad = eos).
+    #:
+    #: Why this is worth a field: with pad == eos, anything that masks on the pad
+    #: id also masks a genuine end-of-turn, so a completion-only run can be taught
+    #: never to emit the token that ends its own turn.  Llama-3.x ships
+    #: ``<|finetune_right_pad_id|>`` for exactly this and then does not set it as
+    #: ``pad_token``, so the fallback fires on precisely the models that supply a
+    #: better answer.
+    pad_token: str | None = None
+    #: Modules that must **not** be matched by ``lora_target_modules``.  Also a
+    #: choice rather than a property: Qwen3.5's ``in_proj_a``/``in_proj_b`` are
+    #: excluded deliberately, and an exclusion nobody checks is an exclusion that
+    #: quietly stops holding when a target list is edited.
+    excluded_lora_modules: tuple[str, ...] = ()
     notes: str = ""
 
 
@@ -130,3 +157,42 @@ def resolve(model_id: str) -> ModelProfile:
             if best is None or len(profile.match) > len(best.match):
                 best = profile
     return best if best is not None else ModelProfile(match="")
+
+
+def apply_pad_token(tokenizer, profile: ModelProfile) -> str:
+    """Give *tokenizer* a pad token, and say which rule supplied it.
+
+    One definition, called from both training and inference, because the two
+    disagreeing is the failure this prevents: a run trained with a distinct pad
+    and extracted with pad == eos masks different positions in the two halves of
+    the same experiment.
+
+    Three outcomes, in order: the checkpoint already declares one and nothing
+    happens; the profile names one and it is used; neither, and pad falls back to
+    eos, which is what the whole simplex3 suite trained under and is preserved
+    exactly.
+    """
+    if tokenizer.pad_token is not None:
+        return f"declared by the checkpoint ({tokenizer.pad_token})"
+
+    if profile.pad_token is not None:
+        tid = tokenizer.convert_tokens_to_ids(profile.pad_token)
+        unk = getattr(tokenizer, "unk_token_id", None)
+        if tid is None or tid == unk:
+            raise ValueError(
+                f"profile {profile.match!r} names pad_token "
+                f"{profile.pad_token!r}, which this tokenizer does not have. "
+                f"A pad token that silently resolves to unk would pad with a "
+                f"real word."
+            )
+        if tid == tokenizer.eos_token_id:
+            raise ValueError(
+                f"profile {profile.match!r} names pad_token {profile.pad_token!r}, "
+                f"which is the same id as eos ({tid}). Naming it deliberately and "
+                f"getting eos anyway defeats the point of the field."
+            )
+        tokenizer.pad_token = profile.pad_token
+        return f"from profile {profile.match!r} ({profile.pad_token} = {tid})"
+
+    tokenizer.pad_token = tokenizer.eos_token
+    return f"fallback pad = eos ({tokenizer.eos_token})"

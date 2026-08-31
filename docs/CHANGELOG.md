@@ -4,6 +4,70 @@
 
 ## Unreleased
 
+### simplex3 on Llama-3.1-8B-Instruct
+
+The missing cell of the design. `simplex3` is a raw-prompted **base** Llama and
+`simplex3_qwen` is a chat-prompted **instruct** Qwen, so the two differ in model family
+*and* prompting regime at once and any difference in the recovered taxonomy is
+confounded. `meta-llama/Llama-3.1-8B-Instruct` is the instruct sibling of the exact
+checkpoint the 8B suite used: one variable against each of the existing suites.
+
+`src/models/profiles/llama3_instruct.py` plus a `SUITES` entry, at full parity with the
+qwen suite — log-prob level, generation-mode activations, the 10-point temperature sweep.
+The profile's `match` is a complete model id, and that is load-bearing rather than tidy:
+`LLAMA3` matches `meta-llama/Llama-3` and declares `prompt_format='raw'`, and the
+instruct id starts with that prefix, so only `resolve`'s longest-match rule keeps them
+apart. Without the new file `Suite.for_model` emits a suite with no `prompt_format` block
+at all — a raw suite, and a different experiment. `check_analysis.py` pins both
+directions.
+
+`ModelProfile.pad_token`, honoured by one shared `apply_pad_token()` called from both
+`finetune_lora.py` and `_hf_inference.py`. This checkpoint ships
+`<|finetune_right_pad_id|>` and then does not set `pad_token`, so the generic fallback
+would have trained it with pad == eos == `<|eot_id|>` — the arrangement where masking on
+the pad id also masks a genuine end-of-turn, and one Qwen does not share.
+
+### Generalized the Qwen-shaped scripts to arbitrary chat models
+
+Done first and separately, because generalizing *against* a model you are already trying
+to land tends to produce a two-model `if` rather than an abstraction. Both existing
+suites regenerate byte-identically.
+
+`stop_token_ids(model, tokenizer)` unions pad, tokenizer eos, and every id in
+`generation_config.eos_token_id`. `generate` is called without an explicit
+`eos_token_id`, so it already stops on the generation config; deriving the log-prob trim
+from a different place was a disagreement by construction. It matters for instruct
+checkpoints, which end a *turn* with one token and a *sequence* with another:
+Llama-3.1-8B-Instruct declares `[<|end_of_text|>, <|eom_id|>, <|eot_id|>]` while the
+tokenizer eos is only the last. A no-op for Qwen3.5-4B, which was the condition for
+making the change at all — it ships no generation config eos, so the 16 stored
+`07_logprobs` entries are untouched.
+
+`ModelProfile.expected_lora_params` and `.excluded_lora_modules` take the two Qwen
+literals out of `smoke_base_model.py`. `LLAMA3` deliberately gets `None` rather than the
+8B count: its match is family-wide and the 3.2 sizes resolve there too, so a single
+number would falsely fail two models out of three.
+
+`smoke_base_model.py` no longer requires a reasoning model — it branches on the derived
+`</think>` id, reporting termination rate where it reported closure rate. Its
+pad-vs-eos assertion now checks the value inference will actually use, which it did not
+before: checkpoints commonly ship no pad token, the pipeline then sets pad = eos, and
+the assertion meant to forbid exactly that passed vacuously. New stage 1b renders one row
+twice and requires the same bytes, because `chat_template_sha` hashes the template and
+not its output.
+
+`scripts/make_simplex3_figures.py` derives layer count, head count, attention layout and
+`attn_output_gate` from the model config instead of hard-coding Qwen3.5's hybrid pattern,
+and takes run identity (`--base-model`, the draw) from the command line. A
+uniform-attention model drops every `linear-attn ·` spec and the `q_proj` query/gate
+split rather than special-casing them.
+
+`jobs/simplex3_qwen/01_smoke.sh` had a dead `nvl` partition — which now makes `sbatch`
+reject the whole list — and three stale pre-`jhu/` paths. Repaired in place rather than
+folded into the generator: the file states it is deliberately not part of the standing
+job graph, and `submit_all.sh` agrees.
+
+
 ### The figure suite reuses `06_collections`, behind a row-order guard
 
 `scripts/make_simplex3_figures.py` recomputed every distance matrix and every MDS

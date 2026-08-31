@@ -82,11 +82,33 @@ python scripts/make_simplex3_figures.py --skip-surrogate # raw rungs only
 python scripts/make_simplex3_figures.py --outdir figures/simplex3_qwen_v3
 python scripts/make_simplex3_figures.py --cache-root PATH   # name the shared cache
 python scripts/make_simplex3_figures.py --no-cache          # recompute everything
+python scripts/make_simplex3_figures.py \
+    --base-model meta-llama/Llama-3.1-8B-Instruct \
+    --outdir figures/simplex3_llama3i        # a different suite
 ```
 
 Four levels — `dataset_embedding`, `structural`, `functional`, `behavioral` — over the
-16 Qwen3.5-4B adapters spanning the 3-group topic simplex. Distance matrices in
+16 adapters of one suite spanning the 3-group topic simplex. Distance matrices in
 `copper_r`; MDS embeddings coloured by each model's own mixture.
+
+### The suite is not Qwen-specific
+
+`--base-model` names the run; the draw is `--draw-recipe-hash`, `--draw-n`,
+`--draw-seed`, `--draw-format-id`. Everything else about the model is **derived from its
+config** rather than passed: the layer count, the head count, the attention layout
+(`full_attention_interval` — absent means every layer is full attention), and
+`attn_output_gate`.
+
+That derivation is what makes the structural section degrade instead of break. Qwen3.5-4B
+is hybrid, so its figures contrast 8 full-attention layers against 24 linear-attention
+ones, and split `q_proj` into query and gate halves because a gate is fused into it. A
+uniform-attention model such as Llama-3.1-8B has neither: every `linear-attn ·` spec
+drops out, the q_proj split does not exist, and the family prefixes disappear from the
+row labels since there is only one family to name. The figure set gets **smaller**, not
+special-cased. `check_analysis.py` pins both shapes.
+
+`DATASET_EMBEDDER` stays a constant: that layer is recipe-keyed and model-free, which is
+the point of it.
 
 ### Distance matrices and embeddings are reused between runs
 

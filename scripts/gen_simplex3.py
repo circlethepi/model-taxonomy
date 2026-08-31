@@ -887,6 +887,41 @@ SUITES = {
         emit_gen_activation_job=True,
         temperature_sweep=tuple(round(0.1 * i, 1) for i in range(1, 11)),
     ).for_model("Qwen/Qwen3.5-4B"),
+    "llama3i": Suite(
+        tag="llama3i",
+        # As qwen: under a chat template with completion-only loss the question
+        # *is* the training prompt, so question_only is the in-distribution probe
+        # and full_context would measure something the adapters never saw.
+        query_sets=("question_only",),
+        job_tokens={"question_only": "qonly"},
+        # Same reasoning as qwen: draws and centroids are model-free and already
+        # on disk, and every job writes the recipes it needs itself.
+        emit_embed_jobs=False,
+        emit_build_job=False,
+        job_prefix="s3li",
+        # Wall times and memory are the Suite() defaults, which were sized against
+        # exactly this shape -- 8B, 128k vocab, uniform attention -- and proven by
+        # the simplex3 run.  Qwen's inflated values do not transfer: they paid for
+        # a torch linear-attention fallback and a 248k-vocab lm_head, and neither
+        # applies here.  No reasoning block means generations stop well inside the
+        # 128-token budget, so behavioral should run shorter than the raw 8B suite
+        # rather than longer.
+        #
+        # func_gen is the one wall with no precedent on this shape: it decodes all
+        # 16 adapters in one process like the greedy job (proven at 1:30 here) and
+        # additionally retains a hidden state per step.  3:00 for headroom, still
+        # well under Qwen's 4:00, which was sized for a model that always ran the
+        # full 128 steps.
+        func_gen_time="3:00:00",
+        # Full parity with the qwen suite: the log-prob level, generation-mode
+        # activations, and the 10-point temperature sweep.  This is the point of
+        # the run -- against simplex3 it isolates base vs instruct, against
+        # simplex3_qwen it isolates model family, and neither comparison works if
+        # the levels differ too.
+        emit_logprob_jobs=True,
+        emit_gen_activation_job=True,
+        temperature_sweep=tuple(round(0.1 * i, 1) for i in range(1, 11)),
+    ).for_model("meta-llama/Llama-3.1-8B-Instruct"),
 }
 
 

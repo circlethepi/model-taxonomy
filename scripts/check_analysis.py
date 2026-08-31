@@ -2208,6 +2208,155 @@ def t_adapter_name_agreement():
     return "; ".join(checked)
 
 
+@check("figures: the structural spec set follows the model's attention layout")
+def t_figure_specs_follow_layout():
+    """The figure suite used to hard-code Qwen3.5's hybrid layout.
+
+    Two properties, and the first is what stops a generalization from quietly
+    rewriting the existing figures: for Qwen's parameters the derived layout and
+    the emitted spec keys must be exactly what the script shipped with.  The
+    second is that a uniform-attention model degrades rather than special-cases --
+    every ``linear-attn`` spec drops out, and so does the q_proj query/gate split,
+    which only exists because ``attn_output_gate`` fuses a gate into q_proj.
+
+    Driven through ``layout`` rather than a checkpoint so it needs no network.
+    """
+    import importlib.util
+
+    root = Path(__file__).resolve().parent.parent
+    spec = importlib.util.spec_from_file_location(
+        "_figs", root / "scripts" / "make_simplex3_figures.py")
+    figs = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(figs)
+
+    # Qwen3.5-4B: 32 layers, 16 heads, full_attention_interval 4, output gate.
+    figs.apply_architecture(figs.layout(32, 16, 4, True))
+    assert figs.FULL_ATTN_LAYERS == [i for i in range(32) if i % 4 == 3]
+    assert figs.LINEAR_ATTN_LAYERS == [i for i in range(32) if i % 4 != 3]
+    assert figs.N_STATES == 33
+    qwen_proj = list(figs.structural_projection_specs())
+    assert qwen_proj == [
+        "full-attn · q_proj (whole)", "full-attn · q_proj query half",
+        "full-attn · q_proj gate half", "full-attn · k_proj", "full-attn · v_proj",
+        "full-attn · o_proj", "linear-attn · in_proj_qkv", "linear-attn · in_proj_z",
+        "linear-attn · out_proj"], qwen_proj
+    qwen_grp = list(figs.structural_group_specs())
+    assert len(qwen_grp) == 12 and "linear-attn · late third" in qwen_grp, qwen_grp
+
+    # Llama-3.1-8B-Instruct: 32 layers, 32 heads, uniform, no gate.
+    figs.apply_architecture(figs.layout(32, 32, None, False))
+    assert figs.LINEAR_ATTN_LAYERS == [], figs.LINEAR_ATTN_LAYERS
+    assert figs.FULL_ATTN_LAYERS == list(range(32))
+    uni_proj = list(figs.structural_projection_specs())
+    assert uni_proj == ["q_proj (whole)", "k_proj", "v_proj", "o_proj"], uni_proj
+    uni_grp = list(figs.structural_group_specs())
+    assert not any("linear-attn" in k for k in uni_grp), uni_grp
+    uni_fn = list(figs.functional_group_rows())
+    assert not any("attn outputs" in k for k in uni_fn), uni_fn
+    assert len(list(figs.structural_layer_specs())) == 3
+
+    # Degrading is dropping rows, not renaming them into collisions: two labels
+    # selecting the same (layers, projections) would plot an identical row twice
+    # and store it twice in the collection cache.  Checked on both layouts,
+    # because the hybrid branch is where the distinct-looking pairs come from.
+    for arch_name in ("uniform", "hybrid"):
+        if arch_name == "hybrid":
+            figs.apply_architecture(figs.layout(32, 16, 4, True))
+        seen: dict = {}
+        for key, (layers, projs) in figs.structural_group_specs().items():
+            seen.setdefault((tuple(layers), tuple(projs)), []).append(key)
+        dupes = [v for v in seen.values() if len(v) > 1]
+        assert not dupes, f"{arch_name}: labels selecting identical rows: {dupes}"
+
+    # Restore the module default so nothing later sees a mutated global.
+    figs.apply_architecture(figs.layout(32, 16, 4, True))
+    return (f"hybrid -> {len(qwen_proj)} projection specs, {len(qwen_grp)} group "
+            f"specs; uniform -> {len(uni_proj)} and {len(uni_grp)}")
+
+
+@check("profiles: the instruct prefix does not capture its base model")
+def t_profile_prefix_discrimination():
+    """Two ids differing by a suffix, and both suites depend on telling them apart.
+
+    ``LLAMA3`` matches the family prefix ``meta-llama/Llama-3`` and declares
+    ``prompt_format='raw'``.  ``meta-llama/Llama-3.1-8B-Instruct`` starts with
+    that prefix, so the *only* thing routing it to a chat profile is
+    ``resolve``'s longest-match rule.  Get it wrong in one direction and the
+    instruct suite silently emits a raw suite; get it wrong in the other and the
+    16 adapters already stored under ``meta-llama--Llama-3.1-8B`` stop being
+    reproducible.
+
+    Also pins that a width-specific parameter count never reaches a profile whose
+    match spans several widths -- the reason LLAMA3 carries None.
+    """
+    from src.models.profile import resolve
+
+    base = resolve("meta-llama/Llama-3.1-8B")
+    inst = resolve("meta-llama/Llama-3.1-8B-Instruct")
+    assert base.match == "meta-llama/Llama-3", base.match
+    assert base.prompt_format == "raw", base.prompt_format
+    assert base.chat_template_sha is None
+    assert inst.match == "meta-llama/Llama-3.1-8B-Instruct", inst.match
+    assert inst.prompt_format == "chat", inst.prompt_format
+    assert inst.chat_template_sha, "instruct profile must pin its template"
+    assert inst.expected_lora_params == 13_631_488, inst.expected_lora_params
+
+    # A family-wide match must not carry a width-specific claim.
+    for mid in ("meta-llama/Llama-3.2-1B", "meta-llama/Llama-3.2-3B"):
+        prof = resolve(mid)
+        assert prof.match == "meta-llama/Llama-3", (mid, prof.match)
+        assert prof.expected_lora_params is None, (
+            f"{mid} resolves to the family profile, which must not assert an "
+            f"8B parameter count"
+        )
+    return (f"base -> {base.match!r} (raw), instruct -> {inst.match!r} (chat), "
+            f"3.2 sizes -> family profile with no count")
+
+
+@check("profiles: pad resolution is one rule, and never silently eos")
+def t_pad_token_resolution():
+    """Training and inference must pad identically or they mask different rows.
+
+    ``apply_pad_token`` is the single definition.  The cases that matter: a
+    checkpoint that declares its own pad is left alone; a profile that names one
+    supplies it; naming a token the tokenizer lacks, or one that *is* eos, raises
+    rather than quietly padding with a real word or re-creating pad == eos.
+    """
+    from src.models.profile import ModelProfile, apply_pad_token
+
+    class Tok:
+        def __init__(self, pad, eos, vocab):
+            self.pad_token, self.eos_token = pad, eos
+            self._v, self.unk_token_id = vocab, 999
+            self.eos_token_id = vocab.get(eos)
+
+        def convert_tokens_to_ids(self, t):
+            return self._v.get(t, self.unk_token_id)
+
+    vocab = {"<eos>": 1, "<pad>": 2}
+    declared = Tok("<pad>", "<eos>", vocab)
+    apply_pad_token(declared, ModelProfile(match="x"))
+    assert declared.pad_token == "<pad>"
+
+    fallback = Tok(None, "<eos>", vocab)
+    apply_pad_token(fallback, ModelProfile(match="x"))
+    assert fallback.pad_token == "<eos>", "fallback must stay pad = eos"
+
+    named = Tok(None, "<eos>", vocab)
+    apply_pad_token(named, ModelProfile(match="x", pad_token="<pad>"))
+    assert named.pad_token == "<pad>", named.pad_token
+
+    for bad, why in ((("<nope>"), "absent from the vocab"), (("<eos>"), "is eos")):
+        try:
+            apply_pad_token(Tok(None, "<eos>", vocab),
+                            ModelProfile(match="x", pad_token=bad))
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"pad_token {bad!r} ({why}) should have raised")
+    return "declared kept, fallback = eos, profile honoured, unk and eos rejected"
+
+
 @check("prompt format: apply_chat_template has exactly one call site")
 def t_one_chat_template_call_site():
     """One renderer, or the item-11 bug comes back one level up.
@@ -4723,6 +4872,8 @@ SYNTHETIC = [
     t_steps_for_budget, t_one_draw_name, t_embedder_hash_seed, t_surrogate_hash_shared,
     # the prompt-format layer: additive by construction, and rendered in one place
     t_prompt_format_raw_is_inert, t_one_chat_template_call_site,
+    t_profile_prefix_discrimination, t_pad_token_resolution,
+    t_figure_specs_follow_layout,
     t_adapter_name_agreement,
     t_dataset_embedding_layout,
     t_draw_schema_roundtrip,

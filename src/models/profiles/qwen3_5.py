@@ -20,6 +20,10 @@ QWEN3_5 = ModelProfile(
     prompt_format="chat",
     chat_template_sha="a4aee8afcf2e0711942cf848899be66016f8d14a889ff9ede07bca099c28f715",
     chat_template_kwargs={},  # {} == the template's own defaults == thinking ON
+    # Both moved here from scripts/smoke_base_model.py, which hardcoded them as
+    # Qwen literals; the reasoning for each is in the notes below.
+    expected_lora_params=12_386_304,
+    excluded_lora_modules=("in_proj_a", "in_proj_b"),
     notes="""Hybrid attention: 24 linear-attention layers and 8 full-attention
     layers in a 3:1 pattern (full at indices 3, 7, 11, ... 31).  The repo's
     default q/k/v/o target list matches ONLY the 8 full-attention layers -- PEFT

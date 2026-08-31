@@ -16,6 +16,14 @@ LLAMA3 = ModelProfile(
     torch_dtype="float16",
     lora_target_modules=("q_proj", "k_proj", "v_proj", "o_proj"),
     prompt_format="raw",
+    # Deliberately None -- "report the count, do not assert it".  This ``match``
+    # is family-wide: Llama-3.2-1B and -3B resolve here too, and they have
+    # different widths, so any single number would falsely fail two of the three.
+    # The 8B figure is 32 * 16 * (2*(4096+4096) + 2*(4096+1024)) = 13,631,488,
+    # and it belongs on a profile whose match is a full model id -- see
+    # llama3_instruct.py.  A size-specific claim needs a size-specific prefix.
+    expected_lora_params=None,
+    excluded_lora_modules=(),
     chat_template_sha=None,
     notes="""Base (non-instruct) checkpoints: no post-training, no chat template.
     prompt_format='raw' is asserted rather than assumed -- assert_compatible

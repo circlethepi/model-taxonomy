@@ -89,7 +89,7 @@ import numpy as np  # noqa: E402
 from src.analysis import scan_cache  # noqa: E402
 from src.analysis.bridge import as_distance_matrix, fit_geometry  # noqa: E402
 from src.analysis.comparison import (  # noqa: E402
-    _distances, resolve_ordered,
+    _distances, _distances_via_pairs, resolve_ordered,
 )
 from src.analysis.ground_truth import (  # noqa: E402
     dcor_vs_truth, disparity_vs_truth, simplex_distance_matrix, simplex_geometry,
@@ -343,53 +343,45 @@ class SuiteCache:
         self.enabled = enabled
         self.read = read
         self._cc = None
+        self._pw = None
         if enabled:
-            from src.cache import CollectionCache
+            from src.cache import CollectionCache, PairwiseCache
             self._cc = CollectionCache(self.root)
+            self._pw = PairwiseCache(self.root)
         self._handles: dict[int, tuple[object, str]] = {}
         self.hits = 0
         self.misses = 0
 
     # -- distance matrices --------------------------------------------------
 
-    def distance_matrix(self, compute, *, taxonomy, ids, metric, model_entries,
-                        transform=None, surrogate=None, label=None):
-        """Read the matrix back if any run has stored it; otherwise *compute* it.
+    @property
+    def pairwise(self):
+        """The pairwise store, or ``None`` when this cache is inert."""
+        return self._pw
 
-        *surrogate* is the resolved selector dict, never the row's display label:
-        ``"late third"`` is editable prose, and redefining which layers it names
-        without changing the string would serve a matrix built from the old
-        definition. The label is still recorded in ``index.json``, where it makes
-        an opaque hash directory identifiable but keys nothing.
+    def register(self, dm, *, taxonomy, metric, model_entries, transform=None,
+                 surrogate=None, label=None) -> None:
+        """Record which collection handle *dm* belongs to, writing no matrix.
+
+        The suite stores **no distance matrices**.  Pairs are the single source
+        of truth for every pairwise-safe perspective, and an assembled matrix
+        alongside them would be a derived copy that can drift from the pairs it
+        came from — a migration or hand-edit touching one and not the other
+        leaves two answers to the same question with no way to tell which is
+        stale.  Re-assembly on each run is the price, and it is 120 dict lookups
+        against the O(n^2) metric computes the store exists to avoid.
+
+        What the handle is still needed for is the **geometry**: an MDS fit is
+        not an assembly and cannot be reconstructed from pairs, so it stays in
+        ``07_collections`` keyed exactly as before.
         """
         if self._cc is None:
-            return compute()
-
+            return
         from src.analysis.comparison import collection_handle
 
         handle = collection_handle(self._cc, taxonomy, metric, model_entries,
-                                   transform=transform, surrogate=surrogate)
-        dm = None
-        if self.read and self._cc.exists(handle):
-            try:
-                dm = self._cc.load_distance_matrix(handle).reindex(list(ids))
-                self.hits += 1
-            except (ValueError, KeyError, OSError) as exc:
-                # A stored matrix that cannot serve this request is a miss, not a
-                # failure — but say so, because a cache that quietly recomputes
-                # forever looks exactly like a cache that is working.
-                print(f"      cache: recomputing {handle} — "
-                      f"{type(exc).__name__}: {exc}")
-                dm = None
-        if dm is None:
-            self.misses += 1
-            dm = compute()
-            self._cc.save_distance_matrix(
-                dm, handle, model_entries=list(model_entries), label=label,
-                config=self._leaf_config(taxonomy, model_entries, transform, surrogate),
-            )
+                                   transform=transform, rung=surrogate)
         self._handles[id(dm)] = (dm, handle)
-        return dm
 
     @staticmethod
     def _leaf_config(taxonomy, model_entries, transform, surrogate) -> dict:
@@ -443,14 +435,15 @@ class SuiteCache:
         return geo
 
     def report(self) -> str:
-        if not self.enabled:
-            return "collection cache: off, everything recomputed"
+        if not self.enabled or self._pw is None:
+            return "pairwise store: off, everything recomputed"
+        hits, misses = self._pw.hits, self._pw.misses
         if not self.read:
-            return (f"collection cache: reads bypassed (--no-cache), "
-                    f"{self.misses} recomputed and written under "
-                    f"{self.root}/07_collections")
-        return (f"collection cache: {self.hits} hit(s), {self.misses} miss(es) "
-                f"under {self.root}/07_collections")
+            return (f"pairwise store: reads bypassed (--no-cache), {misses} "
+                    f"pair(s) recomputed and written under "
+                    f"{self.root}/06_pairwise")
+        return (f"pairwise store: {hits} pair(s) reused, {misses} computed, "
+                f"under {self.root}/06_pairwise")
 
 
 #: Set in `main()`. Off until then, so importing this module never writes to a
@@ -484,13 +477,15 @@ def metric_row(idx, taxonomy, ids, tf, blocked=None, label=None, **selectors):
         if col in blocked:
             out[col] = blocked[col]
             continue
-        out[col] = SUITE_CACHE.distance_matrix(
-            lambda col=col: _distances(idx, taxonomy, METRICS[col], ids, reps,
-                                       order=order),
-            taxonomy=taxonomy, ids=ids, metric=METRICS[col],
-            model_entries=model_entries, transform=tf, surrogate=selectors,
-            label=label,
+        dm = _distances_via_pairs(
+            idx, taxonomy, METRICS[col], ids, reps, order=order,
+            pairwise_cache=SUITE_CACHE.pairwise, transform=tf,
+            read=SUITE_CACHE.read, label=label, **selectors,
         )
+        SUITE_CACHE.register(dm, taxonomy=taxonomy, metric=METRICS[col],
+                             model_entries=model_entries, transform=tf,
+                             surrogate=selectors, label=label)
+        out[col] = dm
     return out
 
 
@@ -947,10 +942,14 @@ def layer_sweep(idx, ids, outdir):
             with_identity=True)
         for col in METRIC_COLS:
             try:
-                dm = SUITE_CACHE.distance_matrix(
-                    lambda col=col: _distances(idx, "functional", METRICS[col],
-                                               ids, reps, order=order),
-                    taxonomy="functional", ids=ids, metric=METRICS[col],
+                dm = _distances_via_pairs(
+                    idx, "functional", METRICS[col], ids, reps, order=order,
+                    pairwise_cache=SUITE_CACHE.pairwise,
+                    read=SUITE_CACHE.read, label=f"sweep · h{h}",
+                    functional_selector=selector,
+                )
+                SUITE_CACHE.register(
+                    dm, taxonomy="functional", metric=METRICS[col],
                     model_entries=model_entries,
                     surrogate={"functional_selector": selector},
                     label=f"sweep · h{h}",

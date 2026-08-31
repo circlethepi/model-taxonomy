@@ -95,6 +95,11 @@ class PairwiseCache:
     def __init__(self, cache_root: Path | str) -> None:
         self.root = Path(cache_root)
         self._pairs_dir = self.root / self._STAGE_DIR
+        #: Pairs served from disk and pairs written, counted across this
+        #: object's lifetime. Reporting per *pair* rather than per matrix is the
+        #: only honest unit here: one matrix is now a mix of both.
+        self.hits = 0
+        self.misses = 0
 
     # ------------------------------------------------------------------
     # Keys
@@ -222,9 +227,12 @@ class PairwiseCache:
         except (OSError, json.JSONDecodeError):
             return {}
         if pair_ids is None:
-            return {k: float(v) for k, v in stored.items()}
-        wanted = set(pair_ids)
-        return {k: float(v) for k, v in stored.items() if k in wanted}
+            found = {k: float(v) for k, v in stored.items()}
+        else:
+            wanted = set(pair_ids)
+            found = {k: float(v) for k, v in stored.items() if k in wanted}
+        self.hits += len(found)
+        return found
 
     def load_index(self) -> dict[str, dict]:
         """The catalogue.  Recomputable from the tree; no cache hit depends on it."""
@@ -307,8 +315,11 @@ class PairwiseCache:
             _atomic_json(surrogate_dir / "meta.json", meta)
 
             leaf_dir.mkdir(parents=True, exist_ok=True)
+            hits_before = self.hits
             stored = self.load_pairs(handle)
+            self.hits = hits_before          # a read-modify-write is not reuse
             stored.update({k: float(v) for k, v in distances.items()})
+            self.misses += len(distances)
             _atomic_json(leaf_dir / "pairs.json", stored)
             n_pairs = len(stored)
 

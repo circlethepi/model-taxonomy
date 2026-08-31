@@ -4289,6 +4289,347 @@ def t_pairwise_index_concurrent():
     return "two processes under two surrogates; both index records survive"
 
 
+class _CountingMetric:
+    """A cosine metric that counts how many pairs it was actually asked for."""
+
+    metric_name = "cosine"
+
+    def __init__(self, fail_after=None):
+        self.calls = 0
+        self.fail_after = fail_after
+
+    def compute(self, a, b) -> float:
+        self.calls += 1
+        if self.fail_after is not None and self.calls > self.fail_after:
+            raise RuntimeError(f"deliberate failure on call {self.calls}")
+        x = a.matrix.ravel().astype(float)
+        y = b.matrix.ravel().astype(float)
+        denom = float(np.linalg.norm(x) * np.linalg.norm(y)) or 1.0
+        return 1.0 - float(x @ y) / denom
+
+
+def _pw_call(td, index, ids, reps, metric, **kw):
+    """One assembly through the pair store, on a temporary cache root."""
+    from src.analysis import comparison as C
+    from src.cache import PairwiseCache
+
+    order = C._positions_for(index, ids)
+    return C._distances_via_pairs(
+        index, "functional", metric, ids, reps, order=order,
+        pairwise_cache=PairwiseCache(td), **kw
+    )
+
+
+@check("pairwise: a matrix is the same however its rows are ordered")
+def t_pairwise_row_order():
+    """Assembly is by ``pair_id`` lookup, so row order is a property of the request.
+
+    Two orders over one warm store must give matrices that are permutations of
+    each other — the comparison the original row-order bug failed, where the two
+    disagreed in every position.
+    """
+    import tempfile
+
+    index = _fake_index(4)
+    reps_entry = _fake_reps(4)
+    ids_a = [e.model_id for e in index.entries]
+    ids_b = [ids_a[i] for i in (2, 0, 3, 1)]
+
+    with tempfile.TemporaryDirectory() as td:
+        from src.analysis.comparison import _positions_for
+
+        dm_a = _pw_call(td, index, ids_a, reps_entry, _CountingMetric())
+        reps_b = [reps_entry[p] for p in _positions_for(index, ids_b)]
+        dm_b = _pw_call(td, index, ids_b, reps_b, _CountingMetric())
+
+    assert list(dm_a.model_ids) == ids_a and list(dm_b.model_ids) == ids_b
+    perm = [ids_a.index(m) for m in ids_b]
+    assert np.allclose(dm_a.matrix[np.ix_(perm, perm)], dm_b.matrix), (
+        "the two orders do not agree once permuted onto each other"
+    )
+    return "two orders, one store, matrices agree under the permutation"
+
+
+@check("pairwise: a subset is the exact submatrix of the full one")
+def t_pairwise_subset():
+    """Not approximately — the same stored floats.
+
+    This is what a whole-matrix cache cannot do without a second, hand-written
+    definition of "the same collection": a subset here is a set of lookups, not
+    a slice of something keyed on the full model set.
+    """
+    import tempfile
+
+    index = _fake_index(5)
+    reps_entry = _fake_reps(5)
+    ids = [e.model_id for e in index.entries]
+    sub_ids = [ids[3], ids[0], ids[4]]
+
+    with tempfile.TemporaryDirectory() as td:
+        from src.analysis.comparison import _positions_for
+
+        full = _pw_call(td, index, ids, reps_entry, _CountingMetric())
+        counter = _CountingMetric()
+        sub_reps = [reps_entry[p] for p in _positions_for(index, sub_ids)]
+        sub = _pw_call(td, index, sub_ids, sub_reps, counter)
+
+    assert counter.calls == 0, (
+        f"the subset recomputed {counter.calls} pair(s); every one was already stored"
+    )
+    take = [ids.index(m) for m in sub_ids]
+    assert np.array_equal(full.matrix[np.ix_(take, take)], sub.matrix), (
+        "the subset is not the exact submatrix of the full one"
+    )
+    return "3 of 5 models: 0 recomputed, submatrix bit-identical"
+
+
+@check("pairwise: a new model costs its own pairs, not the whole matrix")
+def t_pairwise_incremental():
+    """The benefit the whole design is for.
+
+    A 5th model against a warm 4-model store must cost 4 new distances, not 10.
+    Asserted on the count of metric calls, which is the thing being saved.
+    """
+    import tempfile
+
+    index = _fake_index(5)
+    reps_entry = _fake_reps(5)
+    ids = [e.model_id for e in index.entries]
+
+    with tempfile.TemporaryDirectory() as td:
+        first = _CountingMetric()
+        _pw_call(td, index, ids[:4], reps_entry[:4], first)
+        assert first.calls == 6, first.calls              # 4 choose 2
+
+        second = _CountingMetric()
+        _pw_call(td, index, ids, reps_entry, second)
+
+    assert second.calls == 4, (
+        f"adding a 5th model computed {second.calls} pair(s); it should compute "
+        "the 4 that involve it, not all 10"
+    )
+    return "4 models = 6 pairs; the 5th costs 4 more, not 10"
+
+
+@check("pairwise: two selectors are two handles and two matrices")
+def t_pairwise_selector_key():
+    """Both halves, deliberately.
+
+    Asserting only that the handles differ passes trivially against a key that
+    was merely salted; asserting only that the matrices differ says nothing
+    about the cache.
+    """
+    import tempfile
+
+    from src.cache import PairwiseCache
+
+    index = _fake_index(3)
+    ids = [e.model_id for e in index.entries]
+
+    def reps_with(normalize):
+        out = []
+        for r in _fake_reps(3):
+            meta = dict(r.metadata or {})
+            meta["normalize"] = normalize
+            # A perturbation, not a rescale: cosine is scale-invariant, so
+            # multiplying through would give two handles and identical numbers
+            # and the second half of this check would be untestable.
+            mat = r.matrix + (0.5 if normalize == "layer" else 0.0)
+            out.append(type(r)(model_id=r.model_id, taxonomy=r.taxonomy,
+                               matrix=mat.astype(np.float32), metadata=meta))
+        return out
+
+    with tempfile.TemporaryDirectory() as td:
+        mats = {}
+        for norm in ("global", "layer"):
+            mats[norm] = _pw_call(td, index, ids, reps_with(norm), _CountingMetric())
+        handles = PairwiseCache(td).list_handles()
+
+    assert len(handles) == 2, f"expected 2 handles, got {handles}"
+    assert not np.allclose(mats["global"].matrix, mats["layer"].matrix), (
+        "two selectors produced two handles but identical numbers"
+    )
+    return f"2 handles, max|delta| = {np.abs(mats['global'].matrix - mats['layer'].matrix).max():.3e}"
+
+
+@check("pairwise: a fleet transform never reaches the store")
+def t_pairwise_refuses_transform():
+    """G1.
+
+    Centering and whitening are collection-level operations, "defined by the set
+    of models being compared, and change when a model joins or leaves it". A
+    pair's distance under one is therefore not a property of the pair. Bypass
+    means uncached, not redirected.
+    """
+    import tempfile
+
+    from src.analysis.surrogates import centered
+
+    index = _fake_index(3)
+    reps = _fake_reps(3)
+    ids = [e.model_id for e in index.entries]
+
+    with tempfile.TemporaryDirectory() as td:
+        dm = _pw_call(td, index, ids, reps, _CountingMetric(), transform=centered())
+        assert dm.matrix.shape == (3, 3)
+        store = Path(td) / "06_pairwise"
+        assert not store.exists() or not list(store.rglob("pairs.json")), (
+            "a transformed perspective was written to the pair store"
+        )
+    return "centered() bypasses the store; nothing written"
+
+
+@check("pairwise: assembly writes nothing to 07_collections, on every branch")
+def t_pairwise_writes_no_collection():
+    """Pairs are the single source of truth for every pairwise-safe perspective.
+
+    Checked on **both** branches: the fleet-transform branch falls through to an
+    uncached ``_distances`` rather than redirecting the write, so it must leave
+    the stage alone too. Asserted on the stage directory's mtime, not merely on
+    "no new handle appeared".
+    """
+    import tempfile
+
+    from src.analysis.surrogates import centered
+
+    index = _fake_index(3)
+    reps = _fake_reps(3)
+    ids = [e.model_id for e in index.entries]
+
+    with tempfile.TemporaryDirectory() as td:
+        stage = Path(td) / "07_collections"
+        stage.mkdir()
+        before = stage.stat().st_mtime_ns
+
+        _pw_call(td, index, ids, reps, _CountingMetric())
+        _pw_call(td, index, ids, reps, _CountingMetric(), transform=centered())
+
+        assert stage.stat().st_mtime_ns == before, "07_collections was touched"
+        assert not list(stage.rglob("*")), list(stage.rglob("*"))
+    return "07_collections untouched by both the plain and the transform branch"
+
+
+@check("pairwise: a failed batch keeps what succeeded and re-raises")
+def t_pairwise_partial_failure():
+    """Pairs are independent, so a partial batch is a smaller correct artifact.
+
+    Discarding it would throw away every good distance because the last one
+    raised, and would do so on every retry — defeating an incremental store on
+    precisely the runs that most need one. The exception must still propagate:
+    the caller decides what a failure means, and the layer sweep already records
+    NaN and continues.
+    """
+    import tempfile
+
+    from src.cache import PairwiseCache
+
+    index = _fake_index(4)
+    reps = _fake_reps(4)
+    ids = [e.model_id for e in index.entries]
+
+    with tempfile.TemporaryDirectory() as td:
+        failing = _CountingMetric(fail_after=3)
+        try:
+            _pw_call(td, index, ids, reps, failing)
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError("the failure was swallowed instead of re-raised")
+
+        pw = PairwiseCache(td)
+        handle = pw.list_handles()[0]
+        kept = pw.load_pairs(handle)
+        assert len(kept) == 3, f"expected the 3 that succeeded on disk, got {len(kept)}"
+        meta = pw.load_meta(handle)
+        assert len(meta["models"]) == 4, meta["models"]
+
+        retry = _CountingMetric()
+        dm = _pw_call(td, index, ids, reps, retry)
+
+    assert retry.calls == 3, (
+        f"the retry computed {retry.calls} pair(s); it should compute exactly the "
+        "3 still missing, not all 6"
+    )
+    assert np.isfinite(dm.matrix).all()
+    return "3 of 6 kept on disk, exception propagated, retry computed only the other 3"
+
+
+@check("pairwise: meta.json records each model against its own artifact")
+def t_meta_models_identity():
+    """The consequence of a wrong pairing that reaches **disk**.
+
+    Asserted against the index, never against the stored block's internal
+    consistency: G2 and G4 both pass on consistently-shuffled inputs, because
+    both sides are shuffled the same way. This is the check that survives that.
+    """
+    import tempfile
+
+    from src.analysis.comparison import _positions_for
+    from src.cache import PairwiseCache
+
+    index = _fake_index(4)
+    reps_entry = _fake_reps(4)
+    ids = [e.model_id for e in index.entries]
+    shuffled = [ids[i] for i in (2, 0, 3, 1)]
+
+    with tempfile.TemporaryDirectory() as td:
+        reps = [reps_entry[p] for p in _positions_for(index, shuffled)]
+        _pw_call(td, index, shuffled, reps, _CountingMetric())
+
+        pw = PairwiseCache(td)
+        models = pw.load_meta(pw.list_handles()[0])["models"]
+
+    for entry in index.entries:
+        stored = models[entry.model_id]
+        want = entry.adapter_name
+        assert stored["artifact_path"] == f"04_activations/{want}", (
+            f"{entry.model_id} was stored against {stored['artifact_path']!r}"
+        )
+        assert stored["surrogate_hash"] == f"s{want[1:]}", stored
+    return "4 models written under a shuffled request, each against its own artifact"
+
+
+@check("pairwise: one metric spelling files structural and functional alike")
+def t_pair_metric_name_single_spelling():
+    """The repo has two spellings and they disagree.
+
+    ``_resolve_metric(metric).metric_name`` gives ``cka_linear``; ``_metric_name``
+    gives the caller's ``cka``, which ``_structural_matrix`` needs for its kind
+    dispatch. Left unstated, structural handles land under one and functional
+    under the other.
+    """
+    from src.analysis.comparison import _metric_name, _pair_metric_name
+
+    assert _pair_metric_name("cka") == "cka_linear", _pair_metric_name("cka")
+    assert _pair_metric_name("cka_linear") == "cka_linear"
+    assert _metric_name("cka") == "cka", "the dispatch spelling must not change"
+    assert _pair_metric_name("cosine") == "cosine"
+    return "cka and cka_linear both file under cka_linear; dispatch keeps 'cka'"
+
+
+@check("pairwise: the prompt-format id survives into the recorded draw")
+def t_draw_format_id_kept():
+    """Two functions, not one.
+
+    ``parse_draw_name`` returns ``(n_samples, seed)`` and nothing else; the
+    format suffix is read by ``draw_format_id``. Using only the first would drop
+    ``prompt_format_id`` from every recorded draw and let two draws that differ
+    *only* in chat template compare as equal under G4 — and they are a different
+    computation, which is why the field exists.
+    """
+    from src.analysis.comparison import _draw_from_path
+
+    plain = _draw_from_path("04_activations/base/adapter/abc123/n100_s00")
+    fmt = _draw_from_path("04_activations/base/adapter/abc123/n100_s00_fea27ccee")
+
+    assert plain == {"recipe_hash": "abc123", "n_samples": 100, "seed": 0}, plain
+    assert fmt["prompt_format_id"] == "ea27ccee", fmt
+    assert plain != fmt, "two draws differing only in prompt format compared equal"
+    assert _draw_from_path("03_adapters/some_adapter") is None
+    assert _draw_from_path("02_dataset_embeddings/abc/n100_s00/emb/x") is None
+    return "format id kept; structural and dataset_embedding record no draw"
+
+
 @check("identity: per-model identity follows ids, not entry order")
 def t_model_identity_permuted():
     """``docs/notes/row_order_bug.md``, one layer in from where it was fixed.
@@ -5262,6 +5603,16 @@ def t_cross_taxonomy_coordinates():
 
 
 SYNTHETIC = [
+    t_pairwise_row_order,
+    t_pairwise_subset,
+    t_pairwise_incremental,
+    t_pairwise_selector_key,
+    t_pairwise_refuses_transform,
+    t_pairwise_writes_no_collection,
+    t_pairwise_partial_failure,
+    t_meta_models_identity,
+    t_pair_metric_name_single_spelling,
+    t_draw_format_id_kept,
     t_pair_id_order_free,
     t_pairwise_artifact_conflict,
     t_g2_appends_new_model,

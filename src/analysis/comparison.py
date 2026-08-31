@@ -378,6 +378,68 @@ def collection_handle(
     )
 
 
+def _pair_metric_name(metric) -> str:
+    """The metric's **reported** name, which is the only spelling a pair is filed under.
+
+    The codebase has two and they disagree: ``_resolve_metric(metric).metric_name``
+    gives ``"cka_linear"`` while :func:`_metric_name` gives the caller's
+    ``"cka"``, which ``_structural_matrix`` requires for its ``kind`` dispatch.
+    Left unstated, structural handles would land under ``cka`` and functional
+    ones under ``cka_linear``.
+
+    The resolved name is what ``07_collections`` already stores under, and
+    :func:`collection_handle` records what the other choice cost: looking a
+    collection up under the caller's spelling while saving it under the metric's
+    own meant it was stored where it was never sought.  ``_metric_name`` stays
+    where it is, used only for structural's dispatch — a different question from
+    where the result is filed.
+    """
+    return _resolve_metric(metric).metric_name
+
+
+def _selector_for(taxonomy: str, reps, layers=None, projections=None, **selectors) -> dict:
+    """The resolved selector that identifies one surrogate, for the pair handle.
+
+    Composed **exactly as** :func:`_leaf_config` composes it, so the two cannot
+    drift: the twelve resolved read-time fields at the top level and the
+    caller's selectors nested under a ``"selectors"`` key, with ``None`` values
+    dropped.  Stated because "the resolved block plus the selectors dict" admits
+    a second reading — merging the selectors in at the top level — and the two
+    produce *different digests* for the same inputs.  Nesting is also what keeps
+    ``layers`` unambiguous, since it appears in both halves: once as the
+    resolved read-time value and once as whatever the caller passed.
+
+    ``surrogate_transform`` is retained even though G1 means it is always absent
+    on anything reaching the pair store.  It costs nothing when absent, and
+    keeping the list identical to ``_leaf_config``'s is what stops the two from
+    silently diverging.
+
+    **Structural** has ``reps is None``, so there is no metadata to read a
+    selector off.  What plays the selector's role is the ``structural_view``
+    dict that :func:`_structural_identity` hashes, returned verbatim here so a
+    structural handle keys on the same thing its surrogate hash already does.
+    Forward-compatibility rule: when structural gains more hyperparameters,
+    extend that dict **conditionally**, never unconditionally, or every stored
+    structural handle is orphaned.
+    """
+    if reps is None:
+        return {
+            "kind": "structural_view",
+            "layers": layers if layers is not None else "last",
+            "projections": projections if projections is not None else "o",
+        }
+    resolved = {
+        k: v
+        for k, v in ((reps[0].metadata if reps else None) or {}).items()
+        if k in ("mode", "pooling", "layers", "view", "normalize",
+                 "replicate_reduction", "embedder_hash", "max_new_tokens",
+                 "replicates", "sampling_hash", "is_kernel",
+                 "surrogate_transform")
+    }
+    return {**resolved,
+            "selectors": {k: v for k, v in selectors.items() if v is not None}}
+
+
 def _leaf_config(taxonomy, reps, model_entries, **selectors) -> dict:
     """What the leaf ``config.json`` records, so a collection stays traceable.
 
@@ -539,6 +601,7 @@ def _compute_distance_matrix(
     behavioral_selector: dict | None = None,
     functional_selector: dict | None = None,
     transform: Any = None,
+    pairwise_cache=None,
 ) -> DistanceMatrix:
     """Distances for one taxonomy, always recomputed.
 
@@ -558,6 +621,12 @@ def _compute_distance_matrix(
     representations and returning a new one.  It runs after the reorder, so a
     fleet mean is taken over exactly the models *ids* names, in the order it
     names them.
+
+    *pairwise_cache* routes the distances through ``06_pairwise``, computing only
+    the pairs that are not already stored.  ``None`` keeps the always-recomputed
+    behaviour this function is named for.  Either way it writes nothing to
+    ``07_collections``: that stage has exactly one writer, and it is
+    :func:`build_taxonomy_artifacts`.
     """
     reps, order = resolve_ordered(
         index, taxonomy, ids, layers=layers, projections=projections,
@@ -565,8 +634,16 @@ def _compute_distance_matrix(
         behavioral_selector=behavioral_selector,
         functional_selector=functional_selector, transform=transform,
     )
-    return _distances(index, taxonomy, metric, ids, reps, layers, projections,
-                      order=order)
+    if pairwise_cache is None:
+        return _distances(index, taxonomy, metric, ids, reps, layers,
+                          projections, order=order)
+    return _distances_via_pairs(
+        index, taxonomy, metric, ids, reps, layers, projections, order=order,
+        pairwise_cache=pairwise_cache, transform=transform,
+        embedder_hash=embedder_hash, dataset_selector=dataset_selector,
+        behavioral_selector=behavioral_selector,
+        functional_selector=functional_selector,
+    )
 
 
 def resolve_ordered(
@@ -776,9 +853,49 @@ def _model_identity(index: CacheIndex, reps, taxonomy: str, ids, order, *,
                 "recipe_hash": entry.recipe_hash,
                 "artifact_path": path,
                 "surrogate_hash": surrogate,
+                "draw": _draw_from_path(path) if reps is not None else None,
             }
         )
     return out
+
+
+def _draw_from_path(artifact_path: str | None) -> dict | None:
+    """The query draw a representation was extracted against, from its path.
+
+    No cache surfaces the draw in ``rep.metadata``, and it does not need to be
+    plumbed through them: it is already *in* the artifact path, in a spelling
+    this repo owns — ``04_activations/{base}/{adapter}/{recipe_hash}/n{n}_s{seed}[_f{fmt}]``.
+    Parsed with the canonical parsers rather than a local regex.
+
+    **Two functions, not one.**  ``parse_draw_name`` returns ``(n_samples,
+    seed)`` and nothing else; the prompt-format suffix is read by the separate
+    ``draw_format_id``.  Dropping it would let two draws that differ *only* in
+    chat template compare as equal under G4 — and they are a different
+    computation, which is why that field exists.
+
+    ``None`` for anything with no draw token: ``02_dataset_embeddings`` folds
+    the draw into a hash and writes none, and structural has no query draw at
+    all.  That is not a hole — the draw is still inside the ``artifact_path``
+    that G2 compares byte for byte, so a changed draw still fails, under G2's
+    message rather than G4's.
+    """
+    if not artifact_path:
+        return None
+
+    from src.cache._draw import draw_format_id, parse_draw_name
+
+    parts = Path(artifact_path).parts
+    if len(parts) < 2:
+        return None
+    parsed = parse_draw_name(parts[-1])
+    if parsed is None:
+        return None
+    n_samples, seed = parsed
+    draw = {"recipe_hash": parts[-2], "n_samples": n_samples, "seed": seed}
+    fmt = draw_format_id(parts[-1])
+    if fmt is not None:
+        draw["prompt_format_id"] = fmt
+    return draw
 
 
 def _structural_identity(index: CacheIndex, layers, projections) -> list[dict]:
@@ -901,6 +1018,130 @@ def _distances(
         metric=metric_obj.metric_name,
         taxonomy=taxonomy,
     )
+
+
+def _distances_via_pairs(
+    index: CacheIndex,
+    taxonomy: str,
+    metric: Any,
+    ids: Sequence[ModelID],
+    reps: Sequence | None,
+    layers=None,
+    projections=None,
+    order: Sequence[int] | None = None,
+    *,
+    pairwise_cache=None,
+    transform: Any = None,
+    read: bool = True,
+    label: str | None = None,
+    **selectors,
+) -> DistanceMatrix:
+    """A distance matrix assembled from ``06_pairwise``, computing only the misses.
+
+    A peer of :func:`_distances`, which is left untouched as the uncached path.
+
+    *transform* is not optional decoration: :func:`resolve_ordered` applies a
+    fleet transform to *reps* **before** returning them, so by the time any
+    distance function is called the transform has been folded into the
+    representations and left no trace in the arguments.  A function built
+    literally to ``_distances``'s signature could not evaluate ``transform is
+    not None`` at all, and **G1 would silently never fire** — writing centered
+    distances into the store as though they were reusable.
+
+    *order* is not optional either.  ``order[k]`` is the entry position of
+    ``ids[k]``, and it is the whole safety argument: identity is resolved
+    through it rather than zipped against a list it was not derived from.
+
+    *read* is what ``--no-cache`` turns off.  Misses are still written, so a
+    cold run populates the store it is the control for.
+    """
+    if pairwise_cache is None:
+        return _distances(index, taxonomy, metric, ids, reps, layers,
+                          projections, order=order)
+
+    # G1 — fleet transforms are collection-level operations: centering and
+    # whitening are "defined by the set of models being compared, and change
+    # when a model joins or leaves it" (src/analysis/surrogates.py). A pair's
+    # distance under one is therefore not a property of the pair, so it must not
+    # be stored as though it were. Bypass means *uncached*, not redirected:
+    # nothing on this path writes 07_collections either.
+    if transform is not None:
+        return _distances(index, taxonomy, metric, ids, reps, layers,
+                          projections, order=order)
+
+    ids = list(ids)
+    if order is None:
+        order = _positions_for(index, ids)
+
+    pairs = pairwise_cache
+    selector = _selector_for(taxonomy, reps, layers, projections, **selectors)
+    models = _model_identity(index, reps, taxonomy, ids, order,
+                             layers=layers, projections=projections)
+    metric_obj = _resolve_metric(metric)
+    handle = pairs.handle(taxonomy, _pair_metric_name(metric), selector)
+
+    n = len(ids)
+    wanted = {}
+    for i in range(n):
+        for j in range(i + 1, n):
+            wanted[(i, j)] = pairs.pair_id(ids[i], ids[j])
+
+    table = pairs.load_pairs(handle, set(wanted.values())) if read else {}
+    missing = {pid: (i, j) for (i, j), pid in wanted.items() if pid not in table}
+
+    if missing:
+        computed: dict[str, float] = {}
+        try:
+            if reps is None:
+                computed = _structural_pairs(index, metric, ids, order, missing,
+                                             layers, projections)
+            else:
+                for pid, (i, j) in missing.items():
+                    computed[pid] = float(metric_obj.compute(reps[i], reps[j]))
+        finally:
+            # Partial batches are written, then the exception propagates
+            # unchanged. Pairs are independent, so a partially filled pairs.json
+            # is not an inconsistent artifact but a smaller correct one — and a
+            # retry then recomputes exactly the failures rather than discarding
+            # 119 good distances because the 120th raised. The caller decides
+            # what a failure means; the layer sweep records NaN and continues.
+            if computed:
+                pairs.save_pairs(handle, computed, models, selector, label=label)
+        table.update(computed)
+
+    # G3 — filled by pair_id lookup in the caller's order. No zip of an id list
+    # against a data list it was not derived from.
+    arr = np.zeros((n, n), dtype=np.float64)
+    for (i, j), pid in wanted.items():
+        arr[i, j] = arr[j, i] = table[pid]
+
+    return DistanceMatrix(
+        matrix=arr,
+        model_ids=list(ids),
+        metric=metric_obj.metric_name,
+        taxonomy=taxonomy,
+    )
+
+
+def _structural_pairs(index, metric, ids, order, missing, layers, projections) -> dict:
+    """The missing structural pairs, over just the adapters they mention.
+
+    ``_structural_matrix`` builds a whole matrix through ``lora_distance_matrix``
+    rather than pair by pair, so filling a subset means running that builder over
+    the sub-collection of adapters appearing in *missing*.  All four supported
+    kinds (cosine, frobenius, bures_wasserstein, cka) are genuinely pairwise, so
+    this is sound.
+    """
+    involved = sorted({k for pair in missing.values() for k in pair})
+    sub_ids = [ids[k] for k in involved]
+    sub_order = [order[k] for k in involved]
+    dm = _structural_matrix(index, metric, sub_ids, layers, projections,
+                            order=sub_order)
+    pos = {mid: k for k, mid in enumerate(dm.model_ids)}
+    out = {}
+    for pid, (i, j) in missing.items():
+        out[pid] = float(dm.matrix[pos[ids[i]], pos[ids[j]]])
+    return out
 
 
 def _structural_matrix(

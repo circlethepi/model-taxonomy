@@ -41,7 +41,7 @@ Usage
 
 Reuse
 -----
-Distance matrices and MDS embeddings are read back from ``06_collections`` in
+Distance matrices and MDS embeddings are read back from ``07_collections`` in
 the shared cache when a previous run has already computed them, and written
 there when they have not. ``--no-cache`` ignores what is stored and recomputes
 everything, but **still writes the results back** — that is how a warm run is
@@ -300,7 +300,7 @@ def _blocked(single_row: bool, tf) -> dict[str, str]:
 
 
 class SuiteCache:
-    """Read-through access to ``06_collections`` for the figure suite.
+    """Read-through access to ``07_collections`` for the figure suite.
 
     The suite used to recompute every distance matrix and every MDS embedding on
     every run while the cache that stores exactly those two things sat unused;
@@ -448,9 +448,9 @@ class SuiteCache:
         if not self.read:
             return (f"collection cache: reads bypassed (--no-cache), "
                     f"{self.misses} recomputed and written under "
-                    f"{self.root}/06_collections")
+                    f"{self.root}/07_collections")
         return (f"collection cache: {self.hits} hit(s), {self.misses} miss(es) "
-                f"under {self.root}/06_collections")
+                f"under {self.root}/07_collections")
 
 
 #: Set in `main()`. Off until then, so importing this module never writes to a
@@ -1293,7 +1293,7 @@ def main() -> None:
     ids = sort_by_mixture(idx.model_ids)
     names = [Path(m).name for m in ids]
     print(f"cache: {CACHE_ROOT}\nmodels: {len(ids)}")
-    print(f"reuse: {'reads bypassed (--no-cache), still writing' if args.no_cache else '06_collections'}")
+    print(f"reuse: {'reads bypassed (--no-cache), still writing' if args.no_cache else '07_collections'}")
     if len(ids) != 16:
         raise SystemExit(f"expected 16 models, found {len(ids)} — cache incomplete?")
 

@@ -61,8 +61,8 @@ the objects at that stage**, as in `03A_adapter_alignments`.
 | `03A_adapter_alignments` | Pairwise Procrustes alignments |
 | `04_activations` | Pooled hidden states per layer |
 | `05_generated` | Generated text and its embeddings |
-| `05a_logprobs` | Per-token log-probabilities and entropies |
-| `06_collections` | Distance matrices and geometry results |
+| `05A_logprobs` | Per-token log-probabilities and entropies |
+| `07_collections` | Distance matrices and geometry results |
 
 **Draw** — one sampled subset of a dataset, spelled `n{n}_s{seed:02d}` with the
 seed zero-padded. `src/cache/_draw.py` owns the spelling. Writing is narrow and
@@ -108,7 +108,7 @@ would otherwise change the identity of every cached draw at once.
 ## Collections and their keys
 
 **Collection** — one distance matrix plus its geometries, stored in
-`06_collections` under a handle. The unit of reuse.
+`07_collections` under a handle. The unit of reuse.
 
 **Handle** — the path a collection is stored under:
 `{taxonomy}/{collection_key}/{metric}_{surrogate_key}`. Composed in one place,

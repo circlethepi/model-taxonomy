@@ -219,7 +219,7 @@ def save_collection(
     hand in a notebook usually has no such path, so this is a warning rather than
     an error, but prefer ``build_taxonomy_artifacts`` where you can.
 
-    Returns the handle (the path under ``{cache_root}/06_collections/``).
+    Returns the handle (the path under ``{cache_root}/07_collections/``).
     """
     import warnings
 

@@ -68,7 +68,7 @@ BehavioralTaxonomy(
 )
 ```
 
-This rides along with the generation pass and writes into `05a_logprobs` under a filename
+This rides along with the generation pass and writes into `05A_logprobs` under a filename
 carrying the *same* variant token as the `generations/{token}.json` it describes, so the
 two join by name with no lookup.
 

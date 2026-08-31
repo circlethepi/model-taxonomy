@@ -9,12 +9,20 @@ objects at that stage".
     dataset_embeddings  → 02_dataset_embeddings
     adapters            → 03_adapters
     adapter_alignments  → 03A_adapter_alignments
-    collections         → 06_collections
+    collections         → 07_collections
     representations     → deleted (empty; split into 04_activations / 05_generated,
                           both created on first write)
 
 There is deliberately no compatibility shim in the cache classes: a call site that
 was missed must fail loudly rather than quietly keep reading the old directory.
+
+**A later renumbering moved collections again.**  This script originally produced
+``06_collections``; ``scripts/migrate_pairwise_layout.py`` then moved that to
+``07_collections`` to free ``06`` for the pairwise-distance store, which
+collections are assembled from.  The mapping above names the *current* stage
+rather than the historical one, so running this on an old cache lands it in
+today's layout in one step instead of a layout that immediately needs migrating
+again.
 
 This also gives recipes a hash-indexed home.  Until now the only way to resolve a
 ``recipe_hash`` to its recipe was to reach into the dataset-embedding cache, which
@@ -53,7 +61,7 @@ RENAMES = {
     "dataset_embeddings": "02_dataset_embeddings",
     "adapters": "03_adapters",
     "adapter_alignments": "03A_adapter_alignments",
-    "collections": "06_collections",
+    "collections": "07_collections",
 }
 
 #: Emptied by the 04/05 split.  Removed rather than moved; the two replacements are

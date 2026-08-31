@@ -64,7 +64,7 @@ the natural stand-in for ground truth.
 
 The middle three share one `HFInferenceTaxonomy` base class and one cache key, so a
 model under a given query draw sits at the same coordinates in `04_activations`,
-`05_generated` and `05a_logprobs`.
+`05_generated` and `05A_logprobs`.
 
 ---
 
@@ -152,8 +152,9 @@ Several cache classes cover different storage needs. All tensor data is stored i
 | `LoRACache` | `03_adapters` | Raw PEFT weights and structural representations |
 | `ActivationCache` | `04_activations` | Pooled hidden states per layer |
 | `GeneratedTextCache` | `05_generated` | Generated text and its embeddings |
-| `LogProbCache` | `05a_logprobs` | Per-token log-probabilities and entropies |
-| `CollectionCache` | `06_collections` | Distance matrices and geometry results |
+| `LogProbCache` | `05A_logprobs` | Per-token log-probabilities and entropies |
+| `PairwiseCache` | `06_pairwise` | Individual pairwise distances, one entry per model pair |
+| `CollectionCache` | `07_collections` | Distance matrices and geometry results |
 | `DiskCache` | — | The general-purpose flat, hash-keyed fallback |
 
 `ActivationCache`, `GeneratedTextCache` and `LogProbCache` all derive from
@@ -173,8 +174,9 @@ results/shared_cache/
     03A_adapter_alignments/      pairwise Procrustes alignments
     04_activations/              {base}/{adapter}/{recipe_hash}/n{n}_s{seed}[_f{fmt}]/
     05_generated/                {base}/{adapter}/{recipe_hash}/n{n}_s{seed}[_f{fmt}]/
-    05a_logprobs/                {base}/{adapter}/{recipe_hash}/n{n}_s{seed}[_f{fmt}]/
-    06_collections/              distance matrices, geometries, index.json
+    05A_logprobs/                {base}/{adapter}/{recipe_hash}/n{n}_s{seed}[_f{fmt}]/
+    06_pairwise/                 {taxonomy}/{selector_slug}_{selector_key}/{metric}/pairs.json
+    07_collections/              distance matrices, geometries, index.json
 ```
 
 The three inference stages share that key exactly, from

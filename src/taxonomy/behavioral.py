@@ -109,7 +109,7 @@ class BehavioralTaxonomy(HFInferenceTaxonomy, Taxonomy):
     — it collects no hidden states.  Use :class:`FunctionalTaxonomy` if you need
     activation-based comparison.  With ``collect_logprobs=True`` it additionally
     records the per-token log-probabilities of the text it drew, into
-    ``05a_logprobs`` beside the generations; that is a second artifact from the
+    ``05A_logprobs`` beside the generations; that is a second artifact from the
     same pass, not a change to what the behavioral matrix contains.
 
     Generated texts are stored in ``ModelRepresentation.metadata["generated_texts"]``
@@ -146,7 +146,7 @@ class BehavioralTaxonomy(HFInferenceTaxonomy, Taxonomy):
         are two entries, not one entry silently reused.
     collect_logprobs, logprob_cache:
         Collect the per-token log-probability and entropy of every generated
-        token and store them in ``05a_logprobs`` under the *same* variant token as
+        token and store them in ``05A_logprobs`` under the *same* variant token as
         the generations, so the two files join by name.
 
         **Two distributions are stored, not one.**  ``generate`` runs the raw
@@ -243,7 +243,7 @@ class BehavioralTaxonomy(HFInferenceTaxonomy, Taxonomy):
         self.collect_logprobs = bool(collect_logprobs)
         self.logprob_cache = logprob_cache
         # Filled by _extract_fresh when collecting; read by extract() to write
-        # the 05a_logprobs entry beside the generations it describes.
+        # the 05A_logprobs entry beside the generations it describes.
         self._logprob_arrays: dict[str, np.ndarray] | None = None
 
     @property
@@ -606,7 +606,7 @@ class BehavioralTaxonomy(HFInferenceTaxonomy, Taxonomy):
 
         One row per generated sequence, in the query-major order ``generate``
         returns and the behavioral matrix stores, so row *i* means the same thing
-        in ``05_generated`` and ``05a_logprobs``.
+        in ``05_generated`` and ``05A_logprobs``.
 
         Reduced **step by step**: each step's ``(rows, V)`` distribution is turned
         into two scalars per row and dropped, so the peak here is one step, not

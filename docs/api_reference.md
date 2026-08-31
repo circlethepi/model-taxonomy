@@ -352,7 +352,7 @@ returned representation is a summary of the stored arrays.
 
 `mode="generation"` raises. Generation-mode log-probs are collected by
 `BehavioralTaxonomy(collect_logprobs=True, logprob_cache=...)`, because the distributions
-they need exist only inside the `generate()` call. Both write into `05a_logprobs`.
+they need exist only inside the `generate()` call. Both write into `05A_logprobs`.
 
 See [Log-Probability Taxonomy](guides/logprob_taxonomy.md).
 
@@ -991,7 +991,7 @@ representation means re-embedding, not a read-time rebuild.
 from src.cache.logprob_cache import LogProbCache
 
 class LogProbCache(DrawKeyedCache):
-    _STAGE_DIR = "05a_logprobs"
+    _STAGE_DIR = "05A_logprobs"
 
     def exists(base_model_id, adapter_id, query_key, mode, *,
                max_new_tokens=None, replicates=None, sampling_hash=None) -> bool
@@ -1234,7 +1234,7 @@ that wants to cache what it resolved does not have to resolve twice to find out 
 resolved.
 
 `collection_handle` composes `{taxonomy}/{collection_key}/{metric}_{surrogate_key}` in one
-place, so every writer into `06_collections` keys identically. The metric's **reported**
+place, so every writer into `07_collections` keys identically. The metric's **reported**
 name is used (`"cka"` → `"cka_linear"`). `transform` and `surrogate` are the two things
 resolution does not show; both join the surrogate key, tagged and only when present, so a
 raw, surrogate-less handle is unchanged from before either existed. `surrogate` is the **resolved

@@ -112,7 +112,7 @@ the point of it.
 
 ### Distance matrices and embeddings are reused between runs
 
-Every cell the suite computes is stored in the shared cache's `06_collections` and read
+Every cell the suite computes is stored in the shared cache's `07_collections` and read
 back on the next run, keyed on the taxonomy, the metric's reported name, each model's
 resolved artifact, its surrogate, the transform and the **resolved selector** of the surrogate
 — never the row's display label, which is editable prose.

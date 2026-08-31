@@ -7,7 +7,7 @@ hidden state it passed through, this one reads the probability the model assigne
 It is the third `HFInferenceTaxonomy` subclass, peer of `FunctionalTaxonomy` and
 `BehavioralTaxonomy`, and it shares their cache key exactly — one model under one
 draw sits at the same coordinates in `04_activations`, `05_generated` and
-`05a_logprobs`, so the three trees can be read side by side.
+`05A_logprobs`, so the three trees can be read side by side.
 
 ## Two modes, one storage stage
 
@@ -21,7 +21,7 @@ The level has two modes, and only one of them is a class.
 `LogProbTaxonomy` accepts `mode="input"` only, and raises otherwise. Generation-mode
 log-probs are *not* a second class: the distributions they need exist only inside the
 `generate()` call, so they ride along with the behavioral extraction that already
-makes it. Both write into the same `05a_logprobs` stage.
+makes it. Both write into the same `05A_logprobs` stage.
 
 ### Why input mode is worth having on its own
 
@@ -33,7 +33,7 @@ same text likely*, which stays well-defined where the generations are noisy.
 ## What is stored
 
 ```
-results/shared_cache/05a_logprobs/{base_slug}/{adapter_slug}/{recipe_hash}/n{n}_s{seed}[_f{fmt}]/
+results/shared_cache/05A_logprobs/{base_slug}/{adapter_slug}/{recipe_hash}/n{n}_s{seed}[_f{fmt}]/
     queries.json                      ← query_key + source row indices
     runs/{config_hash}.json           ← extraction provenance
     logprobs/input.safetensors

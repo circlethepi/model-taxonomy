@@ -27,9 +27,9 @@ cost that deferred this item is not a real cost.
 
 Layout::
 
-    before:  06_collections/{old_hash}/{collection_info.json,distance_matrix.safetensors,coordinates/}
-    after:   06_collections/_legacy/{old_hash}/...          ← untouched, still readable
-             06_collections/{taxonomy}/{collection_key}/... ← written fresh on next read
+    before:  07_collections/{old_hash}/{collection_info.json,distance_matrix.safetensors,coordinates/}
+    after:   07_collections/_legacy/{old_hash}/...          ← untouched, still readable
+             07_collections/{taxonomy}/{collection_key}/... ← written fresh on next read
 
 Safety model
 ------------
@@ -95,7 +95,7 @@ def _old_entries(root: Path) -> list[Path]:
     ``distance_matrix.safetensors``.  The new layout never puts one at this
     depth, so there is no ambiguity.
     """
-    base = root / "06_collections"
+    base = root / "07_collections"
     if not base.exists():
         return []
     out = []
@@ -108,14 +108,14 @@ def _old_entries(root: Path) -> list[Path]:
 
 
 def _quarantined(root: Path) -> list[Path]:
-    base = root / "06_collections" / LEGACY
+    base = root / "07_collections" / LEGACY
     if not base.exists():
         return []
     return sorted(d for d in base.iterdir() if d.is_dir())
 
 
 def plan(root: Path) -> list[tuple[Path, Path]]:
-    base = root / "06_collections"
+    base = root / "07_collections"
     return [(d, base / LEGACY / d.name) for d in _old_entries(root)]
 
 
@@ -150,7 +150,7 @@ def root_index(moves: list[tuple[Path, Path]]) -> tuple[Path, Path] | None:
 
 
 def revert(root: Path, dry_run: bool) -> int:
-    base = root / "06_collections"
+    base = root / "07_collections"
     n = 0
     for d in _quarantined(root):
         target = base / d.name

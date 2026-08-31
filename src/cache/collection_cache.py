@@ -18,7 +18,7 @@ class CollectionCache:
 
     Directory layout::
 
-        cache_root/06_collections/
+        cache_root/07_collections/
             index.json                        ← readable catalogue of every collection
             {taxonomy}/
                 {collection_key}/
@@ -72,7 +72,7 @@ class CollectionCache:
 
     def __init__(self, cache_root: Path | str) -> None:
         self.root = Path(cache_root)
-        self._collections_dir = self.root / "06_collections"
+        self._collections_dir = self.root / "07_collections"
 
     # ------------------------------------------------------------------
     # Hash helpers

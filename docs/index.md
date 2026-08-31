@@ -49,7 +49,7 @@ Collection of models
 | [Core Concepts](concepts.md) | Data model, pipeline, cache hierarchy, and design rationale |
 | [Behavioral Taxonomy](guides/behavioral_taxonomy.md) | Generated-output comparison, embedder strategies, probe design |
 | [Functional Taxonomy](guides/functional_taxonomy.md) | Activation modes (input / generation / both), read-time views, layer selection |
-| [Log-Probability Taxonomy](guides/logprob_taxonomy.md) | Teacher-forced and generation-mode log-probs, entropies, and the `05a_logprobs` stage |
+| [Log-Probability Taxonomy](guides/logprob_taxonomy.md) | Teacher-forced and generation-mode log-probs, entropies, and the `05A_logprobs` stage |
 | [Structural Taxonomy](guides/structural_taxonomy.md) | LoRA adapter cache, config.json schema, layer selection |
 | [Model Profiles and Prompt Formats](guides/model_profiles.md) | Per-checkpoint defaults, chat-template pinning, and the prompt/completion cut |
 | [Experiment Suites](guides/experiment_suites.md) | `Suite`, the simplex3 config generator, and smoke-testing a new base model |

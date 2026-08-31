@@ -192,11 +192,11 @@ def build_taxonomy_artifacts(
         It runs after resolution and before any distance is taken, and its
         :func:`~src.analysis.surrogates.transform_key` joins the collection key,
         so a centered collection and a raw one over the same tensors cannot
-        collide in ``06_collections``.  Not available for ``structural``, which
+        collide in ``07_collections``.  Not available for ``structural``, which
         never materializes the representations a transform would act on.
 
     use_cache:
-        ``False`` skips ``06_collections`` entirely — nothing is read and nothing
+        ``False`` skips ``07_collections`` entirely — nothing is read and nothing
         is written.  ``cache_root=None`` does **not** do this: it falls back to
         ``index.cache_root``, which a ``scan_cache`` index always carries, so a
         caller meaning "just compute" wrote to the shared cache anyway.  That
@@ -313,7 +313,7 @@ def collection_handle(
     """The handle one distance matrix is stored under, composed in one place.
 
     Everything that changes the numbers has to be in the key, and the pieces are
-    not all obvious, so both callers that write into ``06_collections`` —
+    not all obvious, so both callers that write into ``07_collections`` —
     :func:`build_taxonomy_artifacts` and the figure suite — compose it here
     rather than each assembling their own.
 
@@ -536,7 +536,7 @@ def _compute_distance_matrix(
     """Distances for one taxonomy, always recomputed.
 
     The selector-faithful path: it honours every selector on every call and never
-    reads or writes ``06_collections``.  :func:`build_taxonomy_artifacts` goes
+    reads or writes ``07_collections``.  :func:`build_taxonomy_artifacts` goes
     through the cache instead; this is what to call to sweep selectors without
     populating it.
 

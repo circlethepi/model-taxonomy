@@ -62,6 +62,7 @@ the objects at that stage**, as in `03A_adapter_alignments`.
 | `04_activations` | Pooled hidden states per layer |
 | `05_generated` | Generated text and its embeddings |
 | `05A_logprobs` | Per-token log-probabilities and entropies |
+| `06_pairwise` | Individual pairwise distances, one entry per model pair |
 | `07_collections` | Distance matrices and geometry results |
 
 **Draw** — one sampled subset of a dataset, spelled `n{n}_s{seed:02d}` with the
@@ -133,16 +134,50 @@ Note the asymmetry with `collection_key`, which sorts: `surrogate_key` does
 **not**. That asymmetry is currently masked because the models in a collection
 share one surrogate hash, and it is recorded rather than relied upon.
 
-**Rung** — one row of a figure grid: a resolved selector over a level, such as a
-layer group or a pooling choice. A grid is **surrogate × metric**. Two surrogates of one
-level read the same artifacts under the same surrogate — that is what makes them
-one level — so a surrogate must reach the cache key explicitly or two surrogates collide
-on a single handle.
+### The settled triple
 
-Key on the **resolved selector dict**, never the surrogate's display label. Labels
-like `"late third"` are editable prose: redefining which layers that names,
-without changing the string, would leave a label-keyed entry serving a matrix
-built from the old definition.
+These three were ambiguous and are now fixed. They are the spine of the caching
+design, because a `06_pairwise` handle addresses exactly one **perspective**.
+
+| term | meaning |
+|---|---|
+| **selector** | The collection of hyperparameters that produce a surrogate — mode, pooling, layers, projections, view, normalize, replicate reduction, the query draw, the embedder, and any fleet transform. |
+| **surrogate** | What a selector produces: the representation view being compared. One **row** of the figure grid, e.g. `late third · centered`. |
+| **perspective** | A surrogate together with a similarity metric. One **cell** of the figure grid, e.g. `late third · centered` × `cosine`. |
+
+**`rung` is retired**, replaced by `surrogate`. This was a unification rather
+than a rename: `surrogate` already meant "a read-time view of a stored artifact,
+computed on demand and written back", the module applying fleet transforms was
+already `src/analysis/surrogates.py`, and the figure suite's own docstring
+section was already headed "Surrogate rungs". The two words were describing one
+thing at two layers.
+
+One caveat to keep in mind: the cached `surrogates/{hash}/` in `04`/`05` covers
+view, pooling and normalize, while the *fleet* transform is applied later in
+`src/analysis/surrogates.py`. Both are surrogates, produced at different stages.
+
+Two surrogates of one level read the same artifacts under the same *stage*
+surrogate — that is what makes them one level — so a surrogate must reach the
+cache key explicitly, or two of them collide on a single handle.
+
+Key on the **resolved selector dict**, never the surrogate's display label.
+Labels like `"late third"` are editable prose: redefining which layers that
+names, without changing the string, would leave a label-keyed entry serving a
+matrix built from the old definition.
+
+**Pair id** (`pair_id`) — the readable key of one entry in a `pairs.json`,
+naming an unordered pair of models: `"__".join(sorted([model_id_a,
+model_id_b]))`. It is an `_id` and not a `_key` because this codebase draws that
+line: `model_id`, `recipe_id` and `adapter_name` are readable, while
+`collection_key`, `surrogate_key` and `recipe_hash` are opaque digests.
+
+**Selector key** — the digest of a selector, named to match `collection_key` and
+`surrogate_key`.
+
+**Selector slug** — the readable, **non-identifying** prefix on a `06_pairwise`
+handle's surrogate component, e.g. `input_mean_concat_layer_L0-28`. Identity
+lives entirely in the selector key, which is what lets the slug be improved later
+without orphaning a single stored pair.
 
 **Row-order guard** — `DistanceMatrix.reindex(model_ids)`, which permutes rows
 and columns into the caller's order, selects a subset, and raises on an unknown

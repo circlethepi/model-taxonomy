@@ -155,11 +155,41 @@ Several cache classes cover different storage needs. All tensor data is stored i
 | `LogProbCache` | `05A_logprobs` | Per-token log-probabilities and entropies |
 | `PairwiseCache` | `06_pairwise` | Individual pairwise distances, one entry per model pair |
 | `CollectionCache` | `07_collections` | Distance matrices and geometry results |
+
+Matrices and MDS fits in `07_collections` are stored **canonically**, with rows
+in `model_id` order, and permuted onto the caller's order on read. That makes the
+bytes on disk a function of the handle alone, so a warm run is byte-identical to
+a cold one however the caller ordered its request. It is also a deliberate
+deviation from `docs/notes/caching_collections.md` §3, which says a geometry must
+be recomputed rather than permuted: that holds for a fit made under an *unknown*
+order, and canonical storage removes the premise, since the stored fit is always
+the same fit. A **subset** is still refitted — an MDS fit of 16 models restricted
+to 12 is not the fit of those 12.
 | `DiskCache` | — | The general-purpose flat, hash-keyed fallback |
 
 `ActivationCache`, `GeneratedTextCache` and `LogProbCache` all derive from
 `DrawKeyedCache` and so share one key; `SampledDatasetCache` and
 `DatasetEmbeddingCache` are keyed by recipe alone and are model-free.
+
+### The pairwise store
+
+`06_pairwise` holds **individual pairwise distances**, keyed on the pair rather
+than on the collection. A distance matrix for any set of models, in any order, is
+assembled by lookup from them, so a subset of a computed collection is free and a
+new model costs only the pairs that involve it — 16 new distances against a warm
+16-model handle rather than all 136.
+
+A **handle** is `{taxonomy}/{selector_slug}_{selector_key}/{metric}` and
+addresses exactly one *perspective* (a surrogate together with a metric). The
+model set is deliberately not part of it; per-model identity is recorded in
+`meta.json` and verified on every read and write instead, so stored pairs built
+from different tensors are refused rather than served.
+
+Fleet transforms — `centered()`, `whitened()` — never reach this store. They are
+collection-level operations, so a pair's distance under one is not a property of
+the pair; those perspectives are computed uncached.
+
+Full design, guards and limitations: `docs/notes/pairwise_store.md`.
 
 ### The shared cache layout
 

@@ -41,9 +41,17 @@ Usage
 
 Reuse
 -----
-Distance matrices and MDS embeddings are read back from ``07_collections`` in
-the shared cache when a previous run has already computed them, and written
-there when they have not. ``--no-cache`` ignores what is stored and recomputes
+Distances come from ``06_pairwise``, the shared cache's store of **individual
+pairwise distances**: every pair this suite needs is looked up, only the misses
+are computed, and every computed pair is written back. So a re-run with one more
+adapter costs the pairs that involve it rather than every pair again, and a
+subset of a computed collection costs nothing.
+
+The suite writes **no distance matrices**. Pairs are the single source of truth
+for every pairwise-safe perspective, and a stored assembly beside them could
+drift from what it was assembled from. MDS embeddings are still cached in
+``07_collections``, since a fit is not an assembly and cannot be rebuilt from
+pairs. ``--no-cache`` ignores what is stored and recomputes
 everything, but **still writes the results back** — that is how a warm run is
 checked against a cold one: run it once with ``--no-cache`` and once without
 against the same ``--cache-root``, and the ``matrix_sha256`` column of
@@ -380,7 +388,7 @@ class SuiteCache:
         from src.analysis.comparison import collection_handle
 
         handle = collection_handle(self._cc, taxonomy, metric, model_entries,
-                                   transform=transform, rung=surrogate)
+                                   transform=transform, surrogate=surrogate)
         self._handles[id(dm)] = (dm, handle)
 
     @staticmethod
@@ -772,16 +780,28 @@ def _structural_grid(idx, names, ids, specs):
                 # the cache is handed is always a matrix and never a reason.
                 cells[(row, col)] = NO_CKA_GROUP
                 continue
-            cells[(row, col)] = SUITE_CACHE.distance_matrix(
-                lambda row=row, layers=layers, projs=projs, col=col:
-                    compute(row, layers, projs, col),
-                taxonomy="structural", ids=ids, metric=METRICS[col],
-                # No `surrogate=`: for structural the view *is* the surrogate —
-                # `_structural_identity` hashes (layers, projections) into
-                # `surrogate_hash` — so passing the selectors again would key the
-                # same collection twice, once per writer.
-                model_entries=entries_for(layers, projs), label=row,
+            entries = entries_for(layers, projs)
+            # For structural the view *is* the surrogate — `_structural_identity`
+            # hashes (layers, projections) into `surrogate_hash` — so the pair
+            # handle keys on that same `structural_view` dict rather than on a
+            # separate selector, and a structural handle stays comparable with
+            # what the collection cache already writes.
+            dm = _distances_via_pairs(
+                idx, "structural", METRICS[col], ids, None,
+                list(layers), list(projs), order=order,
+                pairwise_cache=SUITE_CACHE.pairwise, read=SUITE_CACHE.read,
+                label=row,
+                # The grid loads every adapter once and runs the low-rank
+                # builders over the whole collection; filling pair by pair would
+                # reload weights per pair and lose exactly the optimisation this
+                # function exists for. Every pair it yields is still stored, so a
+                # later subset or superset of this collection is free.
+                compute_all=(lambda row=row, layers=layers, projs=projs, col=col:
+                             compute(row, layers, projs, col)),
             )
+            SUITE_CACHE.register(dm, taxonomy="structural", metric=METRICS[col],
+                                 model_entries=entries, label=row)
+            cells[(row, col)] = dm
     return list(specs), cells
 
 
@@ -991,7 +1011,7 @@ def layer_sweep(idx, ids, outdir):
 MDS_SEED = 0
 
 
-class RungScore(NamedTuple):
+class SurrogateScore(NamedTuple):
     """One scored (surrogate, metric) cell of one level.
 
     ``dcor`` runs 0→1 better; ``procrustes`` runs 1→0 better. They are not two
@@ -1011,7 +1031,7 @@ class RungScore(NamedTuple):
 def rank_surrogates(level_cells, ids, tdm=None, tgeo=None):
     """Every computed (surrogate, metric) cell of one level, scored against the truth.
 
-    Returns ``[RungScore, ...]`` sorted by **dCor** descending. The sort key is
+    Returns ``[SurrogateScore, ...]`` sorted by **dCor** descending. The sort key is
     deliberately still dCor even though a second score is now reported: the
     winner each figure draws is the dCor winner, and this is the ranking the
     tracked tables record. Scoring every cell rather than a designated reference
@@ -1037,7 +1057,7 @@ def rank_surrogates(level_cells, ids, tdm=None, tgeo=None):
             # would let the reported numbers describe different configurations.
             geo = SUITE_CACHE.geometry(cell, n_components=2,
                                        random_state=MDS_SEED)
-            scored.append(RungScore(
+            scored.append(SurrogateScore(
                 dcor=dcor_vs_truth(cell, tdm),
                 procrustes=disparity_vs_truth(cell, tgeo, geometry=geo),
                 stress=float(kruskal_stress(cell, geo)),
@@ -1302,7 +1322,7 @@ def main() -> None:
     ids = sort_by_mixture(idx.model_ids)
     names = [Path(m).name for m in ids]
     print(f"cache: {CACHE_ROOT}\nmodels: {len(ids)}")
-    print(f"reuse: {'reads bypassed (--no-cache), still writing' if args.no_cache else '07_collections'}")
+    print(f"reuse: {'reads bypassed (--no-cache), still writing' if args.no_cache else '06_pairwise'}")
     if len(ids) != 16:
         raise SystemExit(f"expected 16 models, found {len(ids)} — cache incomplete?")
 

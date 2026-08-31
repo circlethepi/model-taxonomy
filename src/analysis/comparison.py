@@ -1077,6 +1077,8 @@ def _distances_via_pairs(
     transform: Any = None,
     read: bool = True,
     label: str | None = None,
+    selector: dict | None = None,
+    compute_all=None,
     **selectors,
 ) -> DistanceMatrix:
     """A distance matrix assembled from ``06_pairwise``, computing only the misses.
@@ -1097,6 +1099,16 @@ def _distances_via_pairs(
 
     *read* is what ``--no-cache`` turns off.  Misses are still written, so a
     cold run populates the store it is the control for.
+
+    *selector* overrides what :func:`_selector_for` would resolve, for a caller
+    that has already resolved it.  *compute_all* is for a caller whose builder
+    produces a **whole matrix** rather than one pair at a time: it is invoked at
+    most once, only if something is missing, and must return a
+    :class:`DistanceMatrix` labelled with *ids*.  The structural grid is the
+    case — it loads every adapter once and runs the low-rank builders over the
+    whole collection, so filling pair by pair would reload weights per pair and
+    lose the optimisation the grid exists for.  Every pair it produces is stored,
+    so a later subset or superset of that collection is still free.
     """
     if pairwise_cache is None:
         return _distances(index, taxonomy, metric, ids, reps, layers,
@@ -1117,7 +1129,8 @@ def _distances_via_pairs(
         order = _positions_for(index, ids)
 
     pairs = pairwise_cache
-    selector = _selector_for(taxonomy, reps, layers, projections, **selectors)
+    if selector is None:
+        selector = _selector_for(taxonomy, reps, layers, projections, **selectors)
     models = _model_identity(index, reps, taxonomy, ids, order,
                              layers=layers, projections=projections)
     metric_obj = _resolve_metric(metric)
@@ -1135,7 +1148,12 @@ def _distances_via_pairs(
     if missing:
         computed: dict[str, float] = {}
         try:
-            if reps is None:
+            if compute_all is not None:
+                whole = compute_all()
+                pos = {mid: k for k, mid in enumerate(whole.model_ids)}
+                for pid, (i, j) in missing.items():
+                    computed[pid] = float(whole.matrix[pos[ids[i]], pos[ids[j]]])
+            elif reps is None:
                 computed = _structural_pairs(index, metric, ids, order, missing,
                                              layers, projections)
             else:

@@ -4044,6 +4044,251 @@ def _fake_reps(n=4, rows=6, d=5, seed=7):
     ]
 
 
+def _pw_models(n=3, draw=None, prefix="m"):
+    """Per-model identity dicts of the shape ``_model_identity`` produces."""
+    return [
+        {"model_id": f"/adapters/{prefix}{i}",
+         "artifact_path": f"04_activations/{prefix}{i}",
+         "surrogate_hash": f"s{i}",
+         "draw": draw}
+        for i in range(n)
+    ]
+
+
+@check("pairwise: a pair id does not depend on the order of its two models")
+def t_pair_id_order_free():
+    """The property the whole store rests on: a pair is unordered.
+
+    Also pins that the ``qualifier`` escape hatch, unused today, does not change
+    the ids being written — enabling a cross-draw mode later must *add* ids, not
+    rewrite the ones already on disk.
+    """
+    from src.cache import PairwiseCache as P
+
+    assert P.pair_id("b", "a") == P.pair_id("a", "b") == "a__b"
+    assert P.pair_id("a", "b", qualifier=None) == P.pair_id("a", "b")
+    return "order-free, and qualifier=None is the bare readable form"
+
+
+@check("pairwise: a model presenting a different artifact is refused")
+def t_pairwise_artifact_conflict():
+    """G2's second case.
+
+    The safety ``collection_key`` bought by hashing ``artifact_path`` into the
+    handle is what keeping the model set *out* of the handle gives up.  It is
+    recovered here: identity is recorded and verified rather than hashed, so
+    stored pairs built from other tensors are refused instead of served.
+    """
+    import tempfile
+
+    from src.cache import PairwiseCache
+
+    with tempfile.TemporaryDirectory() as td:
+        pw = PairwiseCache(td)
+        models = _pw_models(2)
+        sel = {"mode": "input"}
+        h = pw.handle("functional", "cosine", sel)
+        pw.save_pairs(h, {"/adapters/m0__/adapters/m1": 0.5}, models, sel)
+
+        moved = [dict(m) for m in models]
+        moved[1]["artifact_path"] = "04_activations/somewhere_else"
+        try:
+            pw.save_pairs(h, {}, moved, sel)
+        except ValueError as e:
+            assert "/adapters/m1" in str(e), e
+            assert "somewhere_else" in str(e), e
+        else:
+            raise AssertionError("a changed artifact_path was accepted")
+    return "a changed artifact_path is refused, naming the model and both paths"
+
+
+@check("pairwise: a new model is appended rather than refused")
+def t_g2_appends_new_model():
+    """G2's third case — the one that makes incremental growth real.
+
+    Paired deliberately with the conflict check: either one alone is satisfiable
+    by a wrong implementation.  Appending without the conflict check is a store
+    with no identity guard; refusing everything absent is a store that can never
+    grow, which is the whole point of keeping the model set out of the handle.
+    """
+    import tempfile
+
+    from src.cache import PairwiseCache
+
+    with tempfile.TemporaryDirectory() as td:
+        pw = PairwiseCache(td)
+        sel = {"mode": "input"}
+        h = pw.handle("functional", "cosine", sel)
+        pw.save_pairs(h, {"/adapters/m0__/adapters/m1": 0.5}, _pw_models(2), sel)
+
+        # A third model arrives: two new pairs, and the first one still on disk.
+        pw.save_pairs(h, {"/adapters/m0__/adapters/m2": 0.25,
+                          "/adapters/m1__/adapters/m2": 0.75},
+                      _pw_models(3), sel)
+
+        meta = pw.load_meta(h)
+        assert set(meta["models"]) == {f"/adapters/m{i}" for i in range(3)}, meta["models"]
+        pairs = pw.load_pairs(h)
+        assert pairs["/adapters/m0__/adapters/m1"] == 0.5, pairs
+        assert len(pairs) == 3, pairs
+    return "a third model appended; the original pair is still read from disk"
+
+
+@check("pairwise: appending has not weakened the identity guard")
+def t_g2_still_raises_on_conflict():
+    """The other half of the pair above, after a model set has grown."""
+    import tempfile
+
+    from src.cache import PairwiseCache
+
+    with tempfile.TemporaryDirectory() as td:
+        pw = PairwiseCache(td)
+        sel = {"mode": "input"}
+        h = pw.handle("functional", "cosine", sel)
+        pw.save_pairs(h, {}, _pw_models(2), sel)
+        pw.save_pairs(h, {}, _pw_models(3), sel)
+
+        bad = _pw_models(3)
+        bad[0]["surrogate_hash"] = "different"
+        try:
+            pw.save_pairs(h, {}, bad, sel)
+        except ValueError as e:
+            assert "surrogate_hash" in str(e), e
+        else:
+            raise AssertionError("a changed surrogate_hash was accepted after a growth")
+    return "a conflicting model is still refused once the block has grown"
+
+
+@check("pairwise: two query draws under one handle are refused")
+def t_pairwise_draw_conflict():
+    """G4, and the reason for it.
+
+    The hazard is not that different draws are incomparable — comparing one
+    model across two draws is a legitimate thing to want.  It is that
+    ``pair_id`` is built from ``model_id`` alone, so the same model under two
+    draws produces the same pair id, and two genuinely different distances would
+    silently overwrite each other.
+    """
+    import tempfile
+
+    from src.cache import PairwiseCache
+
+    d1 = {"recipe_hash": "abc", "n_samples": 100, "seed": 0}
+    d2 = {"recipe_hash": "abc", "n_samples": 100, "seed": 1}
+
+    with tempfile.TemporaryDirectory() as td:
+        pw = PairwiseCache(td)
+        sel = {"mode": "input"}
+        h = pw.handle("functional", "cosine", sel)
+        models = _pw_models(2, draw=d1)
+        models[1]["draw"] = d2
+        try:
+            pw.save_pairs(h, {}, models, sel)
+        except ValueError as e:
+            assert "seed" in str(e), e
+        else:
+            raise AssertionError("two draws under one handle were accepted")
+    return "mixed draws refused, and the error shows both"
+
+
+@check("pairwise: levels with no query draw are exempt from G4, not vacuous")
+def t_draw_absent_levels():
+    """Structural and dataset_embedding write no draw token and record ``null``.
+
+    Recorded as ``null`` rather than omitted so that "this level has no draw"
+    and "an older writer did not record one" stay distinguishable.  What matters
+    is that the exemption is real: a handle of all-null draws is accepted, and a
+    null draw beside a genuine one is exempt rather than compared against it.
+    """
+    import tempfile
+
+    from src.cache import PairwiseCache
+
+    d1 = {"recipe_hash": "abc", "n_samples": 100, "seed": 0}
+    with tempfile.TemporaryDirectory() as td:
+        pw = PairwiseCache(td)
+        sel = {"projections": "o"}
+        h = pw.handle("structural", "cosine", sel)
+        pw.save_pairs(h, {}, _pw_models(3), sel)          # all draws null
+        assert all(m["draw"] is None for m in pw.load_meta(h)["models"].values())
+
+        mixed = _pw_models(3)
+        mixed[0]["draw"] = d1                              # one real, two null
+        pw.save_pairs(h, {}, mixed, sel)
+    return "all-null accepted; a null draw is exempt rather than compared"
+
+
+@check("pairwise: several metrics under one selector share one meta.json")
+def t_pairwise_meta_shared():
+    """The surrogate lock's scope.
+
+    ``meta.json`` describes the selector and the models, not the metric, so it
+    sits one level above the metric leaves and is shared by all of them.
+    Several leaves race to write it; the content is identical, so the write is
+    idempotent and the lock only has to make it atomic.
+    """
+    import tempfile
+
+    from src.cache import PairwiseCache
+
+    with tempfile.TemporaryDirectory() as td:
+        pw = PairwiseCache(td)
+        sel = {"mode": "input", "pooling": "mean"}
+        models = _pw_models(2)
+        handles = [pw.handle("functional", m, sel) for m in ("cosine", "cka_linear")]
+        for h in handles:
+            pw.save_pairs(h, {"/adapters/m0__/adapters/m1": 0.5}, models, sel)
+
+        metas = {pw._surrogate_dir(h) for h in handles}
+        assert len(metas) == 1, f"metrics did not share a surrogate directory: {metas}"
+        assert (next(iter(metas)) / "meta.json").exists()
+        assert set(pw.load_index()) == set(handles), pw.load_index()
+    return "one meta.json under one surrogate, two metric leaves, two index records"
+
+
+@check("pairwise: concurrent writers under different surrogates both survive")
+def t_pairwise_index_concurrent():
+    """The **root** lock, which the shared-meta check cannot reach.
+
+    ``index.json`` lives at the root of the stage and is shared by every
+    surrogate, so two writers under *different* surrogates hold *different*
+    surrogate locks and both read-modify-write it.  A scheme with only a
+    surrogate-level lock loses one of the two merges.  Run as separate
+    processes, because that is the case the file lock exists for: several SLURM
+    jobs writing different collections into one cache at once.
+    """
+    import subprocess
+    import sys
+    import tempfile
+
+    from src.cache import PairwiseCache
+
+    src = "\n".join([
+        "import sys",
+        "sys.path.insert(0, sys.argv[3])",
+        "from src.cache import PairwiseCache",
+        "pw = PairwiseCache(sys.argv[1])",
+        "sel = {'mode': sys.argv[2]}",
+        "h = pw.handle('functional', 'cosine', sel)",
+        "models = [{'model_id': 'a', 'artifact_path': 'p/a', 'surrogate_hash': 's'},",
+        "          {'model_id': 'b', 'artifact_path': 'p/b', 'surrogate_hash': 's'}]",
+        "pw.save_pairs(h, {'a__b': 1.0}, models, sel)",
+    ])
+
+    with tempfile.TemporaryDirectory() as td:
+        procs = [subprocess.Popen([sys.executable, "-c", src, td, mode, str(REPO)])
+                 for mode in ("input", "generation")]
+        codes = [pr.wait(timeout=180) for pr in procs]
+        assert codes == [0, 0], codes
+
+        index = PairwiseCache(td).load_index()
+        assert len(index) == 2, (
+            f"index.json holds {len(index)} record(s), not 2 — one writer's merge "
+            f"was lost: {list(index)}"
+        )
+    return "two processes under two surrogates; both index records survive"
+
+
 @check("identity: per-model identity follows ids, not entry order")
 def t_model_identity_permuted():
     """``docs/notes/row_order_bug.md``, one layer in from where it was fixed.
@@ -5017,6 +5262,14 @@ def t_cross_taxonomy_coordinates():
 
 
 SYNTHETIC = [
+    t_pair_id_order_free,
+    t_pairwise_artifact_conflict,
+    t_g2_appends_new_model,
+    t_g2_still_raises_on_conflict,
+    t_pairwise_draw_conflict,
+    t_draw_absent_levels,
+    t_pairwise_meta_shared,
+    t_pairwise_index_concurrent,
     t_model_identity_uses_resolver,
     t_build_artifacts_identity,
     t_model_identity_permuted,

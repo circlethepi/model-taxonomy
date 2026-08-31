@@ -441,7 +441,7 @@ def scan_cache(
                 "functional_repr": _draw_keyed_repr_exists(
                     act_cache, entry.base_model_id, entry.model_id, functional_draw
                 ),
-                # Same helper again: 07_logprobs is a DrawKeyedCache too, so it
+                # Same helper again: 05a_logprobs is a DrawKeyedCache too, so it
                 # answers the same has_draw/has_any protocol as the other two.
                 "logprob_repr": _draw_keyed_repr_exists(
                     lp_cache, entry.base_model_id, entry.model_id, logprob_draw

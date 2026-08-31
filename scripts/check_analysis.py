@@ -3003,7 +3003,7 @@ def t_generated_cache_hash_stable():
 
 @check("logprob: entries join the generations they describe, by name")
 def t_logprob_cache_names_join():
-    """``07_logprobs`` addresses an entry exactly as ``05_generated`` does.
+    """``05a_logprobs`` addresses an entry exactly as ``05_generated`` does.
 
     The two stages are read together — "what did this model say, and how likely
     did it think it was" is one question — and they are joined by *filename*, not
@@ -3049,7 +3049,7 @@ def t_logprob_cache_names_join():
         )
         assert lp.draw_dir(base, adapter, draw).relative_to(lp.root).parts[1:] == (
             gen.draw_dir(base, adapter, draw).relative_to(gen.root).parts[1:]
-        ), "07_logprobs and 05_generated disagree below the stage directory"
+        ), "05a_logprobs and 05_generated disagree below the stage directory"
 
         # The ten sweep points, plus the greedy T=0 entry already on disk.
         temps = [round(0.1 * i, 1) for i in range(1, 11)]

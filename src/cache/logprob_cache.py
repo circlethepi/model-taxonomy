@@ -1,13 +1,13 @@
-"""``07_logprobs`` — per-token log-probabilities and entropies.
+"""``05a_logprobs`` — per-token log-probabilities and entropies.
 
-The fourth stage keyed by :class:`~src.cache._draw_keyed.DrawKeyedCache`, and
+The third stage keyed by :class:`~src.cache._draw_keyed.DrawKeyedCache`, and
 the first that stores what the model *believes* rather than where it sits or
 what it said.  ``04_activations`` holds a hidden state, ``05_generated`` holds
 text and its embedding; neither reads the probability the model assigned.
 
 Directory layout::
 
-    cache_root/07_logprobs/{base_slug}/{adapter_slug}/{recipe_hash}/n{n}_s{seed}[_f{fmt}]/
+    cache_root/05a_logprobs/{base_slug}/{adapter_slug}/{recipe_hash}/n{n}_s{seed}[_f{fmt}]/
         queries.json                        ← query_key + source row indices
         runs/{config_hash}.json             ← extraction provenance
         logprobs/input.safetensors
@@ -64,9 +64,9 @@ __all__ = ["LogProbCache"]
 
 
 class LogProbCache(DrawKeyedCache):
-    """Cache for the log-probability level: ``07_logprobs``."""
+    """Cache for the log-probability level: ``05a_logprobs``."""
 
-    _STAGE_DIR = "07_logprobs"
+    _STAGE_DIR = "05a_logprobs"
     _ARTIFACT_DIR = "logprobs"
 
     # ------------------------------------------------------------------

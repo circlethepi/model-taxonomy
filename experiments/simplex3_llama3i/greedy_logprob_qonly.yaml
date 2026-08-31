@@ -9,7 +9,7 @@
 # collect_logprobs on.
 #
 # It re-generates rather than reusing the cached greedy entry, and it must:
-# the generations live in 05_generated and the log-probs in 07_logprobs, so
+# the generations live in 05_generated and the log-probs in 05a_logprobs, so
 # a hit on the first alone would return cached text and write no log-probs
 # at all. BehavioralTaxonomy's hit test requires both when collecting.
 # Re-generation is exact -- greedy is deterministic -- so the existing
@@ -117,7 +117,7 @@ extraction:
       max_new_tokens: 128
       replicates: 1               # enforced: >1 with do_sample:false raises
       do_sample: false            # THE difference from the sampled runs
-      # Adds the 07_logprobs half of this entry. It also changes the
+      # Adds the 05a_logprobs half of this entry. It also changes the
       # cache-hit test -- a hit now requires the log-prob file too -- so
       # this job re-decodes the cached greedy text rather than skipping.
       # Greedy is deterministic, so that re-decode confirms the existing

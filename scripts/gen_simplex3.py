@@ -610,7 +610,7 @@ def write_extract(
             f"# collect_logprobs on.\n"
             f"#\n"
             f"# It re-generates rather than reusing the cached greedy entry, and it must:\n"
-            f"# the generations live in 05_generated and the log-probs in 07_logprobs, so\n"
+            f"# the generations live in 05_generated and the log-probs in 05a_logprobs, so\n"
             f"# a hit on the first alone would return cached text and write no log-probs\n"
             f"# at all. BehavioralTaxonomy's hit test requires both when collecting.\n"
             f"# Re-generation is exact -- greedy is deterministic -- so the existing\n"
@@ -765,7 +765,7 @@ def write_extract(
 """
         if level == "greedy_logprob":
             body += (
-                "      # Adds the 07_logprobs half of this entry. It also changes the\n"
+                "      # Adds the 05a_logprobs half of this entry. It also changes the\n"
                 "      # cache-hit test -- a hit now requires the log-prob file too -- so\n"
                 "      # this job re-decodes the cached greedy text rather than skipping.\n"
                 "      # Greedy is deterministic, so that re-decode confirms the existing\n"

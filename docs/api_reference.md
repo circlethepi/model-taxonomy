@@ -352,7 +352,7 @@ returned representation is a summary of the stored arrays.
 
 `mode="generation"` raises. Generation-mode log-probs are collected by
 `BehavioralTaxonomy(collect_logprobs=True, logprob_cache=...)`, because the distributions
-they need exist only inside the `generate()` call. Both write into `07_logprobs`.
+they need exist only inside the `generate()` call. Both write into `05a_logprobs`.
 
 See [Log-Probability Taxonomy](guides/logprob_taxonomy.md).
 
@@ -991,7 +991,7 @@ representation means re-embedding, not a read-time rebuild.
 from src.cache.logprob_cache import LogProbCache
 
 class LogProbCache(DrawKeyedCache):
-    _STAGE_DIR = "07_logprobs"
+    _STAGE_DIR = "05a_logprobs"
 
     def exists(base_model_id, adapter_id, query_key, mode, *,
                max_new_tokens=None, replicates=None, sampling_hash=None) -> bool

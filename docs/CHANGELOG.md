@@ -4,6 +4,30 @@
 
 ## Unreleased
 
+### Renumbered the log-prob stage: `07_logprobs` → `05a_logprobs`
+
+`07` sorted the log-probs after `06_collections`, which reads as though they were derived
+from a collection. They are not. They are a ride-along artifact of the pass that writes
+`05_generated`: `BehavioralTaxonomy` with `collect_logprobs=True` fills both trees in one
+generation, under the same draw key and the same variant token, so a log-prob file and
+the generations it describes join by *filename* with no lookup. `05a` puts the stage
+beside the thing it annotates and ahead of the collections built on the inference stages.
+
+The letter suffix stretches what `03A_adapter_alignments` established — there it means
+"analysis of the objects at that stage", and log-probs are a parallel artifact rather
+than an analysis. The adjacency was judged worth the stretch.
+
+`scripts/migrate_logprob_stage.py` moves an existing tree (`--dry-run` by default,
+`--apply`, `--revert`); it is one `os.rename` and refuses to run when both names exist,
+since entries are addressed identically below the stage directory and a merge would look
+plausible while leaving half the draws unreachable.
+
+**No compatibility shim**, following the precedent `migrate_cache_layout.py` set:
+`LogProbCache._STAGE_DIR` moves outright. An unmigrated root finds no entries and
+re-extracts, which is loud; a fallback read would quietly split one experiment's results
+across two trees. Migrate before running log-prob extraction for a new suite, so it never
+writes to the old path.
+
 ### simplex3 on Llama-3.1-8B-Instruct
 
 The missing cell of the design. `simplex3` is a raw-prompted **base** Llama and

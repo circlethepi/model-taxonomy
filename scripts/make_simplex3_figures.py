@@ -35,7 +35,7 @@ Usage
     python scripts/make_simplex3_figures.py                  # everything
     python scripts/make_simplex3_figures.py --level functional
     python scripts/make_simplex3_figures.py --skip-sweep     # omit the slow one
-    python scripts/make_simplex3_figures.py --skip-surrogate # raw surrogates only
+    python scripts/make_simplex3_figures.py --with-surrogate # add the fleet transforms
     python scripts/make_simplex3_figures.py --cache-root PATH  # explicit cache
     python scripts/make_simplex3_figures.py --no-cache          # force a cold run
 
@@ -1232,8 +1232,18 @@ def main() -> None:
                     help="skip the 33-layer functional sweep")
     ap.add_argument("--skip-detail", action="store_true",
                     help="skip the per-metric detail figures")
-    ap.add_argument("--skip-surrogate", action="store_true",
-                    help="omit the centered/whitened surrogates, leaving the raw ones")
+    # Dropped from the default grid on the evidence in
+    # figures/simplex3_qwen_v3/crosslevel_scores.csv: no centered or whitened
+    # perspective wins at any level. They are dominated rather than broken —
+    # functional centered reaches 0.955 against a 0.975 best — except behavioral
+    # CKA, where both go negative (-0.548 centered, -0.674 whitened). The code
+    # path survives behind the flag so the finding can be re-checked without
+    # reinstating code. When run, these are computed uncached: G1 sends them to
+    # the plain `_distances`, so they touch neither 06_pairwise nor
+    # 07_collections.
+    ap.add_argument("--with-surrogate", action="store_true",
+                    help="also compute the centered/whitened fleet transforms, "
+                         "which are off by default")
     ap.add_argument("--cache-root", default=None,
                     help="the shared cache to read models from and to reuse "
                          f"distance matrices in (default: {CACHE_ROOT})")
@@ -1268,7 +1278,7 @@ def main() -> None:
     print(f"arch : {N_LAYERS} layers, {ATTN_NUM_HEADS} heads, "
           f"{len(FULL_ATTN_LAYERS)} full-attn / {len(LINEAR_ATTN_LAYERS)} "
           f"linear-attn, output_gate={ATTN_OUTPUT_GATE}")
-    surrogates = not args.skip_surrogate
+    surrogates = args.with_surrogate
 
     if args.cache_root:
         CACHE_ROOT = Path(args.cache_root).expanduser().resolve()

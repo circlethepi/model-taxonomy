@@ -4630,6 +4630,91 @@ def t_draw_format_id_kept():
     return "format id kept; structural and dataset_embedding record no draw"
 
 
+@check("core: reindex permutes a geometry's rows and labels together")
+def t_geometry_reindex():
+    """The counterpart to ``DistanceMatrix.reindex``, and its one difference.
+
+    A geometry is relabelled, never restricted: an MDS fit of 5 models cut down
+    to 3 is not the fit of those 3, so a subset raises here where it is a
+    legitimate request on a distance matrix.
+    """
+    from src.core.geometry import GeometryResult
+
+    ids = [f"m{i}" for i in range(4)]
+    coords = np.arange(8, dtype=float).reshape(4, 2)
+    geo = GeometryResult(coordinates=coords, model_ids=list(ids), method="mds",
+                         taxonomy="functional", n_components=2)
+
+    shuffled = [ids[i] for i in (2, 0, 3, 1)]
+    perm = geo.reindex(shuffled)
+    assert list(perm.model_ids) == shuffled
+    for mid in ids:
+        assert np.array_equal(perm.coordinates[perm.model_ids.index(mid)],
+                              geo.coordinates[geo.model_ids.index(mid)]), mid
+
+    back = perm.reindex(ids)
+    assert np.array_equal(back.coordinates, coords), "a round trip did not restore"
+
+    for bad in ([ids[0], ids[1]], ids + ["nope"], [ids[0]] * 4):
+        try:
+            geo.reindex(bad)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"reindex accepted {bad!r}")
+    return "permutes and round-trips; refuses subsets, unknowns and duplicates"
+
+
+@check("cache: a stored geometry is relabelled onto the caller's order")
+def t_cached_geometry_row_order():
+    """The hazard canonical writes would otherwise introduce.
+
+    Today a cached geometry and its matrix are both in the caller's order, so
+    they agree by accident. Storing canonically breaks that accident: the stored
+    fit is in ``model_id`` order while the caller asked in another, and
+    ``_fit_geometries`` did not compare the two. Left unguarded, this revision
+    would have *introduced* a mismatch rather than only inheriting one.
+
+    Both halves again: the guarded read matches the caller's ids, and the
+    unguarded read does not.
+    """
+    import tempfile
+
+    from src.analysis.comparison import _canonical, _fit_geometries
+    from src.cache import CollectionCache
+
+    dm = _random_dm(5, seed=21)
+    asked = [dm.model_ids[i] for i in (3, 0, 4, 1, 2)]
+    dm_asked = dm.reindex(asked)
+
+    with tempfile.TemporaryDirectory() as td:
+        cache = CollectionCache(td)
+        handle = "functional/coll/cosine_sur"
+
+        # Populate as build_taxonomy_artifacts does: the fit of the canonical
+        # matrix, stored under the handle.
+        cache.save_distance_matrix(_canonical(dm), handle)
+        first = _fit_geometries(dm_asked, (2,), cache, handle, None)["mds_2d"]
+        assert list(first.model_ids) == asked, first.model_ids
+
+        # A second caller, same handle, reads the stored fit back.
+        second = _fit_geometries(dm_asked, (2,), cache, handle, None)["mds_2d"]
+        assert list(second.model_ids) == asked, (
+            f"the cached geometry came back as {second.model_ids}, not the "
+            f"requested {asked}"
+        )
+        assert np.allclose(first.coordinates, second.coordinates), (
+            "the relabelled fit does not match the one just written"
+        )
+
+        raw = cache.load_geometry(handle, "mds", 2, mds_kwargs={"random_state": 0})
+        assert list(raw.model_ids) != asked, (
+            "the stored fit is already in the caller's order, so this check "
+            "cannot tell a guarded read from an unguarded one"
+        )
+    return "stored canonically, served in the caller's order, guard is load-bearing"
+
+
 @check("identity: per-model identity follows ids, not entry order")
 def t_model_identity_permuted():
     """``docs/notes/row_order_bug.md``, one layer in from where it was fixed.
@@ -5603,6 +5688,8 @@ def t_cross_taxonomy_coordinates():
 
 
 SYNTHETIC = [
+    t_geometry_reindex,
+    t_cached_geometry_row_order,
     t_pairwise_row_order,
     t_pairwise_subset,
     t_pairwise_incremental,

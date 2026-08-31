@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 
 import networkx as nx
 import numpy as np
@@ -30,6 +30,59 @@ class GeometryResult:
             raise ValueError(
                 f"coordinates shape {self.coordinates.shape} expected ({n}, {self.n_components})"
             )
+
+    def reindex(self, model_ids: "Sequence[ModelID]") -> "GeometryResult":
+        """Return this embedding with its rows in *model_ids* order.
+
+        The counterpart to :meth:`~src.core.distance.DistanceMatrix.reindex`,
+        and needed for the same reason: once a stored fit is written in a
+        canonical order, the caller's order is no longer the stored one, and a
+        geometry handed back unpermuted pairs coordinates with the wrong labels.
+
+        ``docs/notes/caching_collections.md`` argues geometries must be
+        *recomputed* rather than permuted, and it is right about a fit made under
+        an **unknown** order — restricting or rotating a fit is not permuting it.
+        Canonical storage removes that premise: the stored fit is always the
+        *same* fit, so reordering its rows is relabelling rather than refitting.
+        A **subset** is still a different question and is not offered here: an
+        MDS fit of 16 models restricted to 12 is not the fit of those 12, so
+        callers refit instead.
+
+        The coordinates and ``model_ids`` move together, which is what keeps the
+        two plot consumers self-consistent. The exposure this protects against
+        is an external per-model array paired positionally with the coordinates
+        — ``color_by`` in ``src.plots.figures`` is the live example.
+        """
+        wanted = list(model_ids)
+        if len(set(wanted)) != len(wanted):
+            dupes = sorted({m for m in wanted if wanted.count(m) > 1})
+            raise ValueError(
+                f"reindex was asked for duplicate ids {dupes}: one row is one "
+                "model, so a repeated id has no meaning here."
+            )
+        if set(wanted) != set(self.model_ids):
+            missing = sorted(set(wanted) - set(self.model_ids))
+            extra = sorted(set(self.model_ids) - set(wanted))
+            raise ValueError(
+                "reindex is a relabelling, not a restriction: this geometry "
+                f"holds {len(self.model_ids)} model(s) and was asked for "
+                f"{len(wanted)}"
+                + (f"; unknown: {missing}" if missing else "")
+                + (f"; dropped: {extra}" if extra else "")
+                + ". An MDS fit restricted to a subset is not the fit of that "
+                "subset — refit instead."
+            )
+        pos = {mid: i for i, mid in enumerate(self.model_ids)}
+        take = [pos[m] for m in wanted]
+        return GeometryResult(
+            coordinates=self.coordinates[take],
+            model_ids=wanted,
+            method=self.method,
+            taxonomy=self.taxonomy,
+            n_components=self.n_components,
+            stress=self.stress,
+            metadata=dict(self.metadata),
+        )
 
     def nearest_neighbors(self, model_id: ModelID, k: int = 3) -> list[ModelID]:
         """Return k nearest neighbors in coordinate space (Euclidean)."""

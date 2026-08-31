@@ -283,13 +283,17 @@ def build_taxonomy_artifacts(
             cache, taxonomy, metric, model_entries, transform=transform,
         )
         if cache.exists(handle):
-            dm = cache.load_distance_matrix(handle)
+            # Stored canonically, so a hit comes back in model_id order while
+            # the caller may have asked in another. Permuting a symmetric matrix
+            # onto the requested labels is exact; handing it back unpermuted is
+            # the defect docs/notes/row_order_bug.md records.
+            dm = cache.load_distance_matrix(handle).reindex(list(ids))
 
     if dm is None:
         dm = _distances(index, taxonomy, metric, ids, reps, layers, projections)
         if cache is not None:
             cache.save_distance_matrix(
-                dm,
+                _canonical(dm),
                 handle,
                 model_entries=model_entries,
                 label=label,
@@ -304,6 +308,10 @@ def build_taxonomy_artifacts(
                 ),
             )
 
+    # Fit on the canonical matrix, so the stored geometry is the fit of the
+    # stored matrix — that identity is what lets a cached geometry be permuted
+    # onto a caller's order rather than refitted. `_fit_geometries` then
+    # reindexes it back to what this caller asked for.
     geometries = _fit_geometries(dm, n_components, cache, handle, mds_kwargs)
     return dm, geometries
 
@@ -551,6 +559,22 @@ def _collection_cache(cache_root: Path | str | None):
     return CollectionCache(cache_root)
 
 
+def _canonical(dm: DistanceMatrix) -> DistanceMatrix:
+    """*dm* with its rows in ``model_id`` order, which is how it is stored.
+
+    Storing canonically makes the bytes on disk a function of the handle alone,
+    so a warm run is byte-identical to a cold one however the caller happened to
+    order its request.  Without it the stored matrix is whichever order the
+    first writer used, and two runs that agree on every number still differ in
+    their stored digests.
+
+    It is also what makes :meth:`GeometryResult.reindex` sound rather than
+    guesswork: a fit of a canonically ordered matrix is always the *same* fit,
+    so permuting its rows is relabelling.
+    """
+    return dm.reindex(sorted(dm.model_ids))
+
+
 def _fit_geometries(
     dm: DistanceMatrix,
     n_components: Sequence[int],
@@ -576,10 +600,29 @@ def _fit_geometries(
                 geo = cache.load_geometry(chash, "mds", n, mds_kwargs=kwargs)
             except (FileNotFoundError, ValueError, KeyError):
                 geo = None
+            if geo is not None and list(geo.model_ids) != list(dm.model_ids):
+                # A stored fit is written canonically, so it comes back in
+                # model_id order while the caller may have asked in another —
+                # sort_by_mixture is the motivating case. Same id *set* is a
+                # relabelling and is permuted; a different set is a different
+                # fit and is discarded, because restricting an MDS fit is not
+                # the same operation as permuting one.
+                if set(geo.model_ids) == set(dm.model_ids):
+                    geo = geo.reindex(list(dm.model_ids))
+                else:
+                    geo = None
         if geo is None:
-            geo = fit_geometry(dm, method="mds", n_components=n, **kwargs)
             if cache is not None and chash is not None:
+                # Fit the canonical matrix and store that fit, then relabel onto
+                # the caller's order. Storing the caller's fit instead would make
+                # the stored coordinates depend on who wrote first, which is the
+                # accident canonical writes exist to remove.
+                canon = _canonical(dm)
+                geo = fit_geometry(canon, method="mds", n_components=n, **kwargs)
                 cache.save_geometry(chash, geo, mds_kwargs=kwargs)
+                geo = geo.reindex(list(dm.model_ids))
+            else:
+                geo = fit_geometry(dm, method="mds", n_components=n, **kwargs)
         out[key] = geo
     if not out:
         raise ValueError(

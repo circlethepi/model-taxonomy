@@ -389,6 +389,14 @@ class SuiteCache:
 
         handle = collection_handle(self._cc, taxonomy, metric, model_entries,
                                    transform=transform, surrogate=surrogate)
+        # Record what the collection is, even though no matrix is stored for it.
+        # save_distance_matrix used to write this provenance as a side effect;
+        # without it a stored fit would have no collection_info.json, no
+        # config.json and no index record, and the directory name is a digest.
+        self._cc.save_collection_info(
+            handle, list(model_entries), label=label,
+            config=self._leaf_config(taxonomy, model_entries, transform, surrogate),
+        )
         self._handles[id(dm)] = (dm, handle)
 
     @staticmethod

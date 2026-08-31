@@ -290,6 +290,46 @@ class CollectionCache:
             tmp.write_text(json.dumps(info, indent=2))
             os.replace(tmp, info_dir / "collection_info.json")
 
+    def save_collection_info(
+        self,
+        handle: str,
+        model_entries: list[dict],
+        label: str | None = None,
+        slice_key: dict | None = None,
+        config: dict | None = None,
+    ) -> None:
+        """Record what a collection *is*, without storing a distance matrix.
+
+        ``save_distance_matrix`` writes this provenance as a side effect, which
+        was fine while every stored geometry sat beside a stored matrix.  A
+        caller that stores **only** geometries — the figure suite, since
+        distances moved to ``06_pairwise`` — would otherwise leave coordinates
+        with no ``collection_info.json``, no ``config.json`` and no
+        ``index.json`` record: a fit that cannot be traced back to the models or
+        the selector it was fitted for.  The directory name is a digest, so
+        these files are the only way back.
+        """
+        info = {
+            "schema_version": "4",
+            "collection_key": handle.split("/")[1],
+            "taxonomy": handle.split("/")[0],
+            "label": label,
+            "slice": slice_key or {},
+            "model_entries": list(model_entries),
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }
+        self._write_info(handle, info)
+
+        coll_dir = self._collection_dir(handle)
+        coll_dir.mkdir(parents=True, exist_ok=True)
+        cfg_path = coll_dir / "config.json"
+        leaf_config = json.loads(cfg_path.read_text()) if cfg_path.exists() else {}
+        leaf_config.update({"schema_version": "1", **(config or {})})
+        cfg_tmp = coll_dir / "config.json.tmp"
+        cfg_tmp.write_text(json.dumps(leaf_config, indent=2, sort_keys=True))
+        os.replace(cfg_tmp, cfg_path)
+        self._update_index(handle, info, leaf_config)
+
     def save_geometry(
         self,
         handle: str,

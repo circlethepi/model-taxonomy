@@ -235,14 +235,21 @@ def build_taxonomy_artifacts(
     # and only once they are do we know which artifact and which view each model
     # actually resolved to — which is what the collection is keyed on.  The cache
     # then saves the pairwise computation, which is the expensive part.
-    reps, identity = _resolve_representations(
+    reps = _resolve_representations(
         index, taxonomy,
         layers=layers, projections=projections, embedder_hash=embedder_hash,
         dataset_selector=dataset_selector,
         behavioral_selector=behavioral_selector,
         functional_selector=functional_selector,
     )
-    model_entries = [{**ident, "model_id": i} for i, ident in zip(ids, identity)]
+    # `ids` is entry order here and so is `reps`, so this resolves to the
+    # identity permutation and every lookup lands where the old zip landed.  It
+    # is written down because it turns an assumption into a check: the pairing
+    # stops depending on _resolve_ids' undocumented entry-order guarantee and
+    # starts being verified against _positions_for on every call.
+    order = _positions_for(index, ids)
+    model_entries = _model_identity(index, reps, taxonomy, ids, order,
+                                    layers=layers, projections=projections)
 
     from .surrogates import transform_key
     tkey = transform_key(transform)
@@ -599,15 +606,17 @@ def resolve_ordered(
 
     Pass the result to :func:`_distances` with the same *ids*.
     """
-    reps, identity = _resolve_representations(
+    reps = _resolve_representations(
         index, taxonomy, layers=layers, projections=projections,
         embedder_hash=embedder_hash, dataset_selector=dataset_selector,
         behavioral_selector=behavioral_selector,
         functional_selector=functional_selector,
     )
     order = _positions_for(index, ids)
+    ordered_raw = None
     if reps is not None:
         reps = [reps[p] for p in order]
+        ordered_raw = reps            # before any transform, for identity below
         if transform is not None:
             reps = list(transform(reps))
     elif transform is not None:
@@ -619,12 +628,13 @@ def resolve_ordered(
         )
     if not with_identity:
         return reps, order
-    # Identity comes back one per index entry; the caller asked in its own order
-    # and possibly for a subset, so it is permuted the same way the
-    # representations were.  Pairing the two by position rather than by name is
-    # the one thing ``docs/notes/row_order_bug.md`` says not to get wrong, and
-    # it is the same permutation both halves use here.
-    entries = [{**identity[p], "model_id": mid} for p, mid in zip(order, ids)]
+    # Identity is resolved through `order` rather than paired by position — the
+    # rule ``docs/notes/row_order_bug.md`` generalizes to.  It is read off the
+    # *untransformed* reps: a fleet transform returns new representations, and
+    # what identifies a model is the artifact it was read from, not what was
+    # subsequently done to the whole fleet.
+    entries = _model_identity(index, ordered_raw, taxonomy, ids, order,
+                              layers=layers, projections=projections)
     return reps, order, entries
 
 
@@ -642,14 +652,17 @@ def _resolve_representations(
     dataset_selector: dict | None = None,
     behavioral_selector: dict | None = None,
     functional_selector: dict | None = None,
-) -> tuple[list | None, list[dict]]:
+) -> list | None:
     """Resolve what each model's representation *is*, before any distance is computed.
 
-    Returns ``(reps, identity)``.  ``identity`` is one dict per model in
-    ``index.entries`` order, carrying the ``artifact_path`` and
-    ``surrogate_hash`` that key the collection — this is the ground truth the
-    collection cache is keyed on, rather than the caller's selector, which may be
-    underspecified (``{}`` and ``{"draw": ...}`` are the same read).
+    Returns the representations, one per model in ``index.entries`` order.
+
+    It used to return per-model identity alongside them, built by zipping
+    ``index.entries`` against ``reps``.  That is now :func:`_model_identity`,
+    which a caller invokes with the ``ids`` and ``order`` it actually wants —
+    because identity paired by *position* is only correct while nothing has
+    permuted the reps, and the whole point of ``order`` is that something has.
+    See ``docs/notes/row_order_bug.md``.
 
     ``reps`` is ``None`` for **structural** only.  Structural gets the same
     resolution seam and the same identity shape as the other three, but its
@@ -661,7 +674,7 @@ def _resolve_representations(
     here and only :func:`_distances` changes.
     """
     if taxonomy == "structural":
-        return None, _structural_identity(index, layers, projections)
+        return None
     if taxonomy == "dataset_embedding":
         reps = _dataset_embedding_reps(index, embedder_hash, dataset_selector)
     elif taxonomy == "behavioral":
@@ -672,33 +685,97 @@ def _resolve_representations(
         raise ValueError(
             f"unknown taxonomy {taxonomy!r}. Choose from {', '.join(_TAXONOMIES)}."
         )
-    return reps, _identity_from_reps(index, reps, taxonomy)
+    return reps
 
 
-def _identity_from_reps(
-    index: CacheIndex, reps: Sequence, taxonomy: str
-) -> list[dict]:
-    """One identity dict per model, read off what the caches actually resolved."""
+def _model_identity(index: CacheIndex, reps, taxonomy: str, ids, order, *,
+                    layers=None, projections=None) -> list[dict]:
+    """One identity dict per model, in *ids* order, resolved through *order*.
+
+    ``order[k]`` is the position in ``index.entries`` of the model named
+    ``ids[k]`` — see :func:`_positions_for`.  Indexing through it is what makes
+    ``model_id`` and ``artifact_path`` describe the same model; zipping
+    ``index.entries`` against a caller-ordered ``reps`` does not, and is the
+    defect ``docs/notes/row_order_bug.md`` records.  Follows
+    :func:`_structural_matrix`, which derives its entry list the same way.
+
+    *reps* must already be in *ids* order, as :func:`resolve_ordered` returns
+    them; ``reps[k]`` is read alongside ``index.entries[order[k]]``.  ``reps is
+    None`` is the structural level, which reads adapter files rather than
+    representations and takes its surrogate hash from *layers* / *projections* —
+    the read-time choice that plays a surrogate's role there.
+
+    This replaces ``_identity_from_reps`` rather than extending it.  That
+    signature could not express the guarantee: given only ``(index, reps)``
+    there is no way to know which entry a rep came from, so any implementation
+    had to assume an alignment it could not check.  Renaming forces every call
+    site to be revisited instead of silently inheriting the assumption.
+    """
+    ids = list(ids)
+    order = list(order)
+    if len(order) != len(ids):
+        raise ValueError(
+            f"_model_identity got {len(order)} position(s) for {len(ids)} id(s); "
+            "order[k] is the entry position of ids[k], so the two must agree."
+        )
+    if reps is not None and len(reps) != len(ids):
+        raise ValueError(
+            f"_model_identity got {len(reps)} representation(s) for {len(ids)} "
+            "id(s); reps must already be in ids order, one per id."
+        )
+
+    # Assert the contract by calling the resolver, never by re-implementing its
+    # rule.  A hand-written `model_id or recipe_id` test is subtly weaker:
+    # _positions_for consults recipe_id only when it is unambiguous across the
+    # whole index, so the hand-written form waves through exactly the ambiguous
+    # case the resolver exists to reject.
+    expected = _positions_for(index, ids)
+    if order != expected:
+        k = next(i for i, (a, b) in enumerate(zip(order, expected)) if a != b)
+        raise ValueError(
+            f"order does not resolve ids: at position {k}, ids[{k}]={ids[k]!r} "
+            f"resolves to entry {expected[k]} "
+            f"({index.entries[expected[k]].model_id!r}) but order says "
+            f"{order[k]} ({index.entries[order[k]].model_id!r})."
+        )
+
+    view = None
+    if reps is None:
+        from src.cache._draw_keyed import DrawKeyedCache
+
+        view = DrawKeyedCache.config_hash(
+            {
+                "kind": "structural_view",
+                "layers": layers if layers is not None else "last",
+                "projections": projections if projections is not None else "o",
+            }
+        )
+
     out = []
-    for entry, rep in zip(index.entries, reps):
-        meta = rep.metadata or {}
-        path = meta.get("artifact_path")
-        if path is None:
-            raise ValueError(
-                f"the {taxonomy} cache returned a representation for "
-                f"{entry.model_id!r} with no 'artifact_path' in its metadata, so "
-                "the collection it belongs to cannot be keyed on what it was "
-                "built from. Every cache's load() must surface artifact_path and "
-                "surrogate_hash — see TODO.md item 14."
-            )
+    for k, (mid, pos) in enumerate(zip(ids, order)):
+        entry = index.entries[pos]
+        if reps is None:
+            path, surrogate = f"03_adapters/{entry.adapter_name}", view
+        else:
+            meta = reps[k].metadata or {}
+            path = meta.get("artifact_path")
+            if path is None:
+                raise ValueError(
+                    f"the {taxonomy} cache returned a representation for "
+                    f"{mid!r} with no 'artifact_path' in its metadata, so the "
+                    "collection it belongs to cannot be keyed on what it was "
+                    "built from. Every cache's load() must surface "
+                    "artifact_path and surrogate_hash — see TODO.md item 14."
+                )
+            surrogate = meta.get("surrogate_hash")
         out.append(
             {
-                "model_id": None,  # filled in by the caller, which knows id_scheme
+                "model_id": mid,
                 "entry_type": "lora_adapter" if entry.adapter_dir else "recipe",
                 "adapter_name": entry.adapter_name,
                 "recipe_hash": entry.recipe_hash,
                 "artifact_path": path,
-                "surrogate_hash": meta.get("surrogate_hash"),
+                "surrogate_hash": surrogate,
             }
         )
     return out

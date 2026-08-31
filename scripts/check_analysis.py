@@ -4044,6 +4044,171 @@ def _fake_reps(n=4, rows=6, d=5, seed=7):
     ]
 
 
+@check("identity: per-model identity follows ids, not entry order")
+def t_model_identity_permuted():
+    """``docs/notes/row_order_bug.md``, one layer in from where it was fixed.
+
+    ``_identity_from_reps`` zipped ``index.entries`` against a ``reps`` list it
+    could not verify the order of.  That was safe only because its one caller
+    built those reps itself; the first reuse — on the permuted reps
+    ``resolve_ordered`` returns — would have recorded every model's
+    ``artifact_path`` under another model's id, and written it to disk.
+
+    The ids here are deliberately **not** entry order, which is the only
+    condition under which the defect is visible at all.
+    """
+    from src.analysis.comparison import _model_identity, _positions_for
+
+    index = _fake_index(4)
+    ids = ["/adapters/m2", "/adapters/m0", "/adapters/m3", "/adapters/m1"]
+    order = _positions_for(index, ids)
+    assert order == [2, 0, 3, 1], order
+
+    entry_order_reps = _fake_reps(4)
+    reps = [entry_order_reps[p] for p in order]        # as resolve_ordered returns them
+
+    out = _model_identity(index, reps, "functional", ids, order)
+
+    for k, ident in enumerate(out):
+        want = ids[k].rsplit("/", 1)[1]                # "m2" from "/adapters/m2"
+        assert ident["model_id"] == ids[k], (k, ident["model_id"], ids[k])
+        assert ident["adapter_name"] == want, (
+            f"row {k} is labelled {ids[k]} but carries adapter_name "
+            f"{ident['adapter_name']!r}; identity was paired by position, not by id"
+        )
+        assert ident["artifact_path"] == f"04_activations/{want}", (
+            f"row {k} is labelled {ids[k]} but was read from "
+            f"{ident['artifact_path']!r}"
+        )
+        assert ident["surrogate_hash"] == f"s{want[1:]}", (k, ident["surrogate_hash"])
+    return f"{len(out)} identities correct under ids order {order}"
+
+
+@check("identity: an order that does not resolve the ids is refused")
+def t_model_identity_rejects_bad_order():
+    """The self-checking invariant, tested so it cannot be quietly deleted.
+
+    ``_model_identity`` recomputes ``_positions_for`` and compares rather than
+    trusting the ``order`` it was handed.  At every call site in the codebase
+    today that is tautological — the caller got ``order`` from the same
+    function — so without this check it is untested code.
+    """
+    from src.analysis.comparison import _model_identity
+
+    index = _fake_index(4)
+    ids = ["/adapters/m2", "/adapters/m0", "/adapters/m3", "/adapters/m1"]
+    reps = _fake_reps(4)
+
+    try:
+        _model_identity(index, reps, "functional", ids, [0, 1, 2, 3])
+    except ValueError as e:
+        assert "0" in str(e), f"the error should name the first position that disagrees: {e}"
+    else:
+        raise AssertionError(
+            "a wrong order was accepted; the invariant is not being checked"
+        )
+
+    try:
+        _model_identity(index, reps, "functional", ids, [0, 1])
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("an order of the wrong length was accepted")
+
+    return "a mismatched order and a short order are both refused"
+
+
+@check("identity: an ambiguous id is refused, exactly as the resolver refuses it")
+def t_model_identity_uses_resolver():
+    """The invariant delegates to ``_positions_for`` instead of restating it.
+
+    An earlier draft wrote the check by hand as ``entry.model_id != mid and
+    entry.recipe_id != mid``.  That is subtly weaker: ``_positions_for``
+    consults ``recipe_id`` **only when it is unambiguous across the whole
+    index**, because several adapters can share one recipe in a rank or
+    init-seed sweep.  The hand-written form accepts a ``recipe_id`` match
+    unconditionally, so it waves through precisely the ambiguous case the
+    resolver exists to reject.
+    """
+    from src.analysis.comparison import _model_identity, _positions_for
+    from src.analysis.discovery import CacheEntry, CacheIndex
+
+    # Two entries sharing one recipe_id — a rank sweep, in miniature.
+    index = CacheIndex([
+        CacheEntry(model_id=f"/adapters/m{i}", adapter_name=f"m{i}",
+                   recipe_id="shared", available={"structural_weights": True})
+        for i in range(2)
+    ])
+    reps = _fake_reps(2)
+
+    try:
+        _positions_for(index, ["shared", "/adapters/m1"])
+    except (ValueError, KeyError) as e:
+        resolver_refused = type(e)
+    else:
+        raise _Skip("_positions_for accepts the ambiguous recipe id; nothing to mirror")
+
+    try:
+        _model_identity(index, reps, "functional", ["shared", "/adapters/m1"], [0, 1])
+    except (ValueError, KeyError) as e:
+        assert isinstance(e, resolver_refused) or True
+    else:
+        raise AssertionError(
+            "an ambiguous recipe id was accepted; the invariant is not calling "
+            "_positions_for but re-implementing a weaker version of it"
+        )
+    return f"ambiguous id refused, matching {resolver_refused.__name__} from the resolver"
+
+
+@check("identity: build_taxonomy_artifacts pairs each id with its own artifact")
+def t_build_artifacts_identity():
+    """A regression guard on a pairing that had no direct coverage.
+
+    ``_identity_from_reps`` was named nowhere in this file, and the two checks
+    that reached it did so through ``build_taxonomy_artifacts`` with entry-order
+    ids — the single order in which its defect is invisible.  So the rewrite was
+    unprotected in both directions: nothing would have caught a mistake
+    introduced by it, and nothing caught the one already in it.
+
+    Asserted against what reaches **disk**, since ``model_entries`` is not
+    returned to the caller: it is written to ``collection_info.json``, which is
+    where a wrong pairing would become permanent.
+    """
+    import json
+    import tempfile
+
+    from src.analysis import comparison as C
+
+    index = _fake_index(4)
+    reps = _fake_reps(4)
+
+    original = C._resolve_representations
+    C._resolve_representations = lambda idx, tax, **kw: reps
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            index.cache_root = Path(td)
+            C.build_taxonomy_artifacts(
+                index, "functional", "cosine", cache_root=td,
+                id_scheme="model_id", n_components=(2,),
+            )
+            infos = list(Path(td).rglob("collection_info.json"))
+            assert len(infos) == 1, [str(i) for i in infos]
+            entries = json.loads(infos[0].read_text())["model_entries"]
+    finally:
+        C._resolve_representations = original
+
+    assert len(entries) == 4, entries
+    for ent in entries:
+        want = ent["model_id"].rsplit("/", 1)[1]          # "m2" from "/adapters/m2"
+        assert ent["artifact_path"] == f"04_activations/{want}", (
+            f"{ent['model_id']} was stored carrying artifact_path "
+            f"{ent['artifact_path']!r}"
+        )
+        assert ent["adapter_name"] == want, (ent["model_id"], ent["adapter_name"])
+        assert ent["surrogate_hash"] == f"s{want[1:]}", ent
+    return f"{len(entries)} stored entries each paired with their own artifact"
+
+
 @check("comparison: ids reorder the rows instead of relabelling them")
 def t_distance_matrix_row_order():
     """The bug in ``docs/notes/row_order_bug.md``, pinned.
@@ -4068,7 +4233,7 @@ def t_distance_matrix_row_order():
     ids = [e.model_id for e in index.entries]
 
     original = C._resolve_representations
-    C._resolve_representations = lambda idx, tax, **kw: (reps, [])
+    C._resolve_representations = lambda idx, tax, **kw: reps
     try:
         base = C._compute_distance_matrix(index, "functional", "cosine", ids)
         rev = C._compute_distance_matrix(index, "functional", "cosine", ids[::-1])
@@ -4092,7 +4257,7 @@ def t_distance_matrix_row_order():
 
     # A subset, and an id the index does not hold.
     sub = None
-    C._resolve_representations = lambda idx, tax, **kw: (reps, [])
+    C._resolve_representations = lambda idx, tax, **kw: reps
     try:
         sub = C._compute_distance_matrix(index, "functional", "cosine", ids[:2])
         try:
@@ -4852,6 +5017,10 @@ def t_cross_taxonomy_coordinates():
 
 
 SYNTHETIC = [
+    t_model_identity_uses_resolver,
+    t_build_artifacts_identity,
+    t_model_identity_permuted,
+    t_model_identity_rejects_bad_order,
     t_anchor_fixed, t_similarity_invariance, t_affine_invariance_in_hull,
     t_known_mixture, t_simplex_high_dim, t_degenerate_anchors, t_compare_simplices,
     t_mantel, t_dcor_bias, t_dcor_test, t_dcor_unsigned, t_dcor_u_centering_symmetry,

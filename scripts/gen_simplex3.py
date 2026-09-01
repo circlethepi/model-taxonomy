@@ -141,7 +141,15 @@ BEHAVIORAL_SHARDS = 8
 #: GPU partition order is a Suite field -- it is a property of what the run needs
 #: from the hardware, not of the experiment.  CPU stays here: nothing about it
 #: varies by model.
-CPU_PARTITION = "cpu"
+#:
+#: "cpu" was the name until the 2026-08-26 cluster reorganization, the same one
+#: that removed "nvl" from the GPU list.  There is now exactly one non-GPU
+#: partition and it is called "med" (`sinfo -a` lists no "cpu" at all), so every
+#: prefetch job emitted before that date fails at SUBMIT time with
+#: "invalid partition specified: cpu" -- and because submit_all.sh runs under
+#: `set -e` with the whole chain hanging afterok off the prefetch, that aborts
+#: the submit before a single job is queued.
+CPU_PARTITION = "med"
 
 
 # ── The simplex ────────────────────────────────────────────────────────────────

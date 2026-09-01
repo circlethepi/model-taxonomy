@@ -4,6 +4,92 @@
 
 ## Unreleased
 
+### simplex3 on Mistral-Nemo-12B and OLMo-2-1B
+
+Two more chat suites at two new scales, `nemo` and `olmo2`, at full parity with `qwen`
+and `llama3i` — same query set, log-prob level, generation-mode activations, 10-point
+temperature sweep. Alongside the existing 4B and 8B they turn the suite family into a
+**scale ladder** (1B / 4B / 8B / 12B) as well as a family comparison.
+
+**Both checkpoints are substitutions**, and the reasons are recorded in the profiles so
+they survive:
+
+`mistralai/Mistral-Nemo-Instruct-2407` stands in for `Ministral-3-14B-Instruct-2512`,
+which is fp8-quantized and a multimodal `Mistral3ForConditionalGeneration`:
+`AutoModelForCausalLM` has no mapping for its config, so all three of the repo's load
+sites fail, and its Pixtral vision tower carries `q_proj`/`k_proj`/`v_proj`/`o_proj` in
+24 further layers that the default target list would silently adapt. Nemo has identical
+text-tower dimensions — 40 layers, hidden 5120, 32 query heads, 8 KV heads — so the
+adapter is parameter-for-parameter the same, while the checkpoint is bf16, ungated and
+loadable with no code change.
+
+`allenai/OLMo-2-0425-1B-Instruct` stands in for `apple/OpenELM-1_1B-Instruct`, which
+ships no tokenizer and no chat template, names its projections `qkv_proj`/`out_proj` so
+the default target list matches nothing, and whose remote code calls
+`DynamicCache.from_legacy_cache`, gone from the installed transformers.
+
+**Adapter capacity parity is deliberately broken and declared.** `LORA_RANK = 16` stays
+one constant for the whole experiment; the two new suites land at 19,660,800 and
+4,194,304 against the 12–13M band `qwen` and `llama3i` share. Each profile records its
+true `expected_lora_params` and says so in `notes`. No ~1B model reaches that band at
+any sensible rank, so the divergence is inherent to adding a scale ladder rather than a
+property of the checkpoints chosen — and `expected_lora_params` exists precisely to make
+it visible instead of hidden.
+
+**The `olmo2` suite is generated but must not be submitted**, and the reason is a latent
+bug in shared prompt rendering rather than anything about the checkpoint. OLMo-2's
+rendered training prompt is the bare string `<|endoftext|>` — the question is gone.
+`render_prompt` ends by calling `_trim_to_last_atomic`, which cuts everything after the
+last token of the tokenizer's *added vocabulary*; OLMo-2 emits `<|user|>`/`<|assistant|>`
+as ordinary text, so the only such token is the BOS the template puts at index 0, and the
+cut lands at character 13. Nothing downstream reports it: shapes stay valid, the loss
+stays finite, and all 16 adapters would train on an empty prompt. Smoke stages 1b–4 pass,
+because none of them assert that the prompt contains the question.
+
+Measured, the trim removes `'\n'` for Qwen3.5, `'\n\n'` for Llama-3.1-8B-Instruct and
+`''` for Mistral-Nemo — all whitespace, which is its evident purpose. **Qwen3.5 escapes
+only by accident**: its template ends `<|im_start|>assistant\n<think>\n`, and only because
+`<think>` is a registered token after `assistant\n` does the cut land correctly. Models
+ending in a bare `<|im_start|>assistant\n` are damaged more quietly — SmolLM2-1.7B,
+Qwen2.5-1.5B and LFM2-1.2B were all checked and all silently lose `assistant\n`, leaving
+the model prompted with a dangling `<|im_start|>`.
+
+Two resolutions are identified and **neither is applied**: making the trim refuse to cut
+non-whitespace (fixes the class; must be verified to leave the three existing suites'
+prompts byte-identical), or swapping the 1B rung to `tiiuae/Falcon3-1B-Instruct` (verified
+clean through the same code path — 1B, ungated, no remote code, standard q/k/v/o, distinct
+pad, single weight file, date-free template, and 4,128,768 LoRA parameters against
+OLMo-2's 4,194,304, so the capacity argument is unchanged). The profile and tree are kept
+rather than deleted; the profile notes and the suite table carry the warning.
+
+**Mistral-Nemo's behavioral level embeds truncated text, declared rather than fixed.**
+Smoke stage 5 measured `termination_rate 0.00`: this checkpoint answers a Yahoo question
+with a numbered, headed essay and never finishes inside the 128-token budget, where
+`llama3i` and `qwen` do. `ModelProfile` gains **`allow_truncated_generation`** (default
+`False`, so every other checkpoint keeps the check at full force); `MISTRAL_NEMO` sets it
+and records why in `notes`. `max_new_tokens` is a property of the experiment, not a
+`Suite` field — raising it for one suite would make its behavioral level incomparable to
+the suites it exists to sit beside, and raising it everywhere would invalidate every
+behavioral result already on disk. The structural and functional levels are unaffected;
+greedy and the temperature sweep are affected exactly as the behavioral level is.
+
+**`smoke_base_model.py`'s parameter floor now comes from the checkpoint.** `t_load`
+asserted `n_params > 4.0e9`, which was never a derived number — it was a floor under the
+roster as it stood (8B, 4B, 3B) and encoded "every model here is large", which the scale
+ladder is exactly what stops being true; OLMo-2-1B failed it at a correct 1.48B. The
+check itself is worth keeping: it is an independent tripwire against a structurally
+consistent load that `missing_keys` reports as clean, which is the `model.language_model.`
+prefix case its docstring names. It now sums the shapes the checkpoint's own safetensors
+headers declare, minus anything the loader reported as unexpected, so it holds at any
+scale and needs no edit at the next rung.
+
+`Suite` gains **`prefetch_ignore`**, emitted as `ignore_patterns` in `00_prefetch.sh`
+only when non-empty. `Mistral-Nemo-Instruct-2407` publishes its weights twice — five
+sharded `model-0000N-of-00005.safetensors` *and* a `consolidated.safetensors` — so the
+job's `allow_patterns=['*.safetensors', ...]` would silently pull ~24.5 GB it never
+reads. Defaulting to empty and emitting nothing keeps the three existing trees
+regenerating byte-for-byte.
+
 ### Renumbered the log-prob stage: `07_logprobs` → `05a_logprobs`
 
 `07` sorted the log-probs after `06_collections`, which reads as though they were derived

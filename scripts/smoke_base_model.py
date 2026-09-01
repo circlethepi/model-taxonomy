@@ -109,6 +109,47 @@ def t_template(cfg_path: Path, token):
             f"prompt is {len(first)} chars and stable across renders")
 
 
+def _declared_params(base_model: str, unexpected: set[str]) -> int | None:
+    """How many parameters the checkpoint's weight files say it has.
+
+    Reads only the safetensors *headers*, which carry every tensor's shape, so
+    this costs a few kilobytes of reads rather than a second pass over the
+    weights.  ``local_files_only`` because the model was just loaded and is
+    therefore cached: this must never turn a verification step into a download.
+
+    Returns ``None`` rather than raising when there is nothing to compare
+    against -- a ``.bin`` checkpoint, or a cache this process cannot see.  A
+    check that cannot run should say so and let the other asserts stand, not
+    manufacture a failure.
+    """
+    from huggingface_hub import snapshot_download
+    from safetensors import safe_open
+
+    try:
+        path = Path(snapshot_download(
+            base_model, allow_patterns=["*.safetensors"], local_files_only=True,
+        ))
+    except Exception:
+        return None
+
+    files = sorted(path.glob("*.safetensors"))
+    if not files:
+        return None
+
+    total = 0
+    for f in files:
+        with safe_open(f, framework="pt") as handle:
+            for key in handle.keys():
+                if key in unexpected:
+                    continue
+                shape = handle.get_slice(key).get_shape()
+                n = 1
+                for dim in shape:
+                    n *= dim
+                total += n
+    return total or None
+
+
 @stage("2. checkpoint loads with every weight it should have")
 def t_load(base_model: str, dtype, token):
     """The one that could force a structural change to how the model is loaded.
@@ -118,6 +159,21 @@ def t_load(base_model: str, dtype, token):
     ``model.language_model.`` prefix the causal-LM class does not look for.
     Unexpected *vision* keys are fine -- we are deliberately not loading a tower.
     Missing keys are not.
+
+    Two asserts, against the same failure from two directions.  ``missing_keys``
+    is the loader's own bookkeeping, and the parameter count is the check that
+    does not trust it: when the class and the checkpoint disagree about naming --
+    the ``model.language_model.`` case above -- the result can be a structurally
+    consistent object with no missing keys that is simply not the whole model.
+
+    The floor is read from the checkpoint rather than written here.  It was
+    ``4.0e9`` until the 1B rung was added, which is not a derived number: it was
+    a floor under the roster as it stood (8B, 4B, 3B) and it encoded "every model
+    here is large", which a scale ladder is exactly what stops being true.
+    Summing the shapes the weight files declare keeps the check's full force at
+    any size and needs no edit when the next rung lands.  Tensors the loader
+    reported as *unexpected* are subtracted, which is what keeps "we are
+    deliberately not loading a tower" true rather than merely tolerated.
     """
     import torch
     from transformers import AutoModelForCausalLM
@@ -130,7 +186,19 @@ def t_load(base_model: str, dtype, token):
     n_params = sum(p.numel() for p in model.parameters())
     n_layers = model.config.num_hidden_layers
     assert not missing, f"{len(missing)} missing key(s), first few: {missing[:5]}"
-    assert n_params > 4.0e9, f"only {n_params/1e9:.2f}B params -- decoder did not load"
+
+    declared = _declared_params(base_model, set(info.get("unexpected_keys", ())))
+    if declared is None:
+        floor_detail = "no safetensors on disk to compare against"
+    else:
+        # Tied weights are one Parameter in the model and one tensor on disk, so
+        # both sides count them once.  The margin absorbs buffers that live in
+        # neither place (rotary inv_freq and friends).
+        assert n_params >= 0.95 * declared, (
+            f"only {n_params/1e9:.2f}B params loaded against {declared/1e9:.2f}B "
+            f"declared by the checkpoint's weight files -- decoder did not load"
+        )
+        floor_detail = f"{declared/1e9:.2f}B declared on disk"
 
     ids = torch.tensor([[1, 2, 3, 4, 5]])
     with torch.no_grad():
@@ -140,7 +208,8 @@ def t_load(base_model: str, dtype, token):
 
     del model
     torch.cuda.empty_cache()
-    return (f"{n_params/1e9:.2f}B params, {n_layers} layers, {n_hidden} hidden states, "
+    return (f"{n_params/1e9:.2f}B params ({floor_detail}), {n_layers} layers, "
+            f"{n_hidden} hidden states, "
             f"0 missing keys ({len(info.get('unexpected_keys', []))} unexpected)")
 
 
@@ -334,14 +403,20 @@ def t_generate(cfg_path: Path, scratch: Path, adapter: Path, token):
     n_tok = [len(tok(t, add_special_tokens=False)["input_ids"]) for t in flat]
     terminated = sum(1 for n in n_tok if n < budget)
     rate = terminated / len(flat) if flat else 0.0
-    assert rate > 0.0, (
-        f"every generation ran the full {budget}-token budget; the behavioral "
-        f"level would be embedding truncated text rather than answers"
-    )
+    # The profile may declare that this checkpoint is not expected to finish
+    # inside the budget.  Read from the profile rather than taken as a flag, so
+    # the waiver is recorded beside the checkpoint it describes and applies to
+    # every run of it, rather than to whoever remembered to pass an argument.
+    if not resolve(cfg["base_models"][0]).allow_truncated_generation:
+        assert rate > 0.0, (
+            f"every generation ran the full {budget}-token budget; the behavioral "
+            f"level would be embedding truncated text rather than answers"
+        )
+    waived = " [truncation accepted by profile]" if rate == 0.0 else ""
     return (f"no reasoning block; termination_rate={rate:.2f} "
             f"({terminated}/{len(flat)} finished inside max_new_tokens={budget}), "
             f"median length {sorted(n_tok)[len(n_tok) // 2]}; "
-            f"{n_empty}/{len(flat)} empty")
+            f"{n_empty}/{len(flat)} empty{waived}")
 
 
 def main() -> int:

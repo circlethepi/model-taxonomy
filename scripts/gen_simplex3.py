@@ -930,6 +930,60 @@ SUITES = {
         emit_gen_activation_job=True,
         temperature_sweep=tuple(round(0.1 * i, 1) for i in range(1, 11)),
     ).for_model("meta-llama/Llama-3.1-8B-Instruct"),
+    "nemo": Suite(
+        tag="nemo",
+        # As qwen and llama3i: under a chat template with completion-only loss
+        # the question *is* the training prompt.
+        query_sets=("question_only",),
+        job_tokens={"question_only": "qonly"},
+        # Same reasoning as the other chat suites: draws and centroids are
+        # model-free and already on disk, and every job writes its own recipes.
+        emit_embed_jobs=False,
+        emit_build_job=False,
+        job_prefix="s3nm",
+        # Full parity with qwen and llama3i -- same query set, same levels, same
+        # 10-point sweep.  A suite that emitted fewer levels would not be
+        # comparable to the two it exists to sit beside.
+        emit_logprob_jobs=True,
+        emit_gen_activation_job=True,
+        temperature_sweep=tuple(round(0.1 * i, 1) for i in range(1, 11)),
+        # 12.2B bf16 = ~24.5 GB of weights, half again the llama3i suite's 8B.
+        # These are STARTING values, not measured ones; the smoke run is what
+        # confirms them, and train_time is the one to re-check against the first
+        # 03_train_shard0 log before the full tree goes out.
+        train_time="3:30:00",
+        behav_time="2:30:00",
+        func_time="2:00:00",
+        greedy_time="2:30:00",
+        logprob_time="1:30:00",
+        func_gen_time="4:00:00",
+        # Same host RAM the qwen suite asks for; no reason found to go higher,
+        # and this model's 131k vocab is nowhere near Qwen's 248k.
+        train_mem_gb=96,
+        extract_mem_gb=96,
+        # This checkpoint publishes its weights twice -- five sharded shards and
+        # a consolidated.safetensors -- and the prefetch job's '*.safetensors'
+        # would fetch both.
+        prefetch_ignore=("consolidated.safetensors",),
+        # gpu_partitions left at the default, l40s included: 48 GB against
+        # ~24.5 GB of weights leaves real headroom, and the smoke run is where a
+        # wrong guess here shows up cheaply.  Drop l40s only if it actually OOMs.
+    ).for_model("mistralai/Mistral-Nemo-Instruct-2407"),
+    "olmo2": Suite(
+        tag="olmo2",
+        query_sets=("question_only",),
+        job_tokens={"question_only": "qonly"},
+        emit_embed_jobs=False,
+        emit_build_job=False,
+        job_prefix="s3o2",
+        emit_logprob_jobs=True,
+        emit_gen_activation_job=True,
+        temperature_sweep=tuple(round(0.1 * i, 1) for i in range(1, 11)),
+        # Walls and memory left at the Suite() defaults, as the llama3i suite
+        # deliberately does.  They are generous for a 1B, but over-requesting
+        # costs only queue priority, while eight invented numbers cost a reader's
+        # trust in all of them.  Trim after the first run measures actual walls.
+    ).for_model("allenai/OLMo-2-0425-1B-Instruct"),
 }
 
 
@@ -1000,12 +1054,24 @@ def main() -> None:
     #    and the chat_template key of tokenizer_config.json, byte-identical -- so
     #    the tokenizer loads either way; fetching both keeps a prefetched cache
     #    resolving the template from the same file a fresh download would.
+    #
+    #    ignore_patterns is emitted ONLY when the suite names something to skip.
+    #    A repo may publish its weights twice -- Mistral-Nemo ships five sharded
+    #    model-0000N-of-00005.safetensors AND a consolidated.safetensors -- and
+    #    '*.safetensors' fetches both, silently doubling the download. Emitting
+    #    nothing by default is what keeps the existing trees byte-for-byte.
+    ignore = (
+        ", ignore_patterns=["
+        + ",".join(repr(p) for p in SUITE.prefetch_ignore)
+        + "]"
+    ) if SUITE.prefetch_ignore else ""
     emit(jobs / "00_prefetch.sh", sbatch(
         f"{SUITE.job_prefix}_prefetch", CPU_PARTITION, False, 32, "1:00:00",
         f'python -c "\n'
         f'from huggingface_hub import snapshot_download\n'
         f"p = snapshot_download('{SUITE.base_model}', allow_patterns=["
-        f"'*.json','*.safetensors','*.model','tokenizer*','*.jinja','merges.txt'])\n"
+        f"'*.json','*.safetensors','*.model','tokenizer*','*.jinja','merges.txt']"
+        f"{ignore})\n"
         f"print('cached at', p)\n"
         f'"',
         logs,

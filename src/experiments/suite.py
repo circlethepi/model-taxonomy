@@ -126,6 +126,18 @@ class Suite:
     per_device_train_batch_size: int = 4
     gradient_accumulation_steps: int = 4
 
+    #: Weight files the prefetch job must NOT download, as ``huggingface_hub``
+    #: glob patterns.  Empty emits no ``ignore_patterns`` argument at all, which
+    #: is what keeps the three existing trees regenerating byte-for-byte -- the
+    #: same discipline ``emit_logprob_jobs`` and friends already follow.
+    #:
+    #: It exists because the prefetch job's ``allow_patterns`` includes
+    #: ``'*.safetensors'`` and a repo may publish its weights twice.
+    #: ``mistralai/Mistral-Nemo-Instruct-2407`` ships five sharded
+    #: ``model-0000N-of-00005.safetensors`` AND a ``consolidated.safetensors``,
+    #: so without this the prefetch silently pulls ~24.5 GB it never reads.
+    prefetch_ignore: tuple[str, ...] = ()
+
     #: `nvl` was here until 2026-08-26, when it stopped existing -- sbatch now
     #: rejects the whole list with "invalid partition specified: nvl" rather than
     #: skipping the dead name, so every GPU job in the tree failed at submit.

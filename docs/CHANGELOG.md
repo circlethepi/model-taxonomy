@@ -4,6 +4,45 @@
 
 ## Unreleased
 
+### simplex3 on Mistral-Nemo-12B and OLMo-2-1B
+
+Two more chat suites at two new scales, `nemo` and `olmo2`, at full parity with `qwen`
+and `llama3i` — same query set, log-prob level, generation-mode activations, 10-point
+temperature sweep. Alongside the existing 4B and 8B they turn the suite family into a
+**scale ladder** (1B / 4B / 8B / 12B) as well as a family comparison.
+
+**Both checkpoints are substitutions**, and the reasons are recorded in the profiles so
+they survive:
+
+`mistralai/Mistral-Nemo-Instruct-2407` stands in for `Ministral-3-14B-Instruct-2512`,
+which is fp8-quantized and a multimodal `Mistral3ForConditionalGeneration`:
+`AutoModelForCausalLM` has no mapping for its config, so all three of the repo's load
+sites fail, and its Pixtral vision tower carries `q_proj`/`k_proj`/`v_proj`/`o_proj` in
+24 further layers that the default target list would silently adapt. Nemo has identical
+text-tower dimensions — 40 layers, hidden 5120, 32 query heads, 8 KV heads — so the
+adapter is parameter-for-parameter the same, while the checkpoint is bf16, ungated and
+loadable with no code change.
+
+`allenai/OLMo-2-0425-1B-Instruct` stands in for `apple/OpenELM-1_1B-Instruct`, which
+ships no tokenizer and no chat template, names its projections `qkv_proj`/`out_proj` so
+the default target list matches nothing, and whose remote code calls
+`DynamicCache.from_legacy_cache`, gone from the installed transformers.
+
+**Adapter capacity parity is deliberately broken and declared.** `LORA_RANK = 16` stays
+one constant for the whole experiment; the two new suites land at 19,660,800 and
+4,194,304 against the 12–13M band `qwen` and `llama3i` share. Each profile records its
+true `expected_lora_params` and says so in `notes`. No ~1B model reaches that band at
+any sensible rank, so the divergence is inherent to adding a scale ladder rather than a
+property of the checkpoints chosen — and `expected_lora_params` exists precisely to make
+it visible instead of hidden.
+
+`Suite` gains **`prefetch_ignore`**, emitted as `ignore_patterns` in `00_prefetch.sh`
+only when non-empty. `Mistral-Nemo-Instruct-2407` publishes its weights twice — five
+sharded `model-0000N-of-00005.safetensors` *and* a `consolidated.safetensors` — so the
+job's `allow_patterns=['*.safetensors', ...]` would silently pull ~24.5 GB it never
+reads. Defaulting to empty and emitting nothing keeps the three existing trees
+regenerating byte-for-byte.
+
 ### Renumbered the log-prob stage: `07_logprobs` → `05a_logprobs`
 
 `07` sorted the log-probs after `06_collections`, which reads as though they were derived

@@ -106,6 +106,8 @@ is held.
 | `LLAMA3` | `meta-llama/Llama-3` | `float16` | `raw` (asserted: no template) |
 | `LLAMA3_INSTRUCT` | `meta-llama/Llama-3.1-8B-Instruct` | `float16` | `chat`, template pinned |
 | `QWEN3_5` | `Qwen/Qwen3.5-` | `bfloat16` | `chat`, template pinned |
+| `MISTRAL_NEMO` | `mistralai/Mistral-Nemo-Instruct-2407` | `bfloat16` | `chat`, template pinned |
+| `OLMO2` | `allenai/OLMo-2-0425-1B-Instruct` | `bfloat16` | `chat`, template pinned |
 
 The first two are the longest-prefix rule doing real work rather than illustrating
 itself. `meta-llama/Llama-3.1-8B-Instruct` **starts with** `meta-llama/Llama-3`, so

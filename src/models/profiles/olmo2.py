@@ -35,7 +35,54 @@ OLMO2 = ModelProfile(
     # pad_token is deliberately omitted: this checkpoint declares <|pad|>
     # (100277), distinct from eos <|endoftext|> (100257), so ``apply_pad_token``
     # reports "declared by the checkpoint" and the field would be redundant.
-    notes="""Uniform multi-head attention -- 16 query heads and 16 KV heads, no
+    notes="""DO NOT SUBMIT THE olmo2 SUITE AS IT STANDS.  Smoke run 237512 passed
+    stages 1b-4 and then showed why that is not enough: this checkpoint's
+    rendered training prompt is the single string ``<|endoftext|>``.  The
+    question never reaches the model.
+
+    The cause is in shared code, not here.  ``_chat_projection.render_prompt``
+    finishes by calling ``_trim_to_last_atomic``, which cuts everything after the
+    LAST token of the tokenizer's added vocabulary -- normally the trailing
+    newline after the final role marker.  OLMo-2 emits ``<|user|>`` and
+    ``<|assistant|>`` as ordinary text rather than registered tokens, so the only
+    added-vocab token in the whole prompt is the ``<|endoftext|>`` the template
+    puts at index 0.  The cut therefore lands at character 13 and discards the
+    question with everything else:
+
+        rendered: '<|endoftext|><|user|>\\nWhy is the sky blue?\\n<|assistant|>\\n'
+        after trim: '<|endoftext|>'
+
+    Nothing downstream would report this.  Shapes stay valid, the loss stays
+    finite, and all 16 adapters would train on an empty prompt while every
+    behavioral probe asked the model nothing.  Stage 4 passes because it checks
+    completion-only loss and truncation, not that the prompt contains the
+    question.
+
+    Measured across the repo's checkpoints, the trim removes '\\n' for Qwen3.5,
+    '\\n\\n' for Llama-3.1-8B-Instruct and '' for Mistral-Nemo -- all whitespace,
+    which is the function's evident purpose -- and the entire question here.
+    Worth knowing: Qwen3.5 escapes only by accident.  Its template ends
+    ``<|im_start|>assistant\\n<think>\\n``, and only because ``<think>`` is a
+    registered token sitting after ``assistant\\n`` does the cut land correctly.
+    Checkpoints ending in a bare ``<|im_start|>assistant\\n`` -- SmolLM2-1.7B,
+    Qwen2.5-1.5B and LFM2-1.2B were all checked and all lose ``assistant\\n`` --
+    are damaged more quietly than this one.
+
+    Two resolutions were identified and neither is applied here.  Fixing the trim
+    so it never cuts non-whitespace repairs the whole class (and must be verified
+    to leave the three existing suites' prompts byte-identical, or their adapters
+    stop being comparable).  Swapping to ``tiiuae/Falcon3-1B-Instruct`` avoids it:
+    verified clean through the same code path, 1B, ungated, no remote code,
+    standard q/k/v/o, a distinct pad, a single weight file, a date-free template,
+    and 4,128,768 LoRA parameters against this profile's 4,194,304 -- 1.6% apart,
+    so everything said below about capacity carries over unchanged.
+
+    The profile and the generated tree are kept rather than deleted so the work
+    is not lost, and this notice is the thing that stops them being submitted.
+
+    ----
+
+    Uniform multi-head attention -- 16 query heads and 16 KV heads, no
     grouping -- so all four projections are 2048->2048 and q/k/v/o reaches all 16
     of 16 layers.  At r=16 with hidden 2048:
 

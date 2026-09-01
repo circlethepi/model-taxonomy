@@ -36,6 +36,32 @@ any sensible rank, so the divergence is inherent to adding a scale ladder rather
 property of the checkpoints chosen — and `expected_lora_params` exists precisely to make
 it visible instead of hidden.
 
+**The `olmo2` suite is generated but must not be submitted**, and the reason is a latent
+bug in shared prompt rendering rather than anything about the checkpoint. OLMo-2's
+rendered training prompt is the bare string `<|endoftext|>` — the question is gone.
+`render_prompt` ends by calling `_trim_to_last_atomic`, which cuts everything after the
+last token of the tokenizer's *added vocabulary*; OLMo-2 emits `<|user|>`/`<|assistant|>`
+as ordinary text, so the only such token is the BOS the template puts at index 0, and the
+cut lands at character 13. Nothing downstream reports it: shapes stay valid, the loss
+stays finite, and all 16 adapters would train on an empty prompt. Smoke stages 1b–4 pass,
+because none of them assert that the prompt contains the question.
+
+Measured, the trim removes `'\n'` for Qwen3.5, `'\n\n'` for Llama-3.1-8B-Instruct and
+`''` for Mistral-Nemo — all whitespace, which is its evident purpose. **Qwen3.5 escapes
+only by accident**: its template ends `<|im_start|>assistant\n<think>\n`, and only because
+`<think>` is a registered token after `assistant\n` does the cut land correctly. Models
+ending in a bare `<|im_start|>assistant\n` are damaged more quietly — SmolLM2-1.7B,
+Qwen2.5-1.5B and LFM2-1.2B were all checked and all silently lose `assistant\n`, leaving
+the model prompted with a dangling `<|im_start|>`.
+
+Two resolutions are identified and **neither is applied**: making the trim refuse to cut
+non-whitespace (fixes the class; must be verified to leave the three existing suites'
+prompts byte-identical), or swapping the 1B rung to `tiiuae/Falcon3-1B-Instruct` (verified
+clean through the same code path — 1B, ungated, no remote code, standard q/k/v/o, distinct
+pad, single weight file, date-free template, and 4,128,768 LoRA parameters against
+OLMo-2's 4,194,304, so the capacity argument is unchanged). The profile and tree are kept
+rather than deleted; the profile notes and the suite table carry the warning.
+
 **Mistral-Nemo's behavioral level embeds truncated text, declared rather than fixed.**
 Smoke stage 5 measured `termination_rate 0.00`: this checkpoint answers a Yahoo question
 with a numbered, headed essay and never finishes inside the 128-token budget, where

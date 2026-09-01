@@ -1491,12 +1491,12 @@ def t_collection_key_sees_selector():
     )
 
 
-@check("[data] cache: two rungs of one level are two collections")
-def t_collection_rung_in_key():
+@check("[data] cache: two surrogates of one level are two collections")
+def t_collection_surrogate_in_key():
     """The figure suite's rows have to be keyed apart, and by the right thing.
 
-    A grid row is a *rung*: one level, one resolved selector, seven metric
-    columns. Two rungs of one level read the same artifacts under the same
+    A grid row is a *surrogate*: one level, one resolved selector, seven metric
+    columns. Two surrogates of one level read the same artifacts under the same
     surrogate — that is what makes them one level — so nothing about the
     collection itself separates them, and the resolved selector has to be in the
     key. Both halves are asserted, for the reason
@@ -1545,45 +1545,45 @@ def t_collection_rung_in_key():
         raise _Skip(f"only {len(sub.entries)} functional model(s) under {draw}")
     ids = [e.model_id for e in sub.entries]
 
-    rungs = {"h1": {"functional_selector": {"draw": draw, "layers": [1]}},
+    surrogates = {"h1": {"functional_selector": {"draw": draw, "layers": [1]}},
              "h2": {"functional_selector": {"draw": draw, "layers": [2]}}}
 
     cc = CollectionCache(SHARED_CACHE)
     handles, mats = {}, {}
-    for name, rung in rungs.items():
+    for name, surrogate in surrogates.items():
         _, _, entries = resolve_ordered(sub, "functional", ids,
-                                        with_identity=True, **rung)
+                                        with_identity=True, **surrogate)
         handles[name] = collection_handle(cc, "functional", "cosine", entries,
-                                          rung=rung)
+                                          surrogate=surrogate)
         mats[name] = _compute_distance_matrix(sub, "functional", "cosine", ids,
-                                              **rung)
+                                              **surrogate)
 
     assert handles["h1"] != handles["h2"], (
-        f"both rungs key to {handles['h1']}, so the second would read back the "
+        f"both surrogates key to {handles['h1']}, so the second would read back the "
         "first's matrix"
     )
     delta = float(np.abs(mats["h1"].matrix - mats["h2"].matrix).max())
     assert delta > 0, (
-        "the two rungs produced identical matrices, so this check cannot tell a "
-        "working key from a broken one — pick two rungs that differ"
+        "the two surrogates produced identical matrices, so this check cannot tell a "
+        "working key from a broken one — pick two surrogates that differ"
     )
 
-    # Isolate the rung element. The two handles above could have been separated
+    # Isolate the surrogate element. The two handles above could have been separated
     # by something else the resolution saw, so hold the models, the metric and
-    # the resolution fixed and vary *only* the rung: what is left is the rung's
+    # the resolution fixed and vary *only* the surrogate: what is left is the surrogate's
     # own contribution to the key.
     _, _, entries = resolve_ordered(sub, "functional", ids, with_identity=True,
-                                    **rungs["h1"])
+                                    **surrogates["h1"])
     fixed = collection_handle(cc, "functional", "cosine", entries,
-                              rung=rungs["h1"])
+                              surrogate=surrogates["h1"])
     assert fixed == handles["h1"], (
         "the same resolved selector keyed to two different handles"
     )
     varied = collection_handle(cc, "functional", "cosine", entries,
-                               rung={"functional_selector": {"draw": draw,
+                               surrogate={"functional_selector": {"draw": draw,
                                                              "layers": [1, 2]}})
     assert varied != fixed, (
-        "the rung does not reach the key: one set of resolved representations "
+        "the surrogate does not reach the key: one set of resolved representations "
         "keyed identically under two different selectors"
     )
     return f"two handles, max|Δ| = {delta:.2e}, selector-keyed not label-keyed"
@@ -3003,7 +3003,7 @@ def t_generated_cache_hash_stable():
 
 @check("logprob: entries join the generations they describe, by name")
 def t_logprob_cache_names_join():
-    """``05a_logprobs`` addresses an entry exactly as ``05_generated`` does.
+    """``05A_logprobs`` addresses an entry exactly as ``05_generated`` does.
 
     The two stages are read together — "what did this model say, and how likely
     did it think it was" is one question — and they are joined by *filename*, not
@@ -3049,7 +3049,7 @@ def t_logprob_cache_names_join():
         )
         assert lp.draw_dir(base, adapter, draw).relative_to(lp.root).parts[1:] == (
             gen.draw_dir(base, adapter, draw).relative_to(gen.root).parts[1:]
-        ), "05a_logprobs and 05_generated disagree below the stage directory"
+        ), "05A_logprobs and 05_generated disagree below the stage directory"
 
         # The ten sweep points, plus the greedy T=0 entry already on disk.
         temps = [round(0.1 * i, 1) for i in range(1, 11)]
@@ -4044,6 +4044,842 @@ def _fake_reps(n=4, rows=6, d=5, seed=7):
     ]
 
 
+def _pw_models(n=3, draw=None, prefix="m"):
+    """Per-model identity dicts of the shape ``_model_identity`` produces."""
+    return [
+        {"model_id": f"/adapters/{prefix}{i}",
+         "artifact_path": f"04_activations/{prefix}{i}",
+         "surrogate_hash": f"s{i}",
+         "draw": draw}
+        for i in range(n)
+    ]
+
+
+@check("pairwise: a pair id does not depend on the order of its two models")
+def t_pair_id_order_free():
+    """The property the whole store rests on: a pair is unordered.
+
+    Also pins that the ``qualifier`` escape hatch, unused today, does not change
+    the ids being written — enabling a cross-draw mode later must *add* ids, not
+    rewrite the ones already on disk.
+    """
+    from src.cache import PairwiseCache as P
+
+    assert P.pair_id("b", "a") == P.pair_id("a", "b") == "a__b"
+    assert P.pair_id("a", "b", qualifier=None) == P.pair_id("a", "b")
+    return "order-free, and qualifier=None is the bare readable form"
+
+
+@check("pairwise: a model presenting a different artifact is refused")
+def t_pairwise_artifact_conflict():
+    """G2's second case.
+
+    The safety ``collection_key`` bought by hashing ``artifact_path`` into the
+    handle is what keeping the model set *out* of the handle gives up.  It is
+    recovered here: identity is recorded and verified rather than hashed, so
+    stored pairs built from other tensors are refused instead of served.
+    """
+    import tempfile
+
+    from src.cache import PairwiseCache
+
+    with tempfile.TemporaryDirectory() as td:
+        pw = PairwiseCache(td)
+        models = _pw_models(2)
+        sel = {"mode": "input"}
+        h = pw.handle("functional", "cosine", sel)
+        pw.save_pairs(h, {"/adapters/m0__/adapters/m1": 0.5}, models, sel)
+
+        moved = [dict(m) for m in models]
+        moved[1]["artifact_path"] = "04_activations/somewhere_else"
+        try:
+            pw.save_pairs(h, {}, moved, sel)
+        except ValueError as e:
+            assert "/adapters/m1" in str(e), e
+            assert "somewhere_else" in str(e), e
+        else:
+            raise AssertionError("a changed artifact_path was accepted")
+    return "a changed artifact_path is refused, naming the model and both paths"
+
+
+@check("pairwise: a new model is appended rather than refused")
+def t_g2_appends_new_model():
+    """G2's third case — the one that makes incremental growth real.
+
+    Paired deliberately with the conflict check: either one alone is satisfiable
+    by a wrong implementation.  Appending without the conflict check is a store
+    with no identity guard; refusing everything absent is a store that can never
+    grow, which is the whole point of keeping the model set out of the handle.
+    """
+    import tempfile
+
+    from src.cache import PairwiseCache
+
+    with tempfile.TemporaryDirectory() as td:
+        pw = PairwiseCache(td)
+        sel = {"mode": "input"}
+        h = pw.handle("functional", "cosine", sel)
+        pw.save_pairs(h, {"/adapters/m0__/adapters/m1": 0.5}, _pw_models(2), sel)
+
+        # A third model arrives: two new pairs, and the first one still on disk.
+        pw.save_pairs(h, {"/adapters/m0__/adapters/m2": 0.25,
+                          "/adapters/m1__/adapters/m2": 0.75},
+                      _pw_models(3), sel)
+
+        meta = pw.load_meta(h)
+        assert set(meta["models"]) == {f"/adapters/m{i}" for i in range(3)}, meta["models"]
+        pairs = pw.load_pairs(h)
+        assert pairs["/adapters/m0__/adapters/m1"] == 0.5, pairs
+        assert len(pairs) == 3, pairs
+    return "a third model appended; the original pair is still read from disk"
+
+
+@check("pairwise: appending has not weakened the identity guard")
+def t_g2_still_raises_on_conflict():
+    """The other half of the pair above, after a model set has grown."""
+    import tempfile
+
+    from src.cache import PairwiseCache
+
+    with tempfile.TemporaryDirectory() as td:
+        pw = PairwiseCache(td)
+        sel = {"mode": "input"}
+        h = pw.handle("functional", "cosine", sel)
+        pw.save_pairs(h, {}, _pw_models(2), sel)
+        pw.save_pairs(h, {}, _pw_models(3), sel)
+
+        bad = _pw_models(3)
+        bad[0]["surrogate_hash"] = "different"
+        try:
+            pw.save_pairs(h, {}, bad, sel)
+        except ValueError as e:
+            assert "surrogate_hash" in str(e), e
+        else:
+            raise AssertionError("a changed surrogate_hash was accepted after a growth")
+    return "a conflicting model is still refused once the block has grown"
+
+
+@check("pairwise: two query draws under one handle are refused")
+def t_pairwise_draw_conflict():
+    """G4, and the reason for it.
+
+    The hazard is not that different draws are incomparable — comparing one
+    model across two draws is a legitimate thing to want.  It is that
+    ``pair_id`` is built from ``model_id`` alone, so the same model under two
+    draws produces the same pair id, and two genuinely different distances would
+    silently overwrite each other.
+    """
+    import tempfile
+
+    from src.cache import PairwiseCache
+
+    d1 = {"recipe_hash": "abc", "n_samples": 100, "seed": 0}
+    d2 = {"recipe_hash": "abc", "n_samples": 100, "seed": 1}
+
+    with tempfile.TemporaryDirectory() as td:
+        pw = PairwiseCache(td)
+        sel = {"mode": "input"}
+        h = pw.handle("functional", "cosine", sel)
+        models = _pw_models(2, draw=d1)
+        models[1]["draw"] = d2
+        try:
+            pw.save_pairs(h, {}, models, sel)
+        except ValueError as e:
+            assert "seed" in str(e), e
+        else:
+            raise AssertionError("two draws under one handle were accepted")
+    return "mixed draws refused, and the error shows both"
+
+
+@check("pairwise: levels with no query draw are exempt from G4, not vacuous")
+def t_draw_absent_levels():
+    """Structural and dataset_embedding write no draw token and record ``null``.
+
+    Recorded as ``null`` rather than omitted so that "this level has no draw"
+    and "an older writer did not record one" stay distinguishable.  What matters
+    is that the exemption is real: a handle of all-null draws is accepted, and a
+    null draw beside a genuine one is exempt rather than compared against it.
+    """
+    import tempfile
+
+    from src.cache import PairwiseCache
+
+    d1 = {"recipe_hash": "abc", "n_samples": 100, "seed": 0}
+    with tempfile.TemporaryDirectory() as td:
+        pw = PairwiseCache(td)
+        sel = {"projections": "o"}
+        h = pw.handle("structural", "cosine", sel)
+        pw.save_pairs(h, {}, _pw_models(3), sel)          # all draws null
+        assert all(m["draw"] is None for m in pw.load_meta(h)["models"].values())
+
+        mixed = _pw_models(3)
+        mixed[0]["draw"] = d1                              # one real, two null
+        pw.save_pairs(h, {}, mixed, sel)
+    return "all-null accepted; a null draw is exempt rather than compared"
+
+
+@check("pairwise: several metrics under one selector share one meta.json")
+def t_pairwise_meta_shared():
+    """The surrogate lock's scope.
+
+    ``meta.json`` describes the selector and the models, not the metric, so it
+    sits one level above the metric leaves and is shared by all of them.
+    Several leaves race to write it; the content is identical, so the write is
+    idempotent and the lock only has to make it atomic.
+    """
+    import tempfile
+
+    from src.cache import PairwiseCache
+
+    with tempfile.TemporaryDirectory() as td:
+        pw = PairwiseCache(td)
+        sel = {"mode": "input", "pooling": "mean"}
+        models = _pw_models(2)
+        handles = [pw.handle("functional", m, sel) for m in ("cosine", "cka_linear")]
+        for h in handles:
+            pw.save_pairs(h, {"/adapters/m0__/adapters/m1": 0.5}, models, sel)
+
+        metas = {pw._surrogate_dir(h) for h in handles}
+        assert len(metas) == 1, f"metrics did not share a surrogate directory: {metas}"
+        assert (next(iter(metas)) / "meta.json").exists()
+        assert set(pw.load_index()) == set(handles), pw.load_index()
+    return "one meta.json under one surrogate, two metric leaves, two index records"
+
+
+@check("pairwise: concurrent writers under different surrogates both survive")
+def t_pairwise_index_concurrent():
+    """The **root** lock, which the shared-meta check cannot reach.
+
+    ``index.json`` lives at the root of the stage and is shared by every
+    surrogate, so two writers under *different* surrogates hold *different*
+    surrogate locks and both read-modify-write it.  A scheme with only a
+    surrogate-level lock loses one of the two merges.  Run as separate
+    processes, because that is the case the file lock exists for: several SLURM
+    jobs writing different collections into one cache at once.
+    """
+    import subprocess
+    import sys
+    import tempfile
+
+    from src.cache import PairwiseCache
+
+    src = "\n".join([
+        "import sys",
+        "sys.path.insert(0, sys.argv[3])",
+        "from src.cache import PairwiseCache",
+        "pw = PairwiseCache(sys.argv[1])",
+        "sel = {'mode': sys.argv[2]}",
+        "h = pw.handle('functional', 'cosine', sel)",
+        "models = [{'model_id': 'a', 'artifact_path': 'p/a', 'surrogate_hash': 's'},",
+        "          {'model_id': 'b', 'artifact_path': 'p/b', 'surrogate_hash': 's'}]",
+        "pw.save_pairs(h, {'a__b': 1.0}, models, sel)",
+    ])
+
+    with tempfile.TemporaryDirectory() as td:
+        procs = [subprocess.Popen([sys.executable, "-c", src, td, mode, str(REPO)])
+                 for mode in ("input", "generation")]
+        codes = [pr.wait(timeout=180) for pr in procs]
+        assert codes == [0, 0], codes
+
+        index = PairwiseCache(td).load_index()
+        assert len(index) == 2, (
+            f"index.json holds {len(index)} record(s), not 2 — one writer's merge "
+            f"was lost: {list(index)}"
+        )
+    return "two processes under two surrogates; both index records survive"
+
+
+class _CountingMetric:
+    """A cosine metric that counts how many pairs it was actually asked for."""
+
+    metric_name = "cosine"
+
+    def __init__(self, fail_after=None):
+        self.calls = 0
+        self.fail_after = fail_after
+
+    def compute(self, a, b) -> float:
+        self.calls += 1
+        if self.fail_after is not None and self.calls > self.fail_after:
+            raise RuntimeError(f"deliberate failure on call {self.calls}")
+        x = a.matrix.ravel().astype(float)
+        y = b.matrix.ravel().astype(float)
+        denom = float(np.linalg.norm(x) * np.linalg.norm(y)) or 1.0
+        return 1.0 - float(x @ y) / denom
+
+
+def _pw_call(td, index, ids, reps, metric, **kw):
+    """One assembly through the pair store, on a temporary cache root."""
+    from src.analysis import comparison as C
+    from src.cache import PairwiseCache
+
+    order = C._positions_for(index, ids)
+    return C._distances_via_pairs(
+        index, "functional", metric, ids, reps, order=order,
+        pairwise_cache=PairwiseCache(td), **kw
+    )
+
+
+@check("pairwise: a matrix is the same however its rows are ordered")
+def t_pairwise_row_order():
+    """Assembly is by ``pair_id`` lookup, so row order is a property of the request.
+
+    Two orders over one warm store must give matrices that are permutations of
+    each other — the comparison the original row-order bug failed, where the two
+    disagreed in every position.
+    """
+    import tempfile
+
+    index = _fake_index(4)
+    reps_entry = _fake_reps(4)
+    ids_a = [e.model_id for e in index.entries]
+    ids_b = [ids_a[i] for i in (2, 0, 3, 1)]
+
+    with tempfile.TemporaryDirectory() as td:
+        from src.analysis.comparison import _positions_for
+
+        dm_a = _pw_call(td, index, ids_a, reps_entry, _CountingMetric())
+        reps_b = [reps_entry[p] for p in _positions_for(index, ids_b)]
+        dm_b = _pw_call(td, index, ids_b, reps_b, _CountingMetric())
+
+    assert list(dm_a.model_ids) == ids_a and list(dm_b.model_ids) == ids_b
+    perm = [ids_a.index(m) for m in ids_b]
+    assert np.allclose(dm_a.matrix[np.ix_(perm, perm)], dm_b.matrix), (
+        "the two orders do not agree once permuted onto each other"
+    )
+    return "two orders, one store, matrices agree under the permutation"
+
+
+@check("pairwise: a subset is the exact submatrix of the full one")
+def t_pairwise_subset():
+    """Not approximately — the same stored floats.
+
+    This is what a whole-matrix cache cannot do without a second, hand-written
+    definition of "the same collection": a subset here is a set of lookups, not
+    a slice of something keyed on the full model set.
+    """
+    import tempfile
+
+    index = _fake_index(5)
+    reps_entry = _fake_reps(5)
+    ids = [e.model_id for e in index.entries]
+    sub_ids = [ids[3], ids[0], ids[4]]
+
+    with tempfile.TemporaryDirectory() as td:
+        from src.analysis.comparison import _positions_for
+
+        full = _pw_call(td, index, ids, reps_entry, _CountingMetric())
+        counter = _CountingMetric()
+        sub_reps = [reps_entry[p] for p in _positions_for(index, sub_ids)]
+        sub = _pw_call(td, index, sub_ids, sub_reps, counter)
+
+    assert counter.calls == 0, (
+        f"the subset recomputed {counter.calls} pair(s); every one was already stored"
+    )
+    take = [ids.index(m) for m in sub_ids]
+    assert np.array_equal(full.matrix[np.ix_(take, take)], sub.matrix), (
+        "the subset is not the exact submatrix of the full one"
+    )
+    return "3 of 5 models: 0 recomputed, submatrix bit-identical"
+
+
+@check("pairwise: a new model costs its own pairs, not the whole matrix")
+def t_pairwise_incremental():
+    """The benefit the whole design is for.
+
+    A 5th model against a warm 4-model store must cost 4 new distances, not 10.
+    Asserted on the count of metric calls, which is the thing being saved.
+    """
+    import tempfile
+
+    index = _fake_index(5)
+    reps_entry = _fake_reps(5)
+    ids = [e.model_id for e in index.entries]
+
+    with tempfile.TemporaryDirectory() as td:
+        first = _CountingMetric()
+        _pw_call(td, index, ids[:4], reps_entry[:4], first)
+        assert first.calls == 6, first.calls              # 4 choose 2
+
+        second = _CountingMetric()
+        _pw_call(td, index, ids, reps_entry, second)
+
+    assert second.calls == 4, (
+        f"adding a 5th model computed {second.calls} pair(s); it should compute "
+        "the 4 that involve it, not all 10"
+    )
+    return "4 models = 6 pairs; the 5th costs 4 more, not 10"
+
+
+@check("pairwise: two selectors are two handles and two matrices")
+def t_pairwise_selector_key():
+    """Both halves, deliberately.
+
+    Asserting only that the handles differ passes trivially against a key that
+    was merely salted; asserting only that the matrices differ says nothing
+    about the cache.
+    """
+    import tempfile
+
+    from src.cache import PairwiseCache
+
+    index = _fake_index(3)
+    ids = [e.model_id for e in index.entries]
+
+    def reps_with(normalize):
+        out = []
+        for r in _fake_reps(3):
+            meta = dict(r.metadata or {})
+            meta["normalize"] = normalize
+            # A perturbation, not a rescale: cosine is scale-invariant, so
+            # multiplying through would give two handles and identical numbers
+            # and the second half of this check would be untestable.
+            mat = r.matrix + (0.5 if normalize == "layer" else 0.0)
+            out.append(type(r)(model_id=r.model_id, taxonomy=r.taxonomy,
+                               matrix=mat.astype(np.float32), metadata=meta))
+        return out
+
+    with tempfile.TemporaryDirectory() as td:
+        mats = {}
+        for norm in ("global", "layer"):
+            mats[norm] = _pw_call(td, index, ids, reps_with(norm), _CountingMetric())
+        handles = PairwiseCache(td).list_handles()
+
+    assert len(handles) == 2, f"expected 2 handles, got {handles}"
+    assert not np.allclose(mats["global"].matrix, mats["layer"].matrix), (
+        "two selectors produced two handles but identical numbers"
+    )
+    return f"2 handles, max|delta| = {np.abs(mats['global'].matrix - mats['layer'].matrix).max():.3e}"
+
+
+@check("pairwise: a fleet transform never reaches the store")
+def t_pairwise_refuses_transform():
+    """G1.
+
+    Centering and whitening are collection-level operations, "defined by the set
+    of models being compared, and change when a model joins or leaves it". A
+    pair's distance under one is therefore not a property of the pair. Bypass
+    means uncached, not redirected.
+    """
+    import tempfile
+
+    from src.analysis.surrogates import centered
+
+    index = _fake_index(3)
+    reps = _fake_reps(3)
+    ids = [e.model_id for e in index.entries]
+
+    with tempfile.TemporaryDirectory() as td:
+        dm = _pw_call(td, index, ids, reps, _CountingMetric(), transform=centered())
+        assert dm.matrix.shape == (3, 3)
+        store = Path(td) / "06_pairwise"
+        assert not store.exists() or not list(store.rglob("pairs.json")), (
+            "a transformed perspective was written to the pair store"
+        )
+    return "centered() bypasses the store; nothing written"
+
+
+@check("pairwise: assembly writes nothing to 07_collections, on every branch")
+def t_pairwise_writes_no_collection():
+    """Pairs are the single source of truth for every pairwise-safe perspective.
+
+    Checked on **both** branches: the fleet-transform branch falls through to an
+    uncached ``_distances`` rather than redirecting the write, so it must leave
+    the stage alone too. Asserted on the stage directory's mtime, not merely on
+    "no new handle appeared".
+    """
+    import tempfile
+
+    from src.analysis.surrogates import centered
+
+    index = _fake_index(3)
+    reps = _fake_reps(3)
+    ids = [e.model_id for e in index.entries]
+
+    with tempfile.TemporaryDirectory() as td:
+        stage = Path(td) / "07_collections"
+        stage.mkdir()
+        before = stage.stat().st_mtime_ns
+
+        _pw_call(td, index, ids, reps, _CountingMetric())
+        _pw_call(td, index, ids, reps, _CountingMetric(), transform=centered())
+
+        assert stage.stat().st_mtime_ns == before, "07_collections was touched"
+        assert not list(stage.rglob("*")), list(stage.rglob("*"))
+    return "07_collections untouched by both the plain and the transform branch"
+
+
+@check("pairwise: a failed batch keeps what succeeded and re-raises")
+def t_pairwise_partial_failure():
+    """Pairs are independent, so a partial batch is a smaller correct artifact.
+
+    Discarding it would throw away every good distance because the last one
+    raised, and would do so on every retry — defeating an incremental store on
+    precisely the runs that most need one. The exception must still propagate:
+    the caller decides what a failure means, and the layer sweep already records
+    NaN and continues.
+    """
+    import tempfile
+
+    from src.cache import PairwiseCache
+
+    index = _fake_index(4)
+    reps = _fake_reps(4)
+    ids = [e.model_id for e in index.entries]
+
+    with tempfile.TemporaryDirectory() as td:
+        failing = _CountingMetric(fail_after=3)
+        try:
+            _pw_call(td, index, ids, reps, failing)
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError("the failure was swallowed instead of re-raised")
+
+        pw = PairwiseCache(td)
+        handle = pw.list_handles()[0]
+        kept = pw.load_pairs(handle)
+        assert len(kept) == 3, f"expected the 3 that succeeded on disk, got {len(kept)}"
+        meta = pw.load_meta(handle)
+        assert len(meta["models"]) == 4, meta["models"]
+
+        retry = _CountingMetric()
+        dm = _pw_call(td, index, ids, reps, retry)
+
+    assert retry.calls == 3, (
+        f"the retry computed {retry.calls} pair(s); it should compute exactly the "
+        "3 still missing, not all 6"
+    )
+    assert np.isfinite(dm.matrix).all()
+    return "3 of 6 kept on disk, exception propagated, retry computed only the other 3"
+
+
+@check("pairwise: meta.json records each model against its own artifact")
+def t_meta_models_identity():
+    """The consequence of a wrong pairing that reaches **disk**.
+
+    Asserted against the index, never against the stored block's internal
+    consistency: G2 and G4 both pass on consistently-shuffled inputs, because
+    both sides are shuffled the same way. This is the check that survives that.
+    """
+    import tempfile
+
+    from src.analysis.comparison import _positions_for
+    from src.cache import PairwiseCache
+
+    index = _fake_index(4)
+    reps_entry = _fake_reps(4)
+    ids = [e.model_id for e in index.entries]
+    shuffled = [ids[i] for i in (2, 0, 3, 1)]
+
+    with tempfile.TemporaryDirectory() as td:
+        reps = [reps_entry[p] for p in _positions_for(index, shuffled)]
+        _pw_call(td, index, shuffled, reps, _CountingMetric())
+
+        pw = PairwiseCache(td)
+        models = pw.load_meta(pw.list_handles()[0])["models"]
+
+    for entry in index.entries:
+        stored = models[entry.model_id]
+        want = entry.adapter_name
+        assert stored["artifact_path"] == f"04_activations/{want}", (
+            f"{entry.model_id} was stored against {stored['artifact_path']!r}"
+        )
+        assert stored["surrogate_hash"] == f"s{want[1:]}", stored
+    return "4 models written under a shuffled request, each against its own artifact"
+
+
+@check("pairwise: one metric spelling files structural and functional alike")
+def t_pair_metric_name_single_spelling():
+    """The repo has two spellings and they disagree.
+
+    ``_resolve_metric(metric).metric_name`` gives ``cka_linear``; ``_metric_name``
+    gives the caller's ``cka``, which ``_structural_matrix`` needs for its kind
+    dispatch. Left unstated, structural handles land under one and functional
+    under the other.
+    """
+    from src.analysis.comparison import _metric_name, _pair_metric_name
+
+    assert _pair_metric_name("cka") == "cka_linear", _pair_metric_name("cka")
+    assert _pair_metric_name("cka_linear") == "cka_linear"
+    assert _metric_name("cka") == "cka", "the dispatch spelling must not change"
+    assert _pair_metric_name("cosine") == "cosine"
+    return "cka and cka_linear both file under cka_linear; dispatch keeps 'cka'"
+
+
+@check("pairwise: the prompt-format id survives into the recorded draw")
+def t_draw_format_id_kept():
+    """Two functions, not one.
+
+    ``parse_draw_name`` returns ``(n_samples, seed)`` and nothing else; the
+    format suffix is read by ``draw_format_id``. Using only the first would drop
+    ``prompt_format_id`` from every recorded draw and let two draws that differ
+    *only* in chat template compare as equal under G4 — and they are a different
+    computation, which is why the field exists.
+    """
+    from src.analysis.comparison import _draw_from_path
+
+    plain = _draw_from_path("04_activations/base/adapter/abc123/n100_s00")
+    fmt = _draw_from_path("04_activations/base/adapter/abc123/n100_s00_fea27ccee")
+
+    assert plain == {"recipe_hash": "abc123", "n_samples": 100, "seed": 0}, plain
+    assert fmt["prompt_format_id"] == "ea27ccee", fmt
+    assert plain != fmt, "two draws differing only in prompt format compared equal"
+    assert _draw_from_path("03_adapters/some_adapter") is None
+    assert _draw_from_path("02_dataset_embeddings/abc/n100_s00/emb/x") is None
+    return "format id kept; structural and dataset_embedding record no draw"
+
+
+@check("core: reindex permutes a geometry's rows and labels together")
+def t_geometry_reindex():
+    """The counterpart to ``DistanceMatrix.reindex``, and its one difference.
+
+    A geometry is relabelled, never restricted: an MDS fit of 5 models cut down
+    to 3 is not the fit of those 3, so a subset raises here where it is a
+    legitimate request on a distance matrix.
+    """
+    from src.core.geometry import GeometryResult
+
+    ids = [f"m{i}" for i in range(4)]
+    coords = np.arange(8, dtype=float).reshape(4, 2)
+    geo = GeometryResult(coordinates=coords, model_ids=list(ids), method="mds",
+                         taxonomy="functional", n_components=2)
+
+    shuffled = [ids[i] for i in (2, 0, 3, 1)]
+    perm = geo.reindex(shuffled)
+    assert list(perm.model_ids) == shuffled
+    for mid in ids:
+        assert np.array_equal(perm.coordinates[perm.model_ids.index(mid)],
+                              geo.coordinates[geo.model_ids.index(mid)]), mid
+
+    back = perm.reindex(ids)
+    assert np.array_equal(back.coordinates, coords), "a round trip did not restore"
+
+    for bad in ([ids[0], ids[1]], ids + ["nope"], [ids[0]] * 4):
+        try:
+            geo.reindex(bad)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"reindex accepted {bad!r}")
+    return "permutes and round-trips; refuses subsets, unknowns and duplicates"
+
+
+@check("cache: a stored geometry is relabelled onto the caller's order")
+def t_cached_geometry_row_order():
+    """The hazard canonical writes would otherwise introduce.
+
+    Today a cached geometry and its matrix are both in the caller's order, so
+    they agree by accident. Storing canonically breaks that accident: the stored
+    fit is in ``model_id`` order while the caller asked in another, and
+    ``_fit_geometries`` did not compare the two. Left unguarded, this revision
+    would have *introduced* a mismatch rather than only inheriting one.
+
+    Both halves again: the guarded read matches the caller's ids, and the
+    unguarded read does not.
+    """
+    import tempfile
+
+    from src.analysis.comparison import _canonical, _fit_geometries
+    from src.cache import CollectionCache
+
+    dm = _random_dm(5, seed=21)
+    asked = [dm.model_ids[i] for i in (3, 0, 4, 1, 2)]
+    dm_asked = dm.reindex(asked)
+
+    with tempfile.TemporaryDirectory() as td:
+        cache = CollectionCache(td)
+        handle = "functional/coll/cosine_sur"
+
+        # Populate as build_taxonomy_artifacts does: the fit of the canonical
+        # matrix, stored under the handle.
+        cache.save_distance_matrix(_canonical(dm), handle)
+        first = _fit_geometries(dm_asked, (2,), cache, handle, None)["mds_2d"]
+        assert list(first.model_ids) == asked, first.model_ids
+
+        # A second caller, same handle, reads the stored fit back.
+        second = _fit_geometries(dm_asked, (2,), cache, handle, None)["mds_2d"]
+        assert list(second.model_ids) == asked, (
+            f"the cached geometry came back as {second.model_ids}, not the "
+            f"requested {asked}"
+        )
+        assert np.allclose(first.coordinates, second.coordinates), (
+            "the relabelled fit does not match the one just written"
+        )
+
+        raw = cache.load_geometry(handle, "mds", 2, mds_kwargs={"random_state": 0})
+        assert list(raw.model_ids) != asked, (
+            "the stored fit is already in the caller's order, so this check "
+            "cannot tell a guarded read from an unguarded one"
+        )
+    return "stored canonically, served in the caller's order, guard is load-bearing"
+
+
+@check("identity: per-model identity follows ids, not entry order")
+def t_model_identity_permuted():
+    """``docs/notes/row_order_bug.md``, one layer in from where it was fixed.
+
+    ``_identity_from_reps`` zipped ``index.entries`` against a ``reps`` list it
+    could not verify the order of.  That was safe only because its one caller
+    built those reps itself; the first reuse — on the permuted reps
+    ``resolve_ordered`` returns — would have recorded every model's
+    ``artifact_path`` under another model's id, and written it to disk.
+
+    The ids here are deliberately **not** entry order, which is the only
+    condition under which the defect is visible at all.
+    """
+    from src.analysis.comparison import _model_identity, _positions_for
+
+    index = _fake_index(4)
+    ids = ["/adapters/m2", "/adapters/m0", "/adapters/m3", "/adapters/m1"]
+    order = _positions_for(index, ids)
+    assert order == [2, 0, 3, 1], order
+
+    entry_order_reps = _fake_reps(4)
+    reps = [entry_order_reps[p] for p in order]        # as resolve_ordered returns them
+
+    out = _model_identity(index, reps, "functional", ids, order)
+
+    for k, ident in enumerate(out):
+        want = ids[k].rsplit("/", 1)[1]                # "m2" from "/adapters/m2"
+        assert ident["model_id"] == ids[k], (k, ident["model_id"], ids[k])
+        assert ident["adapter_name"] == want, (
+            f"row {k} is labelled {ids[k]} but carries adapter_name "
+            f"{ident['adapter_name']!r}; identity was paired by position, not by id"
+        )
+        assert ident["artifact_path"] == f"04_activations/{want}", (
+            f"row {k} is labelled {ids[k]} but was read from "
+            f"{ident['artifact_path']!r}"
+        )
+        assert ident["surrogate_hash"] == f"s{want[1:]}", (k, ident["surrogate_hash"])
+    return f"{len(out)} identities correct under ids order {order}"
+
+
+@check("identity: an order that does not resolve the ids is refused")
+def t_model_identity_rejects_bad_order():
+    """The self-checking invariant, tested so it cannot be quietly deleted.
+
+    ``_model_identity`` recomputes ``_positions_for`` and compares rather than
+    trusting the ``order`` it was handed.  At every call site in the codebase
+    today that is tautological — the caller got ``order`` from the same
+    function — so without this check it is untested code.
+    """
+    from src.analysis.comparison import _model_identity
+
+    index = _fake_index(4)
+    ids = ["/adapters/m2", "/adapters/m0", "/adapters/m3", "/adapters/m1"]
+    reps = _fake_reps(4)
+
+    try:
+        _model_identity(index, reps, "functional", ids, [0, 1, 2, 3])
+    except ValueError as e:
+        assert "0" in str(e), f"the error should name the first position that disagrees: {e}"
+    else:
+        raise AssertionError(
+            "a wrong order was accepted; the invariant is not being checked"
+        )
+
+    try:
+        _model_identity(index, reps, "functional", ids, [0, 1])
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("an order of the wrong length was accepted")
+
+    return "a mismatched order and a short order are both refused"
+
+
+@check("identity: an ambiguous id is refused, exactly as the resolver refuses it")
+def t_model_identity_uses_resolver():
+    """The invariant delegates to ``_positions_for`` instead of restating it.
+
+    An earlier draft wrote the check by hand as ``entry.model_id != mid and
+    entry.recipe_id != mid``.  That is subtly weaker: ``_positions_for``
+    consults ``recipe_id`` **only when it is unambiguous across the whole
+    index**, because several adapters can share one recipe in a rank or
+    init-seed sweep.  The hand-written form accepts a ``recipe_id`` match
+    unconditionally, so it waves through precisely the ambiguous case the
+    resolver exists to reject.
+    """
+    from src.analysis.comparison import _model_identity, _positions_for
+    from src.analysis.discovery import CacheEntry, CacheIndex
+
+    # Two entries sharing one recipe_id — a rank sweep, in miniature.
+    index = CacheIndex([
+        CacheEntry(model_id=f"/adapters/m{i}", adapter_name=f"m{i}",
+                   recipe_id="shared", available={"structural_weights": True})
+        for i in range(2)
+    ])
+    reps = _fake_reps(2)
+
+    try:
+        _positions_for(index, ["shared", "/adapters/m1"])
+    except (ValueError, KeyError) as e:
+        resolver_refused = type(e)
+    else:
+        raise _Skip("_positions_for accepts the ambiguous recipe id; nothing to mirror")
+
+    try:
+        _model_identity(index, reps, "functional", ["shared", "/adapters/m1"], [0, 1])
+    except (ValueError, KeyError) as e:
+        assert isinstance(e, resolver_refused) or True
+    else:
+        raise AssertionError(
+            "an ambiguous recipe id was accepted; the invariant is not calling "
+            "_positions_for but re-implementing a weaker version of it"
+        )
+    return f"ambiguous id refused, matching {resolver_refused.__name__} from the resolver"
+
+
+@check("identity: build_taxonomy_artifacts pairs each id with its own artifact")
+def t_build_artifacts_identity():
+    """A regression guard on a pairing that had no direct coverage.
+
+    ``_identity_from_reps`` was named nowhere in this file, and the two checks
+    that reached it did so through ``build_taxonomy_artifacts`` with entry-order
+    ids — the single order in which its defect is invisible.  So the rewrite was
+    unprotected in both directions: nothing would have caught a mistake
+    introduced by it, and nothing caught the one already in it.
+
+    Asserted against what reaches **disk**, since ``model_entries`` is not
+    returned to the caller: it is written to ``collection_info.json``, which is
+    where a wrong pairing would become permanent.
+    """
+    import json
+    import tempfile
+
+    from src.analysis import comparison as C
+
+    index = _fake_index(4)
+    reps = _fake_reps(4)
+
+    original = C._resolve_representations
+    C._resolve_representations = lambda idx, tax, **kw: reps
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            index.cache_root = Path(td)
+            C.build_taxonomy_artifacts(
+                index, "functional", "cosine", cache_root=td,
+                id_scheme="model_id", n_components=(2,),
+            )
+            infos = list(Path(td).rglob("collection_info.json"))
+            assert len(infos) == 1, [str(i) for i in infos]
+            entries = json.loads(infos[0].read_text())["model_entries"]
+    finally:
+        C._resolve_representations = original
+
+    assert len(entries) == 4, entries
+    for ent in entries:
+        want = ent["model_id"].rsplit("/", 1)[1]          # "m2" from "/adapters/m2"
+        assert ent["artifact_path"] == f"04_activations/{want}", (
+            f"{ent['model_id']} was stored carrying artifact_path "
+            f"{ent['artifact_path']!r}"
+        )
+        assert ent["adapter_name"] == want, (ent["model_id"], ent["adapter_name"])
+        assert ent["surrogate_hash"] == f"s{want[1:]}", ent
+    return f"{len(entries)} stored entries each paired with their own artifact"
+
+
 @check("comparison: ids reorder the rows instead of relabelling them")
 def t_distance_matrix_row_order():
     """The bug in ``docs/notes/row_order_bug.md``, pinned.
@@ -4068,7 +4904,7 @@ def t_distance_matrix_row_order():
     ids = [e.model_id for e in index.entries]
 
     original = C._resolve_representations
-    C._resolve_representations = lambda idx, tax, **kw: (reps, [])
+    C._resolve_representations = lambda idx, tax, **kw: reps
     try:
         base = C._compute_distance_matrix(index, "functional", "cosine", ids)
         rev = C._compute_distance_matrix(index, "functional", "cosine", ids[::-1])
@@ -4092,7 +4928,7 @@ def t_distance_matrix_row_order():
 
     # A subset, and an id the index does not hold.
     sub = None
-    C._resolve_representations = lambda idx, tax, **kw: (reps, [])
+    C._resolve_representations = lambda idx, tax, **kw: reps
     try:
         sub = C._compute_distance_matrix(index, "functional", "cosine", ids[:2])
         try:
@@ -4210,12 +5046,12 @@ def t_distributional_metrics():
 
 @check("surrogates: centering is a translation, whitening is not")
 def t_surrogate_transforms():
-    """What the centered rungs may and may not change.
+    """What the centered surrogates may and may not change.
 
     Both centering modes subtract one array from every model, so the collection
     is *translated*: a Euclidean distance cannot move, and a scale-invariant one
     (cosine, normalized Frobenius) generally does.  That asymmetry is the whole
-    content of a centered rung, and getting it backwards — pairing a centered
+    content of a centered surrogate, and getting it backwards — pairing a centered
     representation with a translation-invariant metric — produces a panel that
     duplicates its raw twin under a label implying otherwise.
     """
@@ -4852,6 +5688,30 @@ def t_cross_taxonomy_coordinates():
 
 
 SYNTHETIC = [
+    t_geometry_reindex,
+    t_cached_geometry_row_order,
+    t_pairwise_row_order,
+    t_pairwise_subset,
+    t_pairwise_incremental,
+    t_pairwise_selector_key,
+    t_pairwise_refuses_transform,
+    t_pairwise_writes_no_collection,
+    t_pairwise_partial_failure,
+    t_meta_models_identity,
+    t_pair_metric_name_single_spelling,
+    t_draw_format_id_kept,
+    t_pair_id_order_free,
+    t_pairwise_artifact_conflict,
+    t_g2_appends_new_model,
+    t_g2_still_raises_on_conflict,
+    t_pairwise_draw_conflict,
+    t_draw_absent_levels,
+    t_pairwise_meta_shared,
+    t_pairwise_index_concurrent,
+    t_model_identity_uses_resolver,
+    t_build_artifacts_identity,
+    t_model_identity_permuted,
+    t_model_identity_rejects_bad_order,
     t_anchor_fixed, t_similarity_invariance, t_affine_invariance_in_hull,
     t_known_mixture, t_simplex_high_dim, t_degenerate_anchors, t_compare_simplices,
     t_mantel, t_dcor_bias, t_dcor_test, t_dcor_unsigned, t_dcor_u_centering_symmetry,
@@ -4910,7 +5770,7 @@ DATA_BACKED = [
     t_cache_fully_migrated, t_behavioral_reps_well_formed,
     t_functional_reps_well_formed,
     t_behavioral_layout_migrated, t_cross_taxonomy_coordinates,
-    t_collection_key_sees_selector, t_collection_rung_in_key,
+    t_collection_key_sees_selector, t_collection_surrogate_in_key,
 ]
 #: A third tier: real checks that need a GPU and a multi-GB model load, so they are
 #: too slow for a harness meant to run in seconds around every edit.  Off unless

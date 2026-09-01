@@ -61,8 +61,9 @@ the objects at that stage**, as in `03A_adapter_alignments`.
 | `03A_adapter_alignments` | Pairwise Procrustes alignments |
 | `04_activations` | Pooled hidden states per layer |
 | `05_generated` | Generated text and its embeddings |
-| `05a_logprobs` | Per-token log-probabilities and entropies |
-| `06_collections` | Distance matrices and geometry results |
+| `05A_logprobs` | Per-token log-probabilities and entropies |
+| `06_pairwise` | Individual pairwise distances, one entry per model pair |
+| `07_collections` | Distance matrices and geometry results |
 
 **Draw** — one sampled subset of a dataset, spelled `n{n}_s{seed:02d}` with the
 seed zero-padded. `src/cache/_draw.py` owns the spelling. Writing is narrow and
@@ -108,7 +109,7 @@ would otherwise change the identity of every cached draw at once.
 ## Collections and their keys
 
 **Collection** — one distance matrix plus its geometries, stored in
-`06_collections` under a handle. The unit of reuse.
+`07_collections` under a handle. The unit of reuse.
 
 **Handle** — the path a collection is stored under:
 `{taxonomy}/{collection_key}/{metric}_{surrogate_key}`. Composed in one place,
@@ -133,16 +134,50 @@ Note the asymmetry with `collection_key`, which sorts: `surrogate_key` does
 **not**. That asymmetry is currently masked because the models in a collection
 share one surrogate hash, and it is recorded rather than relied upon.
 
-**Rung** — one row of a figure grid: a resolved selector over a level, such as a
-layer group or a pooling choice. A grid is **rung × metric**. Two rungs of one
-level read the same artifacts under the same surrogate — that is what makes them
-one level — so a rung must reach the cache key explicitly or two rungs collide
-on a single handle.
+### The settled triple
 
-Key on the **resolved selector dict**, never the rung's display label. Labels
-like `"late third"` are editable prose: redefining which layers that names,
-without changing the string, would leave a label-keyed entry serving a matrix
-built from the old definition.
+These three were ambiguous and are now fixed. They are the spine of the caching
+design, because a `06_pairwise` handle addresses exactly one **perspective**.
+
+| term | meaning |
+|---|---|
+| **selector** | The collection of hyperparameters that produce a surrogate — mode, pooling, layers, projections, view, normalize, replicate reduction, the query draw, the embedder, and any fleet transform. |
+| **surrogate** | What a selector produces: the representation view being compared. One **row** of the figure grid, e.g. `late third · centered`. |
+| **perspective** | A surrogate together with a similarity metric. One **cell** of the figure grid, e.g. `late third · centered` × `cosine`. |
+
+**`rung` is retired**, replaced by `surrogate`. This was a unification rather
+than a rename: `surrogate` already meant "a read-time view of a stored artifact,
+computed on demand and written back", the module applying fleet transforms was
+already `src/analysis/surrogates.py`, and the figure suite's own docstring
+section was already headed "Surrogate rungs". The two words were describing one
+thing at two layers.
+
+One caveat to keep in mind: the cached `surrogates/{hash}/` in `04`/`05` covers
+view, pooling and normalize, while the *fleet* transform is applied later in
+`src/analysis/surrogates.py`. Both are surrogates, produced at different stages.
+
+Two surrogates of one level read the same artifacts under the same *stage*
+surrogate — that is what makes them one level — so a surrogate must reach the
+cache key explicitly, or two of them collide on a single handle.
+
+Key on the **resolved selector dict**, never the surrogate's display label.
+Labels like `"late third"` are editable prose: redefining which layers that
+names, without changing the string, would leave a label-keyed entry serving a
+matrix built from the old definition.
+
+**Pair id** (`pair_id`) — the readable key of one entry in a `pairs.json`,
+naming an unordered pair of models: `"__".join(sorted([model_id_a,
+model_id_b]))`. It is an `_id` and not a `_key` because this codebase draws that
+line: `model_id`, `recipe_id` and `adapter_name` are readable, while
+`collection_key`, `surrogate_key` and `recipe_hash` are opaque digests.
+
+**Selector key** — the digest of a selector, named to match `collection_key` and
+`surrogate_key`.
+
+**Selector slug** — the readable, **non-identifying** prefix on a `06_pairwise`
+handle's surrogate component, e.g. `input_mean_concat_layer_L0-28`. Identity
+lives entirely in the selector key, which is what lets the slug be improved later
+without orphaning a single stored pair.
 
 **Row-order guard** — `DistanceMatrix.reindex(model_ids)`, which permutes rows
 and columns into the caller's order, selects a subset, and raises on an unknown
@@ -172,7 +207,7 @@ covariance), from `src/analysis/surrogates.py`. These are **not alternative
 metrics** — they change what is being compared. Every level carries a large
 component shared by all models (the same questions, the same answer register,
 the same base model) which is identical by construction and can only dilute a
-similarity; the centered rungs measure what is left.
+similarity; the centered surrogates measure what is left.
 
 **`transform_key`** — the short stable name a transform keys under. An anonymous
 callable keys as `"custom"` and is rejected for cached collections, since two
@@ -190,11 +225,11 @@ projection and **evaluation points** are those held out from it.
 taxonomy's estimate of them.
 
 **dCor** / **Procrustes** / **stress** — the agreement scores reported per
-(rung, metric) cell in `crosslevel_scores.csv`. Note that `dcor_vs_truth` and
+(surrogate, metric) cell in `crosslevel_scores.csv`. Note that `dcor_vs_truth` and
 `disparity_vs_truth` run in **opposite directions**: higher is better for one,
 lower for the other.
 
-**Absent cell** — a (rung, metric) combination that cannot exist, drawn with its
+**Absent cell** — a (surrogate, metric) combination that cannot exist, drawn with its
 reason in place rather than left blank or dropped, so the constraint stays
 visible in the figure. The gaps are structural: CKA, MMD and energy all need
 more than one row, so none can run on a `model mean` representation, and

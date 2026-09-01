@@ -192,11 +192,11 @@ def build_taxonomy_artifacts(
         It runs after resolution and before any distance is taken, and its
         :func:`~src.analysis.surrogates.transform_key` joins the collection key,
         so a centered collection and a raw one over the same tensors cannot
-        collide in ``06_collections``.  Not available for ``structural``, which
+        collide in ``07_collections``.  Not available for ``structural``, which
         never materializes the representations a transform would act on.
 
     use_cache:
-        ``False`` skips ``06_collections`` entirely — nothing is read and nothing
+        ``False`` skips ``07_collections`` entirely — nothing is read and nothing
         is written.  ``cache_root=None`` does **not** do this: it falls back to
         ``index.cache_root``, which a ``scan_cache`` index always carries, so a
         caller meaning "just compute" wrote to the shared cache anyway.  That
@@ -235,14 +235,21 @@ def build_taxonomy_artifacts(
     # and only once they are do we know which artifact and which view each model
     # actually resolved to — which is what the collection is keyed on.  The cache
     # then saves the pairwise computation, which is the expensive part.
-    reps, identity = _resolve_representations(
+    reps = _resolve_representations(
         index, taxonomy,
         layers=layers, projections=projections, embedder_hash=embedder_hash,
         dataset_selector=dataset_selector,
         behavioral_selector=behavioral_selector,
         functional_selector=functional_selector,
     )
-    model_entries = [{**ident, "model_id": i} for i, ident in zip(ids, identity)]
+    # `ids` is entry order here and so is `reps`, so this resolves to the
+    # identity permutation and every lookup lands where the old zip landed.  It
+    # is written down because it turns an assumption into a check: the pairing
+    # stops depending on _resolve_ids' undocumented entry-order guarantee and
+    # starts being verified against _positions_for on every call.
+    order = _positions_for(index, ids)
+    model_entries = _model_identity(index, reps, taxonomy, ids, order,
+                                    layers=layers, projections=projections)
 
     from .surrogates import transform_key
     tkey = transform_key(transform)
@@ -276,13 +283,17 @@ def build_taxonomy_artifacts(
             cache, taxonomy, metric, model_entries, transform=transform,
         )
         if cache.exists(handle):
-            dm = cache.load_distance_matrix(handle)
+            # Stored canonically, so a hit comes back in model_id order while
+            # the caller may have asked in another. Permuting a symmetric matrix
+            # onto the requested labels is exact; handing it back unpermuted is
+            # the defect docs/notes/row_order_bug.md records.
+            dm = cache.load_distance_matrix(handle).reindex(list(ids))
 
     if dm is None:
         dm = _distances(index, taxonomy, metric, ids, reps, layers, projections)
         if cache is not None:
             cache.save_distance_matrix(
-                dm,
+                _canonical(dm),
                 handle,
                 model_entries=model_entries,
                 label=label,
@@ -297,6 +308,10 @@ def build_taxonomy_artifacts(
                 ),
             )
 
+    # Fit on the canonical matrix, so the stored geometry is the fit of the
+    # stored matrix — that identity is what lets a cached geometry be permuted
+    # onto a caller's order rather than refitted. `_fit_geometries` then
+    # reindexes it back to what this caller asked for.
     geometries = _fit_geometries(dm, n_components, cache, handle, mds_kwargs)
     return dm, geometries
 
@@ -308,12 +323,12 @@ def collection_handle(
     model_entries: Sequence[Mapping[str, Any]],
     *,
     transform: Any = None,
-    rung: Mapping[str, Any] | None = None,
+    surrogate: Mapping[str, Any] | None = None,
 ) -> str:
     """The handle one distance matrix is stored under, composed in one place.
 
     Everything that changes the numbers has to be in the key, and the pieces are
-    not all obvious, so both callers that write into ``06_collections`` —
+    not all obvious, so both callers that write into ``07_collections`` —
     :func:`build_taxonomy_artifacts` and the figure suite — compose it here
     rather than each assembling their own.
 
@@ -328,18 +343,18 @@ def collection_handle(
     :class:`~src.cache.collection_cache.CollectionCache`, which is what makes the
     key see the selectors *via what they resolve to*.
 
-    *transform* and *rung* are the two things that resolution does **not** show.
+    *transform* and *surrogate* are the two things that resolution does **not** show.
     Both join the surrogate list rather than the metric name: they are properties
     of the representations, not of how two of them are compared.  Each is tagged,
     so neither can be mistaken for a model's surrogate hash, and each is appended
-    only when present — so a raw, rung-less key stays bit-identical to what it
+    only when present — so a raw, surrogate-less key stays bit-identical to what it
     was before either argument existed, and the collections already on disk are
     not orphaned.
 
-    *rung* is the **resolved selector dict**, never the display label.  Row names
+    *surrogate* is the **resolved selector dict**, never the display label.  Row names
     like ``"late third"`` are editable prose: redefining which layers that means
     without changing the string would have a label-keyed entry serve a matrix
-    built from the old definition.  Two rungs of one level read the same
+    built from the old definition.  Two surrogates of one level read the same
     artifacts under the same surrogate — that is the whole reason they are one
     level — so without this they collide on a single key.
     """
@@ -358,10 +373,10 @@ def collection_handle(
     surrogates = [e["surrogate_hash"] for e in model_entries]
     if transform is not None:
         surrogates = surrogates + [f"transform:{tkey}"]
-    if rung:
+    if surrogate:
         from src.cache._draw_keyed import DrawKeyedCache
 
-        surrogates = surrogates + [f"rung:{DrawKeyedCache.config_hash(dict(rung))}"]
+        surrogates = surrogates + [f"surrogate:{DrawKeyedCache.config_hash(dict(surrogate))}"]
 
     return cache.handle(
         taxonomy,
@@ -369,6 +384,68 @@ def collection_handle(
         _resolve_metric(metric).metric_name,
         cache.surrogate_key(surrogates),
     )
+
+
+def _pair_metric_name(metric) -> str:
+    """The metric's **reported** name, which is the only spelling a pair is filed under.
+
+    The codebase has two and they disagree: ``_resolve_metric(metric).metric_name``
+    gives ``"cka_linear"`` while :func:`_metric_name` gives the caller's
+    ``"cka"``, which ``_structural_matrix`` requires for its ``kind`` dispatch.
+    Left unstated, structural handles would land under ``cka`` and functional
+    ones under ``cka_linear``.
+
+    The resolved name is what ``07_collections`` already stores under, and
+    :func:`collection_handle` records what the other choice cost: looking a
+    collection up under the caller's spelling while saving it under the metric's
+    own meant it was stored where it was never sought.  ``_metric_name`` stays
+    where it is, used only for structural's dispatch — a different question from
+    where the result is filed.
+    """
+    return _resolve_metric(metric).metric_name
+
+
+def _selector_for(taxonomy: str, reps, layers=None, projections=None, **selectors) -> dict:
+    """The resolved selector that identifies one surrogate, for the pair handle.
+
+    Composed **exactly as** :func:`_leaf_config` composes it, so the two cannot
+    drift: the twelve resolved read-time fields at the top level and the
+    caller's selectors nested under a ``"selectors"`` key, with ``None`` values
+    dropped.  Stated because "the resolved block plus the selectors dict" admits
+    a second reading — merging the selectors in at the top level — and the two
+    produce *different digests* for the same inputs.  Nesting is also what keeps
+    ``layers`` unambiguous, since it appears in both halves: once as the
+    resolved read-time value and once as whatever the caller passed.
+
+    ``surrogate_transform`` is retained even though G1 means it is always absent
+    on anything reaching the pair store.  It costs nothing when absent, and
+    keeping the list identical to ``_leaf_config``'s is what stops the two from
+    silently diverging.
+
+    **Structural** has ``reps is None``, so there is no metadata to read a
+    selector off.  What plays the selector's role is the ``structural_view``
+    dict that :func:`_structural_identity` hashes, returned verbatim here so a
+    structural handle keys on the same thing its surrogate hash already does.
+    Forward-compatibility rule: when structural gains more hyperparameters,
+    extend that dict **conditionally**, never unconditionally, or every stored
+    structural handle is orphaned.
+    """
+    if reps is None:
+        return {
+            "kind": "structural_view",
+            "layers": layers if layers is not None else "last",
+            "projections": projections if projections is not None else "o",
+        }
+    resolved = {
+        k: v
+        for k, v in ((reps[0].metadata if reps else None) or {}).items()
+        if k in ("mode", "pooling", "layers", "view", "normalize",
+                 "replicate_reduction", "embedder_hash", "max_new_tokens",
+                 "replicates", "sampling_hash", "is_kernel",
+                 "surrogate_transform")
+    }
+    return {**resolved,
+            "selectors": {k: v for k, v in selectors.items() if v is not None}}
 
 
 def _leaf_config(taxonomy, reps, model_entries, **selectors) -> dict:
@@ -482,6 +559,22 @@ def _collection_cache(cache_root: Path | str | None):
     return CollectionCache(cache_root)
 
 
+def _canonical(dm: DistanceMatrix) -> DistanceMatrix:
+    """*dm* with its rows in ``model_id`` order, which is how it is stored.
+
+    Storing canonically makes the bytes on disk a function of the handle alone,
+    so a warm run is byte-identical to a cold one however the caller happened to
+    order its request.  Without it the stored matrix is whichever order the
+    first writer used, and two runs that agree on every number still differ in
+    their stored digests.
+
+    It is also what makes :meth:`GeometryResult.reindex` sound rather than
+    guesswork: a fit of a canonically ordered matrix is always the *same* fit,
+    so permuting its rows is relabelling.
+    """
+    return dm.reindex(sorted(dm.model_ids))
+
+
 def _fit_geometries(
     dm: DistanceMatrix,
     n_components: Sequence[int],
@@ -507,10 +600,29 @@ def _fit_geometries(
                 geo = cache.load_geometry(chash, "mds", n, mds_kwargs=kwargs)
             except (FileNotFoundError, ValueError, KeyError):
                 geo = None
+            if geo is not None and list(geo.model_ids) != list(dm.model_ids):
+                # A stored fit is written canonically, so it comes back in
+                # model_id order while the caller may have asked in another —
+                # sort_by_mixture is the motivating case. Same id *set* is a
+                # relabelling and is permuted; a different set is a different
+                # fit and is discarded, because restricting an MDS fit is not
+                # the same operation as permuting one.
+                if set(geo.model_ids) == set(dm.model_ids):
+                    geo = geo.reindex(list(dm.model_ids))
+                else:
+                    geo = None
         if geo is None:
-            geo = fit_geometry(dm, method="mds", n_components=n, **kwargs)
             if cache is not None and chash is not None:
+                # Fit the canonical matrix and store that fit, then relabel onto
+                # the caller's order. Storing the caller's fit instead would make
+                # the stored coordinates depend on who wrote first, which is the
+                # accident canonical writes exist to remove.
+                canon = _canonical(dm)
+                geo = fit_geometry(canon, method="mds", n_components=n, **kwargs)
                 cache.save_geometry(chash, geo, mds_kwargs=kwargs)
+                geo = geo.reindex(list(dm.model_ids))
+            else:
+                geo = fit_geometry(dm, method="mds", n_components=n, **kwargs)
         out[key] = geo
     if not out:
         raise ValueError(
@@ -532,11 +644,12 @@ def _compute_distance_matrix(
     behavioral_selector: dict | None = None,
     functional_selector: dict | None = None,
     transform: Any = None,
+    pairwise_cache=None,
 ) -> DistanceMatrix:
     """Distances for one taxonomy, always recomputed.
 
     The selector-faithful path: it honours every selector on every call and never
-    reads or writes ``06_collections``.  :func:`build_taxonomy_artifacts` goes
+    reads or writes ``07_collections``.  :func:`build_taxonomy_artifacts` goes
     through the cache instead; this is what to call to sweep selectors without
     populating it.
 
@@ -551,6 +664,12 @@ def _compute_distance_matrix(
     representations and returning a new one.  It runs after the reorder, so a
     fleet mean is taken over exactly the models *ids* names, in the order it
     names them.
+
+    *pairwise_cache* routes the distances through ``06_pairwise``, computing only
+    the pairs that are not already stored.  ``None`` keeps the always-recomputed
+    behaviour this function is named for.  Either way it writes nothing to
+    ``07_collections``: that stage has exactly one writer, and it is
+    :func:`build_taxonomy_artifacts`.
     """
     reps, order = resolve_ordered(
         index, taxonomy, ids, layers=layers, projections=projections,
@@ -558,8 +677,16 @@ def _compute_distance_matrix(
         behavioral_selector=behavioral_selector,
         functional_selector=functional_selector, transform=transform,
     )
-    return _distances(index, taxonomy, metric, ids, reps, layers, projections,
-                      order=order)
+    if pairwise_cache is None:
+        return _distances(index, taxonomy, metric, ids, reps, layers,
+                          projections, order=order)
+    return _distances_via_pairs(
+        index, taxonomy, metric, ids, reps, layers, projections, order=order,
+        pairwise_cache=pairwise_cache, transform=transform,
+        embedder_hash=embedder_hash, dataset_selector=dataset_selector,
+        behavioral_selector=behavioral_selector,
+        functional_selector=functional_selector,
+    )
 
 
 def resolve_ordered(
@@ -599,15 +726,17 @@ def resolve_ordered(
 
     Pass the result to :func:`_distances` with the same *ids*.
     """
-    reps, identity = _resolve_representations(
+    reps = _resolve_representations(
         index, taxonomy, layers=layers, projections=projections,
         embedder_hash=embedder_hash, dataset_selector=dataset_selector,
         behavioral_selector=behavioral_selector,
         functional_selector=functional_selector,
     )
     order = _positions_for(index, ids)
+    ordered_raw = None
     if reps is not None:
         reps = [reps[p] for p in order]
+        ordered_raw = reps            # before any transform, for identity below
         if transform is not None:
             reps = list(transform(reps))
     elif transform is not None:
@@ -619,12 +748,13 @@ def resolve_ordered(
         )
     if not with_identity:
         return reps, order
-    # Identity comes back one per index entry; the caller asked in its own order
-    # and possibly for a subset, so it is permuted the same way the
-    # representations were.  Pairing the two by position rather than by name is
-    # the one thing ``docs/notes/row_order_bug.md`` says not to get wrong, and
-    # it is the same permutation both halves use here.
-    entries = [{**identity[p], "model_id": mid} for p, mid in zip(order, ids)]
+    # Identity is resolved through `order` rather than paired by position — the
+    # rule ``docs/notes/row_order_bug.md`` generalizes to.  It is read off the
+    # *untransformed* reps: a fleet transform returns new representations, and
+    # what identifies a model is the artifact it was read from, not what was
+    # subsequently done to the whole fleet.
+    entries = _model_identity(index, ordered_raw, taxonomy, ids, order,
+                              layers=layers, projections=projections)
     return reps, order, entries
 
 
@@ -642,14 +772,17 @@ def _resolve_representations(
     dataset_selector: dict | None = None,
     behavioral_selector: dict | None = None,
     functional_selector: dict | None = None,
-) -> tuple[list | None, list[dict]]:
+) -> list | None:
     """Resolve what each model's representation *is*, before any distance is computed.
 
-    Returns ``(reps, identity)``.  ``identity`` is one dict per model in
-    ``index.entries`` order, carrying the ``artifact_path`` and
-    ``surrogate_hash`` that key the collection — this is the ground truth the
-    collection cache is keyed on, rather than the caller's selector, which may be
-    underspecified (``{}`` and ``{"draw": ...}`` are the same read).
+    Returns the representations, one per model in ``index.entries`` order.
+
+    It used to return per-model identity alongside them, built by zipping
+    ``index.entries`` against ``reps``.  That is now :func:`_model_identity`,
+    which a caller invokes with the ``ids`` and ``order`` it actually wants —
+    because identity paired by *position* is only correct while nothing has
+    permuted the reps, and the whole point of ``order`` is that something has.
+    See ``docs/notes/row_order_bug.md``.
 
     ``reps`` is ``None`` for **structural** only.  Structural gets the same
     resolution seam and the same identity shape as the other three, but its
@@ -661,7 +794,7 @@ def _resolve_representations(
     here and only :func:`_distances` changes.
     """
     if taxonomy == "structural":
-        return None, _structural_identity(index, layers, projections)
+        return None
     if taxonomy == "dataset_embedding":
         reps = _dataset_embedding_reps(index, embedder_hash, dataset_selector)
     elif taxonomy == "behavioral":
@@ -672,36 +805,140 @@ def _resolve_representations(
         raise ValueError(
             f"unknown taxonomy {taxonomy!r}. Choose from {', '.join(_TAXONOMIES)}."
         )
-    return reps, _identity_from_reps(index, reps, taxonomy)
+    return reps
 
 
-def _identity_from_reps(
-    index: CacheIndex, reps: Sequence, taxonomy: str
-) -> list[dict]:
-    """One identity dict per model, read off what the caches actually resolved."""
+def _model_identity(index: CacheIndex, reps, taxonomy: str, ids, order, *,
+                    layers=None, projections=None) -> list[dict]:
+    """One identity dict per model, in *ids* order, resolved through *order*.
+
+    ``order[k]`` is the position in ``index.entries`` of the model named
+    ``ids[k]`` — see :func:`_positions_for`.  Indexing through it is what makes
+    ``model_id`` and ``artifact_path`` describe the same model; zipping
+    ``index.entries`` against a caller-ordered ``reps`` does not, and is the
+    defect ``docs/notes/row_order_bug.md`` records.  Follows
+    :func:`_structural_matrix`, which derives its entry list the same way.
+
+    *reps* must already be in *ids* order, as :func:`resolve_ordered` returns
+    them; ``reps[k]`` is read alongside ``index.entries[order[k]]``.  ``reps is
+    None`` is the structural level, which reads adapter files rather than
+    representations and takes its surrogate hash from *layers* / *projections* —
+    the read-time choice that plays a surrogate's role there.
+
+    This replaces ``_identity_from_reps`` rather than extending it.  That
+    signature could not express the guarantee: given only ``(index, reps)``
+    there is no way to know which entry a rep came from, so any implementation
+    had to assume an alignment it could not check.  Renaming forces every call
+    site to be revisited instead of silently inheriting the assumption.
+    """
+    ids = list(ids)
+    order = list(order)
+    if len(order) != len(ids):
+        raise ValueError(
+            f"_model_identity got {len(order)} position(s) for {len(ids)} id(s); "
+            "order[k] is the entry position of ids[k], so the two must agree."
+        )
+    if reps is not None and len(reps) != len(ids):
+        raise ValueError(
+            f"_model_identity got {len(reps)} representation(s) for {len(ids)} "
+            "id(s); reps must already be in ids order, one per id."
+        )
+
+    # Assert the contract by calling the resolver, never by re-implementing its
+    # rule.  A hand-written `model_id or recipe_id` test is subtly weaker:
+    # _positions_for consults recipe_id only when it is unambiguous across the
+    # whole index, so the hand-written form waves through exactly the ambiguous
+    # case the resolver exists to reject.
+    expected = _positions_for(index, ids)
+    if order != expected:
+        k = next(i for i, (a, b) in enumerate(zip(order, expected)) if a != b)
+        raise ValueError(
+            f"order does not resolve ids: at position {k}, ids[{k}]={ids[k]!r} "
+            f"resolves to entry {expected[k]} "
+            f"({index.entries[expected[k]].model_id!r}) but order says "
+            f"{order[k]} ({index.entries[order[k]].model_id!r})."
+        )
+
+    view = None
+    if reps is None:
+        from src.cache._draw_keyed import DrawKeyedCache
+
+        view = DrawKeyedCache.config_hash(
+            {
+                "kind": "structural_view",
+                "layers": layers if layers is not None else "last",
+                "projections": projections if projections is not None else "o",
+            }
+        )
+
     out = []
-    for entry, rep in zip(index.entries, reps):
-        meta = rep.metadata or {}
-        path = meta.get("artifact_path")
-        if path is None:
-            raise ValueError(
-                f"the {taxonomy} cache returned a representation for "
-                f"{entry.model_id!r} with no 'artifact_path' in its metadata, so "
-                "the collection it belongs to cannot be keyed on what it was "
-                "built from. Every cache's load() must surface artifact_path and "
-                "surrogate_hash — see TODO.md item 14."
-            )
+    for k, (mid, pos) in enumerate(zip(ids, order)):
+        entry = index.entries[pos]
+        if reps is None:
+            path, surrogate = f"03_adapters/{entry.adapter_name}", view
+        else:
+            meta = reps[k].metadata or {}
+            path = meta.get("artifact_path")
+            if path is None:
+                raise ValueError(
+                    f"the {taxonomy} cache returned a representation for "
+                    f"{mid!r} with no 'artifact_path' in its metadata, so the "
+                    "collection it belongs to cannot be keyed on what it was "
+                    "built from. Every cache's load() must surface "
+                    "artifact_path and surrogate_hash — see TODO.md item 14."
+                )
+            surrogate = meta.get("surrogate_hash")
         out.append(
             {
-                "model_id": None,  # filled in by the caller, which knows id_scheme
+                "model_id": mid,
                 "entry_type": "lora_adapter" if entry.adapter_dir else "recipe",
                 "adapter_name": entry.adapter_name,
                 "recipe_hash": entry.recipe_hash,
                 "artifact_path": path,
-                "surrogate_hash": meta.get("surrogate_hash"),
+                "surrogate_hash": surrogate,
+                "draw": _draw_from_path(path) if reps is not None else None,
             }
         )
     return out
+
+
+def _draw_from_path(artifact_path: str | None) -> dict | None:
+    """The query draw a representation was extracted against, from its path.
+
+    No cache surfaces the draw in ``rep.metadata``, and it does not need to be
+    plumbed through them: it is already *in* the artifact path, in a spelling
+    this repo owns — ``04_activations/{base}/{adapter}/{recipe_hash}/n{n}_s{seed}[_f{fmt}]``.
+    Parsed with the canonical parsers rather than a local regex.
+
+    **Two functions, not one.**  ``parse_draw_name`` returns ``(n_samples,
+    seed)`` and nothing else; the prompt-format suffix is read by the separate
+    ``draw_format_id``.  Dropping it would let two draws that differ *only* in
+    chat template compare as equal under G4 — and they are a different
+    computation, which is why that field exists.
+
+    ``None`` for anything with no draw token: ``02_dataset_embeddings`` folds
+    the draw into a hash and writes none, and structural has no query draw at
+    all.  That is not a hole — the draw is still inside the ``artifact_path``
+    that G2 compares byte for byte, so a changed draw still fails, under G2's
+    message rather than G4's.
+    """
+    if not artifact_path:
+        return None
+
+    from src.cache._draw import draw_format_id, parse_draw_name
+
+    parts = Path(artifact_path).parts
+    if len(parts) < 2:
+        return None
+    parsed = parse_draw_name(parts[-1])
+    if parsed is None:
+        return None
+    n_samples, seed = parsed
+    draw = {"recipe_hash": parts[-2], "n_samples": n_samples, "seed": seed}
+    fmt = draw_format_id(parts[-1])
+    if fmt is not None:
+        draw["prompt_format_id"] = fmt
+    return draw
 
 
 def _structural_identity(index: CacheIndex, layers, projections) -> list[dict]:
@@ -824,6 +1061,148 @@ def _distances(
         metric=metric_obj.metric_name,
         taxonomy=taxonomy,
     )
+
+
+def _distances_via_pairs(
+    index: CacheIndex,
+    taxonomy: str,
+    metric: Any,
+    ids: Sequence[ModelID],
+    reps: Sequence | None,
+    layers=None,
+    projections=None,
+    order: Sequence[int] | None = None,
+    *,
+    pairwise_cache=None,
+    transform: Any = None,
+    read: bool = True,
+    label: str | None = None,
+    selector: dict | None = None,
+    compute_all=None,
+    **selectors,
+) -> DistanceMatrix:
+    """A distance matrix assembled from ``06_pairwise``, computing only the misses.
+
+    A peer of :func:`_distances`, which is left untouched as the uncached path.
+
+    *transform* is not optional decoration: :func:`resolve_ordered` applies a
+    fleet transform to *reps* **before** returning them, so by the time any
+    distance function is called the transform has been folded into the
+    representations and left no trace in the arguments.  A function built
+    literally to ``_distances``'s signature could not evaluate ``transform is
+    not None`` at all, and **G1 would silently never fire** — writing centered
+    distances into the store as though they were reusable.
+
+    *order* is not optional either.  ``order[k]`` is the entry position of
+    ``ids[k]``, and it is the whole safety argument: identity is resolved
+    through it rather than zipped against a list it was not derived from.
+
+    *read* is what ``--no-cache`` turns off.  Misses are still written, so a
+    cold run populates the store it is the control for.
+
+    *selector* overrides what :func:`_selector_for` would resolve, for a caller
+    that has already resolved it.  *compute_all* is for a caller whose builder
+    produces a **whole matrix** rather than one pair at a time: it is invoked at
+    most once, only if something is missing, and must return a
+    :class:`DistanceMatrix` labelled with *ids*.  The structural grid is the
+    case — it loads every adapter once and runs the low-rank builders over the
+    whole collection, so filling pair by pair would reload weights per pair and
+    lose the optimisation the grid exists for.  Every pair it produces is stored,
+    so a later subset or superset of that collection is still free.
+    """
+    if pairwise_cache is None:
+        return _distances(index, taxonomy, metric, ids, reps, layers,
+                          projections, order=order)
+
+    # G1 — fleet transforms are collection-level operations: centering and
+    # whitening are "defined by the set of models being compared, and change
+    # when a model joins or leaves it" (src/analysis/surrogates.py). A pair's
+    # distance under one is therefore not a property of the pair, so it must not
+    # be stored as though it were. Bypass means *uncached*, not redirected:
+    # nothing on this path writes 07_collections either.
+    if transform is not None:
+        return _distances(index, taxonomy, metric, ids, reps, layers,
+                          projections, order=order)
+
+    ids = list(ids)
+    if order is None:
+        order = _positions_for(index, ids)
+
+    pairs = pairwise_cache
+    if selector is None:
+        selector = _selector_for(taxonomy, reps, layers, projections, **selectors)
+    models = _model_identity(index, reps, taxonomy, ids, order,
+                             layers=layers, projections=projections)
+    metric_obj = _resolve_metric(metric)
+    handle = pairs.handle(taxonomy, _pair_metric_name(metric), selector)
+
+    n = len(ids)
+    wanted = {}
+    for i in range(n):
+        for j in range(i + 1, n):
+            wanted[(i, j)] = pairs.pair_id(ids[i], ids[j])
+
+    table = pairs.load_pairs(handle, set(wanted.values())) if read else {}
+    missing = {pid: (i, j) for (i, j), pid in wanted.items() if pid not in table}
+
+    if missing:
+        computed: dict[str, float] = {}
+        try:
+            if compute_all is not None:
+                whole = compute_all()
+                pos = {mid: k for k, mid in enumerate(whole.model_ids)}
+                for pid, (i, j) in missing.items():
+                    computed[pid] = float(whole.matrix[pos[ids[i]], pos[ids[j]]])
+            elif reps is None:
+                computed = _structural_pairs(index, metric, ids, order, missing,
+                                             layers, projections)
+            else:
+                for pid, (i, j) in missing.items():
+                    computed[pid] = float(metric_obj.compute(reps[i], reps[j]))
+        finally:
+            # Partial batches are written, then the exception propagates
+            # unchanged. Pairs are independent, so a partially filled pairs.json
+            # is not an inconsistent artifact but a smaller correct one — and a
+            # retry then recomputes exactly the failures rather than discarding
+            # 119 good distances because the 120th raised. The caller decides
+            # what a failure means; the layer sweep records NaN and continues.
+            if computed:
+                pairs.save_pairs(handle, computed, models, selector, label=label)
+        table.update(computed)
+
+    # G3 — filled by pair_id lookup in the caller's order. No zip of an id list
+    # against a data list it was not derived from.
+    arr = np.zeros((n, n), dtype=np.float64)
+    for (i, j), pid in wanted.items():
+        arr[i, j] = arr[j, i] = table[pid]
+
+    return DistanceMatrix(
+        matrix=arr,
+        model_ids=list(ids),
+        metric=metric_obj.metric_name,
+        taxonomy=taxonomy,
+    )
+
+
+def _structural_pairs(index, metric, ids, order, missing, layers, projections) -> dict:
+    """The missing structural pairs, over just the adapters they mention.
+
+    ``_structural_matrix`` builds a whole matrix through ``lora_distance_matrix``
+    rather than pair by pair, so filling a subset means running that builder over
+    the sub-collection of adapters appearing in *missing*.  All four supported
+    kinds (cosine, frobenius, bures_wasserstein, cka) are genuinely pairwise, so
+    this is sound.
+    """
+    involved = sorted({k for pair in missing.values() for k in pair})
+    sub_ids = [ids[k] for k in involved]
+    sub_order = [order[k] for k in involved]
+    dm = _structural_matrix(index, metric, sub_ids, layers, projections,
+                            order=sub_order)
+    pos = {mid: k for k, mid in enumerate(dm.model_ids)}
+    out = {}
+    for pid, (i, j) in missing.items():
+        out[pid] = float(dm.matrix[pos[ids[i]], pos[ids[j]]])
+    return out
 
 
 def _structural_matrix(

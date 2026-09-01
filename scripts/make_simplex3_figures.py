@@ -5,7 +5,7 @@ Four taxonomy levels over the 16 Qwen3.5-4B adapters that span a 3-group topic
 simplex. Distance matrices in ``copper_r``; MDS embeddings coloured by each
 model's own mixture (see :mod:`src.plots.simplex`).
 
-Not every (rung, metric) cell exists, and the gaps are structural rather than
+Not every (surrogate, metric) cell exists, and the gaps are structural rather than
 accidental:
 
 * **CKA**, **MMD** and **energy** all need more than one row, so none of them can
@@ -20,33 +20,44 @@ accidental:
 Absent cells are drawn with the reason in place rather than left blank or
 silently dropped, so the constraint stays visible in the figure.
 
-Surrogate rungs
----------------
+Fleet transforms
+----------------
 Several rows apply a *fleet-level* transform from :mod:`src.analysis.surrogates`
 before distancing — centering on the fleet mean, or whitening against the fleet
 covariance. These are not alternative metrics; they change what is being
 compared. Every level here carries a large component shared by all 16 models
 (the same 100 questions, the same Yahoo answer register, the same base model),
 and it is identical by construction, so it can only dilute a similarity. The
-centered rungs measure what is left.
+centered surrogates measure what is left.
 
 Usage
 -----
     python scripts/make_simplex3_figures.py                  # everything
     python scripts/make_simplex3_figures.py --level functional
     python scripts/make_simplex3_figures.py --skip-sweep     # omit the slow one
-    python scripts/make_simplex3_figures.py --skip-surrogate # raw rungs only
+    python scripts/make_simplex3_figures.py --with-surrogate # add the fleet transforms
     python scripts/make_simplex3_figures.py --cache-root PATH  # explicit cache
     python scripts/make_simplex3_figures.py --no-cache          # force a cold run
 
 Reuse
 -----
-Distance matrices and MDS embeddings are read back from ``06_collections`` in
-the shared cache when a previous run has already computed them, and written
-there when they have not. ``--no-cache`` forces everything to be recomputed,
-which is how a warm run is checked against a cold one: the ``matrix_sha256``
-column of ``crosslevel_scores.csv`` must agree between the two. See
-``docs/notes/caching_collections.md``.
+Distances come from ``06_pairwise``, the shared cache's store of **individual
+pairwise distances**: every pair this suite needs is looked up, only the misses
+are computed, and every computed pair is written back. So a re-run with one more
+adapter costs the pairs that involve it rather than every pair again, and a
+subset of a computed collection costs nothing.
+
+The suite writes **no distance matrices**. Pairs are the single source of truth
+for every pairwise-safe perspective, and a stored assembly beside them could
+drift from what it was assembled from. MDS embeddings are still cached in
+``07_collections``, since a fit is not an assembly and cannot be rebuilt from
+pairs. ``--no-cache`` ignores what is stored and recomputes
+everything, but **still writes the results back** — that is how a warm run is
+checked against a cold one: run it once with ``--no-cache`` and once without
+against the same ``--cache-root``, and the ``matrix_sha256`` column of
+``crosslevel_scores.csv`` must agree between the two. A flag that also skipped
+the writes would leave the second run nothing to read, so both runs would
+compute cold and agree trivially. See ``docs/notes/caching_collections.md``.
 """
 
 from __future__ import annotations
@@ -86,7 +97,7 @@ import numpy as np  # noqa: E402
 from src.analysis import scan_cache  # noqa: E402
 from src.analysis.bridge import as_distance_matrix, fit_geometry  # noqa: E402
 from src.analysis.comparison import (  # noqa: E402
-    _distances, resolve_ordered,
+    _distances, _distances_via_pairs, resolve_ordered,
 )
 from src.analysis.ground_truth import (  # noqa: E402
     dcor_vs_truth, disparity_vs_truth, simplex_distance_matrix, simplex_geometry,
@@ -297,7 +308,7 @@ def _blocked(single_row: bool, tf) -> dict[str, str]:
 
 
 class SuiteCache:
-    """Read-through access to ``06_collections`` for the figure suite.
+    """Read-through access to ``07_collections`` for the figure suite.
 
     The suite used to recompute every distance matrix and every MDS embedding on
     every run while the cache that stores exactly those two things sat unused;
@@ -324,60 +335,72 @@ class SuiteCache:
     key safe, since a freed object's ``id()`` can be reused by another.
     """
 
-    def __init__(self, cache_root, enabled: bool = True) -> None:
+    def __init__(self, cache_root, enabled: bool = True,
+                 read: bool = True) -> None:
+        """*read* is what ``--no-cache`` turns off, and it turns off **reads
+        only**.
+
+        A run that neither reads nor writes cannot be compared against a warm
+        one: the cold run would leave an empty cache, the next run would compute
+        cold as well, and their digests would match while testing nothing. A
+        cold run must therefore populate the cache it is the control for.
+        *enabled* is the separate question of whether this object has a cache at
+        all, which is how the module-level default stays inert on import.
+        """
         self.root = Path(cache_root)
         self.enabled = enabled
+        self.read = read
         self._cc = None
+        self._pw = None
         if enabled:
-            from src.cache import CollectionCache
+            from src.cache import CollectionCache, PairwiseCache
             self._cc = CollectionCache(self.root)
+            self._pw = PairwiseCache(self.root)
         self._handles: dict[int, tuple[object, str]] = {}
         self.hits = 0
         self.misses = 0
 
     # -- distance matrices --------------------------------------------------
 
-    def distance_matrix(self, compute, *, taxonomy, ids, metric, model_entries,
-                        transform=None, rung=None, label=None):
-        """Read the matrix back if any run has stored it; otherwise *compute* it.
+    @property
+    def pairwise(self):
+        """The pairwise store, or ``None`` when this cache is inert."""
+        return self._pw
 
-        *rung* is the resolved selector dict, never the row's display label:
-        ``"late third"`` is editable prose, and redefining which layers it names
-        without changing the string would serve a matrix built from the old
-        definition. The label is still recorded in ``index.json``, where it makes
-        an opaque hash directory identifiable but keys nothing.
+    def register(self, dm, *, taxonomy, metric, model_entries, transform=None,
+                 surrogate=None, label=None) -> None:
+        """Record which collection handle *dm* belongs to, writing no matrix.
+
+        The suite stores **no distance matrices**.  Pairs are the single source
+        of truth for every pairwise-safe perspective, and an assembled matrix
+        alongside them would be a derived copy that can drift from the pairs it
+        came from — a migration or hand-edit touching one and not the other
+        leaves two answers to the same question with no way to tell which is
+        stale.  Re-assembly on each run is the price, and it is 120 dict lookups
+        against the O(n^2) metric computes the store exists to avoid.
+
+        What the handle is still needed for is the **geometry**: an MDS fit is
+        not an assembly and cannot be reconstructed from pairs, so it stays in
+        ``07_collections`` keyed exactly as before.
         """
         if self._cc is None:
-            return compute()
-
+            return
         from src.analysis.comparison import collection_handle
 
         handle = collection_handle(self._cc, taxonomy, metric, model_entries,
-                                   transform=transform, rung=rung)
-        dm = None
-        if self._cc.exists(handle):
-            try:
-                dm = self._cc.load_distance_matrix(handle).reindex(list(ids))
-                self.hits += 1
-            except (ValueError, KeyError, OSError) as exc:
-                # A stored matrix that cannot serve this request is a miss, not a
-                # failure — but say so, because a cache that quietly recomputes
-                # forever looks exactly like a cache that is working.
-                print(f"      cache: recomputing {handle} — "
-                      f"{type(exc).__name__}: {exc}")
-                dm = None
-        if dm is None:
-            self.misses += 1
-            dm = compute()
-            self._cc.save_distance_matrix(
-                dm, handle, model_entries=list(model_entries), label=label,
-                config=self._leaf_config(taxonomy, model_entries, transform, rung),
-            )
+                                   transform=transform, surrogate=surrogate)
+        # Record what the collection is, even though no matrix is stored for it.
+        # save_distance_matrix used to write this provenance as a side effect;
+        # without it a stored fit would have no collection_info.json, no
+        # config.json and no index record, and the directory name is a digest.
+        self._cc.save_collection_info(
+            handle, list(model_entries), label=label,
+            config=self._leaf_config(taxonomy, model_entries, transform, surrogate),
+        )
         self._handles[id(dm)] = (dm, handle)
-        return dm
 
     @staticmethod
-    def _leaf_config(taxonomy, model_entries, transform, rung) -> dict:
+    def _leaf_config(taxonomy, model_entries, transform, surrogate) -> dict:
         """What the leaf ``config.json`` records, so a collection stays traceable.
 
         The directory name is a digest, so the parts that went into it are
@@ -388,7 +411,7 @@ class SuiteCache:
         return {
             "taxonomy": taxonomy,
             "source": "scripts/make_simplex3_figures.py",
-            "selectors": dict(rung or {}),
+            "selectors": dict(surrogate or {}),
             "transform": transform_key(transform),
             "representations": [
                 {"model_id": e["model_id"], "artifact_path": e["artifact_path"],
@@ -413,7 +436,7 @@ class SuiteCache:
             entry = self._handles.get(id(dm))
             handle = entry[1] if entry is not None else None
 
-        if handle is not None:
+        if handle is not None and self.read:
             try:
                 geo = self._cc.load_geometry(handle, "mds", n_components,
                                              mds_kwargs=kwargs)
@@ -428,10 +451,15 @@ class SuiteCache:
         return geo
 
     def report(self) -> str:
-        if not self.enabled:
-            return "collection cache: off (--no-cache), everything recomputed"
-        return (f"collection cache: {self.hits} hit(s), {self.misses} miss(es) "
-                f"under {self.root}/06_collections")
+        if not self.enabled or self._pw is None:
+            return "pairwise store: off, everything recomputed"
+        hits, misses = self._pw.hits, self._pw.misses
+        if not self.read:
+            return (f"pairwise store: reads bypassed (--no-cache), {misses} "
+                    f"pair(s) recomputed and written under "
+                    f"{self.root}/06_pairwise")
+        return (f"pairwise store: {hits} pair(s) reused, {misses} computed, "
+                f"under {self.root}/06_pairwise")
 
 
 #: Set in `main()`. Off until then, so importing this module never writes to a
@@ -465,13 +493,15 @@ def metric_row(idx, taxonomy, ids, tf, blocked=None, label=None, **selectors):
         if col in blocked:
             out[col] = blocked[col]
             continue
-        out[col] = SUITE_CACHE.distance_matrix(
-            lambda col=col: _distances(idx, taxonomy, METRICS[col], ids, reps,
-                                       order=order),
-            taxonomy=taxonomy, ids=ids, metric=METRICS[col],
-            model_entries=model_entries, transform=tf, rung=selectors,
-            label=label,
+        dm = _distances_via_pairs(
+            idx, taxonomy, METRICS[col], ids, reps, order=order,
+            pairwise_cache=SUITE_CACHE.pairwise, transform=tf,
+            read=SUITE_CACHE.read, label=label, **selectors,
         )
+        SUITE_CACHE.register(dm, taxonomy=taxonomy, metric=METRICS[col],
+                             model_entries=model_entries, transform=tf,
+                             surrogate=selectors, label=label)
+        out[col] = dm
     return out
 
 
@@ -526,7 +556,7 @@ def behavioral_cells(idx, ids, surrogates=True):
                 (sel(16, SAMP_SAMPLED), centered("rowwise")),
             "R=16 · per generation · whitened":
                 (sel(16, SAMP_SAMPLED), whitened(0.1, "rowwise")),
-            # The pooled rung has one row per model, so `grand` is the only mode
+            # The pooled surrogate has one row per model, so `grand` is the only mode
             # available and it reduces to subtracting the fleet centroid.
             "R=16 · model mean · centered":
                 (sel(16, SAMP_SAMPLED, **model_mean), centered("grand")),
@@ -598,12 +628,12 @@ DATASET_MATRIX = {"n_samples": 1000, "seed": 0, "representation": "matrix"}
 
 
 def dataset_rows(idx, ids, surrogates=True):
-    """(selector, transform) per row, dropping rungs the cache cannot serve.
+    """(selector, transform) per row, dropping surrogates the cache cannot serve.
 
     The `matrix` surrogate is authored, not derived — see
     ``docs/notes/dataset_embedding_layout.md`` §4 — so it exists only if the
     re-embed job has run. Its rows are omitted with a printed note rather than
-    raising, so the no-GPU rungs still render on a cache that predates it.
+    raising, so the no-GPU surrogates still render on a cache that predates it.
     """
     rows = {"dataset text · mean · n1000_s00": (DATASET_MEAN, None)}
     if not surrogates:
@@ -758,16 +788,28 @@ def _structural_grid(idx, names, ids, specs):
                 # the cache is handed is always a matrix and never a reason.
                 cells[(row, col)] = NO_CKA_GROUP
                 continue
-            cells[(row, col)] = SUITE_CACHE.distance_matrix(
-                lambda row=row, layers=layers, projs=projs, col=col:
-                    compute(row, layers, projs, col),
-                taxonomy="structural", ids=ids, metric=METRICS[col],
-                # No `rung=`: for structural the view *is* the surrogate —
-                # `_structural_identity` hashes (layers, projections) into
-                # `surrogate_hash` — so passing the selectors again would key the
-                # same collection twice, once per writer.
-                model_entries=entries_for(layers, projs), label=row,
+            entries = entries_for(layers, projs)
+            # For structural the view *is* the surrogate — `_structural_identity`
+            # hashes (layers, projections) into `surrogate_hash` — so the pair
+            # handle keys on that same `structural_view` dict rather than on a
+            # separate selector, and a structural handle stays comparable with
+            # what the collection cache already writes.
+            dm = _distances_via_pairs(
+                idx, "structural", METRICS[col], ids, None,
+                list(layers), list(projs), order=order,
+                pairwise_cache=SUITE_CACHE.pairwise, read=SUITE_CACHE.read,
+                label=row,
+                # The grid loads every adapter once and runs the low-rank
+                # builders over the whole collection; filling pair by pair would
+                # reload weights per pair and lose exactly the optimisation this
+                # function exists for. Every pair it yields is still stored, so a
+                # later subset or superset of this collection is free.
+                compute_all=(lambda row=row, layers=layers, projs=projs, col=col:
+                             compute(row, layers, projs, col)),
             )
+            SUITE_CACHE.register(dm, taxonomy="structural", metric=METRICS[col],
+                                 model_entries=entries, label=row)
+            cells[(row, col)] = dm
     return list(specs), cells
 
 
@@ -896,7 +938,7 @@ def emit(level, rows, cells, outdir, title):
 
 
 def emit_detail(level, row, cells, outdir, title):
-    """One annotated panel per metric for the level's reference rung."""
+    """One annotated panel per metric for the level's reference surrogate."""
     for col in METRIC_COLS:
         cell = cells.get((row, col))
         if cell is None or isinstance(cell, str):
@@ -928,12 +970,16 @@ def layer_sweep(idx, ids, outdir):
             with_identity=True)
         for col in METRIC_COLS:
             try:
-                dm = SUITE_CACHE.distance_matrix(
-                    lambda col=col: _distances(idx, "functional", METRICS[col],
-                                               ids, reps, order=order),
-                    taxonomy="functional", ids=ids, metric=METRICS[col],
+                dm = _distances_via_pairs(
+                    idx, "functional", METRICS[col], ids, reps, order=order,
+                    pairwise_cache=SUITE_CACHE.pairwise,
+                    read=SUITE_CACHE.read, label=f"sweep · h{h}",
+                    functional_selector=selector,
+                )
+                SUITE_CACHE.register(
+                    dm, taxonomy="functional", metric=METRICS[col],
                     model_entries=model_entries,
-                    rung={"functional_selector": selector},
+                    surrogate={"functional_selector": selector},
                     label=f"sweep · h{h}",
                 )
                 scores[col].append(dcor_vs_truth(dm, tdm))
@@ -973,8 +1019,8 @@ def layer_sweep(idx, ids, outdir):
 MDS_SEED = 0
 
 
-class RungScore(NamedTuple):
-    """One scored (rung, metric) cell of one level.
+class SurrogateScore(NamedTuple):
+    """One scored (surrogate, metric) cell of one level.
 
     ``dcor`` runs 0→1 better; ``procrustes`` runs 1→0 better. They are not two
     readings of one quantity: dCor scores the distance matrix and never embeds,
@@ -990,14 +1036,14 @@ class RungScore(NamedTuple):
     dm: object
 
 
-def rank_rungs(level_cells, ids, tdm=None, tgeo=None):
-    """Every computed (rung, metric) cell of one level, scored against the truth.
+def rank_surrogates(level_cells, ids, tdm=None, tgeo=None):
+    """Every computed (surrogate, metric) cell of one level, scored against the truth.
 
-    Returns ``[RungScore, ...]`` sorted by **dCor** descending. The sort key is
+    Returns ``[SurrogateScore, ...]`` sorted by **dCor** descending. The sort key is
     deliberately still dCor even though a second score is now reported: the
     winner each figure draws is the dCor winner, and this is the ranking the
     tracked tables record. Scoring every cell rather than a designated reference
-    rung is the point of the surrogate work: which rung recovers the simplex
+    surrogate is the point of the surrogate work: which surrogate recovers the simplex
     best is the question, so it cannot be answered by hardcoding one and
     reporting it.
 
@@ -1019,7 +1065,7 @@ def rank_rungs(level_cells, ids, tdm=None, tgeo=None):
             # would let the reported numbers describe different configurations.
             geo = SUITE_CACHE.geometry(cell, n_components=2,
                                        random_state=MDS_SEED)
-            scored.append(RungScore(
+            scored.append(SurrogateScore(
                 dcor=dcor_vs_truth(cell, tdm),
                 procrustes=disparity_vs_truth(cell, tgeo, geometry=geo),
                 stress=float(kruskal_stress(cell, geo)),
@@ -1059,7 +1105,7 @@ def write_scores_csv(per_level_scores, path) -> None:
     """
     with open(path, "w", newline="") as fh:
         w = csv.writer(fh)
-        w.writerow(["level", "rung", "metric", "dcor", "procrustes", "stress",
+        w.writerow(["level", "surrogate", "metric", "dcor", "procrustes", "stress",
                     "n_models", "matrix_sha256"])
         for lvl, ranked in per_level_scores.items():
             for s in ranked:
@@ -1081,10 +1127,10 @@ LEVEL_ORDER = [
 
 
 def cross_level(per_level, ids, outdir, metric_override=None, suffix=""):
-    """Each level's best-scoring rung side by side, plus the agreement table.
+    """Each level's best-scoring surrogate side by side, plus the agreement table.
 
     *metric_override* maps a level to a metric name that level must be read
-    under, e.g. ``{"dataset_embedding": "cosine"}``. The rung is still chosen by
+    under, e.g. ``{"dataset_embedding": "cosine"}``. The surrogate is still chosen by
     dCor, but only among that metric's cells. It exists to ask what a level looks
     like when it is held to the same metric as the rest of the figure, rather
     than to whichever metric happens to score best on it — a real question here,
@@ -1106,7 +1152,7 @@ def cross_level(per_level, ids, outdir, metric_override=None, suffix=""):
     # the csv. Ranking each level twice used to recompute every dCor; with a
     # second score and an MDS fit per cell that waste is no longer small.
     tdm, tgeo = truth_dm(ids), truth_geometry(ids)
-    per_level_scores = {lvl: rank_rungs(cells, ids, tdm=tdm, tgeo=tgeo)
+    per_level_scores = {lvl: rank_surrogates(cells, ids, tdm=tdm, tgeo=tgeo)
                         for lvl, cells in per_level.items()}
 
     winners, table_rows = {}, []
@@ -1119,7 +1165,7 @@ def cross_level(per_level, ids, outdir, metric_override=None, suffix=""):
             else:
                 # Fall back rather than drop the level: a missing metric should
                 # cost the constraint, not the panel.
-                print(f"    {lvl}: no {want!r} cell — using its overall best rung")
+                print(f"    {lvl}: no {want!r} cell — using its overall best surrogate")
         if not ranked:
             print(f"    {lvl}: no scorable cell — omitted from the comparison")
             continue
@@ -1152,9 +1198,9 @@ def cross_level(per_level, ids, outdir, metric_override=None, suffix=""):
         random_state=MDS_SEED,
     )
     plt.close("all")
-    cells = {("best rung", name): winners[lvl].dm for name, lvl in ordered}
-    dm_grid(cells, ["best rung"], [name for name, _ in ordered],
-            "Cross-level comparison — distance matrices, each level's best rung"
+    cells = {("best surrogate", name): winners[lvl].dm for name, lvl in ordered}
+    dm_grid(cells, ["best surrogate"], [name for name, _ in ordered],
+            "Cross-level comparison — distance matrices, each level's best surrogate"
             + (f" ({note})" if note else ""),
             savepath=outdir / f"fig_crosslevel_dm{suffix}.png")
     plt.close("all")
@@ -1162,7 +1208,7 @@ def cross_level(per_level, ids, outdir, metric_override=None, suffix=""):
     # Two scores in one table, running in opposite directions, so the header
     # says which way each one reads rather than leaving it to be inferred.
     header = ["| level | dCor vs ground truth | Procrustes residual (lower=better) "
-              "| rung | metric |", "|---|---|---|---|---|"]
+              "| surrogate | metric |", "|---|---|---|---|---|"]
     best_proc = min((s.procrustes for _, s in table_rows), default=None)
     lines = list(header)
     for lvl, s in table_rows:
@@ -1170,17 +1216,17 @@ def cross_level(per_level, ids, outdir, metric_override=None, suffix=""):
                      f"| {s.row} | {s.col} |")
     table = "\n".join(lines)
 
-    # The full ranking beside the winners, so a rung that wins by a hair does not
+    # The full ranking beside the winners, so a surrogate that wins by a hair does not
     # read as a decisive one, and so a surrogate that helped is visible even when
     # it did not take first place.
-    detail = ["", "", "## Every rung, per level", ""]
+    detail = ["", "", "## Every surrogate, per level", ""]
     for lvl, ranked in per_level_scores.items():
         # Rows stay in dCor order — the Procrustes bolding marks the best three
         # of *that* column, which is exactly the interesting case when the two
-        # scores disagree about which rung recovers the simplex.
+        # scores disagree about which surrogate recovers the simplex.
         top3 = {id(s) for s in sorted(ranked, key=lambda s: s.procrustes)[:3]}
         detail += [f"### {lvl}", "",
-                   "| dCor | Procrustes residual (lower=better) | rung | metric |",
+                   "| dCor | Procrustes residual (lower=better) | surrogate | metric |",
                    "|---|---|---|---|"]
         detail += [f"| {s.dcor:.4f} | {_bold_if(s.procrustes, id(s) in top3)} "
                    f"| {s.row} | {s.col} |" for s in ranked]
@@ -1214,8 +1260,18 @@ def main() -> None:
                     help="skip the 33-layer functional sweep")
     ap.add_argument("--skip-detail", action="store_true",
                     help="skip the per-metric detail figures")
-    ap.add_argument("--skip-surrogate", action="store_true",
-                    help="omit the centered/whitened rungs, leaving the raw ones")
+    # Dropped from the default grid on the evidence in
+    # figures/simplex3_qwen_v3/crosslevel_scores.csv: no centered or whitened
+    # perspective wins at any level. They are dominated rather than broken —
+    # functional centered reaches 0.955 against a 0.975 best — except behavioral
+    # CKA, where both go negative (-0.548 centered, -0.674 whitened). The code
+    # path survives behind the flag so the finding can be re-checked without
+    # reinstating code. When run, these are computed uncached: G1 sends them to
+    # the plain `_distances`, so they touch neither 06_pairwise nor
+    # 07_collections.
+    ap.add_argument("--with-surrogate", action="store_true",
+                    help="also compute the centered/whitened fleet transforms, "
+                         "which are off by default")
     ap.add_argument("--cache-root", default=None,
                     help="the shared cache to read models from and to reuse "
                          f"distance matrices in (default: {CACHE_ROOT})")
@@ -1224,8 +1280,8 @@ def main() -> None:
     # cold one. Compare the `matrix_sha256` column of the two runs'
     # `crosslevel_scores.csv`.
     ap.add_argument("--no-cache", action="store_true",
-                    help="recompute every distance matrix and embedding, "
-                         "neither reading nor writing 06_collections")
+                    help="recompute everything, ignoring stored results "
+                         "(still writes them back)")
     # Run identity.  Architecture is derived from the checkpoint; what cannot be
     # derived is *which run* to plot, so that comes from here.
     ap.add_argument("--base-model", default=BASE_MODEL,
@@ -1250,7 +1306,7 @@ def main() -> None:
     print(f"arch : {N_LAYERS} layers, {ATTN_NUM_HEADS} heads, "
           f"{len(FULL_ATTN_LAYERS)} full-attn / {len(LINEAR_ATTN_LAYERS)} "
           f"linear-attn, output_gate={ATTN_OUTPUT_GATE}")
-    surrogates = not args.skip_surrogate
+    surrogates = args.with_surrogate
 
     if args.cache_root:
         CACHE_ROOT = Path(args.cache_root).expanduser().resolve()
@@ -1261,7 +1317,7 @@ def main() -> None:
             "the default is derived from this file's location and may not "
             "resolve to the checkout that holds the cache."
         )
-    SUITE_CACHE = SuiteCache(CACHE_ROOT, enabled=not args.no_cache)
+    SUITE_CACHE = SuiteCache(CACHE_ROOT, read=not args.no_cache)
 
     levels = args.level or ["behavioral", "functional", "structural",
                             "dataset_embedding"]
@@ -1274,7 +1330,7 @@ def main() -> None:
     ids = sort_by_mixture(idx.model_ids)
     names = [Path(m).name for m in ids]
     print(f"cache: {CACHE_ROOT}\nmodels: {len(ids)}")
-    print(f"reuse: {'off (--no-cache)' if args.no_cache else '06_collections'}")
+    print(f"reuse: {'reads bypassed (--no-cache), still writing' if args.no_cache else '06_pairwise'}")
     if len(ids) != 16:
         raise SystemExit(f"expected 16 models, found {len(ids)} — cache incomplete?")
 

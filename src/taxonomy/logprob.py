@@ -331,7 +331,7 @@ def _pad_rows(
     """Stack variable-length left-aligned rows into ``(rows, T_max)`` arrays.
 
     Shared with :class:`~src.taxonomy.behavioral.BehavioralTaxonomy`'s
-    ride-along collection, so both modes of ``05a_logprobs`` are padded by one
+    ride-along collection, so both modes of ``05A_logprobs`` are padded by one
     piece of code and cannot disagree about the convention.
 
     Padding is zero and is *not* meaningful: ``lengths`` is the only thing that

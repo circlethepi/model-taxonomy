@@ -36,6 +36,7 @@ MISTRAL_NEMO = ModelProfile(
     expected_lora_params=19_660_800,
     excluded_lora_modules=(),
     pad_token="<pad>",
+    allow_truncated_generation=True,
     notes="""Uniform grouped-query attention, so q/k/v/o reaches all 40 of 40
     layers -- no hybrid layout to work around as in Qwen3.5, and no non-standard
     projection names as in OpenELM.  At r=16 with hidden 5120, 32 query heads at
@@ -64,7 +65,30 @@ MISTRAL_NEMO = ModelProfile(
     to have one.
 
     No reasoning block, so ``</think>`` instrumentation is inert and the
-    behavioral level embeds answers directly.
+    behavioral level embeds generations directly.
+
+    allow_truncated_generation is True, and it is the sharpest caveat on this
+    suite.  Smoke stage 5 measured termination_rate 0.00: every generation ran
+    the full 128-token budget, cut mid-sentence.  This checkpoint answers a Yahoo
+    question with a numbered, headed essay -- "The sky appears blue due to ...
+    Here's a simple explanation: 1. **Sunlight**: ..." -- and 128 tokens does not
+    reach the end of one.  llama3i and qwen finish inside the same budget, so
+    this suite's behavioral level embeds the *opening* of an answer where theirs
+    embed whole ones.
+
+    Accepted rather than fixed, deliberately.  max_new_tokens is a property of
+    the experiment and not a Suite field: raising it for this suite alone would
+    make the behavioral level incomparable to the three suites this one exists to
+    sit beside, and raising it everywhere would invalidate every behavioral
+    result already on disk.  So the truncation is declared here and read at every
+    run, the same treatment the capacity divergence above gets, for the same
+    reason -- a confound the reader can see beats one that is hidden.
+
+    What this does NOT excuse: the structural and functional levels are
+    unaffected (they read weights and activations, not decoded text), and greedy
+    and the temperature sweep are affected exactly as the behavioral level is.
+    Read cross-suite behavioral comparisons involving this suite with that in
+    mind, or restrict them to the levels that do not decode.
 
     The template ships in tokenizer_config.json rather than as a standalone
     chat_template.jinja.  Checked rather than assumed, because that is the shape

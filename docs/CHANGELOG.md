@@ -36,6 +36,27 @@ any sensible rank, so the divergence is inherent to adding a scale ladder rather
 property of the checkpoints chosen — and `expected_lora_params` exists precisely to make
 it visible instead of hidden.
 
+**Mistral-Nemo's behavioral level embeds truncated text, declared rather than fixed.**
+Smoke stage 5 measured `termination_rate 0.00`: this checkpoint answers a Yahoo question
+with a numbered, headed essay and never finishes inside the 128-token budget, where
+`llama3i` and `qwen` do. `ModelProfile` gains **`allow_truncated_generation`** (default
+`False`, so every other checkpoint keeps the check at full force); `MISTRAL_NEMO` sets it
+and records why in `notes`. `max_new_tokens` is a property of the experiment, not a
+`Suite` field — raising it for one suite would make its behavioral level incomparable to
+the suites it exists to sit beside, and raising it everywhere would invalidate every
+behavioral result already on disk. The structural and functional levels are unaffected;
+greedy and the temperature sweep are affected exactly as the behavioral level is.
+
+**`smoke_base_model.py`'s parameter floor now comes from the checkpoint.** `t_load`
+asserted `n_params > 4.0e9`, which was never a derived number — it was a floor under the
+roster as it stood (8B, 4B, 3B) and encoded "every model here is large", which the scale
+ladder is exactly what stops being true; OLMo-2-1B failed it at a correct 1.48B. The
+check itself is worth keeping: it is an independent tripwire against a structurally
+consistent load that `missing_keys` reports as clean, which is the `model.language_model.`
+prefix case its docstring names. It now sums the shapes the checkpoint's own safetensors
+headers declare, minus anything the loader reported as unexpected, so it holds at any
+scale and needs no edit at the next rung.
+
 `Suite` gains **`prefetch_ignore`**, emitted as `ignore_patterns` in `00_prefetch.sh`
 only when non-empty. `Mistral-Nemo-Instruct-2407` publishes its weights twice — five
 sharded `model-0000N-of-00005.safetensors` *and* a `consolidated.safetensors` — so the

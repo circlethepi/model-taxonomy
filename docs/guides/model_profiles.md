@@ -25,6 +25,7 @@ class ModelProfile:
     expected_lora_params: int | None = None      # None = report, don't assert
     excluded_lora_modules: tuple[str, ...] = ()  # must NOT be matched
     pad_token: str | None = None                 # None = fall back to eos
+    allow_truncated_generation: bool = False     # True = budget may be exhausted
     notes: str = ""
 ```
 
@@ -80,6 +81,17 @@ Profile fields, because nothing declares them:
   definition, called from both `finetune_lora.py` and `_hf_inference.py` — resolving pad
   differently in training and extraction would mask different positions in two halves of
   one experiment. Naming an absent token, or one that *is* eos, raises.
+- **`allow_truncated_generation`** — accept generations that run the whole
+  `max_new_tokens` budget instead of finishing inside it. Default `False`, so the smoke
+  harness's stage 5 keeps its full force everywhere it is not deliberately waived. The
+  most consequential of these choices: it declares that this checkpoint's behavioral
+  level embeds the *opening* of an answer where the other suites embed whole ones, which
+  is a real difference from the suites it will be compared against. Only `MISTRAL_NEMO`
+  sets it — it answers a Yahoo question with a numbered, headed essay and never finishes
+  in 128 tokens. Accepted rather than fixed because `max_new_tokens` belongs to the
+  experiment, not the `Suite`: raising it for one suite breaks the comparison that suite
+  exists for, and raising it everywhere invalidates every behavioral result on disk. Set
+  it only next to a `notes` entry saying why.
 
 ### `assert_compatible` — template drift, checked before a GPU is held
 

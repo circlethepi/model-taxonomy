@@ -73,6 +73,16 @@ class ModelProfile:
     #: excluded deliberately, and an exclusion nobody checks is an exclusion that
     #: quietly stops holding when a target list is edited.
     excluded_lora_modules: tuple[str, ...] = ()
+    #: Accept generations that run the whole ``max_new_tokens`` budget instead of
+    #: finishing inside it.  Default ``False``, so the smoke harness's stage 5
+    #: keeps its full force for every checkpoint that does not say otherwise.
+    #:
+    #: A choice, like the two fields above, and the most consequential of the
+    #: three: it declares that this model's behavioral level embeds *truncated*
+    #: text rather than whole answers, which is a real difference from the suites
+    #: it will be compared against.  Setting it is only defensible next to a
+    #: ``notes`` entry saying why the truncation was accepted rather than fixed.
+    allow_truncated_generation: bool = False
     notes: str = ""
 
 

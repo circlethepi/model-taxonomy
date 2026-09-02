@@ -35,12 +35,12 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 from datetime import datetime, timezone
 from pathlib import Path
 
 import numpy as np
 
+from src.utils.atomic import atomic_path, atomic_write_json
 from src.cache._draw import DRAW_RE
 from src.cache._draw import draw_name as _draw_name
 
@@ -98,8 +98,10 @@ class DrawKeyedCache:
     _ARTIFACT_DIR: str = ""
 
     #: Glob matching a *complete* artifact inside ``_ARTIFACT_DIR``.  Deliberately
-    #: not ``*``: an interrupted write leaves a ``.safetensors.tmp`` behind, and a
-    #: bare ``*`` would report that draw as present when it holds nothing usable.
+    #: not ``*``: an interrupted write leaves a ``….tmp`` file behind (see
+    #: ``src.utils.atomic``, whose temp names always end in ``.tmp`` precisely so
+    #: they fall outside this glob), and a bare ``*`` would report that draw as
+    #: present when it holds nothing usable.
     _ARTIFACT_GLOB: str = "*.safetensors"
 
     #: Accepted normalization modes.  Bools are accepted too and canonicalized by
@@ -417,16 +419,11 @@ def _row_normalize(m: np.ndarray) -> np.ndarray:
 
 
 def _atomic_write_json(path: Path, payload: dict) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(payload, indent=2, default=str))
-    os.replace(tmp, path)
+    atomic_write_json(path, payload, default=str)
 
 
 def _atomic_save_tensor(path: Path, arr: np.ndarray, key: str = "activations") -> None:
     from safetensors.numpy import save_file
 
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(".safetensors.tmp")
-    save_file({key: arr}, str(tmp))
-    os.replace(tmp, path)
+    with atomic_path(path) as tmp:
+        save_file({key: arr}, str(tmp))

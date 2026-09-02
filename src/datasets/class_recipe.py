@@ -2,10 +2,10 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from src.utils.atomic import atomic_write_json
 from src.datasets._text_projection import (
     DEFAULT_SEPARATOR,
     composition_dict,
@@ -234,12 +234,13 @@ class ClassAwareDatasetRecipe:
         }
 
     def save(self, path: Path | str) -> None:
-        """Write recipe to a ``.recipe.json`` file atomically."""
-        path = Path(path)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(self.to_dict(), indent=2))
-        os.replace(tmp, path)
+        """Write recipe to a ``.recipe.json`` file atomically.
+
+        Concurrency matters here more than anywhere else in the cache: every job
+        in a suite builds the *same* recipe, so a mass submission has dozens of
+        processes writing this one path within the same second.
+        """
+        atomic_write_json(path, self.to_dict())
 
     @classmethod
     def load(cls, path: Path | str) -> ClassAwareDatasetRecipe:

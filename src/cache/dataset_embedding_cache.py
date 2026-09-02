@@ -1,13 +1,13 @@
 from __future__ import annotations
 
 import json
-import os
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 import numpy as np
 
+from src.utils.atomic import atomic_path, atomic_write_json
 from src.cache._draw import draw_name, parse_draw_name
 from src.cache._draw_keyed import DrawKeyedCache
 from src.core.representation import ModelRepresentation
@@ -187,9 +187,7 @@ class DatasetEmbeddingCache:
             # recipe.json — human-readable, shared across draws and embedders
             recipe_path = self._recipe_dir(recipe_hash) / "recipe.json"
             if not recipe_path.exists():
-                tmp = recipe_path.with_suffix(".tmp")
-                tmp.write_text(json.dumps(recipe.to_dict(), indent=2))
-                os.replace(tmp, recipe_path)
+                _atomic_write_json(recipe_path, recipe.to_dict())
 
             # The entry config describes the embedder and the draw it ran over.
             # n_samples and seed are recorded even though the path already says
@@ -211,7 +209,6 @@ class DatasetEmbeddingCache:
             )
 
             st_path = surr_dir / "surrogate.safetensors"
-            tmp_st = surr_dir / "surrogate.safetensors.tmp"
             meta_bytes = np.frombuffer(
                 json.dumps(
                     {
@@ -222,14 +219,14 @@ class DatasetEmbeddingCache:
                 ).encode("utf-8"),
                 dtype=np.uint8,
             )
-            save_file(
-                {
-                    "matrix": np.ascontiguousarray(rep.matrix.astype(np.float32)),
-                    "_meta_json": meta_bytes,
-                },
-                str(tmp_st),
-            )
-            os.replace(tmp_st, st_path)
+            with atomic_path(st_path) as tmp_st:
+                save_file(
+                    {
+                        "matrix": np.ascontiguousarray(rep.matrix.astype(np.float32)),
+                        "_meta_json": meta_bytes,
+                    },
+                    str(tmp_st),
+                )
 
     # ------------------------------------------------------------------
     # Read
@@ -367,7 +364,4 @@ class DatasetEmbeddingCache:
 
 
 def _atomic_write_json(path: Path, payload: dict) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(payload, indent=2))
-    os.replace(tmp, path)
+    atomic_write_json(path, payload)

@@ -51,6 +51,8 @@ from pathlib import Path
 # Allow running from the repo root without installing the package
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+from src.utils.atomic import atomic_write_json  # noqa: E402
+
 REPO = Path(__file__).parent.parent
 
 DEFAULT_ROOT = REPO / "results" / "shared_cache"
@@ -242,10 +244,7 @@ def backfill_recipes(root: Path, dry_run: bool) -> None:
 
 def _write_json(path: Path, payload: dict) -> None:
     """Atomic write, consistent with the cache classes."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(".tmp")
-    tmp.write_text(json.dumps(payload, indent=2))
-    os.replace(tmp, path)
+    atomic_write_json(path, payload)
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────

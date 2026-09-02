@@ -1,12 +1,12 @@
 from __future__ import annotations
 
 import json
-import os
 from datetime import datetime, timezone
 from pathlib import Path
 
 import numpy as np
 
+from src.utils.atomic import atomic_path, atomic_write_json
 from src.core.distance import DistanceMatrix
 from src.core.geometry import GeometryResult
 
@@ -243,9 +243,7 @@ class CollectionCache:
             "metric": distance_matrix.metric,
             **(config or {}),
         }
-        cfg_tmp = coll_dir / "config.json.tmp"
-        cfg_tmp.write_text(json.dumps(leaf_config, indent=2, sort_keys=True))
-        os.replace(cfg_tmp, coll_dir / "config.json")
+        atomic_write_json(coll_dir / "config.json", leaf_config, sort_keys=True)
 
         # Write distance_matrix.safetensors
         meta_bytes = np.frombuffer(
@@ -265,16 +263,15 @@ class CollectionCache:
         # is that the two runs produce the same `matrix_sha256`. At 16 models
         # this buys the fidelity for two kilobytes. Entries already written at
         # float32 still load: `load_distance_matrix` casts whatever it finds.
-        st_tmp = coll_dir / "distance_matrix.safetensors.tmp"
-        save_file(
-            {
-                "matrix": np.ascontiguousarray(
-                    distance_matrix.matrix.astype(np.float64)),
-                "_meta_json": meta_bytes,
-            },
-            str(st_tmp),
-        )
-        os.replace(st_tmp, coll_dir / "distance_matrix.safetensors")
+        with atomic_path(coll_dir / "distance_matrix.safetensors") as st_tmp:
+            save_file(
+                {
+                    "matrix": np.ascontiguousarray(
+                        distance_matrix.matrix.astype(np.float64)),
+                    "_meta_json": meta_bytes,
+                },
+                str(st_tmp),
+            )
 
         self._update_index(handle, info, leaf_config)
         return handle
@@ -286,9 +283,7 @@ class CollectionCache:
         info_dir = self._info_dir(handle)
         info_dir.mkdir(parents=True, exist_ok=True)
         with FileLock(str(info_dir / "info.lock")):
-            tmp = info_dir / "collection_info.json.tmp"
-            tmp.write_text(json.dumps(info, indent=2))
-            os.replace(tmp, info_dir / "collection_info.json")
+            atomic_write_json(info_dir / "collection_info.json", info)
 
     def save_collection_info(
         self,
@@ -325,9 +320,7 @@ class CollectionCache:
         cfg_path = coll_dir / "config.json"
         leaf_config = json.loads(cfg_path.read_text()) if cfg_path.exists() else {}
         leaf_config.update({"schema_version": "1", **(config or {})})
-        cfg_tmp = coll_dir / "config.json.tmp"
-        cfg_tmp.write_text(json.dumps(leaf_config, indent=2, sort_keys=True))
-        os.replace(cfg_tmp, cfg_path)
+        atomic_write_json(cfg_path, leaf_config, sort_keys=True)
         self._update_index(handle, info, leaf_config)
 
     def save_geometry(
@@ -371,17 +364,16 @@ class CollectionCache:
         # float64 for the same reason the distance matrix is: a cached embedding
         # has to be interchangeable with a freshly fitted one, and the stress and
         # Procrustes residual reported beside it are read to six decimals.
-        st_tmp = coords_dir / f"{key}.safetensors.tmp"
-        save_file(
-            {
-                "coordinates": np.ascontiguousarray(
-                    geometry.coordinates.astype(np.float64)
-                ),
-                "_meta_json": meta_bytes,
-            },
-            str(st_tmp),
-        )
-        os.replace(st_tmp, coords_dir / f"{key}.safetensors")
+        with atomic_path(coords_dir / f"{key}.safetensors") as st_tmp:
+            save_file(
+                {
+                    "coordinates": np.ascontiguousarray(
+                        geometry.coordinates.astype(np.float64)
+                    ),
+                    "_meta_json": meta_bytes,
+                },
+                str(st_tmp),
+            )
 
         # Geometries belong to the leaf, not the collection: coordinates are fitted
         # to one metric's distance matrix, so two metrics over the same models have
@@ -395,9 +387,7 @@ class CollectionCache:
             geometries = cfg.setdefault("geometries", [])
             if entry not in geometries:
                 geometries.append(entry)
-            cfg_tmp = coll_dir / "config.json.tmp"
-            cfg_tmp.write_text(json.dumps(cfg, indent=2, sort_keys=True))
-            os.replace(cfg_tmp, cfg_path)
+            atomic_write_json(cfg_path, cfg, sort_keys=True)
             info_path = self._info_dir(handle) / "collection_info.json"
             info = json.loads(info_path.read_text()) if info_path.exists() else {}
             self._update_index(handle, info, cfg)
@@ -603,6 +593,4 @@ class CollectionCache:
         with FileLock(str(self._collections_dir / "index.lock")):
             index = self.load_index()
             index[handle] = record
-            tmp = self._collections_dir / "index.json.tmp"
-            tmp.write_text(json.dumps(index, indent=2, sort_keys=True))
-            os.replace(tmp, self.index_path)
+            atomic_write_json(self.index_path, index, sort_keys=True)

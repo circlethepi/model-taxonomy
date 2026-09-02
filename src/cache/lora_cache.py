@@ -2,13 +2,13 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 from datetime import datetime, timezone
 from pathlib import Path
 
 import numpy as np
 from tqdm.auto import tqdm
 
+from src.utils.atomic import atomic_path, atomic_write_json
 from src.core.protocols import ModelID
 from src.core.representation import ModelRepresentation
 
@@ -121,16 +121,13 @@ class LoRACache:
                 "extracted_at": datetime.now(timezone.utc).isoformat(),
             }
 
-            config_tmp = rep_dir / "config.json.tmp"
-            config_tmp.write_text(json.dumps(config, indent=2))
-            os.replace(config_tmp, rep_dir / "config.json")
+            atomic_write_json(rep_dir / "config.json", config)
 
-            st_tmp = rep_dir / "representation.safetensors.tmp"
-            save_file(
-                {"matrix": np.ascontiguousarray(rep.matrix.astype(np.float32))},
-                str(st_tmp),
-            )
-            os.replace(st_tmp, rep_dir / "representation.safetensors")
+            with atomic_path(rep_dir / "representation.safetensors") as st_tmp:
+                save_file(
+                    {"matrix": np.ascontiguousarray(rep.matrix.astype(np.float32))},
+                    str(st_tmp),
+                )
 
     def load(self, base_model_id: str, adapter_id: str, extraction_config: dict) -> ModelRepresentation:
         """Read representation.safetensors and reconstruct a ModelRepresentation."""

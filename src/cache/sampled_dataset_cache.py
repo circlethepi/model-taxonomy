@@ -48,9 +48,9 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 from pathlib import Path
 
+from src.utils.atomic import atomic_write_text
 from src.cache._draw import draw_name
 
 #: Draw-manifest schema.  Independent of recipe.json's schema_version.
@@ -288,10 +288,7 @@ class SampledDatasetCache:
 
     @staticmethod
     def _write(path: Path, payload: str) -> None:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_suffix(".tmp")
-        tmp.write_text(payload)
-        os.replace(tmp, path)
+        atomic_write_text(path, payload)
 
 
 def rows_checksum(rows: list[dict]) -> str:

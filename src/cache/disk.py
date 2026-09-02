@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 from pathlib import Path
 from typing import Literal
 
@@ -10,13 +9,15 @@ import numpy as np
 
 from src.core.protocols import ModelID
 from src.core.representation import ModelRepresentation
+from src.utils.atomic import atomic_path
 
 
 class DiskCache:
     """File-backed cache for ModelRepresentation objects.
 
-    Atomic writes (via os.replace) and per-key file locks prevent corruption
-    when multiple SLURM jobs write to a shared network filesystem simultaneously.
+    Atomic writes (via :mod:`src.utils.atomic`) and per-key file locks prevent
+    corruption when multiple SLURM jobs write to a shared network filesystem
+    simultaneously.
 
     Formats:
         "safetensors" (default): memory-mappable, pickle-free, fast load.
@@ -80,37 +81,37 @@ class DiskCache:
             if self.exists(key):
                 return
             path = self._path(key)
-            tmp_path = path.with_suffix(".tmp")
             meta = {
                 "model_id": rep.model_id,
                 "taxonomy": rep.taxonomy,
                 "metadata": rep.metadata,
             }
             if self.format == "npz":
-                # np.savez always appends .npz, so pass the stem without extension
-                # to avoid collisions (subdir/key.tmp → subdir/key.tmp.npz).
-                tmp_stem = path.parent / f"{path.stem}.tmp"
-                np.savez(tmp_stem, matrix=rep.matrix, meta=json.dumps(meta))
-                os.replace(str(tmp_stem) + ".npz", path)
+                # np.savez appends .npz unless the name already ends in it, so the
+                # temp name carries the extension and nothing is appended.
+                with atomic_path(path, suffix=".npz") as tmp_path:
+                    np.savez(tmp_path, matrix=rep.matrix, meta=json.dumps(meta))
             elif self.format == "pt":
                 import torch
 
-                torch.save({"matrix": rep.matrix, "meta": meta}, tmp_path)
-                os.replace(tmp_path, path)
+                with atomic_path(path) as tmp_path:
+                    torch.save({"matrix": rep.matrix, "meta": meta}, tmp_path)
             else:  # safetensors
                 from safetensors.numpy import save_file
 
                 meta_bytes = np.frombuffer(
                     json.dumps(meta).encode("utf-8"), dtype=np.uint8
                 )
-                save_file(
-                    {
-                        "matrix": np.ascontiguousarray(rep.matrix.astype(np.float32)),
-                        "_meta_json": meta_bytes,
-                    },
-                    str(tmp_path),
-                )
-                os.replace(tmp_path, path)
+                with atomic_path(path) as tmp_path:
+                    save_file(
+                        {
+                            "matrix": np.ascontiguousarray(
+                                rep.matrix.astype(np.float32)
+                            ),
+                            "_meta_json": meta_bytes,
+                        },
+                        str(tmp_path),
+                    )
 
     @staticmethod
     def key_for(model_id: ModelID, config: dict) -> str:

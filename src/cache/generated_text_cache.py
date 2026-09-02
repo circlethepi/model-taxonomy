@@ -1,12 +1,12 @@
 from __future__ import annotations
 
 import json
-import os
 import re
 from pathlib import Path
 
 import numpy as np
 
+from src.utils.atomic import atomic_path
 from src.cache._draw_keyed import (
     DrawKeyedCache,
     _atomic_write_json,
@@ -685,7 +685,5 @@ def _atomic_save_matrix(path: Path, matrix: np.ndarray, meta_bytes: np.ndarray) 
     """Write ``matrix`` plus its ``_meta_json`` blob as one safetensors file."""
     from safetensors.numpy import save_file
 
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(".safetensors.tmp")
-    save_file({"matrix": matrix, "_meta_json": meta_bytes}, str(tmp))
-    os.replace(tmp, path)
+    with atomic_path(path) as tmp:
+        save_file({"matrix": matrix, "_meta_json": meta_bytes}, str(tmp))

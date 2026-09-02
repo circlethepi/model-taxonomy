@@ -46,7 +46,6 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
-import os
 import re
 import shutil
 import sys
@@ -55,6 +54,8 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
+
+from src.utils.atomic import atomic_write_json, atomic_write_text  # noqa: E402
 
 DEFAULT_ROOT = REPO / "results" / "shared_cache"
 DATASETS_DIR = "01_datasets"
@@ -481,11 +482,10 @@ def _embeddings_agree(a_dir: Path, b_dir: Path) -> bool:
 
 def _write_json(path: Path, payload) -> None:
     """Atomic write, consistent with the cache classes."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(payload, indent=2) if isinstance(payload, dict)
-                   else json.dumps(payload))
-    os.replace(tmp, path)
+    if isinstance(payload, dict):
+        atomic_write_json(path, payload)
+    else:
+        atomic_write_text(path, json.dumps(payload))
 
 
 def main() -> int:

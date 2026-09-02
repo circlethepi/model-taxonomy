@@ -4,6 +4,41 @@
 
 ## Unreleased
 
+### Atomic writes no longer collide between concurrent jobs
+
+Every cache and recipe write was "write a temp file, then `os.replace` it into place",
+with the temp name derived from the destination alone (`path.with_suffix(".tmp")`). Two
+processes writing the *same* destination therefore shared one temp path, and the loser's
+`os.replace` raised `FileNotFoundError` because the winner had already renamed the file
+out from under it.
+
+This is not hypothetical. It killed two jobs of the `simplex3_nemo` submission —
+`functional_qonly` and `behavioral_qonly_shard0`, both two seconds in — when ~55 SLURM
+jobs started in the same second and every one of them tried to materialize the same
+`yahoo_033g1_033g2_033g3_qtc` recipe. The recipe path is the worst case because *every*
+job in a suite builds the same one, but all 21 atomic-write sites had the same flaw.
+
+New `src/utils/atomic.py` owns the pattern: `atomic_write_bytes` / `_text` / `_json` for
+payloads, and an `atomic_path` context manager for writers that take a filename
+(`safetensors.save_file`, `torch.save`, `np.savez`). Temp names now carry the writing
+process's pid and a random token, so concurrent writers never contend for the temp path.
+They still race on the *destination*, but `os.replace` is atomic — last writer wins, and
+a reader sees one complete file or the other, never a partial one. For content-addressed
+paths, which is most of this cache, racing writers are producing identical bytes anyway.
+
+Two details worth keeping:
+
+- Temp names end in `.tmp` and never in a real extension, which keeps them outside
+  `_ARTIFACT_GLOB` in `src/cache/_draw_keyed.py` — that glob is `*.safetensors` rather
+  than `*` precisely so an interrupted write is not mistaken for a complete artifact.
+- `np.savez` appends `.npz` unless the name already ends in it, so `atomic_path` takes a
+  `suffix` argument for that one case rather than letting the rename miss its target.
+
+Verified by reproducing the original failure: 120 concurrent processes writing one
+recipe fail 5 times on the old code with exactly the production `FileNotFoundError`, and
+0 times on the new. `check_analysis.py` reports the same 5 pre-existing data failures
+before and after, so nothing regressed.
+
 ### simplex3 on Mistral-Nemo-12B and OLMo-2-1B
 
 Two more chat suites at two new scales, `nemo` and `olmo2`, at full parity with `qwen`

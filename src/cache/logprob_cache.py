@@ -52,11 +52,11 @@ from the full rows, the full rows are not recoverable from the trimmed view.
 from __future__ import annotations
 
 import json
-import os
 from pathlib import Path
 
 import numpy as np
 
+from src.utils.atomic import atomic_path
 from src.cache._draw_keyed import DrawKeyedCache, adapter_slug
 from src.cache.generated_text_cache import GeneratedTextCache
 
@@ -414,7 +414,5 @@ def _atomic_save_tensors(path: Path, tensors: dict[str, np.ndarray]) -> None:
     """Write several named arrays as one safetensors file, atomically."""
     from safetensors.numpy import save_file
 
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(".safetensors.tmp")
-    save_file(tensors, str(tmp))
-    os.replace(tmp, path)
+    with atomic_path(path) as tmp:
+        save_file(tensors, str(tmp))

@@ -64,12 +64,13 @@ catalogue no cache hit depends on.  See ``docs/notes/pairwise_store.md``.
 from __future__ import annotations
 
 import json
-import os
 import re
 from datetime import datetime, timezone
 from pathlib import Path
 
 from ._draw_keyed import DrawKeyedCache
+
+from src.utils.atomic import atomic_write_json
 
 #: The selector fields that go into the readable slug, in this fixed order.
 #: Fixed because dict iteration order is a property of how a dict was built, and
@@ -353,9 +354,7 @@ class PairwiseCache:
 
 
 def _atomic_json(path: Path, payload) -> None:
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(payload, indent=2, sort_keys=True))
-    os.replace(tmp, path)
+    atomic_write_json(path, payload, sort_keys=True)
 
 
 def _layers_token(value) -> str:

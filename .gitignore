@@ -13,5 +13,6 @@ figures/nosync
 figures/simplex3_qwen/*.png
 figures/simplex3_qwen_v2/*.png
 figures/simplex3_qwen_v3/*.png
+figures/simplex3_qwen-05temp/*.png
 
 docs/notes/

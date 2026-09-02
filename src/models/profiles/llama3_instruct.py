@@ -33,6 +33,9 @@ LLAMA3_INSTRUCT = ModelProfile(
         "e10ca381b1ccc5cf9db52e371f3b6651576caee0a630b452e2816b2d404d4b65"
     ),
     chat_template_kwargs={},  # {} == the template's own defaults
+    # The generation prompt ends "<|end_header_id|>\n\n"; the header token is
+    # atomic, so the cut moves the two newlines into the completion.
+    prompt_end_token="<|end_header_id|>",
     expected_lora_params=13_631_488,
     excluded_lora_modules=(),
     pad_token="<|finetune_right_pad_id|>",

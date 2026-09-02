@@ -33,6 +33,9 @@ MISTRAL_NEMO = ModelProfile(
         "e4676cb56dffea7782fd3e2b577cfaf1e123537e6ef49b3ec7caa6c095c62272"
     ),
     chat_template_kwargs={},  # {} == the template's own defaults
+    # The generation prompt ends exactly at "[/INST]", which is atomic, so
+    # nothing is discarded at all.
+    prompt_end_token="[/INST]",
     expected_lora_params=19_660_800,
     excluded_lora_modules=(),
     pad_token="<pad>",

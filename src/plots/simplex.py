@@ -251,6 +251,25 @@ def align_to_simplex(
     return x
 
 
+def _in_simplex_frame(coords: np.ndarray, model_ids: Sequence[str]) -> np.ndarray:
+    """:func:`align_to_simplex`, falling back to *coords* when it has no frame.
+
+    Alignment is the default for every MDS scatter here, so it has to cope with
+    a collection that does not define the frame — one with no pure-g1 model, or
+    no centre — rather than taking the whole figure down over one panel. The
+    frame is a convention for where to stand, and a collection that cannot say
+    where to stand is still perfectly plottable from wherever MDS left it.
+
+    The fallback is silent by design in only one direction: it fires on a
+    *missing vertex*, which is a property of the collection and identical for
+    every panel in the figure, so a partially-aligned grid is not reachable.
+    """
+    try:
+        return align_to_simplex(coords, model_ids)
+    except ValueError:
+        return np.asarray(coords, dtype=float)
+
+
 def ternary_legend(
     ax: plt.Axes,
     model_ids: Sequence[str] | None = None,
@@ -464,6 +483,15 @@ def mds_grid(
 
     Panel titles carry Kruskal stress rather than sklearn's raw ``stress_``,
     which is in squared matrix units and so is not comparable between panels.
+
+    Every panel is drawn in the simplex's own frame (:func:`align_to_simplex`):
+    the centre mixture at the origin, pure g1 straight up, pure g2 to the right —
+    the orientation :func:`ternary_legend` is drawn in. An MDS solution is fixed
+    only up to translation, rotation and reflection, so without this each panel
+    arrives in an arbitrary one of those and a grid of them cannot be compared by
+    eye: two panels showing the *same* arrangement look unrelated because one is
+    mirrored. It is a similarity transform, so no distance, stress or score
+    moves — it only chooses where to stand.
     """
     from src.analysis.bridge import fit_geometry
     from src.analysis.quality import kruskal_stress
@@ -491,7 +519,7 @@ def mds_grid(
                            f"(max distance {float(np.max(np.abs(cell.matrix))):.1e})")
             else:
                 geo = fit_geometry(cell, "mds", 2, random_state=random_state)
-                xy = geo.coordinates
+                xy = _in_simplex_frame(geo.coordinates, geo.model_ids)
                 ax.scatter(
                     xy[:, 0], xy[:, 1],
                     c=model_colors(geo.model_ids, anchors),
@@ -558,14 +586,11 @@ def crosslevel_mds(
     figure and its own tables reporting two numbers for one configuration. Pass
     the disparity computed under this same seed, or leave it off.
 
-    Three things separate this from :func:`mds_grid`, which stays as it is for
-    the dense surrogate x metric grids:
+    Two things separate this from :func:`mds_grid`, which stays as it is for the
+    dense surrogate x metric grids. The shared frame is no longer one of them:
+    :func:`align_to_simplex` is applied by both, and this function is where that
+    convention started before it became the default everywhere.
 
-    * **A shared frame.** Every panel is put through :func:`align_to_simplex`, so
-      the centre mixture is at the origin and the pure-g1 model is straight up in
-      all of them. Without it, four independently-fitted embeddings arrive in
-      four arbitrary orientations and cannot be compared by eye at all. It is a
-      similarity transform, so nothing measurable moves.
     * **True 1:1 axes.** ``adjustable="box"`` with symmetric limits, rather than
       ``adjustable="datalim"``, so a unit of x is a unit of y *and* the panel is
       square. Under ``datalim`` matplotlib satisfies the aspect by stretching the

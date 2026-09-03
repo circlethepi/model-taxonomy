@@ -106,18 +106,16 @@ PERSPECTIVES = [
 #: a placement, so the bars are indexed into PERSPECTIVES by label.
 BAR_ORDER = ["Data", "Structural", "Functional", "Behavioral"]
 
-#: Figure version -> (CSV column, transform, axis label, better direction).
+#: Figure version -> (CSV column, transform, axis label).
 #: The transform is applied to the column as read; ``1 - procrustes`` is the
 #: only one that is not the identity, and it exists purely so a disparity can be
 #: read on the same "further out is better" convention as dcor.
 SCORES = {
-    "dcor": ("dcor", lambda v: v,
-             "Distance correlation with ground truth", "higher is better"),
+    "dcor": ("dcor", lambda v: v, "Distance correlation with data mixture"),
     "procrustes": ("procrustes", lambda v: v,
-                   "Procrustes disparity vs. ground truth", "lower is better"),
+                   "Procrustes disparity vs. data mixture"),
     "1-procrustes": ("procrustes", lambda v: 1.0 - v,
-                     "1 - Procrustes disparity vs. ground truth",
-                     "higher is better"),
+                     "1 - Procrustes disparity vs. data mixture"),
 }
 
 
@@ -133,7 +131,7 @@ def collect(figures_root: Path) -> dict[str, dict[str, dict[str, float]]]:
                 )
                 for label, level, surrogate, metric in PERSPECTIVES
             }
-            for version, (column, transform, _, _) in SCORES.items()
+            for version, (column, transform, _) in SCORES.items()
         }
     return out
 
@@ -150,9 +148,9 @@ def _series(scores, version, labels):
 
 
 def draw_radar(scores, version: str, outdir: Path) -> Path:
-    _, _, axis_label, direction = SCORES[version]
+    _, _, axis_label = SCORES[version]
     labels = [p[0] for p in PERSPECTIVES]
-    set_style("one_col", fig_width=6.0, fig_height=5.0)
+    set_style("one_col", fig_width=4.4, fig_height=3.7)
     fig, ax = plt.subplots(subplot_kw={"projection": "polar"})
     plot_radar(
         _series(scores, version, labels),
@@ -172,7 +170,7 @@ def draw_radar(scores, version: str, outdir: Path) -> Path:
         #   numbered once on the Data spoke -- all four share the one scale.
         spoke_axes=True,
         rlabel_spoke=labels.index("Data"),
-        title=f"{axis_label}\n({direction})",
+        title=axis_label,
         savefig=False,
     )
     #   The spoke labels sit outside the axes, and the left/right ones are the
@@ -186,7 +184,7 @@ def draw_radar(scores, version: str, outdir: Path) -> Path:
 
 
 def draw_bars(scores, version: str, outdir: Path) -> Path:
-    _, _, axis_label, direction = SCORES[version]
+    _, _, axis_label = SCORES[version]
     set_style("one_col", fig_width=6.5, fig_height=3.6)
     fig, ax = plt.subplots()
     plot_grouped_bars(
@@ -204,7 +202,7 @@ def draw_bars(scores, version: str, outdir: Path) -> Path:
         #   A fixed 0-1 axis leaves no headroom above a 0.98 bar, so tall bars
         #   take the label inside and short ones keep it above.
         annot_inside="auto",
-        title=f"{axis_label} ({direction})",
+        title=axis_label,
         legend_kwargs={"loc": "upper center", "bbox_to_anchor": (0.5, -0.12),
                        "ncol": 4, "frameon": False},
         savefig=False,

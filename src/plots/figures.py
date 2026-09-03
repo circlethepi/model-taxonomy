@@ -6,6 +6,7 @@ from typing import Any, Callable
 import math
 
 import matplotlib.pyplot as plt
+import matplotlib.transforms as mtransforms
 from mpl_toolkits.axes_grid1 import make_axes_locatable
 import numpy as np
 import seaborn as sns
@@ -407,6 +408,7 @@ def plot_radar(
     spoke_axes: bool = False,
     tick_len: float = 0.018,
     rlabel_spoke: int | None = 0,
+    rlabel_pad: float = 5.0,
     title: str | None = None,
     legend: bool = True,
     legend_kwargs: dict | None = None,
@@ -432,7 +434,10 @@ def plot_radar(
     unrelated quantities that merely share a scale.  *tick_len* sizes those
     marks as a fraction of the radial range, and *rlabel_spoke* indexes the one
     spoke that gets numeric tick labels (``None`` for none) -- repeating the
-    numbers on every spoke only adds clutter, since the scale is shared.
+    numbers on every spoke only adds clutter, since the scale is shared.  Those
+    labels are pushed *rlabel_pad* points to the side of their spoke, clear of
+    the line and of the tick marks; the offset is perpendicular and measured on
+    the page, so every label clears by the same amount whatever its radius.
 
     ``NaN`` values are drawn as gaps rather than pulling the polygon to zero.
     Passing *rlim* fixes the radial range, which is what makes two radars
@@ -484,7 +489,8 @@ def plot_radar(
         ax.set_yticks(rticks)
 
     if spoke_axes:
-        _draw_spoke_axes(ax, theta, tick_len, rlabel_spoke)
+        _draw_spoke_axes(ax, theta, tick_len, rlabel_spoke, rlabel_pad,
+                         start_angle, direction)
 
     if title:
         ax.set_title(title)
@@ -497,7 +503,8 @@ def plot_radar(
     return fig, ax
 
 
-def _draw_spoke_axes(ax, theta, tick_len, rlabel_spoke):
+def _draw_spoke_axes(ax, theta, tick_len, rlabel_spoke, rlabel_pad,
+                     start_angle, direction):
     """Replace a polar axes' rings and frame with one ticked axis per spoke.
 
     Called by :func:`plot_radar` for ``spoke_axes=True``.  Runs after the data
@@ -525,13 +532,39 @@ def _draw_spoke_axes(ax, theta, tick_len, rlabel_spoke):
             if r <= lo:
                 continue
             half = tick_len * (hi - lo) / r
+            #   clip_on=False for the same reason as the spoke line: the mark at
+            #   the outer limit straddles the axes boundary, so half of it is
+            #   outside and would otherwise be cut away.
             ax.plot([t - half, t + half], [r, r], color=color, linewidth=lw,
-                    solid_capstyle="butt", zorder=1)
+                    solid_capstyle="butt", zorder=1, clip_on=False)
 
     if rlabel_spoke is None:
         ax.set_yticklabels([])
-    else:
-        ax.set_rlabel_position(np.rad2deg(theta[rlabel_spoke % len(theta)]))
+        return
+
+    spoke = theta[rlabel_spoke % len(theta)]
+    ax.set_rlabel_position(np.rad2deg(spoke))
+    if not rlabel_pad:
+        return
+
+    #   set_rlabel_position centres the numbers on the spoke, where the axis
+    #   line runs straight through them.  Shifting them along the spoke would
+    #   only move them onto a different part of the same line, so the offset is
+    #   perpendicular to it, in points, applied on top of whatever transform
+    #   the tick labels already carry.
+    on_page = np.deg2rad(start_angle) + (-1 if direction == "cw" else 1) * spoke
+    dx, dy = np.sin(on_page), -np.cos(on_page)
+    shift = mtransforms.ScaledTranslation(
+        rlabel_pad * dx / 72, rlabel_pad * dy / 72,
+        ax.get_figure().dpi_scale_trans)
+    for lab in ax.get_yticklabels():
+        lab.set_transform(lab.get_transform() + shift)
+        #   Anchor the text on the side the shift came from, so the pad is a
+        #   gap between line and glyphs rather than a nudge of the whole box.
+        lab.set_horizontalalignment(
+            "left" if dx > 0.1 else "right" if dx < -0.1 else "center")
+        lab.set_verticalalignment(
+            "bottom" if dy > 0.1 else "top" if dy < -0.1 else "center")
 
 
 # ── plot_grouped_bars ─────────────────────────────────────────────────────────

@@ -66,30 +66,33 @@ import matplotlib.pyplot as plt  # noqa: E402
 from src.plots import make_series, plot_grouped_bars, plot_radar, set_style  # noqa: E402
 from src.plots.simplex_suite import read_scores_csv, select_score  # noqa: E402
 
-#: Source run per base model, in legend order: (base model, figure dir, colour).
+#: Source run per base model: (base model, figure dir, colour, marker, dash).
 #: The base model is the ``BASE_MODEL`` of that directory's own make_figures.py,
 #: written out in full so the legend name is never guessed -- OLMo here is the
 #: **1B** instruct model, not the 7B. The directory is the suite whose
 #: crosslevel_scores.csv is authoritative for that model -- qwen_v4 rather than
 #: qwen_v3 because v4 is the restricted run the llama figures are read against.
 #:
+#: The order is **ascending parameter count**, and it is the order of the bars
+#: within each group and of the legend on every figure. Size is the one axis
+#: these four models can be put on that is not arbitrary, so a trend across a
+#: group can be read left to right; the count is in the model name in each case.
+#:
 #: Colours are Okabe-Ito, which is designed to stay separable under the common
-#: colour-vision deficiencies.
+#: colour-vision deficiencies. Marker and dash travel with the model rather than
+#: with its position, so the series stay separable in greyscale and a reordering
+#: here does not silently reassign them.
 MODELS = [
-    ("meta-llama/Llama-3.1-8B-Instruct",   "simplex3_llama3i", "#0072B2"),  # blue
-    ("mistralai/Mistral-Nemo-Instruct-2407", "simplex3_nemo",  "#D55E00"),  # vermillion
-    ("allenai/OLMo-2-0425-1B-Instruct",    "simplex3_olmo2",   "#E69F00"),  # gold
-    ("Qwen/Qwen3.5-4B",                    "simplex3_qwen_v4", "#CC79A7"),  # purple
+    ("allenai/OLMo-2-0425-1B-Instruct",      "simplex3_olmo2",   "#E69F00", "^", "-."),   # 1B,  gold
+    ("Qwen/Qwen3.5-4B",                      "simplex3_qwen_v4", "#CC79A7", "D", ":"),    # 4B,  purple
+    ("meta-llama/Llama-3.1-8B-Instruct",     "simplex3_llama3i", "#0072B2", "o", "-"),    # 8B,  blue
+    ("mistralai/Mistral-Nemo-Instruct-2407", "simplex3_nemo",    "#D55E00", "s", "--"),   # 12B, vermillion
 ]
 
 
 def label_of(base_model: str) -> str:
     """Legend name for a base model: the HF repo id without its org prefix."""
     return base_model.split("/")[-1]
-
-#: Marker and dash per model, carried alongside colour so the series stay
-#: separable in greyscale and for readers who cannot rely on hue alone.
-ENCODINGS = [("o", "-"), ("s", "--"), ("^", "-."), ("D", ":")]
 
 #: (spoke label, level, surrogate substring, metric). The order is the order the
 #: spokes are drawn in, counter-clockwise from the top: Data at the top,
@@ -122,7 +125,7 @@ SCORES = {
 def collect(figures_root: Path) -> dict[str, dict[str, dict[str, float]]]:
     """``{model: {version: {perspective: score}}}`` for every model in MODELS."""
     out: dict[str, dict[str, dict[str, float]]] = {}
-    for base_model, subdir, _ in MODELS:
+    for base_model, subdir, *_ in MODELS:
         rows = read_scores_csv(figures_root / subdir / "crosslevel_scores.csv")
         out[label_of(base_model)] = {
             version: {
@@ -143,7 +146,7 @@ def _series(scores, version, labels):
             [scores[label_of(base_model)][version][lbl] for lbl in labels],
             label=label_of(base_model), color=color, marker=marker, linestyle=ls,
         )
-        for (base_model, _, color), (marker, ls) in zip(MODELS, ENCODINGS)
+        for base_model, _, color, marker, ls in MODELS
     ]
 
 

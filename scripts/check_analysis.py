@@ -2223,9 +2223,14 @@ def t_figure_specs_follow_layout():
     """
     import importlib.util
 
+    # The suite moved out of scripts/ into src/plots/simplex_suite.py when it
+    # gained a second and third driver; the spec builders and the architecture
+    # derivation this checks went with it.  Still loaded by path rather than
+    # imported, so the check keeps working from a worktree whose sys.path may
+    # not carry the checkout.
     root = Path(__file__).resolve().parent.parent
     spec = importlib.util.spec_from_file_location(
-        "_figs", root / "scripts" / "make_simplex3_figures.py")
+        "_figs", root / "src" / "plots" / "simplex_suite.py")
     figs = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(figs)
 

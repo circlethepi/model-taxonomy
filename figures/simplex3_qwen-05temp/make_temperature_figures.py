@@ -28,7 +28,7 @@ from.
 
 Reuse
 -----
-Everything here comes from ``scripts/make_simplex3_figures.py``: the selector
+Everything here comes from ``src/plots/simplex_suite.py``: the selector
 schema, the per-row metric loop that resolves each row's tensors once, both grid
 figures, the two scores, and the ``06_pairwise`` read-through cache. This module
 contributes a temperature→hash lookup, the slice/surrogate tables, and the
@@ -59,12 +59,17 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT))
 sys.path.insert(0, str(REPO_ROOT / "scripts"))
 
-# `make_simplex3_figures` pins the BLAS thread count to 1 before it imports
-# numpy, and that is load-bearing rather than tidy: unpinned, the behavioral
-# level did not finish inside 50 minutes on this host. Importing numpy — or
-# anything that imports numpy — above this line would let the default thread
-# count win. So this import comes first, and everything numeric comes from it.
-import make_simplex3_figures as S  # noqa: E402
+# `simplex_suite` pins the BLAS thread count to 1 before it imports numpy, and
+# that is load-bearing rather than tidy: unpinned, the behavioral level did not
+# finish inside 50 minutes on this host. Importing numpy — or anything that
+# imports numpy — above this line would let the default thread count win. So
+# this import comes first, and everything numeric comes from it.
+#
+# The suite machinery used to live in `scripts/make_simplex3_figures.py`, which
+# is now a thin Qwen driver over this module. Importing the driver would still
+# work, but the module-level assignments below (`S.METRIC_COLS`, `S.SUITE_CACHE`)
+# have to land on the module the builders actually read, so import that module.
+import src.plots.simplex_suite as S  # noqa: E402
 from gen_simplex3 import temp_token  # noqa: E402
 
 import numpy as np  # noqa: E402

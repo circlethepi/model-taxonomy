@@ -349,3 +349,43 @@ def plot_distance_heatmap(
         _save(fig, _resolve_savepath(savepath, title or _title))
     return fig, ax
 
+
+
+# ── encoding_legend ───────────────────────────────────────────────────────────
+
+def encoding_legend(
+    ax: plt.Axes,
+    *groups: tuple[str, dict[str, dict]],
+    loc: str | tuple | list = "best",
+    **legend_kw,
+) -> list[Any]:
+    """Attach one legend per visual encoding, instead of one per line.
+
+    A plot that encodes two variables at once — colour for one, linestyle or
+    marker for the other — has as many lines as the product of the two, and a
+    single legend listing every line makes the reader recover the encoding from
+    the labels. Two short legends state it directly.
+
+    Each *group* is ``(title, {label: line_kwargs})``, where ``line_kwargs`` are
+    passed to ``matplotlib.lines.Line2D`` (``color``, ``linestyle``, ``marker``
+    …). Entries carry no data; they are proxy handles drawn for the key alone.
+    *loc* is either one location for every group — which overlaps them, so pass
+    it only with a single group — or one location per group.
+
+    Returns the legend artists, first group first. Only the last legend a call
+    to ``ax.legend`` creates survives on the axes, so every group but the last
+    is re-attached with ``add_artist``.
+    """
+    from matplotlib.lines import Line2D
+
+    locs = list(loc) if isinstance(loc, list) else [loc] * len(groups)
+    if len(locs) != len(groups):
+        raise ValueError(f"{len(locs)} locations for {len(groups)} legend groups")
+
+    legends = []
+    for (title, entries), where in zip(groups, locs):
+        handles = [Line2D([], [], label=label, **kw) for label, kw in entries.items()]
+        legends.append(ax.legend(handles=handles, title=title, loc=where, **legend_kw))
+    for leg in legends[:-1]:
+        ax.add_artist(leg)
+    return legends

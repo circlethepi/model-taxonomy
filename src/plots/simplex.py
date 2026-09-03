@@ -618,8 +618,15 @@ def crosslevel_mds(
     bold = {"fontweight": "bold", "fontfamily": family}
 
     n = len(panels)
-    fig = plt.figure(figsize=(panel_w * (n + 1) + 0.4, panel_h + 1.15),
-                     layout="constrained")
+    # A panel name may arrive wrapped over several lines (the cross-level
+    # variant that names each level's winning perspective under its level).
+    # The score block below it is already the tallest thing in the header, so
+    # the extra lines have to buy their own height or they push the panel
+    # titles up into the subtitle.
+    extra_lines = max((str(p[0]).count("\n") for p in panels), default=0)
+    fig = plt.figure(
+        figsize=(panel_w * (n + 1) + 0.4, panel_h + 1.15 + 0.24 * extra_lines),
+        layout="constrained")
     # The legend column is wider than a panel: the triangle carries sixteen
     # labels plus three vertex names, and it is the key everything else is read
     # through, so it should not be the smallest thing in the figure.

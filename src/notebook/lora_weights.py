@@ -361,10 +361,26 @@ def _find_safetensors(root: Path, name: str) -> Path:
     if direct.exists():
         return direct
     # one level nested: root/*/name/adapter_model.safetensors
-    for candidate in sorted(root.iterdir()):
-        nested = candidate / name / "adapter_model.safetensors"
-        if nested.exists():
-            return nested
+    #
+    # Every match is collected rather than the first one returned. One adapter
+    # name under two base-model slugs is not a far-fetched case: a suite family
+    # trains the same recipes on every base model, so `03_adapters` holds the
+    # identical sixteen names under `Qwen--Qwen3.5-4B` and under
+    # `meta-llama--Llama-3.1-8B-Instruct`. Returning the first was returning
+    # whichever slug sorted lowest -- `Q` before `m` -- so a llama caller got
+    # qwen's weights, with no error and a plausible-looking number at the end of
+    # it. Callers that know their base model should pass the scoped root and
+    # take the flat branch above; this is for the ones that cannot.
+    nested = [c / name / "adapter_model.safetensors" for c in sorted(root.iterdir())
+              if (c / name / "adapter_model.safetensors").exists()]
+    if len(nested) == 1:
+        return nested[0]
+    if len(nested) > 1:
+        raise FileNotFoundError(
+            f"{name!r} is ambiguous under {root}: it exists beneath "
+            f"{[p.parent.parent.name for p in nested]}. Pass the base-model-scoped "
+            f"root (e.g. {root / nested[0].parent.parent.name}) to say which is meant."
+        )
     raise FileNotFoundError(
         f"No adapter_model.safetensors found for {name!r} under {root}.\n"
         "Check that adapter_root points to a directory containing raw PEFT adapter folders\n"

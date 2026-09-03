@@ -15,6 +15,8 @@ figures/simplex3_qwen_v2/*.png
 figures/simplex3_qwen_v3/*.png
 figures/simplex3_qwen_v4/*.png
 figures/simplex3_llama3i/*.png
+figures/simplex3_nemo/*.png
+figures/simplex3_olmo2/*.png
 # Unlike the suites above, this directory tracks nothing it generates -- not the
 # score tables either. Only the script that rebuilds them is kept.
 figures/simplex3_qwen-05temp/*

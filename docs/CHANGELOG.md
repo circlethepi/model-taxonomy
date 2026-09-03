@@ -4,6 +4,42 @@
 
 ## Unreleased
 
+### The `olmo2` suite is unparked
+
+The previous release generated the `olmo2` suite and then forbade submitting it: its
+rendered training prompt was the bare string `<|endoftext|>`. That was a defect in shared
+prompt rendering, fixed above by declaring the cut point instead of deriving it. The
+profile notes and the suite table row are rewritten from a parking warning into a
+description of the checkpoint, and `submit_all.sh` is live again.
+
+**Re-smoked on the fixed renderer** (run 264063, H200, `train_shard0.yaml`) — 5 passed, 0
+failed:
+
+| stage | parked (237512) | now (264063) |
+|---|---|---|
+| 1b template renders | prompt is **13 chars** | prompt is **65 chars**, stable across renders |
+| 2 checkpoint loads | pass | 1.48B params, 16 layers, 0 missing keys |
+| 3 LoRA attaches | pass | 4,194,304 trainable, 64 modules across 16/16 layers |
+| 4 completion-only loss | pass | mean 66 supervised tokens, 4/200 rows truncated at 512 |
+| 5 generation terminates | **`termination_rate 0.00`** | **`termination_rate 0.75`**, median length 119 |
+
+**Stage 5 needed no resolution.** The plan carried a decision — declare the truncation via
+`allow_truncated_generation=True` rather than raise `max_new_tokens`, the treatment
+Mistral-Nemo received — to be applied *if the failure recurred*. It did not. The 0.00 was
+an artifact of the empty prompt: a model handed no question has no reason to stop. So
+`allow_truncated_generation` stays `False` and OLMo-2 keeps the termination check at full
+force. This is also the cleanest available evidence that the two smoke failures had one
+cause rather than two.
+
+The parking notice's claim that `tiiuae/Falcon3-1B-Instruct` was "verified clean through
+the same code path" is **retracted** in the profile notes. Under the atomicity check that
+ships above, Falcon3's `<|assistant|>` is not in its added vocabulary, so declaring it as a
+cut point is refused; that checkpoint would have needed `prompt_end_token=None` for exactly
+the same reason OLMo-2 does. The swap would not have avoided anything.
+
+`gen_simplex3.py` reproduces the tree with an empty diff — this changes prose and a
+profile's `notes`, neither of which reaches a config or a cache key.
+
 ### The prompt end is declared by the profile, not guessed from the vocabulary
 
 `render_prompt` used to finish by calling `_trim_to_last_atomic`, which scanned the

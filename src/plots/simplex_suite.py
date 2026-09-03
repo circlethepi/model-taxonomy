@@ -621,6 +621,23 @@ def _fsel(layers):
 
 
 def functional_layer_rows():
+    """Five single-state rows: the control, two early probes, mid-stack, final.
+
+    ``mid`` and ``final`` are derived from the layer count rather than written
+    down, because "the final hidden state" is a *position* in the stack and a
+    literal ``32`` only names it on a 32-layer model.  On Qwen3.5-4B and
+    Llama-3.1-8B the arithmetic reproduces ``h16``/``h32`` exactly, so their
+    figure sets are unchanged; Mistral-Nemo's 40 layers give ``h20``/``h40`` and
+    OLMo-2-1B's 16 give ``h8``/``h16``, where a hard-coded ``h32`` would have
+    been a mid-stack layer mislabelled as the last one and an index the model
+    does not have.
+
+    The ``h1``/``h4`` labels are left as they are: naming a *first* layer of each
+    attention family is a hybrid's question, and both indices are read off
+    Qwen3.5's ``full_attention_interval`` of 4.  On a uniform model they are two
+    early layers under names that overclaim, which is why no uniform-model driver
+    selects them.
+    """
     return {
         # h0 is the negative control: LoRA never touches the embedding matrix, so
         # all 16 models are identical here and whatever a metric reports is its
@@ -628,8 +645,8 @@ def functional_layer_rows():
         "h0 · embeddings (control)":  _fsel([0]),
         "h1 · first linear-attn":     _fsel([1]),
         "h4 · first full-attn":       _fsel([4]),
-        "h16 · mid-stack (full-attn)": _fsel([16]),
-        "h32 · final hidden state":   _fsel([32]),
+        f"h{N_STATES // 2} · mid-stack (full-attn)": _fsel([N_STATES // 2]),
+        f"h{N_LAYERS} · final hidden state":        _fsel([N_LAYERS]),
     }
 
 
@@ -1392,7 +1409,8 @@ def _selected_level(idx, ids, names, level, chosen, surrogates):
 
 def run_suite(*, base_model, draw, outdir, cache_root=None, levels=None,
               skip_sweep=False, skip_detail=False, surrogates=False,
-              no_cache=False, select=None, source=None, n_expected=16):
+              no_cache=False, select=None, source=None, n_expected=16,
+              crosslevel_only=False):
     """Build the figure suite for one run.
 
     This is the old ``main()`` body with the argument parsing lifted out, so the
@@ -1404,6 +1422,14 @@ def run_suite(*, base_model, draw, outdir, cache_root=None, levels=None,
     the unrestricted qwen run byte-for-byte what it was. *source* is recorded in
     every stored collection's ``config.json`` and should name the **driver**, so
     a cached collection says which run wrote it.
+
+    *crosslevel_only* keeps the cross-level closer and drops every other output:
+    the per-level grids, the per-metric detail panels, the functional layer sweep
+    and the barycentric colour key. It changes what is **written**, never what is
+    computed — every perspective is still built and scored, so
+    ``crosslevel_agreement.md`` and ``crosslevel_scores.csv`` rank exactly what
+    they would in a full run. Use it for a suite that exists to be compared with
+    others rather than read on its own.
 
     The run coordinates other than *base_model* and *draw* — the samplers, the
     embedders, ``MAX_NEW_TOKENS`` — are deliberately **not** parameters. They are
@@ -1440,6 +1466,15 @@ def run_suite(*, base_model, draw, outdir, cache_root=None, levels=None,
 
     select = select or {}
     levels = levels or list(ALL_LEVELS)
+    if crosslevel_only:
+        # The detail panels and the layer sweep are per-level outputs like the
+        # grids, so one flag turns off all three rather than asking a driver to
+        # remember to pass three.
+        skip_detail = skip_sweep = True
+        if len(levels) < 2:
+            raise SystemExit(
+                "--crosslevel-only with fewer than two levels would write "
+                "nothing: the cross-level closer needs at least two panels.")
     outdir = Path(outdir)
     outdir.mkdir(parents=True, exist_ok=True)
     set_style("two_col_full")
@@ -1454,11 +1489,21 @@ def run_suite(*, base_model, draw, outdir, cache_root=None, levels=None,
         raise SystemExit(
             f"expected {n_expected} models, found {len(ids)} — cache incomplete?")
 
-    fig, ax = plt.subplots(figsize=(4.2, 4.0))
-    ternary_legend(ax, ids, label_models=True)
-    ax.set_title("simplex3 mixtures — barycentric colour key", fontsize=9)
-    save_figure(fig, str(outdir / "fig_ternary_legend.png"))
-    plt.close("all")
+    if not crosslevel_only:
+        fig, ax = plt.subplots(figsize=(4.2, 4.0))
+        ternary_legend(ax, ids, label_models=True)
+        ax.set_title("simplex3 mixtures — barycentric colour key", fontsize=9)
+        save_figure(fig, str(outdir / "fig_ternary_legend.png"))
+        plt.close("all")
+
+    def emit_grid(*args, **kwargs):
+        """:func:`emit`, unless the driver wants the cross-level closer alone.
+
+        Written as a shim rather than a condition at each of the six call sites
+        so that adding a level cannot forget the flag.
+        """
+        if not crosslevel_only:
+            emit(*args, **kwargs)
 
     #: level -> every computed cell, for the cross-level ranking at the end
     per_level = {}
@@ -1471,7 +1516,7 @@ def run_suite(*, base_model, draw, outdir, cache_root=None, levels=None,
             print(f"{level} (restricted to {len(chosen)} perspectives) …")
             rows, cols, cells = _selected_level(
                 idx, ids, names, level, chosen, surrogates)
-            emit(level, list(rows), cells, outdir, title, cols=cols)
+            emit_grid(level, list(rows), cells, outdir, title, cols=cols)
             if not skip_detail:
                 emit_detail(level, list(rows)[0], cells, outdir, detail_title,
                             cols=cols)
@@ -1480,7 +1525,7 @@ def run_suite(*, base_model, draw, outdir, cache_root=None, levels=None,
         elif level == "behavioral":
             print("behavioral …")
             rows, cells = behavioral_cells(idx, ids, surrogates)
-            emit("behavioral", rows, cells, outdir, title)
+            emit_grid("behavioral", rows, cells, outdir, title)
             if not skip_detail:
                 emit_detail("behavioral", rows[0], cells, outdir, detail_title)
             per_level["behavioral"] = cells
@@ -1489,13 +1534,13 @@ def run_suite(*, base_model, draw, outdir, cache_root=None, levels=None,
             print("functional (individual layers) …")
             lrows = {k: (v, None) for k, v in functional_layer_rows().items()}
             rows, cells = functional_cells(idx, ids, lrows)
-            emit("functional_layers", rows, cells, outdir,
-                 "Functional level — individual layers")
+            emit_grid("functional_layers", rows, cells, outdir,
+                      "Functional level — individual layers")
             print("functional (groupings) …")
             grows, gcells = functional_cells(
                 idx, ids, functional_group_rows(surrogates))
-            emit("functional_groups", grows, gcells, outdir,
-                 "Functional level — layer groupings")
+            emit_grid("functional_groups", grows, gcells, outdir,
+                      "Functional level — layer groupings")
             if not skip_detail:
                 emit_detail("functional", grows[0], gcells, outdir, detail_title)
             per_level["functional"] = {**cells, **gcells}
@@ -1518,7 +1563,7 @@ def run_suite(*, base_model, draw, outdir, cache_root=None, levels=None,
                 # returns onto the full ids the mixture parser and the colour
                 # system expect, before storing anything.
                 rows, cells = _structural_grid(idx, names, ids, specs)
-                emit(tag, rows, cells, outdir, stitle)
+                emit_grid(tag, rows, cells, outdir, stitle)
                 structural_cells.update(cells)
                 if tag == "structural_groups" and not skip_detail:
                     emit_detail("structural", rows[0], cells, outdir, detail_title)
@@ -1528,7 +1573,7 @@ def run_suite(*, base_model, draw, outdir, cache_root=None, levels=None,
             print("dataset_embedding …")
             rows, cells = dataset_cells(
                 idx, ids, dataset_rows(idx, ids, surrogates))
-            emit("dataset_embedding", rows, cells, outdir, title)
+            emit_grid("dataset_embedding", rows, cells, outdir, title)
             if not skip_detail:
                 emit_detail("dataset_embedding", rows[0], cells, outdir,
                             detail_title)

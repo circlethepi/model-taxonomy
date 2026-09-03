@@ -1,0 +1,52 @@
+level,surrogate,metric,dcor,procrustes,stress,n_models,matrix_sha256
+behavioral,R=16 · per query,bw,0.905089,0.721686,0.339026,16,abaf948b8ec96fe4
+behavioral,R=16 · per generation,bw,0.904317,0.733027,0.350417,16,a02da2192eafc6ca
+behavioral,R=16 · per query,cosine,0.900963,0.098088,0.280444,16,c2c6876859949347
+behavioral,R=16 · per query,frobenius,0.896886,0.720562,0.336867,16,5c27bdcca518a14d
+behavioral,R=16 · per query,euclidean,0.896886,0.720562,0.336867,16,6135ab154c35c041
+behavioral,R=16 · per query,cka,0.831431,0.103265,0.255067,16,d7d6ad737c81e31c
+behavioral,greedy · per generation,bw,0.712280,0.782601,0.354968,16,1d1fc6fbc323a6fb
+behavioral,greedy · per generation,cosine,0.696945,0.844265,0.324680,16,8ec0c0090ad5685a
+behavioral,greedy · per generation,euclidean,0.695041,0.794782,0.348762,16,7e93b415b16cb439
+behavioral,greedy · per generation,frobenius,0.695041,0.794782,0.348762,16,ba29c0c656cfa7a0
+behavioral,R=16 · per generation,frobenius,0.621826,0.770592,0.355560,16,0828ec737beb3727
+behavioral,R=16 · per generation,euclidean,0.621826,0.770592,0.355560,16,5361132b937c34d5
+behavioral,R=16 · per generation,cosine,0.616515,0.779167,0.343729,16,c35d09ad4b399b5c
+behavioral,greedy · per generation,cka,0.558054,0.836477,0.312013,16,76035227baa5f41d
+behavioral,R=16 · per generation,cka,0.548396,0.736517,0.334327,16,b937b853b8319660
+functional,all 41 layers (reference),cosine,0.975242,0.008824,0.093892,16,7c0ffd22e35e2d8a
+functional,late third,cosine,0.975065,0.009240,0.089653,16,771c6595eba86bc1
+functional,late third,euclidean,0.967405,0.024085,0.216384,16,cd568b9ea9186669
+functional,late third,frobenius,0.967405,0.024085,0.216384,16,1c847920ce588344
+functional,late third,bw,0.967396,0.024021,0.216054,16,c74aed73887ebfda
+functional,all 41 layers (reference),bw,0.967273,0.024432,0.219433,16,8a13ea07f021d56f
+functional,all 41 layers (reference),euclidean,0.967269,0.024506,0.219657,16,cbec37fedea11c2c
+functional,all 41 layers (reference),frobenius,0.967269,0.024506,0.219657,16,5889cede25f23808
+functional,h40 · final hidden state,cosine,0.967241,0.013466,0.078850,16,633f5af092e11ed4
+functional,h40 · final hidden state,euclidean,0.959626,0.023210,0.208964,16,48eabec3e792bb99
+functional,h40 · final hidden state,frobenius,0.959626,0.023210,0.208964,16,3aab8fe314bf8dd5
+functional,h40 · final hidden state,bw,0.958975,0.023429,0.207952,16,5951bcff044bb7a1
+functional,h40 · final hidden state,cka,0.889411,0.046314,0.162509,16,fc118f42d82af8d8
+functional,late third,cka,0.863381,0.092165,0.139288,16,20bfcaa81f6f569f
+functional,all 41 layers (reference),cka,0.832553,0.113868,0.123916,16,3d44170ef72da0a0
+structural,output projections,cosine,0.955205,0.013909,0.172131,16,410313c229d31308
+structural,v_proj,cosine,0.953852,0.014680,0.177516,16,fdd901f5b2816dd8
+structural,all layers · all projections,cosine,0.949442,0.015851,0.185117,16,a012b5efd11a84f8
+structural,middle third,cosine,0.949255,0.015207,0.183991,16,1a047c029f88b665
+structural,late third,cosine,0.945853,0.016568,0.188109,16,5aa110446e1ae0ca
+structural,"q,k,v (dim-pure)",cosine,0.944084,0.017552,0.195125,16,8a568d33e365fcd0
+structural,k_proj,cosine,0.942410,0.017447,0.191656,16,e4ad7c9495d38a38
+structural,q_proj (whole),cosine,0.941807,0.018411,0.199802,16,59851d5fcfc1fdf2
+structural,output projections,frobenius,0.939448,0.037921,0.267578,16,f68f6ff55609c8d0
+structural,v_proj,frobenius,0.938958,0.036561,0.269517,16,c51f99f13692b405
+structural,all layers · all projections,frobenius,0.933577,0.039145,0.273982,16,7ccfee0738f0a5a2
+structural,middle third,frobenius,0.933182,0.037422,0.273248,16,2ed7fe34836e48e6
+structural,late third,frobenius,0.929831,0.064349,0.276328,16,2e32936bdbdcda4d
+structural,"q,k,v (dim-pure)",frobenius,0.928209,0.040183,0.278815,16,f073580c09b62a9a
+structural,early third,cosine,0.927483,0.025089,0.224425,16,fe1e6006b62a65a8
+structural,q_proj (whole),frobenius,0.925953,0.040786,0.281101,16,42a391a33b877782
+structural,k_proj,frobenius,0.925532,0.041458,0.277438,16,518918d982fb8783
+structural,early third,frobenius,0.911763,0.129668,0.298981,16,80f4d25c3ab0b75f
+dataset_embedding,dataset text · mean · n1000_s00,frobenius,0.979952,0.015251,0.013959,16,9aa61ba7b0d93a57
+dataset_embedding,dataset text · mean · n1000_s00,euclidean,0.979718,0.015227,0.013489,16,0a6cf5360b0557ab
+dataset_embedding,dataset text · mean · n1000_s00,cosine,0.937095,0.075994,0.253430,16,49782cfdbdb340b8

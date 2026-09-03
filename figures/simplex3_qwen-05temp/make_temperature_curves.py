@@ -34,11 +34,17 @@ dash patterns, without either question requiring the eleven-entry key that one
 line-per-label legend would need. Both figures use the same encoding, so the
 dCor and Procrustes figures can be read against each other directly.
 
-Greedy is not on either x axis. ``do_sample=False`` makes the temperature
-parameter inert, so the greedy slice has no temperature to be placed at; it is
-the zero-noise baseline the sweep departs from rather than a point on the curve,
-and ``make_temperature_figures.py`` already shows it beside the sweep. Its rows
-in the CSV are skipped here.
+Greedy sits at T = 0. ``do_sample=False`` makes the temperature parameter inert,
+so the greedy slice carries no temperature of its own; zero is where it belongs
+anyway, as the limit the sampled runs approach — a temperature low enough always
+picks the argmax token, which is what greedy decoding does. The tick is labelled
+``greedy`` rather than ``0.0`` so the figure does not claim the sweep was run at
+that temperature. It is the zero-noise baseline the rest of the curve departs
+from.
+
+Greedy has no ``per query`` surrogate: one replicate means averaging a query's
+replicates is the identity, so ``make_temperature_figures.py`` does not score
+that cell. The orange lines therefore start at T = 0.1.
 
 ``model mean`` has no CKA row at any temperature: the surrogate leaves one row
 per model, and a CKA between two single rows is degenerate. That cell is absent
@@ -96,22 +102,31 @@ SCORES = {
 #: right, stacked, so neither covers a curve.
 LEGEND_LOCS = [(1.03, 0.50), (1.03, 0.00)]
 
+#: Where the greedy slice is drawn, and what its tick says instead of the
+#: number. See the module docstring.
+GREEDY_TEMPERATURE = 0.0
+GREEDY_TICK_LABEL = "greedy"
+
 
 def read_scores(path: Path) -> tuple[list[float], dict[tuple[str, str], dict[float, dict]]]:
     """``(temperatures, {(surrogate, metric): {temperature: row}})`` from the CSV.
 
-    Rows whose slice carries no temperature — greedy — are dropped, and the
-    temperature axis is whatever the remaining rows actually declare rather than
-    a range spelled here, so a re-run over a different sweep needs no edit.
+    The greedy slice is placed at ``GREEDY_TEMPERATURE``; see the module
+    docstring for why zero. Every other x position is whatever the rows
+    themselves declare rather than a range spelled here, so a re-run over a
+    different sweep needs no edit.
     """
     cells: dict[tuple[str, str], dict[float, dict]] = {}
     temps: set[float] = set()
     with open(path, newline="") as fh:
         for row in csv.DictReader(fh):
             slice_label, surrogate = row["surrogate"].split(" · ")
-            if not slice_label.startswith("T="):
+            if slice_label.startswith("T="):
+                temp = float(slice_label.removeprefix("T="))
+            elif slice_label == "greedy":
+                temp = GREEDY_TEMPERATURE
+            else:
                 continue
-            temp = float(slice_label.removeprefix("T="))
             temps.add(temp)
             cells.setdefault((surrogate, row["metric"]), {})[temp] = row
     return sorted(temps), cells
@@ -137,6 +152,8 @@ def curve_figure(temps, cells, column: str, ylabel: str, savepath: Path) -> Path
     plot_lines(temps, series=series, ax=ax, xlabel="Sampling temperature",
                ylabel=ylabel, savepath=savepath)
     ax.set_xticks(temps)
+    ax.set_xticklabels([GREEDY_TICK_LABEL if t == GREEDY_TEMPERATURE else f"{t:g}"
+                        for t in temps])
     legends = encoding_legend(
         ax,
         ("Pooling", {s: {"color": c} for s, c in SURROGATE_COLORS.items()}),

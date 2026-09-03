@@ -7,4 +7,4 @@
 
 
 The full per-level ranking these winners are drawn from is in `crosslevel_agreement.md`.
-The override picks a different row out of that ranking; it does not change how any row scores.
+This variant picks different rows out of that ranking; it does not change how any row scores.

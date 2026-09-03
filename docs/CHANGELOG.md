@@ -34,6 +34,21 @@ form. The six tracked `_dataset_cosine` files are trimmed to match. In `simplex3
 whose format predates the full ranking, the repeated section was the four winner rows
 already printed in its own header table; it is trimmed on the same grounds.
 
+### The dedup covers the `_procrustes` variant too
+
+The `_procrustes` cross-level variant — each panel the surrogate whose *drawn*
+configuration sits closest to the simplex, rather than the one whose distances agree with
+it best — was written against `cross_level` as it stood before the two fixes above, so
+regenerating a suite reintroduced everything they removed: three suffixed scores CSVs and
+three full copies of the ranking, one per variant.
+
+Nothing about that variant needed special handling. `rank_by` is the same kind of knob as
+`metric_override`: it picks a different row out of `per_level_scores`, which is scored
+before either is consulted. So the rule is keyed on `suffix` rather than on which knob was
+turned, and a variant added later is covered without being named. A run now writes one
+`crosslevel_scores.csv` and one `## Every surrogate, per level` section however many
+variants it draws.
+
 ### The `olmo2` suite is unparked
 
 The previous release generated the `olmo2` suite and then forbade submitting it: its

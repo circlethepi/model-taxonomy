@@ -4,7 +4,9 @@ from .figures import (
     encoding_legend,
     make_series,
     plot_distance_heatmap,
+    plot_grouped_bars,
     plot_lines,
+    plot_radar,
     plot_scatter,
     save_figure,
     

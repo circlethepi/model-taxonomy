@@ -1216,9 +1216,10 @@ def _matrix_digest(dm) -> str:
 def write_scores_csv(per_level_scores, path) -> None:
     """One row per scored cell, from the same numbers the tables are built from.
 
-    Run output, not cache: nothing keys off it and nothing reads it back, so it
-    is safe to delete and safe to change. It exists because the markdown tables
-    are for reading and this is for diffing — and because ``matrix_sha256`` is
+    Run output, not cache: nothing keys off it, so it is safe to delete and safe
+    to regenerate. Only :func:`read_scores_csv` reads it back, and only to
+    replot numbers a suite already produced. It exists because the markdown
+    tables are for reading and this is for diffing — and because ``matrix_sha256`` is
     the evidence a later change would need to show that a cached distance matrix
     is the matrix a cold run produces (see ``docs/notes/caching_collections.md``).
     """
@@ -1231,6 +1232,63 @@ def write_scores_csv(per_level_scores, path) -> None:
                 w.writerow([lvl, s.row, s.col, f"{s.dcor:.6f}",
                             f"{s.procrustes:.6f}", f"{s.stress:.6f}",
                             len(s.dm.model_ids), _matrix_digest(s.dm)])
+
+
+_SCORE_FIELDS = ("dcor", "procrustes", "stress")
+
+
+def read_scores_csv(path) -> list[dict]:
+    """Read a :func:`write_scores_csv` file back into a list of row dicts.
+
+    The score columns are parsed to ``float`` and the rest are left as strings.
+    This is the only reader of that file, and it exists so a figure can be drawn
+    from a suite that has already run without paying to recompute it — the CSV
+    is the cheapest handle on numbers that took GPU hours to produce.
+    """
+    with open(path, newline="") as fh:
+        rows = list(csv.DictReader(fh))
+    for r in rows:
+        for f in _SCORE_FIELDS:
+            if r.get(f) not in (None, ""):
+                r[f] = float(r[f])
+    return rows
+
+
+def select_score(
+    rows: list[dict],
+    level: str,
+    metric: str,
+    surrogate: str | None = None,
+    field: str = "dcor",
+) -> float:
+    """The one *field* value for a (level, metric, surrogate) cell.
+
+    *surrogate* is matched as a case-insensitive **substring**, which is what
+    lets one perspective name span models whose labels differ by architecture —
+    ``"output projections"`` selects llama's bare label and qwen's
+    ``"output projections (d_in 4096)"`` alike (see the correspondence table in
+    ``figures/simplex3_qwen_v4/make_figures.py``). Pass ``None`` when the level
+    has a single surrogate.
+
+    Raises if the selection is not exactly one row, so a renamed or missing
+    perspective fails loudly instead of silently plotting the wrong cell.
+    """
+    if field not in _SCORE_FIELDS:
+        raise ValueError(f"field must be one of {_SCORE_FIELDS}, got {field!r}")
+    hits = [
+        r for r in rows
+        if r["level"] == level and r["metric"] == metric
+        and (surrogate is None or surrogate.lower() in r["surrogate"].lower())
+    ]
+    if len(hits) != 1:
+        found = sorted({r["surrogate"] for r in hits}) or sorted(
+            {r["surrogate"] for r in rows if r["level"] == level}
+        )
+        raise LookupError(
+            f"expected exactly 1 row for level={level!r} metric={metric!r} "
+            f"surrogate={surrogate!r}, got {len(hits)}; candidates: {found}"
+        )
+    return hits[0][field]
 
 
 #: Display name and left-to-right order for the cross-taxonomy figure. The

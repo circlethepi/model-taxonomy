@@ -389,3 +389,183 @@ def encoding_legend(
     for leg in legends[:-1]:
         ax.add_artist(leg)
     return legends
+
+
+# ── plot_radar ────────────────────────────────────────────────────────────────
+
+def plot_radar(
+    series: list[PlotSeries],
+    axis_labels: list[str],
+    ax: plt.Axes | None = None,
+    start_angle: float = 90.0,
+    direction: str = "ccw",
+    rlim: tuple[float, float] | None = None,
+    rticks: list[float] | None = None,
+    fill_alpha: float = 0.12,
+    marker_size: int = 5,
+    label_pad: float = 0.0,
+    title: str | None = None,
+    legend: bool = True,
+    legend_kwargs: dict | None = None,
+    savepath=None,
+    savefig: bool = True,
+) -> tuple[plt.Figure, plt.Axes]:
+    """Radar (spider) plot: one closed polygon per series over shared spokes.
+
+    Each ``PlotSeries.data`` is one value per spoke, in the same order as
+    *axis_labels*.  Spokes are spaced evenly around the circle; *start_angle*
+    (degrees, 0 = east, 90 = north) places the first one and *direction*
+    ("ccw" or "cw") decides which way the rest follow, so the caller controls
+    spoke placement purely by the order it passes *axis_labels*.
+
+    *label_pad* pushes the spoke labels outward, in points.  On a full-range
+    radar the polygon reaches the outer ring and its markers land on top of the
+    labels, so a few points of padding is usually needed.
+
+    ``NaN`` values are drawn as gaps rather than pulling the polygon to zero.
+    Passing *rlim* fixes the radial range, which is what makes two radars
+    comparable; leaving it ``None`` autoscales each figure independently.
+    """
+    if direction not in ("ccw", "cw"):
+        raise ValueError(f"direction must be 'ccw' or 'cw', got {direction!r}")
+
+    n = len(axis_labels)
+    if n < 3:
+        raise ValueError(f"a radar needs at least 3 spokes, got {n}")
+
+    if ax is None:
+        fig, ax = plt.subplots(subplot_kw={"projection": "polar"})
+    else:
+        if ax.name != "polar":
+            raise ValueError("plot_radar needs an axes with projection='polar'")
+        fig = ax.get_figure()
+
+    #   The closing point repeats the first so each polygon joins up.
+    theta = np.linspace(0, 2 * np.pi, n, endpoint=False)
+    closed = np.concatenate([theta, theta[:1]])
+
+    for i, s in enumerate(series):
+        vals = np.asarray(s.data, dtype=float).ravel()
+        if vals.size != n:
+            raise ValueError(
+                f"series {s.label!r} has {vals.size} values for {n} spokes"
+            )
+        vals = np.concatenate([vals, vals[:1]])
+        color = s.color if s.color is not None else PALETTE[i % len(PALETTE)]
+        ax.plot(closed, vals, color=color, label=s.label,
+                marker=s.marker if s.marker is not None else "o",
+                markersize=marker_size,
+                linestyle=s.linestyle if s.linestyle is not None else "-",
+                zorder=3)
+        if fill_alpha:
+            ax.fill(closed, vals, color=color, alpha=fill_alpha, zorder=2)
+
+    ax.set_theta_offset(np.deg2rad(start_angle))
+    ax.set_theta_direction(-1 if direction == "cw" else 1)
+    ax.set_xticks(theta)
+    ax.set_xticklabels(axis_labels)
+    if label_pad:
+        ax.tick_params(axis="x", pad=label_pad)
+    if rlim is not None:
+        ax.set_ylim(*rlim)
+    if rticks is not None:
+        ax.set_yticks(rticks)
+
+    if title:
+        ax.set_title(title)
+    if legend and any(s.label for s in series):
+        ax.legend(**(legend_kwargs or {"loc": "upper right",
+                                       "bbox_to_anchor": (1.35, 1.12)}))
+
+    if savefig:
+        _save(fig, _resolve_savepath(savepath, title))
+    return fig, ax
+
+
+# ── plot_grouped_bars ─────────────────────────────────────────────────────────
+
+def plot_grouped_bars(
+    series: list[PlotSeries],
+    group_labels: list[str],
+    ax: plt.Axes | None = None,
+    ylabel: str | None = None,
+    ylim: tuple[float, float] | None = None,
+    bar_width: float = 0.8,
+    annotate: bool = False,
+    annot_fmt: str = "{:.2f}",
+    annot_size: float | None = None,
+    annot_rotation: float = 0.0,
+    annot_inside: bool | str = False,
+    title: str | None = None,
+    legend: bool = True,
+    legend_kwargs: dict | None = None,
+    savepath=None,
+    savefig: bool = True,
+) -> tuple[plt.Figure, plt.Axes]:
+    """Grouped bar chart: one group per *group_labels* entry, one bar per series.
+
+    Each ``PlotSeries.data`` holds one value per group, in the same order as
+    *group_labels*.  *bar_width* is the fraction of a group's slot the bars
+    together occupy, so the gap between groups stays the same however many
+    series are drawn.  ``NaN`` values simply draw no bar.
+    """
+    n_groups = len(group_labels)
+    n_series = len(series)
+    if n_series == 0:
+        raise ValueError("plot_grouped_bars needs at least one series")
+
+    fig, ax = _get_fig_ax(ax)
+
+    x = np.arange(n_groups, dtype=float)
+    width = bar_width / n_series
+    #   Offsets centre the whole cluster on the group's tick.
+    offsets = (np.arange(n_series) - (n_series - 1) / 2) * width
+
+    #   Applied before anything is drawn: the "auto" annotation placement below
+    #   measures each bar against the y-range, so the final range has to be in
+    #   effect by then or short bars get labelled as though they were tall.
+    if ylim is not None:
+        ax.set_ylim(*ylim)
+
+    for i, (s, off) in enumerate(zip(series, offsets)):
+        vals = np.asarray(s.data, dtype=float).ravel()
+        if vals.size != n_groups:
+            raise ValueError(
+                f"series {s.label!r} has {vals.size} values for {n_groups} groups"
+            )
+        color = s.color if s.color is not None else PALETTE[i % len(PALETTE)]
+        bars = ax.bar(x + off, vals, width=width, color=color, label=s.label,
+                      zorder=3)
+        if annotate:
+            for rect, v in zip(bars, vals):
+                if np.isnan(v):
+                    continue
+                inside = annot_inside
+                if inside == "auto":
+                    lo, hi = ax.get_ylim()
+                    span = hi - lo
+                    #   A quarter of the axis is enough height for a rotated
+                    #   label; below that the text would spill past the base.
+                    inside = span > 0 and (v - lo) / span > 0.25
+                ax.annotate(annot_fmt.format(v),
+                            xy=(rect.get_x() + rect.get_width() / 2, v),
+                            xytext=(0, -3 if inside else 2),
+                            textcoords="offset points",
+                            ha="center", va="top" if inside else "bottom",
+                            color="white" if inside else None,
+                            fontsize=annot_size, rotation=annot_rotation,
+                            zorder=4)
+
+    ax.set_xticks(x)
+    ax.set_xticklabels(group_labels)
+    ax.set_xlim(-0.5, n_groups - 0.5)
+    if ylabel:
+        ax.set_ylabel(ylabel)
+    if title:
+        ax.set_title(title)
+    if legend and any(s.label for s in series):
+        ax.legend(**(legend_kwargs or {}))
+
+    if savefig:
+        _save(fig, _resolve_savepath(savepath, title))
+    return fig, ax

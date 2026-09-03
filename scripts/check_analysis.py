@@ -2340,26 +2340,115 @@ def t_pad_token_resolution():
 
     vocab = {"<eos>": 1, "<pad>": 2}
     declared = Tok("<pad>", "<eos>", vocab)
-    apply_pad_token(declared, ModelProfile(match="x"))
+    apply_pad_token(declared, ModelProfile(match="x", prompt_end_token=None))
     assert declared.pad_token == "<pad>"
 
     fallback = Tok(None, "<eos>", vocab)
-    apply_pad_token(fallback, ModelProfile(match="x"))
+    apply_pad_token(fallback, ModelProfile(match="x", prompt_end_token=None))
     assert fallback.pad_token == "<eos>", "fallback must stay pad = eos"
 
     named = Tok(None, "<eos>", vocab)
-    apply_pad_token(named, ModelProfile(match="x", pad_token="<pad>"))
+    apply_pad_token(named, ModelProfile(match="x", pad_token="<pad>", prompt_end_token=None))
     assert named.pad_token == "<pad>", named.pad_token
 
     for bad, why in ((("<nope>"), "absent from the vocab"), (("<eos>"), "is eos")):
         try:
             apply_pad_token(Tok(None, "<eos>", vocab),
-                            ModelProfile(match="x", pad_token=bad))
+                            ModelProfile(match="x", pad_token=bad,
+                                         prompt_end_token=None))
         except ValueError:
             pass
         else:
             raise AssertionError(f"pad_token {bad!r} ({why}) should have raised")
     return "declared kept, fallback = eos, profile honoured, unk and eos rejected"
+
+
+@check("prompt format: the prompt end is declared, and the declaration is checked")
+def t_prompt_end_token():
+    """The cut point is stated by the profile, and nothing else may guess it.
+
+    This replaces a derivation that scanned the rendered prompt for the
+    rightmost added-vocab token.  OLMo-2 broke it: ``<|user|>``/``<|assistant|>``
+    are ordinary text there, so the only added-vocab token in the prompt was the
+    BOS at index 0, the cut landed at character 13, and all 16 adapters would
+    have trained on the bare string ``<|endoftext|>`` with the question gone --
+    while shapes stayed valid and the loss stayed finite.
+
+    So the five properties that now stand in for that derivation: a declared
+    token cuts immediately after its *last* occurrence; ``None`` cuts nothing, so
+    content cannot be lost by default; a declaration that would discard
+    non-whitespace raises rather than discarding it; a declaration absent from
+    the render raises; and a declared token that is not atomic is refused by
+    ``assert_compatible`` at config time, before a GPU is held.
+    """
+    from src.datasets._chat_projection import PromptFormat, render_prompt
+    from src.models.profile import ModelProfile, assert_compatible
+
+    class Tok:
+        """Renders "<s>USER:{content}<end>\\n" and nothing more."""
+
+        chat_template = "a template"
+
+        def __init__(self, added=("<s>", "<end>")):
+            self._added = {t: i for i, t in enumerate(added)}
+
+        def get_added_vocab(self):
+            return dict(self._added)
+
+        def apply_chat_template(self, messages, tokenize=False,
+                                add_generation_prompt=False, **kw):
+            return f"<s>USER:{messages[0]['content']}<end>\n"
+
+    fmt = PromptFormat(format="chat", user_fields=("q",))
+    row = {"q": "why is the sky blue?"}
+
+    def prof(end):
+        return ModelProfile(match="x", prompt_format="chat",
+                            chat_template_sha="deadbeef", prompt_end_token=end)
+
+    # 1. A declared token cuts just past its LAST occurrence -- so a marker that
+    #    also appears inside the user's own text does not move the cut.
+    got = render_prompt(Tok(), row, fmt, profile=prof("<end>"))
+    assert got == "<s>USER:why is the sky blue?<end>", repr(got)
+    adversarial = render_prompt(Tok(), {"q": "what is <end> for?"}, fmt,
+                                profile=prof("<end>"))
+    assert adversarial.endswith("what is <end> for?<end>"), repr(adversarial)
+
+    # 2. None keeps the whole render.  This is the OLMo-2 case, and the reason
+    #    the safe default cannot silently drop the question.
+    whole = render_prompt(Tok(), row, fmt, profile=prof(None))
+    assert whole == "<s>USER:why is the sky blue?<end>\n", repr(whole)
+    assert row["q"] in whole
+
+    # 3. A cut that would discard real content raises instead of discarding it.
+    for end, why in (("<s>", "would discard the question"),
+                     ("<nope>", "does not occur in the render")):
+        try:
+            render_prompt(Tok(), row, fmt, profile=prof(end))
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"prompt_end_token {end!r} ({why}) should raise")
+
+    # 4. And a declared token that BPE could merge across is refused at config
+    #    time, which is the property that makes the cut safe rather than merely
+    #    intentional.
+    from src.models.profile import template_sha
+
+    def pinned(end):
+        return ModelProfile(match="x", prompt_format="chat", prompt_end_token=end,
+                            chat_template_sha=template_sha(Tok()))
+
+    assert_compatible(pinned("<end>"), Tok())  # atomic: fine
+    try:
+        assert_compatible(pinned("USER:"), Tok())  # plain text: not fine
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("a non-atomic prompt_end_token should be refused")
+
+    return ("declared cut lands after the last occurrence, None keeps the whole "
+            "render, and absent/non-whitespace/non-atomic declarations all raise")
 
 
 @check("prompt format: apply_chat_template has exactly one call site")
@@ -2380,8 +2469,12 @@ def t_one_chat_template_call_site():
         for i, line in enumerate(path.read_text().splitlines(), 1):
             if "apply_chat_template(" in line and not line.lstrip().startswith("#"):
                 hits.append(f"{path.relative_to(root)}:{i}")
-    assert hits == ["src/datasets/_chat_projection.py:203",
-                    "src/datasets/_chat_projection.py:227"] or all(
+    # Deliberately no line-number pin.  There was one, and it went stale the
+    # first time the module was edited -- it named 203 and 227 where the calls
+    # had moved to 202 and 228, and the check went on passing only through the
+    # tolerant clause below.  A pin that silently stops pinning is worse than no
+    # pin; what this check is actually about is the *file*, not the line.
+    assert all(
         h.startswith("src/datasets/_chat_projection.py") for h in hits
     ), f"apply_chat_template called outside _chat_projection: {hits}"
     assert hits, "expected at least one call site in _chat_projection"
@@ -5737,6 +5830,7 @@ SYNTHETIC = [
     t_steps_for_budget, t_one_draw_name, t_embedder_hash_seed, t_surrogate_hash_shared,
     # the prompt-format layer: additive by construction, and rendered in one place
     t_prompt_format_raw_is_inert, t_one_chat_template_call_site,
+    t_prompt_end_token,
     t_profile_prefix_discrimination, t_pad_token_resolution,
     t_figure_specs_follow_layout,
     t_adapter_name_agreement,

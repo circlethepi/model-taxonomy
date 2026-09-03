@@ -50,6 +50,26 @@ and `src/taxonomy/behavioral.py` read only the YAML. So:
 
 A profile that leaked into runtime would break all three at once.
 
+**Three fields are exceptions, and the boundary that actually holds is narrower than the
+heading.** `finetune_lora.py` resolves a profile at runtime for `pad_token`; it and
+`scripts/_utils.py` both call `assert_compatible`, which reads `chat_template_sha`; and
+`_chat_projection.render_prompt` reads `prompt_end_token` at render time. State the rule
+as it really is:
+
+> **A profile may be read at runtime for facts about a pinned checkpoint or template,
+> never for choices that belong to an experiment.**
+
+All three are facts of the first kind. In particular, for a template pinned by
+`chat_template_sha` the correct cut point is *determined*: editing `prompt_end_token` is
+a bugfix or an error, never a legitimate change to what a past experiment meant. That is
+the property the rule exists to protect, and it survives.
+
+Emitting `prompt_end_token` into the YAML would honour the heading literally, and was
+rejected. It cannot go inside the `prompt_format:` block — that block feeds `format_id()`,
+which is a cache key, so a new field there would rename every adapter and draw on disk.
+A new top-level key would work but forces all five suites to regenerate with a real diff,
+for behaviour identical to reading the profile.
+
 Note what is deliberately *not* in a profile: the `</think>` token id. It is derived
 generically from the tokenizer at runtime, returning `None` for models that have no such
 token, so a model that grows a thinking mode is instrumented without a profile edit.
@@ -92,6 +112,28 @@ Profile fields, because nothing declares them:
   experiment, not the `Suite`: raising it for one suite breaks the comparison that suite
   exists for, and raising it everywhere invalidates every behavioral result on disk. Set
   it only next to a `notes` entry saying why.
+- **`prompt_end_token`** — the token to cut the generation prompt after, or `None` to
+  keep the template's whole render. Required keyword-only, so the *unset* state does not
+  exist: omitting it is a `TypeError` at import, and a profile author has to have
+  decided. This replaces a derivation — `render_prompt` used to cut after whichever
+  added-vocab token sat furthest right in the rendered text, on the theory that all it
+  would ever remove was the whitespace after the final role marker. OLMo-2 disproved
+  that: it emits `<|user|>`/`<|assistant|>` as ordinary text, so the only added-vocab
+  token in its prompt is the BOS at index 0, the cut landed at character 13, and the
+  training prompt was the bare string `<|endoftext|>` with the question gone. No
+  derivation could get that right, because there is no atomic token after the question to
+  find. `None` is the safe direction rather than the ignorant one: it keeps the whole
+  render, so the question is always present, and if the untrimmed seam is not a token
+  boundary `encode_pair`'s assertion raises — a careless `None` therefore fails loudly or
+  is correct, and can never silently drop content. Discarding content requires naming a
+  token on purpose. The named token must be atomic, which `assert_compatible` checks; see
+  the section below.
+
+  `LLAMA3` and the `resolve()` fallback spell `None` too, but mean something different by
+  it — they are *raw* profiles where a cut point is not applicable, and `render_prompt`
+  returns before ever reading the field. Each profile's comment says which of the two it
+  means. A distinct sentinel was rejected: it reintroduces a name to invent and an unset
+  state to police, for no behavioural difference.
 
 ### `assert_compatible` — template drift, checked before a GPU is held
 
@@ -222,18 +264,46 @@ cut after "<think>\n"   p=[...,248068,198]  c=[198,248069,...]   concat != joint
 cut after "<think>"     p=[...,248068]      c=[271,248069,...]   concat == joint
 ```
 
-Added tokens are never merged into their neighbours, so cutting immediately after the
-last added token of the generation prompt gives both properties at once. None of this is
+Added tokens are never merged into their neighbours, so cutting immediately after an added
+token of the generation prompt gives both properties at once. None of this is
 Qwen-specific — Llama-3 instruct's generation prompt ends `<|end_header_id|>\n\n` and
 takes the identical treatment.
 
-The four functions:
+**Which token to cut after is declared, not derived.** `ModelProfile.prompt_end_token`
+names it, beside the `chat_template_sha` that pins the template the name is a fact about;
+`None` means the prompt is the whole render. This module used to derive it instead — scan
+the rendered text for every added-vocab token and cut after the rightmost one — and
+OLMo-2 disproved the derivation. Its `<|user|>`/`<|assistant|>` are ordinary text, so the
+only added-vocab token in the prompt was the BOS at index 0, the cut landed at character
+13, and the training prompt was the bare string `<|endoftext|>` with the question gone;
+shapes stayed valid and the loss stayed finite, so nothing reported it. Qwen3.5 survived
+only by accident, because `<think>` happens to sit after `assistant\n`; templates ending
+in a bare `<|im_start|>assistant\n` (SmolLM2-1.7B, Qwen2.5-1.5B, LFM2-1.2B) silently lost
+`assistant\n`. No derivation could get OLMo-2 right, because there is no atomic token
+after its question to find.
+
+So `render_prompt` now only *validates* the declaration, in three places:
+
+| Failure | Caught by | When |
+|---|---|---|
+| the declared token is not atomic | `assert_compatible` (added-vocab check) | config time, before a GPU is held |
+| the declared token does not occur in the render | `render_prompt` | render time |
+| the cut would discard non-whitespace | `render_prompt` | render time |
+| the seam is not a token boundary anyway | `encode_pair`'s assertion | encode time |
+
+The last row is why `encode_pair`'s assertion is **kept** rather than retired: declaring
+the token states our *intent*, while the assertion verifies the *tokenizer* agrees. That
+is a different failure mode, and the one that catches a future template revision.
+
+The four functions. `profile` is required and keyword-only on the first three, matching
+the discipline on the field itself, so that no call site can silently omit the thing that
+declares the cut:
 
 | Function | Returns | Notes |
 |---|---|---|
-| `render_prompt(tokenizer, row, fmt, recipe=None)` | `str` | The single definition of "the prompt" — used by both training and extraction, so the two cannot drift apart. |
-| `render_pair(...)` | `(prompt, completion)` | Completion taken by **subtraction** from the full rendered conversation, never assembled from template fragments. Raises if the prompt is not a prefix. |
-| `encode_pair(..., max_length)` | `{input_ids, completion_mask, n_prompt_tokens, n_completion_tokens, truncated}` | **Asserts** `p_ids + c_ids == joint`. Truncation is `keep_start` and explicit, because under completion-only loss a clipped row loses *supervised* tokens. |
+| `render_prompt(tokenizer, row, fmt, *, profile, recipe=None)` | `str` | The single definition of "the prompt" — used by both training and extraction, so the two cannot drift apart. |
+| `render_pair(..., *, profile, recipe=None)` | `(prompt, completion)` | Completion taken by **subtraction** from the full rendered conversation, never assembled from template fragments. Raises if the prompt is not a prefix. |
+| `encode_pair(..., max_length, *, profile, recipe=None)` | `{input_ids, completion_mask, n_prompt_tokens, n_completion_tokens, truncated}` | **Asserts** `p_ids + c_ids == joint`. Truncation is `keep_start` and explicit, because under completion-only loss a clipped row loses *supervised* tokens. |
 | `template_sha(tokenizer)` | `str \| None` | Same hash `ModelProfile.chat_template_sha` pins. |
 
 `add_special_tokens=False` throughout: the template already emits every special token it

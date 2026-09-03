@@ -20,6 +20,13 @@ QWEN3_5 = ModelProfile(
     prompt_format="chat",
     chat_template_sha="a4aee8afcf2e0711942cf848899be66016f8d14a889ff9ede07bca099c28f715",
     chat_template_kwargs={},  # {} == the template's own defaults == thinking ON
+    # The template ends "<|im_start|>assistant\n<think>\n"; <think> is a
+    # registered token, so the cut lands on an atomic boundary and moves the
+    # trailing "\n" into the completion.  This is exactly what the deleted
+    # heuristic found by accident: a template ending in a bare
+    # "<|im_start|>assistant\n" has no atomic token after "assistant" to land on,
+    # and lost that word silently.
+    prompt_end_token="<think>",
     # Both moved here from scripts/smoke_base_model.py, which hardcoded them as
     # Qwen literals; the reasoning for each is in the notes below.
     expected_lora_params=12_386_304,

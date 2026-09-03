@@ -4,6 +4,149 @@
 
 ## Unreleased
 
+### The `olmo2` suite is unparked
+
+The previous release generated the `olmo2` suite and then forbade submitting it: its
+rendered training prompt was the bare string `<|endoftext|>`. That was a defect in shared
+prompt rendering, fixed above by declaring the cut point instead of deriving it. The
+profile notes and the suite table row are rewritten from a parking warning into a
+description of the checkpoint, and `submit_all.sh` is live again.
+
+**Re-smoked on the fixed renderer** (run 264063, H200, `train_shard0.yaml`) — 5 passed, 0
+failed:
+
+| stage | parked (237512) | now (264063) |
+|---|---|---|
+| 1b template renders | prompt is **13 chars** | prompt is **65 chars**, stable across renders |
+| 2 checkpoint loads | pass | 1.48B params, 16 layers, 0 missing keys |
+| 3 LoRA attaches | pass | 4,194,304 trainable, 64 modules across 16/16 layers |
+| 4 completion-only loss | pass | mean 66 supervised tokens, 4/200 rows truncated at 512 |
+| 5 generation terminates | **`termination_rate 0.00`** | **`termination_rate 0.75`**, median length 119 |
+
+**Stage 5 needed no resolution.** The plan carried a decision — declare the truncation via
+`allow_truncated_generation=True` rather than raise `max_new_tokens`, the treatment
+Mistral-Nemo received — to be applied *if the failure recurred*. It did not. The 0.00 was
+an artifact of the empty prompt: a model handed no question has no reason to stop. So
+`allow_truncated_generation` stays `False` and OLMo-2 keeps the termination check at full
+force. This is also the cleanest available evidence that the two smoke failures had one
+cause rather than two.
+
+The parking notice's claim that `tiiuae/Falcon3-1B-Instruct` was "verified clean through
+the same code path" is **retracted** in the profile notes. Under the atomicity check that
+ships above, Falcon3's `<|assistant|>` is not in its added vocabulary, so declaring it as a
+cut point is refused; that checkpoint would have needed `prompt_end_token=None` for exactly
+the same reason OLMo-2 does. The swap would not have avoided anything.
+
+`gen_simplex3.py` reproduces the tree with an empty diff — this changes prose and a
+profile's `notes`, neither of which reaches a config or a cache key.
+
+### The prompt end is declared by the profile, not guessed from the vocabulary
+
+`render_prompt` used to finish by calling `_trim_to_last_atomic`, which scanned the
+rendered generation prompt for every token of the tokenizer's *added vocabulary* and cut
+after the **rightmost occurrence**. The intent was to move trailing whitespace out of the
+prompt so the prompt/completion seam falls on a token boundary. The derivation is wrong,
+and OLMo-2 is the proof: it emits `<|user|>` and `<|assistant|>` as ordinary text, so the
+only added-vocab token anywhere in its prompt is the BOS at index 0, the cut lands at
+character 13, and the rendered training prompt is the bare string `<|endoftext|>`.
+
+```
+rendered:   '<|endoftext|><|user|>\nWhy is the sky blue?\ncurious\n<|assistant|>\n'
+after trim: '<|endoftext|>'
+```
+
+Nothing downstream reported it. Shapes stayed valid, the loss stayed finite, and all 16
+adapters of the parked `olmo2` suite would have trained on an empty prompt while every
+behavioral probe asked the model nothing. Smoke stages 1b–4 passed; stage 1b even printed
+"prompt is 13 chars" without objecting.
+
+Worth being precise about the cause: the scan is positional **in the rendered string**,
+not in the vocabulary. It takes whichever added-vocab token occurs furthest right in the
+text, and vocabulary order is never consulted. OLMo-2 fails because only one such token
+occurs in its prompt at all, and it sits at index 0.
+
+The fragility is not OLMo-2-specific. **Qwen3.5 survived only by accident** — its template
+ends `<|im_start|>assistant\n<think>\n`, and only because `<think>` is a registered token
+sitting after `assistant\n` does the cut land correctly. Checkpoints ending in a bare
+`<|im_start|>assistant\n` lose `assistant\n` silently, leaving the model prompted with a
+dangling `<|im_start|>`; SmolLM2-1.7B, Qwen2.5-1.5B and LFM2-1.2B were all measured doing
+exactly that.
+
+**The design.** `ModelProfile` gains **`prompt_end_token: str | None`**, required
+keyword-only, so the *unset* state cannot exist — omitting it is a `TypeError` at import.
+A string names the token to cut after; `None` means cut nothing. `_atomic_tokens` and
+`_trim_to_last_atomic` are deleted.
+
+| profile | `prompt_end_token` |
+|---|---|
+| `QWEN3_5` | `"<think>"` |
+| `LLAMA3_INSTRUCT` | `"<\|end_header_id\|>"` |
+| `MISTRAL_NEMO` | `"[/INST]"` |
+| `OLMO2` | `None` — chat, deliberately no cut |
+| `LLAMA3` (base) and the `resolve()` fallback | `None` — raw, not applicable |
+
+`None` is the *safe* direction rather than the ignorant one, which is why it needs no
+hard error to police it: it keeps the whole render, so the question is always present, and
+if the untrimmed seam is not a token boundary `encode_pair`'s existing assertion raises.
+A careless `None` therefore fails loudly or is correct — it can never silently drop the
+question, which was the entire OLMo-2 failure. Discarding content now requires naming a
+token on purpose, and three checks validate that naming: `assert_compatible` rejects a
+declared token absent from the added vocabulary (config time, before a GPU is held), and
+`render_prompt` raises if the token does not occur in the render or if cutting would
+discard non-whitespace. `encode_pair`'s assertion is **kept**: declaring the token states
+our intent, while the assertion verifies the tokenizer agrees, which is the different
+failure mode that catches a future template revision.
+
+`render_prompt`, `render_pair` and `encode_pair` take `profile` as a required
+keyword-only argument, matching the field's own discipline so no call site can omit it.
+There are four call sites and every one already had a profile in scope.
+
+**The runtime-lookup rule is amended rather than quietly broken.** `prompt_end_token` is
+read at render time, which `docs/guides/model_profiles.md` said a profile never is. The
+rule already described an ideal rather than the code — `finetune_lora.py` and
+`scripts/_utils.py` both resolve profiles at runtime today, for `pad_token` and for
+`assert_compatible`. The boundary that actually holds is now stated: *a profile may be
+read at runtime for facts about a pinned checkpoint or template, never for choices that
+belong to an experiment.* For a template pinned by `chat_template_sha` the correct cut
+point is determined; editing it is a bugfix or an error, never a legitimate change to a
+past experiment. Emitting the field into YAML was rejected: it cannot go in the
+`prompt_format:` block, which feeds the `format_id()` cache key and would rename every
+adapter and draw on disk, and a new top-level key forces all five suites to regenerate
+with a real diff for behaviour identical to reading the profile.
+
+**Measured migration verification**, offline against the cached tokenizers on CPU, with
+user content `question_title + question_content` to match the suites' `user_fields`:
+
+| model | declared | prompt before | prompt after | `encode_pair` seam |
+|---|---|---|---|---|
+| Qwen3.5-4B | `<think>` | 85 ch | **85 ch** | passes |
+| Llama-3.1-8B-Instruct | `<\|end_header_id\|>` | 259 ch | **259 ch** | passes |
+| Mistral-Nemo-Instruct-2407 | `[/INST]` | 44 ch | **44 ch** | passes |
+| OLMo-2-0425-1B-Instruct | `None` | 13 ch | **65 ch**, question restored | passes |
+
+**All three in-flight suites are byte-identical**, so no adapter stops being comparable
+and nothing on disk is invalidated — the open risk the parking commit could not close. An
+adversarial render with the declared marker embedded inside the Yahoo question itself
+changed nothing: the generation prompt's own copy is always the rightmost, so `rfind`
+still lands correctly, and the whitespace validation covers the residual case. This table
+is a one-time migration check, not a permanent test — it needs four real checkpoints and
+cannot run offline in the synthetic suite, so it is recorded here rather than committed as
+a script.
+
+Falcon3-1B-Instruct was measured too, and supplies the argument for the atomicity check:
+its `<|assistant|>` is the obvious cut point and is **not** in its added vocabulary, so
+declaring it would put the seam on mergeable text — the exact failure this module exists
+to prevent. (This also retires the parking commit's claim that Falcon3-1B is "verified
+clean through the same code path".)
+
+`ModelProfile` is serialized into no config dict or cache key anywhere in the repo, so no
+adapter name, draw key or cached geometry changes; `scripts/gen_simplex3.py` regenerates
+all five suites with an empty diff. `check_analysis.py` gains a synthetic check covering
+all five properties (last-occurrence cut, `None` cuts nothing, non-whitespace discard
+raises, absent token raises, non-atomic token refused) and drops a stale line-number pin
+in `t_one_chat_template_call_site` that had already gone stale and was passing only
+through its tolerant fallback.
+
 ### Atomic writes no longer collide between concurrent jobs
 
 Every cache and recipe write was "write a temp file, then `os.replace` it into place",

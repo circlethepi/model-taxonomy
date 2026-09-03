@@ -98,8 +98,8 @@ def t_template(cfg_path: Path, token):
         return f"raw suite ({profile.match!r}); no chat template to check"
 
     row = {"question_title": "Why is the sky blue?", "question_content": "curious"}
-    first = cp.render_prompt(tok, row, fmt)
-    second = cp.render_prompt(tok, row, fmt)
+    first = cp.render_prompt(tok, row, fmt, profile=profile)
+    second = cp.render_prompt(tok, row, fmt, profile=profile)
     assert first == second, (
         "the chat template rendered two different prompts for one row; something "
         "mutable (a date, a uuid, a clock) is interpolated into it, so the "
@@ -358,7 +358,8 @@ def t_generate(cfg_path: Path, scratch: Path, adapter: Path, token):
     # declares nothing, and spuriously failing on one whose profile supplies a pad.
     from src.models.profile import apply_pad_token, resolve
 
-    pad_source = apply_pad_token(tok, resolve(cfg["base_models"][0]))
+    profile = resolve(cfg["base_models"][0])
+    pad_source = apply_pad_token(tok, profile)
     assert tok.pad_token_id != tok.eos_token_id, (
         f"effective pad ({tok.pad_token_id}) == eos ({tok.eos_token_id}); padding "
         f"and a real end-of-turn are indistinguishable -- {pad_source}"
@@ -368,7 +369,7 @@ def t_generate(cfg_path: Path, scratch: Path, adapter: Path, token):
     fmt = cp.PromptFormat.from_config(cfg.get("prompt_format"))
     rows = [{"question_title": "Why is the sky blue?", "question_content": ""},
             {"question_title": "How do I boil an egg?", "question_content": ""}]
-    queries = [cp.render_prompt(tok, r, fmt) for r in rows]
+    queries = [cp.render_prompt(tok, r, fmt, profile=profile) for r in rows]
 
     tax = make_behavioral_taxonomy(cfg, queries, query_key=None, cache=None)
     rep = tax.extract(str(adapter))

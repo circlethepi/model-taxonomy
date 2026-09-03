@@ -1,8 +1,22 @@
 # Visualization
 
 `src/plots/simplex.py` is the colour system and panel grid for 3-group simplex
-experiments, and `scripts/make_simplex3_figures.py` regenerates the whole figure suite
-from the shared cache.
+experiments, and `src/plots/simplex_suite.py` is the suite machinery that regenerates
+the whole figure suite from the shared cache — the selector schema, the level builders,
+the scoring and the read-through pairwise cache.
+
+The suite module is driven, never run directly. Three drivers exist:
+
+| driver | run |
+|---|---|
+| `scripts/make_simplex3_figures.py` | Qwen3.5-4B, full grid width, whole argparse surface |
+| `figures/simplex3_qwen_v4/make_figures.py` | Qwen3.5-4B, restricted to the chosen perspectives |
+| `figures/simplex3_llama3i/make_figures.py` | Llama-3.1-8B-Instruct, the same restriction |
+
+A *perspective* is a surrogate together with a metric — one cell of a figure grid; a
+*surrogate* is one row of that grid (`docs/terminology.md`). The two restricted drivers
+pass a `select` mapping to `run_suite`, which collapses each level to the smallest
+rectangle covering the chosen cells.
 
 ## Why a barycentric colour system
 
@@ -78,7 +92,7 @@ python scripts/make_simplex3_figures.py                  # everything
 python scripts/make_simplex3_figures.py --level functional
 python scripts/make_simplex3_figures.py --skip-sweep     # omit the 33-layer sweep
 python scripts/make_simplex3_figures.py --skip-detail    # omit per-metric detail figures
-python scripts/make_simplex3_figures.py --skip-surrogate # raw surrogates only
+python scripts/make_simplex3_figures.py --with-surrogate # add the fleet transforms
 python scripts/make_simplex3_figures.py --outdir figures/simplex3_qwen_v3
 python scripts/make_simplex3_figures.py --cache-root PATH   # name the shared cache
 python scripts/make_simplex3_figures.py --no-cache          # recompute everything

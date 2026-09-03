@@ -764,9 +764,13 @@ def make_queries(cfg: dict) -> tuple[list[str], dict, list | None]:
         tokenizer = AutoTokenizer.from_pretrained(
             base_models[0], token=hf_token(cfg), trust_remote_code=True
         )
-        assert_compatible(resolve_profile(base_models[0]), tokenizer)
+        profile = resolve_profile(base_models[0])
+        assert_compatible(profile, tokenizer)
         rows = list(mixed.for_finetuning())[:n_queries]
-        queries = [cp.render_prompt(tokenizer, row, fmt, recipe=recipe) for row in rows]
+        queries = [
+            cp.render_prompt(tokenizer, row, fmt, profile=profile, recipe=recipe)
+            for row in rows
+        ]
     # Truncated to match: to_queries(n) is a prefix, and source_indices is only
     # as long as the loaded sample list, so slice rather than assume equality.
     indices = list(mixed.source_indices or [])[:n_queries] or None

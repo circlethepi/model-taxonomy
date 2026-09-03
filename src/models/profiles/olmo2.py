@@ -30,55 +30,63 @@ OLMO2 = ModelProfile(
         "fe689ffbd6a4e2d0532d7480696b065b10e0e1eff3f9b9fc4bea415761e4bf4a"
     ),
     chat_template_kwargs={},  # {} == the template's own defaults
+    # None deliberately, and this is a *chat* profile declining a cut -- not the
+    # inert None the raw profiles carry.  This template emits <|user|> and
+    # <|assistant|> as ordinary text, so there is no atomic token after the
+    # question to cut at; the prompt is the template's full render, trailing
+    # newline included, and ``encode_pair``'s seam assertion is what confirms
+    # that boundary is safe.  It is the field's whole point that this now reads
+    # as a decision rather than as an accident of the added vocabulary.
+    prompt_end_token=None,
     expected_lora_params=4_194_304,
     excluded_lora_modules=(),
     # pad_token is deliberately omitted: this checkpoint declares <|pad|>
     # (100277), distinct from eos <|endoftext|> (100257), so ``apply_pad_token``
     # reports "declared by the checkpoint" and the field would be redundant.
-    notes="""DO NOT SUBMIT THE olmo2 SUITE AS IT STANDS.  Smoke run 237512 passed
-    stages 1b-4 and then showed why that is not enough: this checkpoint's
-    rendered training prompt is the single string ``<|endoftext|>``.  The
-    question never reaches the model.
+    notes="""Prompt rendering: this template emits ``<|user|>`` and
+    ``<|assistant|>`` as ordinary text rather than as registered tokens, so there
+    is no atomic token after the question to cut at.  The profile declares
+    ``prompt_end_token=None`` and the training prompt is the template's full
+    render; see that field's comment above.
 
-    The cause is in shared code, not here.  ``_chat_projection.render_prompt``
-    finishes by calling ``_trim_to_last_atomic``, which cuts everything after the
-    LAST token of the tokenizer's added vocabulary -- normally the trailing
-    newline after the final role marker.  OLMo-2 emits ``<|user|>`` and
-    ``<|assistant|>`` as ordinary text rather than registered tokens, so the only
-    added-vocab token in the whole prompt is the ``<|endoftext|>`` the template
-    puts at index 0.  The cut therefore lands at character 13 and discards the
-    question with everything else:
+    This suite was parked from 2026-08-31 to 2026-09-02 because the code then
+    derived that cut point instead of reading it.  ``render_prompt`` finished by
+    cutting after the last added-vocabulary token in the rendered string, which
+    here is the ``<|endoftext|>`` the template puts at index 0, so the rendered
+    training prompt was the single string ``<|endoftext|>``:
 
-        rendered: '<|endoftext|><|user|>\\nWhy is the sky blue?\\n<|assistant|>\\n'
+        rendered:   '<|endoftext|><|user|>\\nWhy is the sky blue?\\n<|assistant|>\\n'
         after trim: '<|endoftext|>'
 
-    Nothing downstream would report this.  Shapes stay valid, the loss stays
-    finite, and all 16 adapters would train on an empty prompt while every
-    behavioral probe asked the model nothing.  Stage 4 passes because it checks
-    completion-only loss and truncation, not that the prompt contains the
-    question.
+    Nothing downstream reported it.  Shapes stayed valid, the loss stayed finite,
+    and all 16 adapters would have trained on an empty prompt while every
+    behavioral probe asked the model nothing -- stage 4 checks completion-only
+    loss and truncation, not that the prompt contains the question.  Smoke run
+    237512 passed stages 1b-4 in exactly that state.
 
-    Measured across the repo's checkpoints, the trim removes '\\n' for Qwen3.5,
-    '\\n\\n' for Llama-3.1-8B-Instruct and '' for Mistral-Nemo -- all whitespace,
-    which is the function's evident purpose -- and the entire question here.
-    Worth knowing: Qwen3.5 escapes only by accident.  Its template ends
-    ``<|im_start|>assistant\\n<think>\\n``, and only because ``<think>`` is a
-    registered token sitting after ``assistant\\n`` does the cut land correctly.
-    Checkpoints ending in a bare ``<|im_start|>assistant\\n`` -- SmolLM2-1.7B,
-    Qwen2.5-1.5B and LFM2-1.2B were all checked and all lose ``assistant\\n`` --
-    are damaged more quietly than this one.
+    The defect was in shared code and is fixed there, by declaring the cut point
+    rather than deriving it.  It was never OLMo-2-specific: Qwen3.5 escaped only
+    because ``<think>`` happens to be a registered token sitting after
+    ``assistant\\n``, and SmolLM2-1.7B, Qwen2.5-1.5B and LFM2-1.2B were each
+    measured silently losing ``assistant\\n``.  Under the declaration the three
+    in-flight suites' prompts are byte-identical, so no adapter stopped being
+    comparable, and this checkpoint's prompt goes from 13 characters to 65 with
+    the question restored.
 
-    Two resolutions were identified and neither is applied here.  Fixing the trim
-    so it never cuts non-whitespace repairs the whole class (and must be verified
-    to leave the three existing suites' prompts byte-identical, or their adapters
-    stop being comparable).  Swapping to ``tiiuae/Falcon3-1B-Instruct`` avoids it:
-    verified clean through the same code path, 1B, ungated, no remote code,
-    standard q/k/v/o, a distinct pad, a single weight file, a date-free template,
-    and 4,128,768 LoRA parameters against this profile's 4,194,304 -- 1.6% apart,
-    so everything said below about capacity carries over unchanged.
+    Swapping to ``tiiuae/Falcon3-1B-Instruct`` was the other candidate resolution
+    and is not taken.  Worth recording that it would not have worked as the
+    parking notice described: Falcon3's ``<|assistant|>`` is not in its added
+    vocabulary either, so declaring it as a cut point is refused by
+    ``assert_compatible``, and that checkpoint would have needed ``None`` for the
+    same reason this one does.
 
-    The profile and the generated tree are kept rather than deleted so the work
-    is not lost, and this notice is the thing that stops them being submitted.
+    ``allow_truncated_generation`` stays at its default False.  The parking-era
+    smoke (237512) also failed stage 5 with ``termination_rate 0.00``, but that
+    was measured while the model was prompted with a bare ``<|endoftext|>``, and
+    a model given no question has no reason to stop.  Re-smoked on the fixed
+    renderer (run 264063) the stage passes at 0.75 with median length 119 inside
+    the 128-token budget, so unlike Mistral-Nemo there is no truncation here to
+    declare.
 
     ----
 

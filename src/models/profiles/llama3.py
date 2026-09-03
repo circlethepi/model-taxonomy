@@ -25,6 +25,11 @@ LLAMA3 = ModelProfile(
     expected_lora_params=None,
     excluded_lora_modules=(),
     chat_template_sha=None,
+    # None because this is a *raw* profile: there is no chat render to cut, and
+    # ``render_prompt`` returns before ever reading the field.  Not to be
+    # confused with OLMO2's None, which is a chat profile deliberately declining
+    # a cut.
+    prompt_end_token=None,
     notes="""Base (non-instruct) checkpoints: no post-training, no chat template.
     prompt_format='raw' is asserted rather than assumed -- assert_compatible
     raises if a tokenizer with a template is loaded under this profile, which is

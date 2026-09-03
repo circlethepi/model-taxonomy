@@ -80,8 +80,9 @@ from src.plots.simplex_suite import read_scores_csv, select_score  # noqa: E402
 #:
 #: Colours are Okabe-Ito, which is designed to stay separable under the common
 #: colour-vision deficiencies. Marker and dash travel with the model rather than
-#: with its position, so the series stay separable in greyscale and a reordering
-#: here does not silently reassign them.
+#: with its position, so a reordering here cannot silently reassign them; the
+#: radar overrides both (see draw_radar), so they are the model's assigned
+#: encodings held for whatever draws them, not a promise that every figure does.
 MODELS = [
     ("allenai/OLMo-2-0425-1B-Instruct",      "simplex3_olmo2",   "#E69F00", "^", "-."),   # 1B,  gold
     ("Qwen/Qwen3.5-4B",                      "simplex3_qwen_v4", "#CC79A7", "D", ":"),    # 4B,  purple
@@ -139,14 +140,20 @@ def collect(figures_root: Path) -> dict[str, dict[str, dict[str, float]]]:
     return out
 
 
-def _series(scores, version, labels):
-    """One PlotSeries per model, values ordered to match *labels*."""
+def _series(scores, version, labels, marker=None, linestyle=None):
+    """One PlotSeries per model, values ordered to match *labels*.
+
+    *marker* and *linestyle* override the per-model encodings in MODELS for
+    every series at once, for a figure that wants one uniform stroke.
+    """
     return [
         make_series(
             [scores[label_of(base_model)][version][lbl] for lbl in labels],
-            label=label_of(base_model), color=color, marker=marker, linestyle=ls,
+            label=label_of(base_model), color=color,
+            marker=marker if marker is not None else mkr,
+            linestyle=linestyle if linestyle is not None else ls,
         )
-        for base_model, _, color, marker, ls in MODELS
+        for base_model, _, color, mkr, ls in MODELS
     ]
 
 
@@ -156,7 +163,10 @@ def draw_radar(scores, version: str, outdir: Path) -> Path:
     set_style("one_col", fig_width=4.4, fig_height=3.7)
     fig, ax = plt.subplots(subplot_kw={"projection": "polar"})
     plot_radar(
-        _series(scores, version, labels),
+        #   Solid unmarked outlines: with four polygons crowded into the outer
+        #   fifth of the range, markers and dashes read as texture rather than as
+        #   identity, and colour alone separates the four cleanly enough.
+        _series(scores, version, labels, marker="none", linestyle="-"),
         axis_labels=labels,
         ax=ax,
         start_angle=90.0,      # Data at the top ...
@@ -164,10 +174,10 @@ def draw_radar(scores, version: str, outdir: Path) -> Path:
         rlim=(0.0, 1.0),
         rticks=[0.2, 0.4, 0.6, 0.8, 1.0],
         #   Four translucent polygons over a small range stack into one muddy
-        #   wash, so the fill is faint enough to read as shading, not as ink.
-        fill_alpha=0.05,
-        #   Data and 1 - procrustes both sit at ~0.98, so their markers land on
-        #   the outer ring; without the pad they cover the spoke labels.
+        #   wash whichever alpha is picked, so there is no fill at all.
+        fill_alpha=0.0,
+        #   Data and 1 - procrustes both sit at ~0.98, so their outlines run
+        #   along the outer ring; without the pad they touch the spoke labels.
         label_pad=12,
         #   Straight ticked axes out to each spoke instead of concentric rings,
         #   numbered once on the Data spoke -- all four share the one scale.

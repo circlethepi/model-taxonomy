@@ -1256,6 +1256,7 @@ class ModelProfile:
     prompt_format: str = "raw"                    # "raw" | "chat"
     chat_template_sha: str | None = None
     chat_template_kwargs: dict = field(default_factory=dict)
+    prompt_end_token: str | None          # required kw-only; None = no cut
     notes: str = ""
 
 resolve(model_id) -> ModelProfile        # falls back to a bare default, never raises
@@ -1283,10 +1284,16 @@ class PromptFormat:
     def format_id(self) -> str | None        # 8 hex chars, or None when raw
 ```
 
-A profile is a source of **defaults for spec construction** and never a runtime lookup:
-the generator resolves one when it emits YAML and writes every value out explicitly.
-`encode_pair` asserts that tokenizing prompt and completion separately reproduces the
-joint tokenization. See [Model Profiles and Prompt Formats](guides/model_profiles.md).
+A profile is a source of **defaults for spec construction**, and is read at runtime only
+for facts about a pinned checkpoint or template — `pad_token`, `chat_template_sha`, and
+`prompt_end_token` — never for choices that belong to an experiment. The generator
+resolves one when it emits YAML and writes every other value out explicitly.
+
+`render_prompt`, `render_pair` and `encode_pair` all take `profile` as a **required
+keyword-only** argument: `profile.prompt_end_token` declares where the generation prompt
+ends, and no call site may silently omit it. `encode_pair` asserts that tokenizing prompt
+and completion separately reproduces the joint tokenization. See
+[Model Profiles and Prompt Formats](guides/model_profiles.md).
 
 ---
 

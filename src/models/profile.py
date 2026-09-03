@@ -17,6 +17,16 @@ an old config re-runs identically forever, editing a profile cannot retroactivel
 change a past experiment, and a run's config file stays a complete description of
 itself.  A profile that leaked into runtime would break all three at once.
 
+The boundary that actually holds, stated exactly: **a profile may be read at
+runtime for facts about a pinned checkpoint or template, never for choices that
+belong to an experiment.**  Three fields are read at runtime today and all three
+are facts of the first kind -- ``pad_token`` (``finetune_lora.py``),
+``chat_template_sha`` via ``assert_compatible`` (there and in
+``scripts/_utils.py``), and ``prompt_end_token`` (``_chat_projection`` at render
+time).  For a template pinned by ``chat_template_sha`` the correct cut point is
+*determined*, so editing it is a bugfix or an error, never a legitimate change to
+a past experiment -- which is the property the rule exists to protect.
+
 Note what is deliberately *not* here: the ``</think>`` token id.  It is derived
 generically from the tokenizer at runtime (``convert_tokens_to_ids``), returning
 ``None`` for models that have no such token, so a model that grows a thinking
@@ -83,6 +93,33 @@ class ModelProfile:
     #: it will be compared against.  Setting it is only defensible next to a
     #: ``notes`` entry saying why the truncation was accepted rather than fixed.
     allow_truncated_generation: bool = False
+    #: Where the generation prompt ends: the token to cut immediately after, or
+    #: ``None`` to keep the template's full render.  Required keyword-only, so
+    #: the *unset* state cannot exist -- omitting it is a ``TypeError`` at
+    #: import, and a profile author has to have thought about it.
+    #:
+    #: This replaces a derivation.  ``render_prompt`` used to cut after whichever
+    #: added-vocab token sat furthest right in the rendered text, on the theory
+    #: that the trailing whitespace after the final role marker was all it would
+    #: ever remove.  OLMo-2 disproved that: it emits ``<|user|>``/``<|assistant|>``
+    #: as ordinary text, so the only added-vocab token in its prompt is the BOS at
+    #: index 0, the cut landed at character 13, and the rendered training prompt
+    #: was the bare string ``<|endoftext|>`` with the question discarded.  No
+    #: derivation could have got that right -- there is no atomic token after the
+    #: question to find -- so the cut point is stated instead of guessed.
+    #:
+    #: ``None`` is the safe direction, not the ignorant one: it keeps the whole
+    #: render, so the question is always present, and if the untrimmed seam is
+    #: not a token boundary ``encode_pair``'s assertion raises.  Discarding
+    #: content now requires someone to name a token deliberately.
+    #:
+    #: The named token must be atomic -- in the tokenizer's added vocabulary --
+    #: or the cut lands on text BPE will merge across; ``assert_compatible``
+    #: checks that at config time.  It is a fact about the pinned template rather
+    #: than a per-experiment choice, which is why it lives beside
+    #: ``chat_template_sha`` and is read at render time; see the runtime-lookup
+    #: note in ``docs/guides/model_profiles.md``.
+    prompt_end_token: str | None = field(kw_only=True)
     notes: str = ""
 
 
@@ -141,6 +178,18 @@ def assert_compatible(profile: ModelProfile, tokenizer) -> None:
                 f"update the pin deliberately -- adapters trained against the old "
                 f"template are not comparable to ones trained against the new."
             )
+        if profile.prompt_end_token is not None:
+            added = getattr(tokenizer, "get_added_vocab", None)
+            vocab = added() if callable(added) else {}
+            if profile.prompt_end_token not in vocab:
+                raise ValueError(
+                    f"profile {profile.match!r} declares prompt_end_token "
+                    f"{profile.prompt_end_token!r}, which is not in this "
+                    f"tokenizer's added vocabulary. The prompt/completion cut "
+                    f"must land on an atomic token, or BPE merges across the "
+                    f"seam and the training prompt stops being a prefix of what "
+                    f"generate() is handed."
+                )
         return
 
     if found is not None:
@@ -166,7 +215,11 @@ def resolve(model_id: str) -> ModelProfile:
         if model_id.startswith(profile.match):
             if best is None or len(profile.match) > len(best.match):
                 best = profile
-    return best if best is not None else ModelProfile(match="")
+    # prompt_end_token=None: raw, so a cut point is not applicable --
+    # ``render_prompt`` returns before ever reading the field.
+    return best if best is not None else ModelProfile(
+        match="", prompt_end_token=None
+    )
 
 
 def apply_pad_token(tokenizer, profile: ModelProfile) -> str:

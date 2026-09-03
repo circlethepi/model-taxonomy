@@ -162,7 +162,12 @@ def _finetune_one(
         # which would leave the training prompt ending in a token generate()
         # never produces.  encode_pair owns the split and asserts the two agree;
         # see src/datasets/_chat_projection for why the cut lands where it does.
-        enc = [cp.encode_pair(tokenizer, row, fmt, max_len, recipe=recipe) for row in rows]
+        enc = [
+            cp.encode_pair(
+                tokenizer, row, fmt, max_len, profile=profile, recipe=recipe
+            )
+            for row in rows
+        ]
         n_trunc = sum(1 for e in enc if e["truncated"])
         n_empty = sum(1 for e in enc if e["n_completion_tokens"] == 0)
         if n_empty:

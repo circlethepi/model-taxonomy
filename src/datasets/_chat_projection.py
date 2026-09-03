@@ -28,8 +28,8 @@ the training prompt ending in 271 where generation ends in 198.  That is the
 ``docs/notes/TODO.md`` item 11 mismatch, one level down at the tokenizer.
 
 The fix is to own the tokenization *and* to move the cut.  Added tokens are never
-merged into their neighbours, so cutting immediately after the last added token
-of the generation prompt gives both properties at once::
+merged into their neighbours, so cutting immediately after an added token of the
+generation prompt gives both properties at once::
 
     cut after "<think>\\n"   p=[...,248068,198]  c=[198,248069,...]   concat != joint
     cut after "<think>"      p=[...,248068]      c=[271,248069,...]   concat == joint
@@ -42,6 +42,33 @@ about where the cut is.
 
 None of this is Qwen-specific.  Llama-3 instruct's generation prompt ends
 ``<|end_header_id|>\\n\\n`` and takes the identical treatment.
+
+**Which token to cut after is declared, not derived.**
+
+    ``ModelProfile.prompt_end_token`` names it, per model family, beside the
+    ``chat_template_sha`` that pins the template the name is a fact about.
+    ``None`` means the prompt is the template's whole render.
+
+This module used to derive the cut point instead: scan the rendered text for
+every token of the tokenizer's added vocabulary and cut after the rightmost one,
+on the theory that all it would ever remove was the whitespace after the final
+role marker.  OLMo-2 disproved that.  It emits ``<|user|>`` and ``<|assistant|>``
+as ordinary text, so the only added-vocab token anywhere in its prompt is the BOS
+at index 0; the cut landed at character 13 and the rendered training prompt was
+the bare string ``<|endoftext|>``, with the Yahoo question discarded.  Nothing
+downstream noticed -- shapes stayed valid and the loss stayed finite.  Qwen3.5
+survived only by accident, because ``<think>`` happens to sit after
+``assistant\\n``; templates ending in a bare ``<|im_start|>assistant\\n``
+(SmolLM2-1.7B, Qwen2.5-1.5B, LFM2-1.2B) silently lost ``assistant\\n``.
+
+No derivation could have got OLMo-2 right, because there is no atomic token after
+its question to find.  So the cut point is stated by whoever pins the template,
+and this module only *validates* the statement: a declared token that does not
+occur, or whose cut would discard non-whitespace, raises here, and a declared
+token that is not atomic is rejected by ``assert_compatible`` at config time.
+``None`` is the safe direction rather than the ignorant one -- it keeps the whole
+render, so the question is always present, and :func:`encode_pair`'s assertion is
+then what says whether the untrimmed seam is a token boundary.
 
 **Additive by construction.**  ``PromptFormat()`` with no config block is
 ``format="raw"``, which delegates straight to ``row_text`` -- so every existing
@@ -154,37 +181,9 @@ def _join_fields(row: dict, fields: tuple[str, ...], separator: str) -> str:
     return separator.join(parts)
 
 
-def _atomic_tokens(tokenizer) -> list[str]:
-    """The tokens BPE will never merge across.
-
-    ``all_special_tokens`` is *not* the right set.  Qwen3.5 puts ``<think>`` and
-    ``<|im_start|>`` in the added vocabulary without listing them as special, yet
-    they are single ids and are exactly as unmergeable as ``<|im_end|>`` is.
-    What matters for the cut is atomicity, and that is what the added vocab
-    describes.
-    """
-    added = getattr(tokenizer, "get_added_vocab", None)
-    names = list(added().keys()) if callable(added) else []
-    names.extend(getattr(tokenizer, "all_special_tokens", []) or [])
-    return [n for n in dict.fromkeys(names) if n]
-
-
-def _trim_to_last_atomic(tokenizer, text: str) -> str:
-    """``text`` truncated to just past its last atomic token.
-
-    Returns ``text`` unchanged if it contains none -- a template that ends in
-    plain prose gets no trim, and :func:`encode_pair`'s assertion is then the
-    thing that tells us whether the seam is safe.
-    """
-    end = -1
-    for name in _atomic_tokens(tokenizer):
-        idx = text.rfind(name)
-        if idx >= 0:
-            end = max(end, idx + len(name))
-    return text if end < 0 else text[:end]
-
-
-def render_prompt(tokenizer, row: dict, fmt: PromptFormat, recipe=None) -> str:
+def render_prompt(
+    tokenizer, row: dict, fmt: PromptFormat, *, profile, recipe=None
+) -> str:
     """The exact string the model is prompted with, training and inference alike.
 
     This is the single definition of "the prompt".  ``make_queries`` calls it to
@@ -192,6 +191,10 @@ def render_prompt(tokenizer, row: dict, fmt: PromptFormat, recipe=None) -> str:
     full conversation to get the training completion, so the training prompt and
     the extraction prompt cannot drift apart -- which is the whole item-11
     lesson, stated as code rather than as a comment.
+
+    ``profile`` is required and keyword-only, matching the discipline on
+    ``ModelProfile.prompt_end_token`` itself: the cut point has to be *declared*,
+    so no call site may silently omit the thing that declares it.
     """
     if fmt.format == "raw":
         if recipe is None:
@@ -205,10 +208,27 @@ def render_prompt(tokenizer, row: dict, fmt: PromptFormat, recipe=None) -> str:
         add_generation_prompt=True,
         **fmt.chat_template_kwargs,
     )
-    return _trim_to_last_atomic(tokenizer, rendered)
+    end = profile.prompt_end_token
+    if end is None:  # declared: the prompt is the whole render
+        return rendered
+    idx = rendered.rfind(end)
+    if idx < 0:
+        raise ValueError(
+            f"profile {profile.match!r} declares prompt_end_token {end!r}, which "
+            f"does not occur in the rendered generation prompt"
+        )
+    cut = idx + len(end)
+    if rendered[cut:].strip():  # validation, not heuristic
+        raise ValueError(
+            f"cutting at prompt_end_token {end!r} would discard {rendered[cut:]!r}, "
+            f"which is not whitespace; the declaration is wrong for this template"
+        )
+    return rendered[:cut]
 
 
-def render_pair(tokenizer, row: dict, fmt: PromptFormat, recipe=None) -> tuple[str, str]:
+def render_pair(
+    tokenizer, row: dict, fmt: PromptFormat, *, profile, recipe=None
+) -> tuple[str, str]:
     """``(prompt, completion)`` for one training row.
 
     The completion is taken by **subtraction** -- render the full conversation,
@@ -220,7 +240,7 @@ def render_pair(tokenizer, row: dict, fmt: PromptFormat, recipe=None) -> tuple[s
     if fmt.format == "raw":
         raise ValueError("render_pair is chat-only; the raw path trains on one column")
 
-    prompt = render_prompt(tokenizer, row, fmt, recipe=recipe)
+    prompt = render_prompt(tokenizer, row, fmt, profile=profile, recipe=recipe)
     messages = [
         {"role": "user", "content": _join_fields(row, fmt.user_fields, fmt.separator)},
         {"role": "assistant", "content": _join_fields(row, fmt.answer_fields, fmt.answer_separator)},
@@ -245,6 +265,8 @@ def encode_pair(
     row: dict,
     fmt: PromptFormat,
     max_length: int,
+    *,
+    profile,
     recipe=None,
 ) -> dict:
     """Tokenized ``input_ids`` plus the mask marking which tokens are supervised.
@@ -265,7 +287,9 @@ def encode_pair(
     tokens, and the caller needs the counts to report and to drop rows that end
     up with none.
     """
-    prompt, completion = render_pair(tokenizer, row, fmt, recipe=recipe)
+    prompt, completion = render_pair(
+        tokenizer, row, fmt, profile=profile, recipe=recipe
+    )
     p_ids = tokenizer(prompt, add_special_tokens=False).input_ids
     c_ids = tokenizer(completion, add_special_tokens=False).input_ids
     joint = tokenizer(prompt + completion, add_special_tokens=False).input_ids

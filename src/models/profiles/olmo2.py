@@ -30,6 +30,14 @@ OLMO2 = ModelProfile(
         "fe689ffbd6a4e2d0532d7480696b065b10e0e1eff3f9b9fc4bea415761e4bf4a"
     ),
     chat_template_kwargs={},  # {} == the template's own defaults
+    # None deliberately, and this is a *chat* profile declining a cut -- not the
+    # inert None the raw profiles carry.  This template emits <|user|> and
+    # <|assistant|> as ordinary text, so there is no atomic token after the
+    # question to cut at; the prompt is the template's full render, trailing
+    # newline included, and ``encode_pair``'s seam assertion is what confirms
+    # that boundary is safe.  It is the field's whole point that this now reads
+    # as a decision rather than as an accident of the added vocabulary.
+    prompt_end_token=None,
     expected_lora_params=4_194_304,
     excluded_lora_modules=(),
     # pad_token is deliberately omitted: this checkpoint declares <|pad|>

@@ -404,6 +404,9 @@ def plot_radar(
     fill_alpha: float = 0.12,
     marker_size: int = 5,
     label_pad: float = 0.0,
+    spoke_axes: bool = False,
+    tick_len: float = 0.018,
+    rlabel_spoke: int | None = 0,
     title: str | None = None,
     legend: bool = True,
     legend_kwargs: dict | None = None,
@@ -421,6 +424,15 @@ def plot_radar(
     *label_pad* pushes the spoke labels outward, in points.  On a full-range
     radar the polygon reaches the outer ring and its markers land on top of the
     labels, so a few points of padding is usually needed.
+
+    *spoke_axes* swaps the default polar grid -- concentric rings plus a round
+    outer frame -- for one straight axis line per spoke, each carrying tick
+    marks at the *rticks* radii.  It reads as a set of shared axes radiating
+    from the centre rather than as a web, which suits a radar whose spokes are
+    unrelated quantities that merely share a scale.  *tick_len* sizes those
+    marks as a fraction of the radial range, and *rlabel_spoke* indexes the one
+    spoke that gets numeric tick labels (``None`` for none) -- repeating the
+    numbers on every spoke only adds clutter, since the scale is shared.
 
     ``NaN`` values are drawn as gaps rather than pulling the polygon to zero.
     Passing *rlim* fixes the radial range, which is what makes two radars
@@ -471,6 +483,9 @@ def plot_radar(
     if rticks is not None:
         ax.set_yticks(rticks)
 
+    if spoke_axes:
+        _draw_spoke_axes(ax, theta, tick_len, rlabel_spoke)
+
     if title:
         ax.set_title(title)
     if legend and any(s.label for s in series):
@@ -480,6 +495,43 @@ def plot_radar(
     if savefig:
         _save(fig, _resolve_savepath(savepath, title))
     return fig, ax
+
+
+def _draw_spoke_axes(ax, theta, tick_len, rlabel_spoke):
+    """Replace a polar axes' rings and frame with one ticked axis per spoke.
+
+    Called by :func:`plot_radar` for ``spoke_axes=True``.  Runs after the data
+    and the limits are set, because every length here is measured against the
+    final radial range.
+    """
+    lo, hi = ax.get_ylim()
+    ticks = [t for t in ax.get_yticks() if lo <= t <= hi]
+    #   Line colour and width follow whatever the active style gives the grid,
+    #   so these hand-drawn axes still match the rest of the figure.
+    color = plt.rcParams["grid.color"]
+    lw = plt.rcParams["grid.linewidth"]
+
+    ax.grid(False)
+    ax.spines["polar"].set_visible(False)
+
+    for t in theta:
+        ax.plot([t, t], [lo, hi], color=color, linewidth=lw,
+                solid_capstyle="butt", zorder=1, clip_on=False)
+        for r in ticks:
+            #   A tick mark is a short arc across its spoke.  Its angular
+            #   half-width has to shrink as the radius grows for every mark to
+            #   come out the same length on the page; at r = 0 there is no
+            #   angle that works, and no room for a mark either.
+            if r <= lo:
+                continue
+            half = tick_len * (hi - lo) / r
+            ax.plot([t - half, t + half], [r, r], color=color, linewidth=lw,
+                    solid_capstyle="butt", zorder=1)
+
+    if rlabel_spoke is None:
+        ax.set_yticklabels([])
+    else:
+        ax.set_rlabel_position(np.rad2deg(theta[rlabel_spoke % len(theta)]))
 
 
 # ── plot_grouped_bars ─────────────────────────────────────────────────────────

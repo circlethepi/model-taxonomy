@@ -168,6 +168,10 @@ def draw_radar(scores, version: str, outdir: Path) -> Path:
         #   Data and 1 - procrustes both sit at ~0.98, so their markers land on
         #   the outer ring; without the pad they cover the spoke labels.
         label_pad=12,
+        #   Straight ticked axes out to each spoke instead of concentric rings,
+        #   numbered once on the Data spoke -- all four share the one scale.
+        spoke_axes=True,
+        rlabel_spoke=labels.index("Data"),
         title=f"{axis_label}\n({direction})",
         savefig=False,
     )

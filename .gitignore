@@ -13,5 +13,9 @@ figures/nosync
 figures/simplex3_qwen/*.png
 figures/simplex3_qwen_v2/*.png
 figures/simplex3_qwen_v3/*.png
+# Unlike the suites above, this directory tracks nothing it generates -- not the
+# score tables either. Only the script that rebuilds them is kept.
+figures/simplex3_qwen-05temp/*
+!figures/simplex3_qwen-05temp/make_temperature_figures.py
 
 docs/notes/

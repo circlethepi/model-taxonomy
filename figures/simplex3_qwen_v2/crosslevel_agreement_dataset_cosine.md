@@ -6,29 +6,5 @@
 | dataset_embedding | 0.9371 | dataset text · mean · n1000_s00 | cosine |
 
 
-## Every rung, per level
-
-### behavioral
-
-| dCor | rung | metric |
-|---|---|---|
-| 0.8164 | R=16 · per query | cka |
-
-### functional
-
-| dCor | rung | metric |
-|---|---|---|
-| 0.9746 | h32 · final hidden state | cosine |
-
-### structural
-
-| dCor | rung | metric |
-|---|---|---|
-| 0.9684 | linear-attn · late third | cosine |
-
-### dataset_embedding
-
-| dCor | rung | metric |
-|---|---|---|
-| 0.9371 | dataset text · mean · n1000_s00 | cosine |
-
+The full per-level ranking these winners are drawn from is in `crosslevel_agreement.md`.
+The override picks a different row out of that ranking; it does not change how any row scores.

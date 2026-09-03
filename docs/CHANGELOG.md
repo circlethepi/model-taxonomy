@@ -18,6 +18,22 @@ The scores CSV is now written unsuffixed, so both cross-level calls land on
 `crosslevel_scores.csv`. The five duplicate `_dataset_cosine` CSVs are deleted. The
 figures and `crosslevel_agreement*.md` keep their suffixes — the override is real there.
 
+### A suffixed `crosslevel_agreement` file is only its winners table
+
+The same duplication survived inside the agreement markdown. Each variant file repeated
+the whole `## Every surrogate, per level` section — every cell of every level, ranked —
+under its own winners table, and that section was byte-identical to the unsuffixed
+file's in every suite that had both. It comes from the same `per_level_scores`: the
+override picks a different row *out of* the ranking, it does not change how any row
+scores.
+
+`cross_level` now writes the detail section into `crosslevel_agreement.md` alone. A
+suffixed file carries its winners table and one line pointing at the unsuffixed file,
+which is where the ranking lives — alongside `crosslevel_scores.csv`, its machine-readable
+form. The six tracked `_dataset_cosine` files are trimmed to match. In `simplex3_qwen_v2`,
+whose format predates the full ranking, the repeated section was the four winner rows
+already printed in its own header table; it is trimmed on the same grounds.
+
 ### The `olmo2` suite is unparked
 
 The previous release generated the `olmo2` suite and then forbade submitting it: its

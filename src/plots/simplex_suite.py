@@ -1265,8 +1265,11 @@ def cross_level(per_level, ids, outdir, metric_override=None, suffix=""):
 
     *suffix* is appended to the figure and agreement-table filenames, so an
     override variant sits beside the unrestricted one rather than overwriting
-    it. ``crosslevel_scores.csv`` is exempt: it holds the full per-level
-    ranking, which the override does not change.
+    it. What the override does *not* change is the per-level ranking every
+    winner is drawn from, so that ranking is written exactly once: in
+    ``crosslevel_scores.csv``, which takes no suffix, and in the detail section
+    of the unsuffixed ``crosslevel_agreement.md``. A suffixed agreement file is
+    just its winners table.
     """
     metric_override = metric_override or {}
     # Scored once per level and reused for the winners, the detail tables and
@@ -1340,21 +1343,32 @@ def cross_level(per_level, ids, outdir, metric_override=None, suffix=""):
     # The full ranking beside the winners, so a surrogate that wins by a hair does not
     # read as a decisive one, and so a surrogate that helped is visible even when
     # it did not take first place.
-    detail = ["", "", "## Every surrogate, per level", ""]
-    for lvl, ranked in per_level_scores.items():
-        # Rows stay in dCor order — the Procrustes bolding marks the best three
-        # of *that* column, which is exactly the interesting case when the two
-        # scores disagree about which surrogate recovers the simplex.
-        top3 = {id(s) for s in sorted(ranked, key=lambda s: s.procrustes)[:3]}
-        detail += [f"### {lvl}", "",
-                   "| dCor | Procrustes residual (lower=better) | surrogate | metric |",
-                   "|---|---|---|---|"]
-        detail += [f"| {s.dcor:.4f} | {_bold_if(s.procrustes, id(s) in top3)} "
-                   f"| {s.row} | {s.col} |" for s in ranked]
-        detail.append("")
+    #
+    # It goes in the unsuffixed file only. `per_level_scores` is scored before
+    # `metric_override` narrows the winner, so a variant's ranking is byte-identical
+    # to this one — the override changes which row is *picked*, not how any row
+    # scores. A variant file is therefore its winners table and a pointer to the
+    # single place the ranking lives.
+    if suffix:
+        body = (table + "\n\n\nThe full per-level ranking these winners are drawn from"
+                " is in `crosslevel_agreement.md`.\nThe override picks a different row"
+                " out of that ranking; it does not change how any row scores.\n")
+    else:
+        detail = ["", "", "## Every surrogate, per level", ""]
+        for lvl, ranked in per_level_scores.items():
+            # Rows stay in dCor order — the Procrustes bolding marks the best three
+            # of *that* column, which is exactly the interesting case when the two
+            # scores disagree about which surrogate recovers the simplex.
+            top3 = {id(s) for s in sorted(ranked, key=lambda s: s.procrustes)[:3]}
+            detail += [f"### {lvl}", "",
+                       "| dCor | Procrustes residual (lower=better) | surrogate | metric |",
+                       "|---|---|---|---|"]
+            detail += [f"| {s.dcor:.4f} | {_bold_if(s.procrustes, id(s) in top3)} "
+                       f"| {s.row} | {s.col} |" for s in ranked]
+            detail.append("")
+        body = table + "\n" + "\n".join(detail) + "\n"
 
-    (outdir / f"crosslevel_agreement{suffix}.md").write_text(
-        table + "\n" + "\n".join(detail) + "\n")
+    (outdir / f"crosslevel_agreement{suffix}.md").write_text(body)
     # Unsuffixed on purpose. `per_level_scores` is every cell of every level,
     # scored before `metric_override` narrows the winner, so an override variant
     # writes byte-identical rows — a suffix here only made duplicate files whose

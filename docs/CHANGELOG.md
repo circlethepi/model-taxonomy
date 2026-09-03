@@ -4,6 +4,20 @@
 
 ## Unreleased
 
+### One `crosslevel_scores.csv` per suite
+
+`cross_level` appended its *suffix* to every output it wrote, so the
+`dataset_embedding`-pinned-to-`cosine` variant also produced
+`crosslevel_scores_dataset_cosine.csv`. That file was byte-identical to
+`crosslevel_scores.csv` in all five tracked suites, and always would be: the CSV holds
+`per_level_scores` — every cell of every level, scored *before* `metric_override`
+narrows the winner. The override changes which surrogate the figures and the agreement
+table show, not how any cell scores.
+
+The scores CSV is now written unsuffixed, so both cross-level calls land on
+`crosslevel_scores.csv`. The five duplicate `_dataset_cosine` CSVs are deleted. The
+figures and `crosslevel_agreement*.md` keep their suffixes — the override is real there.
+
 ### The `olmo2` suite is unparked
 
 The previous release generated the `olmo2` suite and then forbade submitting it: its

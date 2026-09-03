@@ -1263,8 +1263,10 @@ def cross_level(per_level, ids, outdir, metric_override=None, suffix=""):
     ``notebooks/8_crosslevel_dataset_cosine.ipynb`` for the two readings that
     survive it.
 
-    *suffix* is appended to every output filename, so an override variant sits
-    beside the unrestricted one rather than overwriting it.
+    *suffix* is appended to the figure and agreement-table filenames, so an
+    override variant sits beside the unrestricted one rather than overwriting
+    it. ``crosslevel_scores.csv`` is exempt: it holds the full per-level
+    ranking, which the override does not change.
     """
     metric_override = metric_override or {}
     # Scored once per level and reused for the winners, the detail tables and
@@ -1353,7 +1355,12 @@ def cross_level(per_level, ids, outdir, metric_override=None, suffix=""):
 
     (outdir / f"crosslevel_agreement{suffix}.md").write_text(
         table + "\n" + "\n".join(detail) + "\n")
-    write_scores_csv(per_level_scores, outdir / f"crosslevel_scores{suffix}.csv")
+    # Unsuffixed on purpose. `per_level_scores` is every cell of every level,
+    # scored before `metric_override` narrows the winner, so an override variant
+    # writes byte-identical rows — a suffix here only made duplicate files whose
+    # names implied a difference they did not have. The override shows up in the
+    # figures and the agreement table, which is where it actually applies.
+    write_scores_csv(per_level_scores, outdir / "crosslevel_scores.csv")
     print(table)
 
 

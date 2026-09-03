@@ -6,6 +6,7 @@ from typing import Any, Callable
 import math
 
 import matplotlib.pyplot as plt
+import matplotlib.transforms as mtransforms
 from mpl_toolkits.axes_grid1 import make_axes_locatable
 import numpy as np
 import seaborn as sns
@@ -389,3 +390,267 @@ def encoding_legend(
     for leg in legends[:-1]:
         ax.add_artist(leg)
     return legends
+
+
+# ── plot_radar ────────────────────────────────────────────────────────────────
+
+def plot_radar(
+    series: list[PlotSeries],
+    axis_labels: list[str],
+    ax: plt.Axes | None = None,
+    start_angle: float = 90.0,
+    direction: str = "ccw",
+    rlim: tuple[float, float] | None = None,
+    rticks: list[float] | None = None,
+    fill_alpha: float = 0.12,
+    marker_size: int = 5,
+    label_pad: float = 0.0,
+    spoke_axes: bool = False,
+    tick_len: float = 0.018,
+    rlabel_spoke: int | None = 0,
+    rlabel_pad: float = 5.0,
+    title: str | None = None,
+    legend: bool = True,
+    legend_kwargs: dict | None = None,
+    savepath=None,
+    savefig: bool = True,
+) -> tuple[plt.Figure, plt.Axes]:
+    """Radar (spider) plot: one closed polygon per series over shared spokes.
+
+    Each ``PlotSeries.data`` is one value per spoke, in the same order as
+    *axis_labels*.  Spokes are spaced evenly around the circle; *start_angle*
+    (degrees, 0 = east, 90 = north) places the first one and *direction*
+    ("ccw" or "cw") decides which way the rest follow, so the caller controls
+    spoke placement purely by the order it passes *axis_labels*.
+
+    *label_pad* pushes the spoke labels outward, in points.  On a full-range
+    radar the polygon reaches the outer ring and its markers land on top of the
+    labels, so a few points of padding is usually needed.
+
+    *spoke_axes* swaps the default polar grid -- concentric rings plus a round
+    outer frame -- for one straight axis line per spoke, each carrying tick
+    marks at the *rticks* radii.  It reads as a set of shared axes radiating
+    from the centre rather than as a web, which suits a radar whose spokes are
+    unrelated quantities that merely share a scale.  *tick_len* sizes those
+    marks as a fraction of the radial range, and *rlabel_spoke* indexes the one
+    spoke that gets numeric tick labels (``None`` for none) -- repeating the
+    numbers on every spoke only adds clutter, since the scale is shared.  Those
+    labels are pushed *rlabel_pad* points to the side of their spoke, clear of
+    the line and of the tick marks; the offset is perpendicular and measured on
+    the page, so every label clears by the same amount whatever its radius.
+
+    ``NaN`` values are drawn as gaps rather than pulling the polygon to zero.
+    Passing *rlim* fixes the radial range, which is what makes two radars
+    comparable; leaving it ``None`` autoscales each figure independently.
+    """
+    if direction not in ("ccw", "cw"):
+        raise ValueError(f"direction must be 'ccw' or 'cw', got {direction!r}")
+
+    n = len(axis_labels)
+    if n < 3:
+        raise ValueError(f"a radar needs at least 3 spokes, got {n}")
+
+    if ax is None:
+        fig, ax = plt.subplots(subplot_kw={"projection": "polar"})
+    else:
+        if ax.name != "polar":
+            raise ValueError("plot_radar needs an axes with projection='polar'")
+        fig = ax.get_figure()
+
+    #   The closing point repeats the first so each polygon joins up.
+    theta = np.linspace(0, 2 * np.pi, n, endpoint=False)
+    closed = np.concatenate([theta, theta[:1]])
+
+    for i, s in enumerate(series):
+        vals = np.asarray(s.data, dtype=float).ravel()
+        if vals.size != n:
+            raise ValueError(
+                f"series {s.label!r} has {vals.size} values for {n} spokes"
+            )
+        vals = np.concatenate([vals, vals[:1]])
+        color = s.color if s.color is not None else PALETTE[i % len(PALETTE)]
+        ax.plot(closed, vals, color=color, label=s.label,
+                marker=s.marker if s.marker is not None else "o",
+                markersize=marker_size,
+                linestyle=s.linestyle if s.linestyle is not None else "-",
+                zorder=3)
+        if fill_alpha:
+            ax.fill(closed, vals, color=color, alpha=fill_alpha, zorder=2)
+
+    ax.set_theta_offset(np.deg2rad(start_angle))
+    ax.set_theta_direction(-1 if direction == "cw" else 1)
+    ax.set_xticks(theta)
+    ax.set_xticklabels(axis_labels)
+    if label_pad:
+        ax.tick_params(axis="x", pad=label_pad)
+    if rlim is not None:
+        ax.set_ylim(*rlim)
+    if rticks is not None:
+        ax.set_yticks(rticks)
+
+    if spoke_axes:
+        _draw_spoke_axes(ax, theta, tick_len, rlabel_spoke, rlabel_pad,
+                         start_angle, direction)
+
+    if title:
+        ax.set_title(title)
+    if legend and any(s.label for s in series):
+        ax.legend(**(legend_kwargs or {"loc": "upper right",
+                                       "bbox_to_anchor": (1.35, 1.12)}))
+
+    if savefig:
+        _save(fig, _resolve_savepath(savepath, title))
+    return fig, ax
+
+
+def _draw_spoke_axes(ax, theta, tick_len, rlabel_spoke, rlabel_pad,
+                     start_angle, direction):
+    """Replace a polar axes' rings and frame with one ticked axis per spoke.
+
+    Called by :func:`plot_radar` for ``spoke_axes=True``.  Runs after the data
+    and the limits are set, because every length here is measured against the
+    final radial range.
+    """
+    lo, hi = ax.get_ylim()
+    ticks = [t for t in ax.get_yticks() if lo <= t <= hi]
+    #   Line colour and width follow whatever the active style gives the grid,
+    #   so these hand-drawn axes still match the rest of the figure.
+    color = plt.rcParams["grid.color"]
+    lw = plt.rcParams["grid.linewidth"]
+
+    ax.grid(False)
+    ax.spines["polar"].set_visible(False)
+
+    for t in theta:
+        ax.plot([t, t], [lo, hi], color=color, linewidth=lw,
+                solid_capstyle="butt", zorder=1, clip_on=False)
+        for r in ticks:
+            #   A tick mark is a short arc across its spoke.  Its angular
+            #   half-width has to shrink as the radius grows for every mark to
+            #   come out the same length on the page; at r = 0 there is no
+            #   angle that works, and no room for a mark either.
+            if r <= lo:
+                continue
+            half = tick_len * (hi - lo) / r
+            #   clip_on=False for the same reason as the spoke line: the mark at
+            #   the outer limit straddles the axes boundary, so half of it is
+            #   outside and would otherwise be cut away.
+            ax.plot([t - half, t + half], [r, r], color=color, linewidth=lw,
+                    solid_capstyle="butt", zorder=1, clip_on=False)
+
+    if rlabel_spoke is None:
+        ax.set_yticklabels([])
+        return
+
+    spoke = theta[rlabel_spoke % len(theta)]
+    ax.set_rlabel_position(np.rad2deg(spoke))
+    if not rlabel_pad:
+        return
+
+    #   set_rlabel_position centres the numbers on the spoke, where the axis
+    #   line runs straight through them.  Shifting them along the spoke would
+    #   only move them onto a different part of the same line, so the offset is
+    #   perpendicular to it, in points, applied on top of whatever transform
+    #   the tick labels already carry.
+    on_page = np.deg2rad(start_angle) + (-1 if direction == "cw" else 1) * spoke
+    dx, dy = np.sin(on_page), -np.cos(on_page)
+    shift = mtransforms.ScaledTranslation(
+        rlabel_pad * dx / 72, rlabel_pad * dy / 72,
+        ax.get_figure().dpi_scale_trans)
+    for lab in ax.get_yticklabels():
+        lab.set_transform(lab.get_transform() + shift)
+        #   Anchor the text on the side the shift came from, so the pad is a
+        #   gap between line and glyphs rather than a nudge of the whole box.
+        lab.set_horizontalalignment(
+            "left" if dx > 0.1 else "right" if dx < -0.1 else "center")
+        lab.set_verticalalignment(
+            "bottom" if dy > 0.1 else "top" if dy < -0.1 else "center")
+
+
+# ── plot_grouped_bars ─────────────────────────────────────────────────────────
+
+def plot_grouped_bars(
+    series: list[PlotSeries],
+    group_labels: list[str],
+    ax: plt.Axes | None = None,
+    ylabel: str | None = None,
+    ylim: tuple[float, float] | None = None,
+    bar_width: float = 0.8,
+    annotate: bool = False,
+    annot_fmt: str = "{:.2f}",
+    annot_size: float | None = None,
+    annot_rotation: float = 0.0,
+    annot_inside: bool | str = False,
+    title: str | None = None,
+    legend: bool = True,
+    legend_kwargs: dict | None = None,
+    savepath=None,
+    savefig: bool = True,
+) -> tuple[plt.Figure, plt.Axes]:
+    """Grouped bar chart: one group per *group_labels* entry, one bar per series.
+
+    Each ``PlotSeries.data`` holds one value per group, in the same order as
+    *group_labels*.  *bar_width* is the fraction of a group's slot the bars
+    together occupy, so the gap between groups stays the same however many
+    series are drawn.  ``NaN`` values simply draw no bar.
+    """
+    n_groups = len(group_labels)
+    n_series = len(series)
+    if n_series == 0:
+        raise ValueError("plot_grouped_bars needs at least one series")
+
+    fig, ax = _get_fig_ax(ax)
+
+    x = np.arange(n_groups, dtype=float)
+    width = bar_width / n_series
+    #   Offsets centre the whole cluster on the group's tick.
+    offsets = (np.arange(n_series) - (n_series - 1) / 2) * width
+
+    #   Applied before anything is drawn: the "auto" annotation placement below
+    #   measures each bar against the y-range, so the final range has to be in
+    #   effect by then or short bars get labelled as though they were tall.
+    if ylim is not None:
+        ax.set_ylim(*ylim)
+
+    for i, (s, off) in enumerate(zip(series, offsets)):
+        vals = np.asarray(s.data, dtype=float).ravel()
+        if vals.size != n_groups:
+            raise ValueError(
+                f"series {s.label!r} has {vals.size} values for {n_groups} groups"
+            )
+        color = s.color if s.color is not None else PALETTE[i % len(PALETTE)]
+        bars = ax.bar(x + off, vals, width=width, color=color, label=s.label,
+                      zorder=3)
+        if annotate:
+            for rect, v in zip(bars, vals):
+                if np.isnan(v):
+                    continue
+                inside = annot_inside
+                if inside == "auto":
+                    lo, hi = ax.get_ylim()
+                    span = hi - lo
+                    #   A quarter of the axis is enough height for a rotated
+                    #   label; below that the text would spill past the base.
+                    inside = span > 0 and (v - lo) / span > 0.25
+                ax.annotate(annot_fmt.format(v),
+                            xy=(rect.get_x() + rect.get_width() / 2, v),
+                            xytext=(0, -3 if inside else 2),
+                            textcoords="offset points",
+                            ha="center", va="top" if inside else "bottom",
+                            color="white" if inside else None,
+                            fontsize=annot_size, rotation=annot_rotation,
+                            zorder=4)
+
+    ax.set_xticks(x)
+    ax.set_xticklabels(group_labels)
+    ax.set_xlim(-0.5, n_groups - 0.5)
+    if ylabel:
+        ax.set_ylabel(ylabel)
+    if title:
+        ax.set_title(title)
+    if legend and any(s.label for s in series):
+        ax.legend(**(legend_kwargs or {}))
+
+    if savefig:
+        _save(fig, _resolve_savepath(savepath, title))
+    return fig, ax

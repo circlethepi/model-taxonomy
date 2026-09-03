@@ -4,6 +4,51 @@
 
 ## Unreleased
 
+### One `crosslevel_scores.csv` per suite
+
+`cross_level` appended its *suffix* to every output it wrote, so the
+`dataset_embedding`-pinned-to-`cosine` variant also produced
+`crosslevel_scores_dataset_cosine.csv`. That file was byte-identical to
+`crosslevel_scores.csv` in all five tracked suites, and always would be: the CSV holds
+`per_level_scores` — every cell of every level, scored *before* `metric_override`
+narrows the winner. The override changes which surrogate the figures and the agreement
+table show, not how any cell scores.
+
+The scores CSV is now written unsuffixed, so both cross-level calls land on
+`crosslevel_scores.csv`. The five duplicate `_dataset_cosine` CSVs are deleted. The
+figures and `crosslevel_agreement*.md` keep their suffixes — the override is real there.
+
+### A suffixed `crosslevel_agreement` file is only its winners table
+
+The same duplication survived inside the agreement markdown. Each variant file repeated
+the whole `## Every surrogate, per level` section — every cell of every level, ranked —
+under its own winners table, and that section was byte-identical to the unsuffixed
+file's in every suite that had both. It comes from the same `per_level_scores`: the
+override picks a different row *out of* the ranking, it does not change how any row
+scores.
+
+`cross_level` now writes the detail section into `crosslevel_agreement.md` alone. A
+suffixed file carries its winners table and one line pointing at the unsuffixed file,
+which is where the ranking lives — alongside `crosslevel_scores.csv`, its machine-readable
+form. The six tracked `_dataset_cosine` files are trimmed to match. In `simplex3_qwen_v2`,
+whose format predates the full ranking, the repeated section was the four winner rows
+already printed in its own header table; it is trimmed on the same grounds.
+
+### The dedup covers the `_procrustes` variant too
+
+The `_procrustes` cross-level variant — each panel the surrogate whose *drawn*
+configuration sits closest to the simplex, rather than the one whose distances agree with
+it best — was written against `cross_level` as it stood before the two fixes above, so
+regenerating a suite reintroduced everything they removed: three suffixed scores CSVs and
+three full copies of the ranking, one per variant.
+
+Nothing about that variant needed special handling. `rank_by` is the same kind of knob as
+`metric_override`: it picks a different row out of `per_level_scores`, which is scored
+before either is consulted. So the rule is keyed on `suffix` rather than on which knob was
+turned, and a variant added later is covered without being named. A run now writes one
+`crosslevel_scores.csv` and one `## Every surrogate, per level` section however many
+variants it draws.
+
 ### The `olmo2` suite is unparked
 
 The previous release generated the `olmo2` suite and then forbade submitting it: its

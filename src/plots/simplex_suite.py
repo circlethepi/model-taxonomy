@@ -83,6 +83,7 @@ import csv
 import hashlib
 import os
 import sys
+import textwrap
 from pathlib import Path
 from typing import NamedTuple
 
@@ -1303,7 +1304,8 @@ LEVEL_ORDER = [
 ]
 
 
-def cross_level(per_level, ids, outdir, metric_override=None, suffix=""):
+def cross_level(per_level, ids, outdir, metric_override=None, suffix="",
+                rank_by="dcor", label_perspective=False):
     """Each level's best-scoring surrogate side by side, plus the agreement table.
 
     *metric_override* maps a level to a metric name that level must be read
@@ -1321,8 +1323,27 @@ def cross_level(per_level, ids, outdir, metric_override=None, suffix=""):
     ``notebooks/8_crosslevel_dataset_cosine.ipynb`` for the two readings that
     survive it.
 
-    *suffix* is appended to every output filename, so an override variant sits
-    beside the unrestricted one rather than overwriting it.
+    *rank_by* chooses which of the two scores picks each level's panel:
+    ``"dcor"`` takes the highest dCor, ``"procrustes"`` the lowest residual
+    disparity. The two disagree often enough to be worth drawing both — dCor
+    scores the distance matrix and never embeds, while the disparity scores the
+    2-D configuration the panel actually draws — so the ``_procrustes`` variant
+    answers "which surrogate *looks* most like the simplex" where the default
+    answers "which surrogate's distances agree with it".
+
+    *label_perspective* names the winning perspective (surrogate x metric) under
+    each panel's level name. It is on for the ``_procrustes`` variant because
+    that figure exists to be compared against the dCor one, and the comparison is
+    unreadable without seeing which cell each panel came from.
+
+    *suffix* is appended to the figure and agreement-table filenames, so a
+    variant sits beside the unrestricted one rather than overwriting it. What
+    neither *metric_override* nor *rank_by* changes is the per-level ranking
+    every winner is drawn from — both only pick a different row out of it — so
+    that ranking is written exactly once, however many variants a run makes: in
+    ``crosslevel_scores.csv``, which takes no suffix, and in the detail section
+    of the unsuffixed ``crosslevel_agreement.md``. A suffixed agreement file is
+    just its winners table.
     """
     metric_override = metric_override or {}
     # Scored once per level and reused for the winners, the detail tables and
@@ -1346,7 +1367,11 @@ def cross_level(per_level, ids, outdir, metric_override=None, suffix=""):
         if not ranked:
             print(f"    {lvl}: no scorable cell — omitted from the comparison")
             continue
-        best = ranked[0]
+        # `ranked` is in dCor order, so the dCor winner is just its head; the
+        # Procrustes winner has to be searched for, since the two scores run in
+        # opposite directions and are not two readings of one quantity.
+        best = ranked[0] if rank_by == "dcor" else min(ranked,
+                                                       key=lambda s: s.procrustes)
         winners[lvl] = best
         table_rows.append((lvl, best))
 
@@ -1365,20 +1390,38 @@ def cross_level(per_level, ids, outdir, metric_override=None, suffix=""):
     # which panel was pinned to which metric.
     note = ", ".join(f"{display.get(l, l)} pinned to {m}"
                      for l, m in metric_override.items() if l in winners)
+
+    def panel_label(name, lvl):
+        """The level's display name, with the winning perspective under it.
+
+        Wrapped, because a surrogate name is written for a table row and the
+        longest of them (``dataset text · mean · n1000_s00``) runs past a 3.1"
+        panel on one line and collides with its neighbour.
+        """
+        if not label_perspective:
+            return name
+        s = winners[lvl]
+        perspective = f"{s.row} \u00d7 {s.col}"
+        return "\n".join([name] + textwrap.wrap(perspective, width=24))
+
     subtitle = "Mixtures from 3 topic groupings from the Yahoo Answers Dataset"
     crosslevel_mds(
-        [(name, winners[lvl].dm, winners[lvl].dcor, winners[lvl].procrustes)
+        [(panel_label(name, lvl), winners[lvl].dm, winners[lvl].dcor,
+          winners[lvl].procrustes)
          for name, lvl in ordered],
-        "Cross-Taxonomy Simplex — MDS",
+        "Cross-Taxonomy Simplex — MDS"
+        + (" (best Procrustes per level)" if rank_by == "procrustes" else ""),
         subtitle=subtitle + (f" · {note}" if note else ""),
         savepath=outdir / f"fig_crosslevel_mds{suffix}.png",
         random_state=MDS_SEED,
     )
     plt.close("all")
-    cells = {("best surrogate", name): winners[lvl].dm for name, lvl in ordered}
-    dm_grid(cells, ["best surrogate"], [name for name, _ in ordered],
-            "Cross-level comparison — distance matrices, each level's best surrogate"
-            + (f" ({note})" if note else ""),
+    labels = [(panel_label(name, lvl), lvl) for name, lvl in ordered]
+    cells = {("best surrogate", lbl): winners[lvl].dm for lbl, lvl in labels}
+    dm_grid(cells, ["best surrogate"], [lbl for lbl, _ in labels],
+            "Cross-level comparison — distance matrices, each level's "
+            + ("lowest-Procrustes" if rank_by == "procrustes" else "best")
+            + " surrogate" + (f" ({note})" if note else ""),
             savepath=outdir / f"fig_crosslevel_dm{suffix}.png")
     plt.close("all")
 
@@ -1396,22 +1439,40 @@ def cross_level(per_level, ids, outdir, metric_override=None, suffix=""):
     # The full ranking beside the winners, so a surrogate that wins by a hair does not
     # read as a decisive one, and so a surrogate that helped is visible even when
     # it did not take first place.
-    detail = ["", "", "## Every surrogate, per level", ""]
-    for lvl, ranked in per_level_scores.items():
-        # Rows stay in dCor order — the Procrustes bolding marks the best three
-        # of *that* column, which is exactly the interesting case when the two
-        # scores disagree about which surrogate recovers the simplex.
-        top3 = {id(s) for s in sorted(ranked, key=lambda s: s.procrustes)[:3]}
-        detail += [f"### {lvl}", "",
-                   "| dCor | Procrustes residual (lower=better) | surrogate | metric |",
-                   "|---|---|---|---|"]
-        detail += [f"| {s.dcor:.4f} | {_bold_if(s.procrustes, id(s) in top3)} "
-                   f"| {s.row} | {s.col} |" for s in ranked]
-        detail.append("")
+    #
+    # It goes in the unsuffixed file only. `per_level_scores` is scored before
+    # either `metric_override` or `rank_by` is consulted, so every variant's ranking
+    # is byte-identical to this one — a variant changes which row is *picked*, not
+    # how any row scores. A variant file is therefore its winners table and a
+    # pointer to the single place the ranking lives. This holds for any variant
+    # added later, which is the point of keying it on `suffix` rather than on
+    # which knob was turned.
+    if suffix:
+        body = (table + "\n\n\nThe full per-level ranking these winners are drawn from"
+                " is in `crosslevel_agreement.md`.\nThis variant picks different rows"
+                " out of that ranking; it does not change how any row scores.\n")
+    else:
+        detail = ["", "", "## Every surrogate, per level", ""]
+        for lvl, ranked in per_level_scores.items():
+            # Rows stay in dCor order — the Procrustes bolding marks the best three
+            # of *that* column, which is exactly the interesting case when the two
+            # scores disagree about which surrogate recovers the simplex.
+            top3 = {id(s) for s in sorted(ranked, key=lambda s: s.procrustes)[:3]}
+            detail += [f"### {lvl}", "",
+                       "| dCor | Procrustes residual (lower=better) | surrogate | metric |",
+                       "|---|---|---|---|"]
+            detail += [f"| {s.dcor:.4f} | {_bold_if(s.procrustes, id(s) in top3)} "
+                       f"| {s.row} | {s.col} |" for s in ranked]
+            detail.append("")
+        body = table + "\n" + "\n".join(detail) + "\n"
 
-    (outdir / f"crosslevel_agreement{suffix}.md").write_text(
-        table + "\n" + "\n".join(detail) + "\n")
-    write_scores_csv(per_level_scores, outdir / f"crosslevel_scores{suffix}.csv")
+    (outdir / f"crosslevel_agreement{suffix}.md").write_text(body)
+    # Unsuffixed on purpose. `per_level_scores` is every cell of every level,
+    # scored before `metric_override` or `rank_by` narrows the winner, so a
+    # variant writes byte-identical rows — a suffix here only made duplicate
+    # files whose names implied a difference they did not have. A variant shows
+    # up in the figures and its winners table, which is where it actually applies.
+    write_scores_csv(per_level_scores, outdir / "crosslevel_scores.csv")
     print(table)
 
 
@@ -1647,6 +1708,13 @@ def run_suite(*, base_model, draw, outdir, cache_root=None, levels=None,
         cross_level(per_level, ids, outdir,
                     metric_override={"dataset_embedding": "cosine"},
                     suffix="_dataset_cosine")
+        # The same levels, each panel now the surrogate whose *drawn*
+        # configuration sits closest to the simplex rather than the one whose
+        # distances agree with it best. The perspective is named under each
+        # panel, since the point of this variant is what it swapped in.
+        print("cross-level (lowest Procrustes) …")
+        cross_level(per_level, ids, outdir, rank_by="procrustes",
+                    label_perspective=True, suffix="_procrustes")
 
     n = len(list(outdir.glob("*.png")))
     print(f"\nwrote {n} figures to {outdir}")

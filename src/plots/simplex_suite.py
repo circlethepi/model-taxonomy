@@ -114,7 +114,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
 import numpy as np  # noqa: E402
 
-from src.analysis import scan_cache  # noqa: E402
+from src.analysis import datasets_present, scan_cache  # noqa: E402
 from src.analysis.bridge import as_distance_matrix, fit_geometry  # noqa: E402
 from src.analysis.comparison import (  # noqa: E402
     _distances, _distances_via_pairs, resolve_ordered,
@@ -1542,7 +1542,7 @@ def _selected_level(idx, ids, names, level, chosen, surrogates):
 def run_suite(*, base_model, draw, outdir, cache_root=None, levels=None,
               skip_sweep=False, skip_detail=False, surrogates=False,
               no_cache=False, select=None, source=None, n_expected=16,
-              crosslevel_only=False):
+              crosslevel_only=False, datasets=None):
     """Build the figure suite for one run.
 
     This is the old ``main()`` body with the argument parsing lifted out, so the
@@ -1554,6 +1554,14 @@ def run_suite(*, base_model, draw, outdir, cache_root=None, levels=None,
     the unrestricted qwen run byte-for-byte what it was. *source* is recorded in
     every stored collection's ``config.json`` and should name the **driver**, so
     a cached collection says which run wrote it.
+
+    *datasets* restricts the scan to the named corpora, as a sequence of
+    recipe-name prefixes or dataset ids. It is not optional in practice once a
+    base model carries two of them: ``03_adapters/<base_slug>`` holds every
+    adapter for that model whatever it was trained on, so an unfiltered scan of
+    a Qwen cache holding both yahoo and dolly returns 51 models and the
+    ``n_expected`` guard below trips. ``None`` scans everything, which is what
+    every driver did before a second corpus existed.
 
     *crosslevel_only* keeps the cross-level closer and drops every other output:
     the per-level grids, the per-metric detail panels, the functional layer sweep
@@ -1612,21 +1620,46 @@ def run_suite(*, base_model, draw, outdir, cache_root=None, levels=None,
     set_style("two_col_full")
 
     idx = scan_cache(str(CACHE_ROOT), base_model_id=BASE_MODEL,
-                     behavioral_draw=DRAW, functional_draw=DRAW)
+                     behavioral_draw=DRAW, functional_draw=DRAW,
+                     datasets=datasets)
+    # The count guard runs before sort_by_mixture, not after: a mixed-corpus
+    # scan is the likeliest reason for a wrong count, and sorting would raise on
+    # the mixed widths first with a message about weight arrays rather than
+    # about the cache.
+    if len(idx.model_ids) != n_expected:
+        found = datasets_present(idx)
+        raise SystemExit(
+            f"expected {n_expected} models, found {len(idx.model_ids)}"
+            + (f" across {len(found)} corpora {found}" if len(found) > 1 else "")
+            + ". "
+            + ("The cache holds more than one dataset under this base model, "
+               "which is by design -- pass datasets=[...] to say which one this "
+               "figure is about."
+               if len(found) > 1 else "Cache incomplete?")
+        )
     ids = sort_by_mixture(idx.model_ids)
     names = [Path(m).name for m in ids]
-    print(f"cache: {CACHE_ROOT}\nmodels: {len(ids)}")
+    print(f"cache: {CACHE_ROOT}\nmodels: {len(ids)}"
+          + (f"\ndatasets: {list(datasets)}" if datasets else ""))
     print(f"reuse: {'reads bypassed (--no-cache), still writing' if no_cache else '06_pairwise'}")
-    if len(ids) != n_expected:
-        raise SystemExit(
-            f"expected {n_expected} models, found {len(ids)} — cache incomplete?")
 
     if not crosslevel_only:
-        fig, ax = plt.subplots(figsize=(4.2, 4.0))
-        ternary_legend(ax, ids, label_models=True)
-        ax.set_title("simplex3 mixtures — barycentric colour key", fontsize=9)
-        save_figure(fig, str(outdir / "fig_ternary_legend.png"))
-        plt.close("all")
+        if n_groups(ids) == 3:
+            fig, ax = plt.subplots(figsize=(4.2, 4.0))
+            ternary_legend(ax, ids, label_models=True)
+            ax.set_title("simplex3 mixtures — barycentric colour key", fontsize=9)
+            save_figure(fig, str(outdir / "fig_ternary_legend.png"))
+            plt.close("all")
+        else:
+            # There is no honest 2-D barycentric picture of a tetrahedron:
+            # `_bary_to_xy` maps to a triangle and `ternary_legend` labels three
+            # corners, and neither has a 4-vertex analogue. Skipped rather than
+            # projected, and said out loud rather than silently omitted -- the
+            # MDS panels remain, coloured by the full weight vector, and they
+            # are what keeps the recipe legible at K > 3.
+            print(f"note: {n_groups(ids)} groups — no ternary legend "
+                  f"(a simplex above 2-D has no barycentric plane); "
+                  f"points are still coloured by their full mixture")
 
     def emit_grid(*args, **kwargs):
         """:func:`emit`, unless the driver wants the cross-level closer alone.

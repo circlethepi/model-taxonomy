@@ -81,6 +81,15 @@ def main() -> None:
     ap.add_argument("--draw-seed", type=int, default=suite.DRAW["seed"])
     ap.add_argument("--draw-format-id", default=suite.DRAW["prompt_format_id"],
                     help="prompt_format_id of the query draw; '' for a raw suite")
+    # Which corpus. 03_adapters/<base_slug> holds every adapter for a base model
+    # whatever it was trained on -- that is what makes the cache shared -- so
+    # once a second dataset is trained on this model an unfiltered scan returns
+    # both and the count guard trips. Repeatable, so a deliberately
+    # cross-dataset comparison stays expressible.
+    ap.add_argument("--dataset", action="append", dest="datasets",
+                    help="restrict to a corpus, by recipe-name prefix (yahoo, "
+                         "dolly, oasst1) or dataset_id; repeat for several. "
+                         "Default: every corpus in the cache.")
     args = ap.parse_args()
 
     draw = {"recipe_hash": args.draw_recipe_hash, "n_samples": args.draw_n,
@@ -98,6 +107,7 @@ def main() -> None:
         skip_detail=args.skip_detail,
         surrogates=args.with_surrogate,
         no_cache=args.no_cache,
+        datasets=args.datasets,
         source="scripts/make_simplex3_figures.py",
     )
 

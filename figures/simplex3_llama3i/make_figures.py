@@ -59,6 +59,14 @@ from src.plots import simplex_suite as suite  # noqa: E402
 
 BASE_MODEL = "meta-llama/Llama-3.1-8B-Instruct"
 
+#: Which corpus this driver plots. Not optional once a second dataset is trained
+#: on the same base model: `03_adapters/<base_slug>` holds every adapter for that
+#: model regardless of what it was trained on -- the draw arguments set
+#: availability flags and never filter -- so an unfiltered scan would return both
+#: corpora and `n_expected` would trip.
+DATASETS = ["yahoo"]
+
+
 #: The query draw both inference stages used. Identical to the qwen run's, which
 #: is what makes the two comparable at all; read off this run's own
 #: ``04_activations/**/runs/*.json`` rather than assumed.
@@ -143,6 +151,7 @@ def main() -> None:
         # never built and none is selected above.
         surrogates=False,
         select={k: v for k, v in SELECT.items() if k in levels},
+        datasets=DATASETS,
         source="figures/simplex3_llama3i/make_figures.py",
     )
 

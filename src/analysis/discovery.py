@@ -314,6 +314,7 @@ def scan_cache(
     behavioral_draw: dict | None = None,
     functional_draw: dict | None = None,
     logprob_draw: dict | None = None,
+    datasets: Sequence[str] | None = None,
 ) -> CacheIndex:
     """Walk the shared cache and join adapters to the recipes they were trained on.
 
@@ -357,6 +358,30 @@ def scan_cache(
         *something* is stored there.  Read the entries themselves — the
         filenames are a complete description — when the answer has to name a
         decoding point.
+    datasets:
+        Restrict to adapters trained on the named corpora.  A sequence, not a
+        single name, so a deliberately cross-dataset comparison stays
+        expressible; ``None`` (the default) filters nothing, so every existing
+        caller behaves exactly as it did.
+
+        Each name matches either a **recipe-name prefix** — the token every
+        mixture in that corpus starts with, ``yahoo`` / ``dolly`` / ``oasst1`` —
+        or a **dataset_id** appearing in the adapter's resolved recipe.  The
+        prefix is what a figure driver naturally knows; the dataset_id is what
+        the recipe records, and it is the more precise of the two.
+
+        **Why this exists.**  ``03_adapters/<base_slug>`` holds every adapter
+        for a base model regardless of what it was trained on — that is the
+        design, and it is what makes the cache shared.  The ``*_draw``
+        arguments above set per-entry availability *flags*; they never filter
+        the list.  Neither does ``output_dir``, which no adapter path contains.
+        So the moment a second corpus is trained on a base model, an unfiltered
+        scan returns both, ``sort_by_mixture`` parses across them, and the
+        caller's count guard trips.  This is the only argument that separates
+        them.
+
+        Matching a dataset_id requires ``resolve_recipes``; with it off, only
+        the prefix form can match.
     """
     root = Path(cache_root)
     adapters_root = root / "03_adapters"
@@ -424,6 +449,9 @@ def scan_cache(
                     entry.recipe_hash, entry.n_samples, entry.seed
                 )
 
+            if not _matches_datasets(entry, datasets):
+                continue
+
             entry.available = {
                 "structural_weights": (adapter_dir / "adapter_model.safetensors").exists(),
                 "structural_repr": bool(
@@ -453,6 +481,46 @@ def scan_cache(
         _attach_unreferenced_recipes(entries, de_cache, sampled_root, embeddings_root)
 
     return CacheIndex(entries, root)
+
+
+def _matches_datasets(entry: CacheEntry, datasets: Sequence[str] | None) -> bool:
+    """Whether *entry* was trained on any of the named corpora.
+
+    Two spellings are accepted per name, because two callers know two different
+    things.  A figure driver knows the recipe-name prefix its adapters carry;
+    the recipe itself records a ``dataset_id``.  Either matches.
+
+    The prefix is compared against the mixture name's first token rather than
+    with ``startswith``, so ``dolly`` cannot also match a hypothetical
+    ``dolly2`` corpus.
+    """
+    if not datasets:
+        return True
+    wanted = set(datasets)
+
+    name = entry.mixture or entry.recipe_id or entry.adapter_name or ""
+    if name.split("_", 1)[0] in wanted:
+        return True
+
+    for block in (entry.recipe or {}).get("datasets", []) or []:
+        if isinstance(block, dict) and block.get("dataset_id") in wanted:
+            return True
+    return False
+
+
+def datasets_present(index: "CacheIndex") -> list[str]:
+    """The corpus prefixes an index holds, for a failure message that names them.
+
+    "expected 16 models, found 51 — cache incomplete?" is misleading when the
+    cache is not incomplete but mixed, so the guard that says it needs to be
+    able to say which corpora it found.
+    """
+    seen = set()
+    for entry in index:
+        name = entry.mixture or entry.recipe_id or entry.adapter_name or ""
+        if name:
+            seen.add(name.split("_", 1)[0])
+    return sorted(seen)
 
 
 def _build_entry(adapter_dir: Path, base_id: str, meta: dict) -> CacheEntry:

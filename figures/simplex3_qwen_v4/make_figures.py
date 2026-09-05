@@ -62,6 +62,14 @@ sys.path.insert(0, str(REPO_ROOT))
 from src.plots import simplex_suite as suite  # noqa: E402
 
 BASE_MODEL = "Qwen/Qwen3.5-4B"
+
+#: Which corpus this driver plots. Not optional once a second dataset is trained
+#: on the same base model: `03_adapters/<base_slug>` holds every adapter for that
+#: model regardless of what it was trained on -- the draw arguments set
+#: availability flags and never filter -- so an unfiltered scan would return both
+#: corpora and `n_expected` would trip.
+DATASETS = ["yahoo"]
+
 DRAW = {"recipe_hash": "6149cf8055bac2c1", "n_samples": 100, "seed": 1,
         "prompt_format_id": "ea27ccee"}
 
@@ -133,6 +141,7 @@ def main() -> None:
         no_cache=args.no_cache,
         surrogates=False,
         select={k: v for k, v in SELECT.items() if k in levels},
+        datasets=DATASETS,
         source="figures/simplex3_qwen_v4/make_figures.py",
     )
 

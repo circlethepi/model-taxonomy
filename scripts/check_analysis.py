@@ -1717,6 +1717,77 @@ def t_recipe_relabelling():
     )
 
 
+@check("discovery: a dataset filter separates two corpora under one base model")
+def t_scan_cache_dataset_filter():
+    """The guard that keeps the yahoo drivers working once dolly is trained.
+
+    ``03_adapters/<base_slug>`` holds every adapter for a base model whatever it
+    was trained on — that is the design, and it is what makes the cache shared.
+    The ``*_draw`` arguments set per-entry availability *flags* and never filter
+    the list, and no adapter path contains ``output_dir``. So a second corpus on
+    the same base model is invisible to every existing selector, and the only
+    symptom is a count guard tripping on 51 models where 16 were expected.
+    """
+    import json
+    import tempfile
+
+    from src.analysis import datasets_present, scan_cache
+
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        slug = "Qwen--Qwen3.5-4B"
+        planted = {"yahoo": 0, "dolly": 0}
+        for corpus, mixes, n, ds_id in [
+            ("yahoo", ["100g1_000g2_000g3", "000g1_100g2_000g3", "033g1_033g2_033g3"],
+             1000, "yahoo_answers_topics"),
+            ("dolly", ["100g1_000g2_000g3_000g4", "025g1_025g2_025g3_025g4"],
+             1000, "databricks/databricks-dolly-15k"),
+        ]:
+            for mix in mixes:
+                name = f"{corpus}_{mix}_n{n}_s00_r16_i00_b5008_fdeadbeef"
+                d = root / "03_adapters" / slug / name
+                d.mkdir(parents=True)
+                (d / "adapter_model.safetensors").write_bytes(b"")
+                (d / "experiment_meta.json").write_text(json.dumps({
+                    "base_model_id": "Qwen/Qwen3.5-4B",
+                    "dataset_name": f"{corpus}_{mix}_n{n}_s00",
+                    "dataset_recipe_hash": f"hash_{corpus}",
+                    "lora_config": {"r": 16},
+                    "training": {"samples_seen": 5008},
+                }))
+                planted[corpus] += 1
+
+        total = planted["yahoo"] + planted["dolly"]
+
+        # No filter: today's behaviour, unchanged. This is the default, so every
+        # existing caller has to land here.
+        assert len(scan_cache(root).model_ids) == total
+
+        # One corpus at a time — the case that makes the yahoo drivers correct
+        # again rather than merely making the new ones possible.
+        for corpus, want in planted.items():
+            got = scan_cache(root, datasets=[corpus]).model_ids
+            assert len(got) == want, f"{corpus}: {len(got)} != {want}"
+            assert all(Path(m).name.startswith(corpus + "_") for m in got)
+
+        # Several at once. Accepting a sequence rather than one name is an
+        # explicit requirement: the filter must not make a deliberately
+        # cross-dataset comparison impossible to express.
+        both = scan_cache(root, datasets=["yahoo", "dolly"])
+        assert len(both.model_ids) == total
+
+        # A prefix is compared token-wise, not with startswith, so a corpus name
+        # cannot also match a longer one that begins with it.
+        assert len(scan_cache(root, datasets=["doll"]).model_ids) == 0
+
+        # And the message the count guard needs can name what it found.
+        assert datasets_present(scan_cache(root)) == ["dolly", "yahoo"]
+        assert datasets_present(scan_cache(root, datasets=["dolly"])) == ["dolly"]
+
+    return (f"{total} planted, filtered to {planted['yahoo']} yahoo / "
+            f"{planted['dolly']} dolly, union {total}, default unfiltered")
+
+
 @check("[data] discovery: the cache scan joins adapters to their recipes")
 def t_scan_cache():
     from src.analysis import scan_cache
@@ -5936,7 +6007,8 @@ SYNTHETIC = [
 ]
 DATA_BACKED = [
     t_cosine_real_adapters, t_recovery, t_collection_roundtrip, t_cross_taxonomy,
-    t_recipe_relabelling, t_scan_cache, t_comparison_end_to_end,
+    t_recipe_relabelling, t_scan_cache, t_scan_cache_dataset_filter,
+    t_comparison_end_to_end,
     t_cache_fully_migrated, t_behavioral_reps_well_formed,
     t_functional_reps_well_formed,
     t_behavioral_layout_migrated, t_cross_taxonomy_coordinates,

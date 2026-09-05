@@ -36,7 +36,7 @@ from .configurations import (
     procrustes_compare,
     protest,
 )
-from .discovery import CacheEntry, CacheIndex, scan_cache
+from .discovery import CacheEntry, CacheIndex, datasets_present, scan_cache
 from .ground_truth import (
     MixtureComponent,
     dcor_vs_truth,
@@ -112,6 +112,7 @@ __all__ = [
     "anchor_weight_vs_truth",
     "RecoveryResult",
     # discovery
+    "datasets_present",
     "scan_cache",
     "CacheIndex",
     "CacheEntry",

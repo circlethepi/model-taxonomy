@@ -51,43 +51,105 @@ GROUP_TOPICS: dict[str, list[int]] = {
     "g3": [2, 5, 8],
 }
 
-_MIX_RE = re.compile(r"_(\d{3})g1_(\d{3})g2_(\d{3})g3_")
+#: The whole run of ``NNNgI`` segments, matched **greedily**.
+#:
+#: This is the fix for a silent scoring bug, and the greed is the fix. The
+#: pattern was ``_(\d{3})g1_(\d{3})g2_(\d{3})g3_``, which needs a trailing
+#: underscore after ``g3`` -- and a four-group name supplies one, because ``g4``
+#: follows it. So on a 4-group id it *matched*, dropped the fourth group and
+#: returned a renormalized 3-vector, with no exception and no warning:
+#:
+#:     dolly_025g1_025g2_025g3_025g4  ->  an even 3-mix, truth is an even 4-mix
+#:     oasst1_000g1_000g2_050g3_050g4 ->  PURE g3, truth is the g3-g4 midpoint
+#:
+#: The second is the damage: an edge midpoint scored as a pure vertex, producing
+#: agreement numbers that look entirely plausible. Matching the run greedily and
+#: then requiring the indices to be exactly ``1..K`` means a group can no longer
+#: fall off the end -- there is nothing for the match to stop before.
+_MIX_RUN_RE = re.compile(r"_((?:\d{3}g\d+_)+)")
+_MIX_PART_RE = re.compile(r"(\d{3})g(\d+)_")
 
 
 # ── Mixture parsing ───────────────────────────────────────────────────────────
 
-def mixture_weights(model_id: str) -> tuple[float, float, float]:
-    """``(w_g1, w_g2, w_g3)`` for an adapter id, normalized to sum to 1.
+def mixture_weights(model_id: str) -> tuple[float, ...]:
+    """The ``K``-vector of group weights in an adapter id, normalized to sum to 1.
 
-    Normalization is not cosmetic: the centre of the simplex is spelled
+    ``K`` is whatever the id carries -- three for yahoo, four for dolly and
+    oasst1 -- and is never assumed. A truncated vector here is not a plotting
+    bug: ``simplex_suite.truth_weights`` parses these names to build the ground
+    truth that every cross-level score, agreement table and Procrustes fit is
+    measured against.
+
+    Normalization is not cosmetic: the centre of a 3-group simplex is spelled
     ``033g1_033g2_033g3`` and its parts sum to 99, not 100, so using the raw
     integers would place it slightly off-centre and give it the wrong colour.
     """
-    m = _MIX_RE.search(model_id)
+    m = _MIX_RUN_RE.search(model_id)
     if m is None:
         raise ValueError(
-            f"No 3-group mixture found in {model_id!r}; "
-            "expected a '_NNNg1_NNNg2_NNNg3_' segment."
+            f"No mixture found in {model_id!r}; "
+            "expected a '_NNNg1_NNNg2_..._NNNgK_' segment."
         )
-    raw = np.array([int(m.group(i)) for i in (1, 2, 3)], dtype=float)
+    parts = _MIX_PART_RE.findall(m.group(1))
+    indices = [int(i) for _, i in parts]
+    if indices != list(range(1, len(parts) + 1)):
+        raise ValueError(
+            f"Mixture in {model_id!r} has group indices {indices}, "
+            f"expected 1..{len(parts)} consecutively."
+        )
+    raw = np.array([int(p) for p, _ in parts], dtype=float)
     total = raw.sum()
     if total <= 0:
         raise ValueError(f"Mixture in {model_id!r} sums to {total}.")
     return tuple(raw / total)
 
 
+def n_groups(model_ids: Sequence[str]) -> int:
+    """The ``K`` these ids share, raising if they do not share one.
+
+    Every array built from these weights is stacked -- ``truth_weights`` does an
+    ``np.vstack`` -- so a mixed-width collection has to fail here rather than
+    produce a ragged array or, worse, a silently padded one. Two datasets under
+    one base model is exactly how a mixed list arises; see
+    ``src.analysis.discovery.scan_cache``'s dataset filter.
+    """
+    widths = {len(mixture_weights(m)) for m in model_ids}
+    if not widths:
+        raise ValueError("no model ids to read a group count from")
+    if len(widths) > 1:
+        by_width = {
+            k: sorted(m for m in model_ids if len(mixture_weights(m)) == k)[:3]
+            for k in sorted(widths)
+        }
+        raise ValueError(
+            f"model ids mix {sorted(widths)} groups, which cannot be stacked into "
+            f"one weight array. Examples per width: {by_width}. This usually means "
+            f"a cache holding two datasets was scanned without a dataset filter."
+        )
+    return widths.pop()
+
+
 def mixture_label(model_id: str) -> str:
-    """``'25/50/25'`` — a compact tick and annotation label."""
+    """``'25/50/25'`` — a compact tick and annotation label.
+
+    Widens with ``K``: a 4-group id reads ``'25/25/25/25'``.
+    """
     w = mixture_weights(model_id)
     return "/".join(str(int(round(x * 100))) for x in w)
 
 
 def sort_by_mixture(model_ids: Sequence[str]) -> list[str]:
-    """Order ids by (g1, g2, g3) descending, so vertices bracket the sequence.
+    """Order ids by their weights descending, so vertices bracket the sequence.
 
     A stable, meaningful row order matters for the heatmaps: with an arbitrary
     order a block structure that exists is invisible.
+
+    Raises on a mixed-width collection rather than ordering it -- the caller is
+    about to stack these into a weight array, and a tuple of three sorts against
+    a tuple of four without complaint.
     """
+    n_groups(model_ids)
     return sorted(model_ids, key=lambda m: tuple(-x for x in mixture_weights(m)))
 
 

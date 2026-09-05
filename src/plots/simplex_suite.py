@@ -128,7 +128,7 @@ from src.plots.config import set_style  # noqa: E402
 from src.plots.figures import save_figure  # noqa: E402
 from src.plots.simplex import (  # noqa: E402
     crosslevel_mds, dm_grid, mds_grid, mixture_label, mixture_weights,
-    sort_by_mixture, ternary_legend,
+    n_groups, sort_by_mixture, ternary_legend,
 )
 
 # ── Experiment coordinates ────────────────────────────────────────────────────
@@ -969,39 +969,52 @@ def structural_projection_specs():
 
 # ── Ground truth, for the layer sweep and the cross-level closer ──────────────
 
-#: The three mixture components, as :mod:`src.analysis.ground_truth` names its
-#: simplex vertices. The order fixes which column of the weight array is which
-#: vertex, so it must match ``mixture_weights``.
-VERTICES = ["g1", "g2", "g3"]
+def vertices(ids):
+    """The mixture components these ids carry, as ground_truth names its vertices.
+
+    Derived from the parsed width rather than written down: yahoo's three groups
+    were a literal here, and a 4-group collection would have been described by a
+    3-vertex list while ``mixture_weights`` returned four columns. The order
+    fixes which column of the weight array is which vertex, so it must agree
+    with ``mixture_weights`` -- deriving it from the same parse is what makes
+    that agreement structural instead of a convention.
+    """
+    return [f"g{i}" for i in range(1, n_groups(ids) + 1)]
 
 
 def truth_weights(ids):
-    """The ``(n, 3)`` ground-truth mixture array, in *ids* order.
+    """The ``(n, K)`` ground-truth mixture array, in *ids* order.
 
     The only experiment-specific part of the ground truth: these adapters carry
     their recipe in their name, so the weights are parsed rather than read from
     a recipe file. Everything downstream of this array — the simplex embedding,
     its distance matrix, and both scores against it — is
     :mod:`src.analysis.ground_truth`.
+
+    ``n_groups`` is called for its check, not its value: a collection mixing
+    three- and four-group ids would otherwise reach ``np.vstack`` and fail there
+    with a shape error that names neither dataset.
     """
+    ids = list(ids)
+    n_groups(ids)
     return np.vstack([mixture_weights(m) for m in ids])
 
 
 def truth_dm(ids):
     """Pairwise distances on the ground-truth simplex, in *ids* order.
 
-    Barycentric coordinates ``W @ simplex_vertices(3)``, not the raw weight
+    Barycentric coordinates ``W @ simplex_vertices(K)``, not the raw weight
     vectors. Those differ by a constant factor of ``1/√2``, and dCor is
     invariant to a constant rescaling, so this reports the same numbers as the
     ``pdist(W)`` this used to compute — while being the same object
     ``truth_geometry`` embeds, rather than a second convention alongside it.
     """
-    return simplex_distance_matrix(truth_weights(ids), list(ids), VERTICES)
+    return simplex_distance_matrix(truth_weights(ids), list(ids), vertices(ids))
 
 
 def truth_geometry(ids):
     """Where each model sits on the ground-truth simplex — the Procrustes target."""
-    return simplex_geometry(truth_weights(ids), list(ids), VERTICES)
+    return simplex_geometry(truth_weights(ids), list(ids), vertices(ids))
 
 
 # ── Restricting a level to a chosen set of perspectives ───────────────────────

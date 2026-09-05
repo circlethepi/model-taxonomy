@@ -679,6 +679,61 @@ def t_mixture_weights():
     return "3 datasets, 2 classes, dict==object, and the mixed case"
 
 
+@check("adapter names: the mixture parser returns a K-vector, never a truncated one")
+def t_mixture_name_k_vector():
+    """The regression test for a bug that produced plausible wrong numbers.
+
+    The pattern was ``_(\\d{3})g1_(\\d{3})g2_(\\d{3})g3_``, which requires a
+    trailing underscore after ``g3`` -- and a 4-group name supplies one, because
+    ``g4`` follows. So a 4-group id *matched*, the fourth group fell off the end,
+    and a renormalized 3-vector came back with no exception and no warning. That
+    array is what ``simplex_suite.truth_weights`` builds the ground truth from,
+    so it is a scoring bug wearing a plotting bug's clothes.
+    """
+    from src.plots.simplex import (mixture_label, mixture_weights, n_groups,
+                                   sort_by_mixture)
+
+    # The three cases from the design note. The third is the damaging one: an
+    # edge midpoint that the old pattern reported as a pure vertex.
+    assert mixture_weights("dolly_025g1_025g2_025g3_025g4_n1000_s00") == \
+        (0.25, 0.25, 0.25, 0.25)
+    assert mixture_weights("dolly_100g1_000g2_000g3_000g4_n1000_s00") == \
+        (1.0, 0.0, 0.0, 0.0)
+    assert mixture_weights("oasst1_000g1_000g2_050g3_050g4_n500_s00") == \
+        (0.0, 0.0, 0.5, 0.5), "an edge midpoint must not read as a pure vertex"
+
+    # Yahoo's names are unchanged, including the centre, whose parts sum to 99.
+    assert mixture_weights("yahoo_100g1_000g2_000g3_n1000_s00") == (1.0, 0.0, 0.0)
+    centre = mixture_weights("yahoo_033g1_033g2_033g3_n1000_s00")
+    assert len(centre) == 3 and abs(sum(centre) - 1.0) < 1e-12
+    assert all(abs(w - 1 / 3) < 1e-12 for w in centre)
+    assert mixture_label("dolly_025g1_025g2_025g3_025g4_n1") == "25/25/25/25"
+
+    # A non-consecutive index sequence is a malformed name, not a 4-group one
+    # with something after it. Raising is the point: the old pattern would have
+    # returned three weights here.
+    try:
+        mixture_weights("x_025g1_025g2_025g3_025g5_n1")
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("a g5 after g1..g3 must raise, not truncate")
+
+    # Mixed widths cannot be stacked, and truth_weights stacks whatever
+    # sort_by_mixture hands it -- so the failure belongs here, named, rather
+    # than at an np.vstack that mentions neither dataset.
+    mixed = ["yahoo_100g1_000g2_000g3_n1", "dolly_025g1_025g2_025g3_025g4_n1"]
+    for fn in (n_groups, sort_by_mixture):
+        try:
+            fn(mixed)
+        except ValueError as exc:
+            assert "3" in str(exc) and "4" in str(exc), str(exc)
+        else:
+            raise AssertionError(f"{fn.__name__} accepted a mixed-width collection")
+
+    return "4-group ids give 4 weights, yahoo is unchanged, mixed widths raise"
+
+
 @check("ground truth: a dataset cannot be both split and whole in one collection")
 def t_split_and_whole_rejected():
     """The one case where an unsplit entry is genuinely ambiguous.
@@ -2186,26 +2241,41 @@ def t_adapter_name_agreement():
 
     gen = importlib.import_module("scripts.gen_simplex3")
     checked = []
-    for suite_name, suite in gen.SUITES.items():
-        gen.SUITE = suite
-        # The generator names from the proportion and appends the draw itself;
-        # the trainer is handed the already-expanded block name.  Same leaf.
-        want = gen.adapter_name("yahoo_000g1_000g2_100g3")
-        got = adapter_dir(
-            Path("/root"), suite.base_model, "yahoo_000g1_000g2_100g3_n1000_s00",
-            gen.LORA_RANK, gen.LORA_INIT_SEED,
-            samples_seen=gen.SAMPLES_SEEN,
-            prompt_format_id=gen.format_id(),
-        ).name
-        assert want == got, f"{suite_name}: generator says {want!r}, trainer says {got!r}"
-        # The realized-sample retag has to survive whatever suffix follows it.
-        assert retag_adapter_dir(Path("/root") / got, gen.SAMPLES_SEEN).name == got
-        assert retag_adapter_dir(Path("/root") / got, 99).name == got.replace(
-            f"_b{gen.SAMPLES_SEEN}", "_b99"
-        )
-        checked.append(f"{suite_name}={want}")
+    # Every corpus, not only yahoo: the samples-seen token is now derived from
+    # the suite's effective batch rather than written down, so oasst1's smaller
+    # budget gives _b2512 where the other two give _b5008. That derivation is
+    # exactly the kind of thing that drifts between the two call sites.
+    for ds_name, spec in gen.SPECS.items():
+        gen.SPEC = spec
+        base = gen.name_for(spec.even_pct)
+        for suite_name, suite in gen.SUITES.items():
+            gen.SUITE = suite
+            seen = gen.samples_seen()
+            block = f"{base}_n{spec.train_n}_s{spec.train_seed:02d}"
+            # The generator names from the proportion and appends the draw
+            # itself; the trainer is handed the already-expanded block name.
+            # Same leaf.
+            want = gen.adapter_name(base)
+            got = adapter_dir(
+                Path("/root"), suite.base_model, block,
+                gen.LORA_RANK, gen.LORA_INIT_SEED,
+                samples_seen=seen,
+                prompt_format_id=gen.format_id(),
+            ).name
+            assert want == got, (
+                f"{ds_name}/{suite_name}: generator says {want!r}, "
+                f"trainer says {got!r}"
+            )
+            # The realized-sample retag has to survive whatever suffix follows it.
+            assert retag_adapter_dir(Path("/root") / got, seen).name == got
+            assert retag_adapter_dir(Path("/root") / got, 99).name == got.replace(
+                f"_b{seen}", "_b99"
+            )
+        checked.append(f"{ds_name}=_b{gen.samples_seen()}")
+    gen.SPEC = gen.SPECS["yahoo"]
     gen.SUITE = gen.SUITES["llama"]
-    return "; ".join(checked)
+    return f"{len(gen.SPECS)} corpora x {len(gen.SUITES)} suites agree; " + \
+           ", ".join(checked)
 
 
 @check("figures: the structural spec set follows the model's attention layout")
@@ -5819,7 +5889,8 @@ SYNTHETIC = [
     t_bures_wasserstein_equivalence, t_bures_wasserstein_invariance,
     t_relabel_collision,
     # ground truth from recipes, and the storage it needs
-    t_mixture_weights, t_split_and_whole_rejected, t_simplex_geometry,
+    t_mixture_weights, t_mixture_name_k_vector, t_split_and_whole_rejected,
+    t_simplex_geometry,
     t_disparity_vs_truth_exact, t_disparity_vs_truth_label_keyed,
     t_simplex_dimension_requirement, t_projection_dimension_matters,
     t_procrustes_transform, t_collection_multidim, t_analysis_geometries,

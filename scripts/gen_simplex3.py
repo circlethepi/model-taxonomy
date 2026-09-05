@@ -1093,9 +1093,25 @@ SUITES = {
         # a consolidated.safetensors -- and the prefetch job's '*.safetensors'
         # would fetch both.
         prefetch_ignore=("consolidated.safetensors",),
-        # gpu_partitions left at the default, l40s included: 48 GB against
-        # ~24.5 GB of weights leaves real headroom, and the smoke run is where a
-        # wrong guess here shows up cheaply.  Drop l40s only if it actually OOMs.
+        # gpu_partitions left at the default, but l40s is NOT safe for TRAINING
+        # this model, and the note above that said it was has been measured
+        # wrong.  2026-09-05, the dolly and oasst1 trees: 13 of 13 train shards
+        # that landed on an l40s node (gl*) died in the backward pass with
+        #     RuntimeError: Function MmBackward0 returned an invalid gradient at
+        #     index 1 - expected device meta but got cuda:0
+        # while 5 of 5 that landed on gh* (h100/h200) completed.  The mechanism
+        # is device_map="auto": on a 48 GB card accelerate places part of the
+        # model off-device, and the offloaded submodule hands back a meta
+        # gradient.  It is not a clean OOM, so it does not look like one in the
+        # log.  The yahoo tree never caught this because all four of its train
+        # shards happened to schedule onto gh* nodes.
+        #
+        # Extraction is unaffected -- it is forward-only, and a forward through
+        # an offloaded module is correct (just slower) -- so this field stays as
+        # it is and the l40s capacity keeps serving the 18 behavioural shards.
+        # Training was resubmitted with `sbatch --partition=h200,h100`, which
+        # overrides the #SBATCH line without regenerating the tree.  If training
+        # is ever driven from submit_all.sh again, pass that override there.
     ).for_model("mistralai/Mistral-Nemo-Instruct-2407"),
     "olmo2": Suite(
         tag="olmo2",

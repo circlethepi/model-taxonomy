@@ -47,6 +47,32 @@ the ids do not match.
 
 ---
 
+## The simplex experiments
+
+**`DataSimplexSpec`** — the dataset-side counterpart of
+`src/experiments/suite.py::Suite`, defined in
+`src/experiments/data_simplex_spec.py`. Where a `Suite` says *how* a run is
+configured — base model, dtype, LoRA targets, walls, sharding — a
+`DataSimplexSpec` says *what corpus the simplex is built over*: dataset id,
+vertex axis, group partition, field projections, grid denominator, draw sizes,
+embedder, and the prose caveats emitted into that dataset's configs.
+`scripts/gen_simplex3.py` is a function of the pair, which is what lets a second
+corpus be a spec entry rather than a forked generator.
+
+**Vertex axis** — the categorical column whose values become the pure corners of
+the simplex. Yahoo's is `topic`, dolly's is `category`, oasst1's is `lang`. It is
+the `class_field` of every emitted recipe; the separate name exists because
+"class field" says where it lives rather than what it does.
+
+**Grid denominator** — the integer `G` such that mixtures are drawn at every
+multiple of `1/G`. All three datasets use 4, i.e. the 25% grid. The grid points
+are the compositions of `G` into `K` parts: 15 at `K=3`, 35 at `K=4`. The even
+mixture is appended as an extra point only when `K` does not divide `G` — which
+is why yahoo has 16 proportions and not 15, and why dolly and oasst1 have exactly
+35.
+
+---
+
 ## The shared cache
 
 **Shared cache** — the numbered store under `results/shared_cache`. Directories

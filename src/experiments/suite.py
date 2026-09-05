@@ -91,15 +91,36 @@ class Suite:
     #: Replicates per sweep point.  Half the main run's R, which is what buys the
     #: sweep ten points for the cost of five of the existing runs.
     sweep_replicates: int = 8
-    #: Adapters per sweep shard.  Four rather than the main run's eight because
-    #: halving R halves the decode, so four adapters at R=8 lands at the same
-    #: wall the eight-shard R=16 run was sized against — 40 job files instead of
-    #: 80, at no change to the slot length the partitions were chosen for.  Raise
-    #: it and regenerate if the queue is congested; nothing downstream depends on
-    #: the shard count.
+    #: The number of sweep *shards*, not the adapters in one.  The code slices
+    #: ``names[i::sweep_shards]``, so this is a divisor; the two readings happen
+    #: to coincide at yahoo's 16 adapters over 4 shards, which is how the old
+    #: docstring ("adapters per sweep shard") survived.  Resize with that in
+    #: mind.
+    #:
+    #: Four rather than the main run's eight because halving R halves the decode,
+    #: so four adapters at R=8 lands at the same wall the eight-shard R=16 run
+    #: was sized against — 40 job files instead of 80, at no change to the slot
+    #: length the partitions were chosen for.  Raise it and regenerate if the
+    #: queue is congested; nothing downstream depends on the shard count.
     sweep_shards: int = 4
 
+    #: Shard *counts* for training and the R=16 behavioral run, read the same way
+    #: as ``sweep_shards`` above.  They live here rather than in the generator
+    #: because sharding is a property of how much work a run has -- which is the
+    #: number of adapters, times the walls this suite was tuned to -- rather than
+    #: of the model or of the corpus.  The defaults are yahoo's 16 adapters at 4
+    #: and 2 adapters per shard; a 35-adapter corpus holds those ratios by
+    #: raising the counts to 9 and 18 rather than by doubling every wall.
+    train_shards: int = 4
+    behavioral_shards: int = 8
+
     emit_embed_jobs: bool = True
+    #: The ``matrix`` re-embed of the trained draws.  Unlike the sweep above this
+    #: defaults on for every suite, because it authors a surrogate that does not
+    #: exist yet under any of them and is model-free, so whichever suite runs
+    #: first satisfies the rest.  A corpus with its own dataset build tree turns
+    #: it off here: that tree owns it, and two trees emitting it would race.
+    emit_embed_matrix_job: bool = True
     #: The standalone build job is a fail-fast gate for the *embedding* sweeps
     #: only.  Every other job runs ``--steps build ...`` and writes the recipes
     #: it needs, so a suite that emits no embed jobs does not need this one.

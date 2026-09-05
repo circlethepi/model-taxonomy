@@ -80,6 +80,7 @@ compute cold and agree trivially. See ``docs/notes/caching_collections.md``.
 from __future__ import annotations
 
 import csv
+import dataclasses
 import hashlib
 import os
 import sys
@@ -1157,8 +1158,30 @@ class SurrogateScore(NamedTuple):
 
     ``dcor`` runs 0→1 better; ``procrustes`` runs 1→0 better. They are not two
     readings of one quantity: dCor scores the distance matrix and never embeds,
-    while the disparity scores the configuration the MDS panel actually draws
-    and so inherits the distortion ``stress`` reports.
+    while the disparity scores an embedded *configuration* and so inherits the
+    distortion ``stress`` reports.
+
+    **The disparity needs a dimension, and now carries all of them.**  The truth
+    a ``K``-vertex simplex defines lives in ``K-1`` dimensions.  The taxonomy
+    side used to be fitted at a hardcoded 2, which was right only because K=3
+    made ``K-1 == 2`` by coincidence; at K=4 a flat 2-D configuration was being
+    superimposed on a tetrahedral truth, and ``procrustes_compare``'s zero-pad
+    absorbed the mismatch and returned an ordinary-looking number inflated by
+    every bit of truth variance outside the best-fit plane.
+
+    So ``procrustes_by_d`` holds one disparity per ``d`` in ``2 .. K-1``, each
+    fitted under the same ``MDS_SEED``, and ``stress_by_d`` the stress that
+    qualifies it.  ``procrustes`` and ``stress`` are the ``d = K-1`` entries --
+    the truth's own dimension, and the only one no dimensional mismatch can
+    reach.  At K=3 the range degenerates to the single ``d=2`` already reported,
+    so the yahoo suites reproduce their existing numbers exactly.
+
+    Read the stress columns down a row, never across it: stress falls
+    monotonically as ``d`` rises by construction, so it qualifies each disparity
+    and does not compare them.
+
+    ``d=2`` remains the fit the MDS panel draws, which is why it is always in
+    the sweep -- the panel is still showing a configuration that was scored.
     """
 
     dcor: float
@@ -1167,6 +1190,8 @@ class SurrogateScore(NamedTuple):
     row: str
     col: str
     dm: object
+    procrustes_by_d: dict = {}
+    stress_by_d: dict = {}
 
 
 def rank_surrogates(level_cells, ids, tdm=None, tgeo=None):
@@ -1183,9 +1208,24 @@ def rank_surrogates(level_cells, ids, tdm=None, tgeo=None):
     *tdm* and *tgeo* are the ground truth in matrix and configuration form; both
     are rebuilt from *ids* when omitted. Pass them when scoring several levels
     against the same models, which is what ``cross_level`` does.
+
+    The MDS dimension is swept over ``2 .. K-1`` rather than held at 2; see
+    :class:`SurrogateScore` for why the old single number was wrong above K=3.
+    The sweep stops at ``K-1`` because nothing above it can help: the truth has
+    exactly that many real dimensions, and every further dimension only lets the
+    taxonomy configuration spend variance the truth cannot match, measuring
+    headroom rather than agreement.
+
+    Several embeddings are fitted where the comment here used to insist on one.
+    That comment was guarding against fitting twice under *two seeds*, which
+    would let the reported numbers describe different configurations; every fit
+    here is under ``MDS_SEED`` and the drawn panel is still one of them, so the
+    hazard does not arise.
     """
     tdm = truth_dm(ids) if tdm is None else tdm
     tgeo = truth_geometry(ids) if tgeo is None else tgeo
+    truth_dim = np.asarray(tgeo.coordinates).shape[1]
+    dims = list(range(2, max(truth_dim, 2) + 1))
     scored = []
     for (row, col), cell in level_cells.items():
         if cell is None or isinstance(cell, str):
@@ -1193,21 +1233,52 @@ def rank_surrogates(level_cells, ids, tdm=None, tgeo=None):
         if float(np.max(np.abs(cell.matrix))) <= 1e-6:
             continue                     # the h0 control: no geometry to score
         try:
-            # One embedding, three uses: the disparity, the stress that
-            # qualifies it, and nothing else — fitting it twice under two seeds
-            # would let the reported numbers describe different configurations.
-            geo = SUITE_CACHE.geometry(cell, n_components=2,
-                                       random_state=MDS_SEED)
+            geos = {d: SUITE_CACHE.geometry(cell, n_components=d,
+                                            random_state=MDS_SEED)
+                    for d in dims}
+            proc = {d: disparity_vs_truth(cell, tgeo, geometry=_pad_geometry(g, truth_dim))
+                    for d, g in geos.items()}
+            stress = {d: float(kruskal_stress(cell, g)) for d, g in geos.items()}
             scored.append(SurrogateScore(
                 dcor=dcor_vs_truth(cell, tdm),
-                procrustes=disparity_vs_truth(cell, tgeo, geometry=geo),
-                stress=float(kruskal_stress(cell, geo)),
+                # The designated pair is the truth's own dimension: it is the
+                # one fit no padding reaches, and it is what the _procrustes
+                # ranking variant orders by.
+                procrustes=proc[truth_dim],
+                stress=stress[truth_dim],
                 row=row, col=col, dm=cell,
+                procrustes_by_d=proc, stress_by_d=stress,
             ))
         except Exception as exc:
             print(f"    scoring {row!r}/{col} skipped — "
                   f"{type(exc).__name__}: {exc}")
     return sorted(scored, key=lambda s: -s.dcor)
+
+
+def _pad_geometry(geo, width: int):
+    """*geo* embedded in a *width*-dimensional space, by appending zero columns.
+
+    ``procrustes_compare`` would do this itself, silently, for whichever
+    configuration is narrower — which is precisely the failure mode this sweep
+    exists to make visible. Doing it here instead means the padding is a
+    deliberate statement: *this is the d-dimensional fit, placed in the truth's
+    space*, and the column it lands in says which ``d`` that was. A narrower
+    configuration genuinely cannot reach the truth's variance outside its own
+    span, and the disparity should say so rather than hide it.
+    """
+    coords = np.asarray(geo.coordinates, dtype=float)
+    if coords.shape[1] == width:
+        return geo
+    if coords.shape[1] > width:
+        raise ValueError(
+            f"embedding is {coords.shape[1]}-dimensional, wider than the "
+            f"{width}-dimensional truth; nothing above the truth's own "
+            f"dimension is worth fitting."
+        )
+    padded = np.hstack([coords, np.zeros((coords.shape[0], width - coords.shape[1]))])
+    # n_components is corrected too: it names the fit, and a padded configuration
+    # that still claimed 2 would misdescribe itself to anything that read it.
+    return dataclasses.replace(geo, coordinates=padded, n_components=width)
 
 
 def _bold_if(value, flag) -> str:
@@ -1236,18 +1307,41 @@ def write_scores_csv(per_level_scores, path) -> None:
     tables are for reading and this is for diffing — and because ``matrix_sha256`` is
     the evidence a later change would need to show that a cached distance matrix
     is the matrix a cold run produces (see ``docs/notes/caching_collections.md``).
+
+    **The disparity columns are per dimension**: ``procrustes_d2 ..
+    procrustes_d{K-1}``, and the matching ``stress_d*``. Every dimension is
+    reported and none is designated as *the* number. A 3-vertex run therefore
+    has the single ``procrustes_d2``, which is exactly what the plain
+    ``procrustes`` column always was; a 4-vertex run has ``d2`` and ``d3``. The
+    unsuffixed name is deliberately not kept as an alias -- it named a dimension
+    silently, which is the thing being fixed.
     """
+    dims = sorted({d for ranked in per_level_scores.values()
+                   for s in ranked for d in s.procrustes_by_d})
     with open(path, "w", newline="") as fh:
         w = csv.writer(fh)
-        w.writerow(["level", "surrogate", "metric", "dcor", "procrustes", "stress",
-                    "n_models", "matrix_sha256"])
+        w.writerow(["level", "surrogate", "metric", "dcor"]
+                   + [f"procrustes_d{d}" for d in dims]
+                   + [f"stress_d{d}" for d in dims]
+                   + ["n_models", "matrix_sha256"])
         for lvl, ranked in per_level_scores.items():
             for s in ranked:
-                w.writerow([lvl, s.row, s.col, f"{s.dcor:.6f}",
-                            f"{s.procrustes:.6f}", f"{s.stress:.6f}",
-                            len(s.dm.model_ids), _matrix_digest(s.dm)])
+                w.writerow(
+                    [lvl, s.row, s.col, f"{s.dcor:.6f}"]
+                    + [_fmt(s.procrustes_by_d.get(d)) for d in dims]
+                    + [_fmt(s.stress_by_d.get(d)) for d in dims]
+                    + [len(s.dm.model_ids), _matrix_digest(s.dm)]
+                )
 
 
+def _fmt(value) -> str:
+    """A score cell, or an empty one for a dimension this row does not have."""
+    return "" if value is None else f"{value:.6f}"
+
+
+#: Parsed to float on read. These are the *old* unsuffixed spellings, kept so a
+#: CSV written before the dimension sweep still reads back -- several are tracked
+#: under figures/ and are what the aggregate driver plots.
 _SCORE_FIELDS = ("dcor", "procrustes", "stress")
 
 
@@ -1262,9 +1356,20 @@ def read_scores_csv(path) -> list[dict]:
     with open(path, newline="") as fh:
         rows = list(csv.DictReader(fh))
     for r in rows:
-        for f in _SCORE_FIELDS:
-            if r.get(f) not in (None, ""):
-                r[f] = float(r[f])
+        for f in list(r):
+            if f in _SCORE_FIELDS or f.startswith(("procrustes_d", "stress_d")):
+                if r.get(f) not in (None, ""):
+                    r[f] = float(r[f])
+        # A per-dimension file read by something asking for the old unsuffixed
+        # name gets the truth's own dimension -- the widest d present, which is
+        # the designated one and, on a 3-vertex run, is d2 and therefore exactly
+        # what that name always meant.
+        for base in ("procrustes", "stress"):
+            if base not in r:
+                widest = max((int(k.split("_d")[1]) for k in r
+                              if k.startswith(base + "_d")), default=None)
+                if widest is not None:
+                    r[base] = r[f"{base}_d{widest}"]
     return rows
 
 
@@ -1317,6 +1422,11 @@ LEVEL_ORDER = [
 ]
 
 
+def _truth_dim(tgeo) -> int:
+    """The ground truth's own dimension, ``K-1`` — the disparity a caption means."""
+    return int(np.asarray(tgeo.coordinates).shape[1])
+
+
 def cross_level(per_level, ids, outdir, metric_override=None, suffix="",
                 rank_by="dcor", label_perspective=False):
     """Each level's best-scoring surrogate side by side, plus the agreement table.
@@ -1339,10 +1449,17 @@ def cross_level(per_level, ids, outdir, metric_override=None, suffix="",
     *rank_by* chooses which of the two scores picks each level's panel:
     ``"dcor"`` takes the highest dCor, ``"procrustes"`` the lowest residual
     disparity. The two disagree often enough to be worth drawing both — dCor
-    scores the distance matrix and never embeds, while the disparity scores the
-    2-D configuration the panel actually draws — so the ``_procrustes`` variant
-    answers "which surrogate *looks* most like the simplex" where the default
-    answers "which surrogate's distances agree with it".
+    scores the distance matrix and never embeds, while the disparity scores an
+    embedded configuration — so the ``_procrustes`` variant answers "which
+    surrogate *looks* most like the simplex" where the default answers "which
+    surrogate's distances agree with it".
+
+    Which disparity, now that there are several? The ``d = K-1`` one: the truth's
+    own dimension, and the only fit no padding reaches. At K=3 that is ``d=2``,
+    which is both the configuration the panel draws and exactly what this
+    variant always ranked by, so nothing about the yahoo runs moves. At K=4 the
+    ranking is by ``procrustes_d3`` while the panel still draws the ``d=2`` fit,
+    and the caption says so rather than leaving the reader to assume they match.
 
     *label_perspective* names the winning perspective (surrogate x metric) under
     each panel's level name. It is on for the ``_procrustes`` variant because
@@ -1423,7 +1540,8 @@ def cross_level(per_level, ids, outdir, metric_override=None, suffix="",
           winners[lvl].procrustes)
          for name, lvl in ordered],
         "Cross-Taxonomy Simplex — MDS"
-        + (" (best Procrustes per level)" if rank_by == "procrustes" else ""),
+        + (f" (best Procrustes at d={_truth_dim(tgeo)} per level)"
+           if rank_by == "procrustes" else ""),
         subtitle=subtitle + (f" · {note}" if note else ""),
         savepath=outdir / f"fig_crosslevel_mds{suffix}.png",
         random_state=MDS_SEED,
@@ -1433,15 +1551,17 @@ def cross_level(per_level, ids, outdir, metric_override=None, suffix="",
     cells = {("best surrogate", lbl): winners[lvl].dm for lbl, lvl in labels}
     dm_grid(cells, ["best surrogate"], [lbl for lbl, _ in labels],
             "Cross-level comparison — distance matrices, each level's "
-            + ("lowest-Procrustes" if rank_by == "procrustes" else "best")
+            + (f"lowest-Procrustes (d={_truth_dim(tgeo)})"
+               if rank_by == "procrustes" else "best")
             + " surrogate" + (f" ({note})" if note else ""),
             savepath=outdir / f"fig_crosslevel_dm{suffix}.png")
     plt.close("all")
 
     # Two scores in one table, running in opposite directions, so the header
     # says which way each one reads rather than leaving it to be inferred.
-    header = ["| level | dCor vs ground truth | Procrustes residual (lower=better) "
-              "| surrogate | metric |", "|---|---|---|---|---|"]
+    d = _truth_dim(tgeo)
+    header = [f"| level | dCor vs ground truth | Procrustes residual at d={d} "
+              f"(lower=better) | surrogate | metric |", "|---|---|---|---|---|"]
     best_proc = min((s.procrustes for _, s in table_rows), default=None)
     lines = list(header)
     for lvl, s in table_rows:
@@ -1472,7 +1592,8 @@ def cross_level(per_level, ids, outdir, metric_override=None, suffix="",
             # scores disagree about which surrogate recovers the simplex.
             top3 = {id(s) for s in sorted(ranked, key=lambda s: s.procrustes)[:3]}
             detail += [f"### {lvl}", "",
-                       "| dCor | Procrustes residual (lower=better) | surrogate | metric |",
+                       f"| dCor | Procrustes residual at d={d} (lower=better) "
+                       f"| surrogate | metric |",
                        "|---|---|---|---|"]
             detail += [f"| {s.dcor:.4f} | {_bold_if(s.procrustes, id(s) in top3)} "
                        f"| {s.row} | {s.col} |" for s in ranked]

@@ -1,4 +1,4 @@
-level,surrogate,metric,dcor,procrustes,stress,n_models,matrix_sha256
+level,surrogate,metric,dcor,procrustes_d2,stress_d2,n_models,matrix_sha256
 behavioral,R=16 · per query,cka,0.816359,0.197292,0.288007,16,f12d6ffaee3df955
 behavioral,R=16 · per query,frobenius,0.794205,0.300970,0.333917,16,281891cd9a6e8515
 behavioral,R=16 · per query,euclidean,0.794205,0.300970,0.333917,16,1c0aa7e356b856cd

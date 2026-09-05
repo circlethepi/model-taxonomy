@@ -734,6 +734,89 @@ def t_mixture_name_k_vector():
     return "4-group ids give 4 weights, yahoo is unchanged, mixed widths raise"
 
 
+@check("procrustes: the disparity is swept over d = 2..K-1, and cannot zero-pad silently")
+def t_procrustes_dimension_sweep():
+    """The second silent-failure bug, and it is the same shape as the first.
+
+    ``truth_geometry`` builds the ground truth in ``K-1`` dimensions -- 2-D for
+    three vertices, 3-D for four -- while ``rank_surrogates`` fitted the taxonomy
+    side at a hardcoded ``n_components=2``. That mismatch did not error:
+    ``procrustes_compare`` takes ``d = max(a.shape[1], b.shape[1])`` and
+    zero-pads the narrower one, so a flat 2-D configuration was superimposed on a
+    tetrahedral truth and the disparity absorbed every bit of truth variance
+    outside the best-fit plane -- a floor no surrogate can beat, reported as an
+    ordinary number. It was honest only because K=3 makes ``K-1 == 2``.
+    """
+    import numpy as np
+
+    from src.analysis import disparity_vs_truth
+    from src.core.distance import DistanceMatrix
+    from src.plots.simplex_suite import rank_surrogates, truth_geometry, vertices
+
+    def ids_for(k, mixes):
+        return [f"c_" + "_".join(f"{p:03d}g{i + 1}" for i, p in enumerate(m))
+                + "_n1000_s00" for m in mixes]
+
+    # A 3-simplex and a 2-simplex, each with a distance matrix that IS the truth,
+    # so the disparity should be ~0 at the truth's own dimension.
+    cases = {
+        3: [(100, 0, 0), (0, 100, 0), (0, 0, 100), (33, 33, 33),
+            (50, 50, 0), (0, 50, 50), (50, 0, 50)],
+        4: [(100, 0, 0, 0), (0, 100, 0, 0), (0, 0, 100, 0), (0, 0, 0, 100),
+            (25, 25, 25, 25), (50, 50, 0, 0), (0, 0, 50, 50), (50, 0, 50, 0)],
+    }
+    out = []
+    for k, mixes in cases.items():
+        ids = ids_for(k, mixes)
+        assert len(vertices(ids)) == k
+        tgeo = truth_geometry(ids)
+        coords = np.asarray(tgeo.coordinates)
+        assert coords.shape[1] == k - 1, f"K={k} truth is {coords.shape[1]}-D"
+
+        # The truth's own pairwise distances, presented as a taxonomy result.
+        d = np.linalg.norm(coords[:, None, :] - coords[None, :, :], axis=-1)
+        dm = DistanceMatrix(matrix=d, model_ids=list(ids), metric="euclidean",
+                            taxonomy="synthetic")
+
+        scored = rank_surrogates({("truth", "euclidean"): dm}, ids, tgeo=tgeo)
+        assert len(scored) == 1
+        sc = scored[0]
+
+        assert sorted(sc.procrustes_by_d) == list(range(2, k)), sc.procrustes_by_d
+        assert sorted(sc.stress_by_d) == list(range(2, k))
+        # The designated scalar is the truth's own dimension, K-1.
+        assert sc.procrustes == sc.procrustes_by_d[k - 1]
+        assert sc.stress == sc.stress_by_d[k - 1]
+        # At its own dimension the truth recovers itself. The tolerance is
+        # MDS convergence, not float noise: SMACOF stops on a stress delta, so
+        # an exact recovery lands around 1e-5 rather than at machine epsilon.
+        assert sc.procrustes < 1e-4, f"K={k}: d{k-1} disparity {sc.procrustes}"
+
+        if k == 4:
+            # And a flat fit of a genuinely 3-D truth cannot: the d2 column is
+            # the honest report of what the drawn panel shows, and it is worse.
+            assert sc.procrustes_by_d[2] > 100 * sc.procrustes_by_d[3], \
+                sc.procrustes_by_d
+            # Stress falls monotonically with d, which is why the stress columns
+            # qualify each disparity rather than comparing across them.
+            assert sc.stress_by_d[3] <= sc.stress_by_d[2] + 1e-9
+        out.append(f"K={k}: d{sorted(sc.procrustes_by_d)}")
+
+        # The mismatch itself must now raise rather than be absorbed.
+        if k == 4:
+            from src.analysis.bridge import fit_geometry
+            flat = fit_geometry(dm, method="mds", n_components=2, random_state=0)
+            try:
+                disparity_vs_truth(dm, tgeo, geometry=flat)
+            except ValueError as exc:
+                assert "zero-pad" in str(exc), str(exc)
+            else:
+                raise AssertionError(
+                    "a 2-D embedding against a 3-D truth must raise, not zero-pad")
+
+    return "; ".join(out) + "; width mismatch raises"
+
+
 @check("ground truth: a dataset cannot be both split and whole in one collection")
 def t_split_and_whole_rejected():
     """The one case where an unsplit entry is genuinely ambiguous.
@@ -5960,7 +6043,8 @@ SYNTHETIC = [
     t_bures_wasserstein_equivalence, t_bures_wasserstein_invariance,
     t_relabel_collision,
     # ground truth from recipes, and the storage it needs
-    t_mixture_weights, t_mixture_name_k_vector, t_split_and_whole_rejected,
+    t_mixture_weights, t_mixture_name_k_vector, t_procrustes_dimension_sweep,
+    t_split_and_whole_rejected,
     t_simplex_geometry,
     t_disparity_vs_truth_exact, t_disparity_vs_truth_label_keyed,
     t_simplex_dimension_requirement, t_projection_dimension_matters,
@@ -6003,12 +6087,12 @@ SYNTHETIC = [
     # the two inference caches are addressed by one piece of code, and the
     # things that used to be spelled twice
     t_draw_keyed_shared_key, t_generated_surrogate_writeback, t_adapter_name_unique,
+    t_scan_cache_dataset_filter,
     t_replay_queries_uses_recipe_text_field,
 ]
 DATA_BACKED = [
     t_cosine_real_adapters, t_recovery, t_collection_roundtrip, t_cross_taxonomy,
-    t_recipe_relabelling, t_scan_cache, t_scan_cache_dataset_filter,
-    t_comparison_end_to_end,
+    t_recipe_relabelling, t_scan_cache, t_comparison_end_to_end,
     t_cache_fully_migrated, t_behavioral_reps_well_formed,
     t_functional_reps_well_formed,
     t_behavioral_layout_migrated, t_cross_taxonomy_coordinates,

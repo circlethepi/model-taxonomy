@@ -1422,6 +1422,28 @@ LEVEL_ORDER = [
 ]
 
 
+def corpus_subtitle(ids) -> str:
+    """The figure subtitle for whichever corpus these adapters came from.
+
+    This string used to name yahoo's three topic groups on every figure, which
+    became wrong the moment a four-language or four-task corpus produced one.
+    The corpus token is the prefix the adapter ids carry — the only description
+    of the data these plotting functions are handed — and it selects the caption
+    from the same ``DataSimplexSpec`` the configs were generated from, so the
+    figure and the config cannot disagree about what was mixed.
+
+    An unrecognised corpus falls back to a derived sentence rather than raising:
+    a caption is not worth taking a figure down over.
+    """
+    from src.experiments.data_simplex_spec import SPECS
+
+    corpus = Path(list(ids)[0]).name.split("_", 1)[0]
+    spec = SPECS.get(corpus)
+    if spec is not None:
+        return spec.subtitle
+    return f"Mixtures of {n_groups(ids)} groups from the {corpus} dataset"
+
+
 def _truth_dim(tgeo) -> int:
     """The ground truth's own dimension, ``K-1`` — the disparity a caption means."""
     return int(np.asarray(tgeo.coordinates).shape[1])
@@ -1534,7 +1556,7 @@ def cross_level(per_level, ids, outdir, metric_override=None, suffix="",
         perspective = f"{s.row} \u00d7 {s.col}"
         return "\n".join([name] + textwrap.wrap(perspective, width=24))
 
-    subtitle = "Mixtures from 3 topic groupings from the Yahoo Answers Dataset"
+    subtitle = corpus_subtitle(ids)
     crosslevel_mds(
         [(panel_label(name, lvl), winners[lvl].dm, winners[lvl].dcor,
           winners[lvl].procrustes)

@@ -131,6 +131,13 @@ class DataSimplexSpec:
     #: configs).  A missing key emits nothing.
     caveats: dict = field(default_factory=dict)
 
+    #: The figure subtitle for this corpus, printed under the cross-level MDS
+    #: panels. Prose, and per-corpus rather than derived, because a derived
+    #: string ("mixtures of 4 groups from the oasst1 dataset") says less than the
+    #: sentence someone would write, and because yahoo's already exists on
+    #: figures that must not move.
+    subtitle: str = "Mixtures from 3 topic groupings from the Yahoo Answers Dataset"
+
     #: The query-set descriptions, by query set, plus a ``chat`` key used when
     #: the suite wraps rows in a chat template -- under completion-only loss the
     #: question *is* the training prompt, so the two sets' roles invert and one
@@ -271,6 +278,7 @@ DOLLY = DataSimplexSpec(
                  "time, so a mixture's g4 weight moves\nthe row *shape* as well "
                  "as the task."),
     },
+    subtitle="Mixtures of 4 instruction-category groupings from databricks-dolly-15k",
     query_desc={
         "full_context": "instruction + context + response, matching the training composition",
         "question_only": "instruction + context only, question-only ablation",
@@ -319,6 +327,7 @@ OASST1 = DataSimplexSpec(
                  "the seed spread at g3/g4-heavy mixtures as\nan understatement "
                  "of the sampling variance, not as a measurement of it."),
     },
+    subtitle="Mixtures of 4 languages from the oasst1 best-reply pairs",
     query_desc={
         "full_context": "prompt + response, matching the training composition",
         "question_only": "prompt only, question-only ablation",

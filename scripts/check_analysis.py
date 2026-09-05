@@ -817,6 +817,80 @@ def t_procrustes_dimension_sweep():
     return "; ".join(out) + "; width mismatch raises"
 
 
+@check("plots: the colour map takes K anchors and the ternary panel is skipped above 3")
+def t_simplex_colours_at_k_vertices():
+    """What a fourth vertex does to a colour system built for three.
+
+    The barycentric blend had exactly three anchors, so a 4-vector had nowhere to
+    put its last weight: two recipes differing only in g4 would have come out the
+    same colour, which is the specific way a 4-vertex figure would have lied. And
+    the ternary legend draws a *triangle* -- there is no honest 2-D barycentric
+    picture of a tetrahedron -- so at K=4 it must be skipped rather than
+    projected.
+    """
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import numpy as np
+
+    from src.plots.simplex import (ANCHORS, _hex_to_rgb, anchors_for,
+                                   barycentric_color, frame_labels,
+                                   group_display, mixture_weights,
+                                   oklab_delta_e, ternary_legend)
+
+    # Three anchors are exactly the ones every yahoo figure already uses.
+    assert anchors_for(3) == ANCHORS
+    four = anchors_for(4)
+    assert list(four) == ["g1", "g2", "g3", "g4"]
+    assert all(four[g] == ANCHORS[g] for g in ANCHORS)
+
+    # A pure vertex reproduces its anchor exactly, so the points and any legend
+    # agree by construction rather than by eye.
+    for i, g in enumerate(four):
+        w = [0.0] * 4
+        w[i] = 1.0
+        assert np.allclose(barycentric_color(w), _hex_to_rgb(four[g]), atol=1e-6), g
+
+    # The failure a 3-anchor map would have hidden: these two differ only past g3.
+    a = barycentric_color(mixture_weights("dolly_025g1_025g2_050g3_000g4_n1"))
+    b = barycentric_color(mixture_weights("dolly_025g1_025g2_000g3_050g4_n1"))
+    assert oklab_delta_e(a, b) > 0.05, oklab_delta_e(a, b)
+
+    # The four anchors must stay separable under deuteranopia, which is the
+    # constraint the fourth was chosen against -- teal and cyan pass in normal
+    # vision and collapse onto the blue here.
+    def deut(rgb):
+        m = np.array([[0.625, 0.375, 0.0], [0.7, 0.3, 0.0], [0.0, 0.3, 0.7]])
+        return np.clip(m @ np.asarray(rgb), 0, 1)
+
+    import itertools
+    rgbs = [_hex_to_rgb(h) for h in four.values()]
+    worst = min(oklab_delta_e(deut(x), deut(y))
+                for x, y in itertools.combinations(rgbs, 2))
+    assert worst > 0.15, f"deuteranopic worst pair {worst:.3f}"
+
+    # Labels and the panel frame widen with K rather than staying 3-group.
+    assert frame_labels(3) == ("33/33/33", "100/0/0", "0/100/0")
+    assert frame_labels(4) == ("25/25/25/25", "100/0/0/0", "0/100/0/0")
+    assert group_display(4, ("en", "es", "ru", "zh"))["g4"] == "zh"
+
+    # And the triangle is refused rather than drawn for the wrong simplex.
+    ids4 = ["d_100g1_000g2_000g3_000g4_n1", "d_025g1_025g2_025g3_025g4_n1"]
+    fig, ax = plt.subplots()
+    try:
+        ternary_legend(ax, ids4)
+    except ValueError as exc:
+        assert "barycentric plane" in str(exc) or "2-simplex" in str(exc), str(exc)
+    else:
+        raise AssertionError("ternary_legend drew a triangle for a 4-group set")
+    ternary_legend(ax, ["y_100g1_000g2_000g3_n1", "y_033g1_033g2_033g3_n1"])
+    plt.close("all")
+
+    return (f"4 anchors, pure vertices exact, g4 separates (dE "
+            f"{oklab_delta_e(a, b):.3f}), deuteranopic worst {worst:.3f}, "
+            f"ternary refused at K=4")
+
+
 @check("ground truth: a dataset cannot be both split and whole in one collection")
 def t_split_and_whole_rejected():
     """The one case where an unsplit entry is genuinely ambiguous.
@@ -6044,6 +6118,7 @@ SYNTHETIC = [
     t_relabel_collision,
     # ground truth from recipes, and the storage it needs
     t_mixture_weights, t_mixture_name_k_vector, t_procrustes_dimension_sweep,
+    t_simplex_colours_at_k_vertices,
     t_split_and_whole_rejected,
     t_simplex_geometry,
     t_disparity_vs_truth_exact, t_disparity_vs_truth_label_keyed,

@@ -1,15 +1,20 @@
-"""Colour system and panel grids for 3-group simplex experiments.
+"""Colour system and panel grids for grouped-mixture simplex experiments.
 
 Earlier suites mixed *two* topic groups, so a model's composition was a scalar and
 a 1-D ramp (``plasma`` keyed to ``% topic 0``) could carry it. The simplex3 suites
-mix *three* groups, so composition is a point in a 2-simplex and no single ramp can
-represent it without discarding an axis.
+mix three or four groups, so composition is a point in a ``K-1`` simplex and no
+single ramp can represent it without discarding an axis.
 
 The replacement is a **barycentric blend**: a model's colour is its own mixture.
-Three anchor hues sit at the pure vertices and every interior point is the
+One anchor hue sits at each pure vertex and every interior point is the
 weight-average of them, mixed in Oklab so that equal weight steps look like equal
-colour steps. The legend is therefore the simplex itself, drawn as a filled
-triangle, rather than a bar.
+colour steps.
+
+At three groups the legend is the simplex itself, drawn as a filled triangle.
+**At four there is no legend**, and that is the correct answer rather than a gap:
+a tetrahedron has no honest 2-D barycentric picture, every interior mixture
+appears on none of its faces, and the colour blend still carries the full weight
+vector onto the MDS panels, which is where the recipe needs to be legible.
 
 Distance matrices keep the established ``copper_r``; these colours are deliberately
 in a different part of colour space so the two figure types never read as the same
@@ -44,6 +49,42 @@ ANCHORS: dict[str, str] = {
     "g2": "#F02B3A",   # red
     "g3": "#FFC220",   # gold
 }
+
+#: The fourth anchor, for the four-group corpora. Chosen by measurement rather
+#: than by eye: over teal, cyan, purple, magenta and a darker green, this one
+#: maximises the *minimum* pairwise Oklab distance among all four anchors under a
+#: deuteranopic simulation. It scores 0.179 there — exactly the existing three's
+#: own worst pair, so the fourth vertex costs nothing in the case that matters.
+#:
+#: Teal and cyan are the trap and are why this was measured: both look well
+#: separated from the blue in normal vision (0.246, 0.240) and collapse onto it
+#: under deuteranopia (0.038, 0.026).
+FOURTH_ANCHOR = "#2FBF3F"   # green
+
+
+def anchors_for(k: int, anchors: Mapping[str, str] = ANCHORS) -> dict[str, str]:
+    """``{g1: hex, ...}`` for a ``k``-vertex simplex.
+
+    Three vertices return the original three unchanged, so every yahoo figure
+    keeps the colours it has. Four extend them by :data:`FOURTH_ANCHOR` rather
+    than re-deriving all four on an even hue wheel — re-deriving would give a
+    better-spaced set and would recolour every figure already on disk, which is
+    a worse trade than one measured addition.
+    """
+    named = {g: anchors[g] for g in list(anchors)[:k] if g in anchors}
+    for i in range(len(named) + 1, k + 1):
+        key = f"g{i}"
+        if key in anchors:
+            named[key] = anchors[key]
+        elif i == 4:
+            named[key] = FOURTH_ANCHOR
+        else:
+            raise ValueError(
+                f"no anchor colour defined for {key}; this palette covers up to "
+                f"4 vertices. Add one to ANCHORS, checking its Oklab separation "
+                f"from the others under a deuteranopic simulation."
+            )
+    return named
 
 GROUP_TOPICS: dict[str, list[int]] = {
     "g1": [0, 6, 7, 9],
@@ -212,18 +253,24 @@ def barycentric_color(
     weights: Sequence[float],
     anchors: Mapping[str, str] = ANCHORS,
 ) -> np.ndarray:
-    """Blend the three anchors by *weights* in Oklab. Returns sRGB in [0, 1].
+    """Blend the anchors by *weights* in Oklab. Returns sRGB in [0, 1].
 
-    A pure vertex reproduces its anchor exactly, so the legend and the points
-    agree by construction rather than by eye.
+    The number of anchors follows the length of *weights*, so a four-group
+    mixture blends four. A pure vertex reproduces its anchor exactly, so the
+    legend and the points agree by construction rather than by eye.
+
+    Taking ``K`` from the weights is what makes two recipes differing only in
+    their last group visibly different — under a three-anchor blend the fourth
+    weight would have nowhere to go, and the two would come out the same colour.
     """
     w = np.asarray(weights, dtype=float)
-    if w.shape != (3,):
-        raise ValueError(f"weights must have 3 entries, got {w.shape}")
+    if w.ndim != 1 or w.size < 2:
+        raise ValueError(f"weights must be a vector of at least 2 entries, got {w.shape}")
     if w.sum() <= 0:
         raise ValueError("weights must sum to a positive value")
     w = w / w.sum()
-    lab = np.stack([rgb_to_oklab(_hex_to_rgb(anchors[g])) for g in ("g1", "g2", "g3")])
+    named = anchors_for(w.size, anchors)
+    lab = np.stack([rgb_to_oklab(_hex_to_rgb(named[g])) for g in named])
     return oklab_to_rgb(w @ lab)
 
 
@@ -248,20 +295,58 @@ def _bary_to_xy(w: np.ndarray) -> np.ndarray:
 
 
 #: The three pure mixtures and the centre, as ``mixture_label`` spells them.
+#: Three-group spellings, kept because they are the defaults every yahoo caller
+#: relies on; :func:`frame_labels` derives the same strings for any ``K``.
 VERTEX_LABELS = ("100/0/0", "0/100/0", "0/0/100")
 CENTRE_LABEL = "33/33/33"
 
-#: Human-facing names for the three groups, for figures aimed at readers who do
-#: not know the ``g1``/``g2``/``g3`` shorthand.
+
+def frame_labels(k: int) -> tuple[str, str, str]:
+    """``(centre, up, right)`` as ``mixture_label`` spells them at ``k`` groups.
+
+    The frame is a choice of where to stand in a 2-D panel — origin at the even
+    mixture, pure g1 up, pure g2 to the right — and it is well defined at any
+    ``K``, because those three recipes exist in every one of these simplexes.
+    Only the *spelling* changes: ``33/33/33`` at three groups, ``25/25/25/25`` at
+    four.
+
+    The centre rounds, and at K=3 it rounds to parts summing to 99. That is the
+    label the ids themselves carry, which is why it is reproduced rather than
+    corrected.
+    """
+    share = round(100 / k)
+    centre = "/".join([str(share)] * k)
+    up = "/".join(["100"] + ["0"] * (k - 1))
+    right = "/".join(["0", "100"] + ["0"] * (k - 2))
+    return centre, up, right
+
+#: Human-facing names for the groups, for figures aimed at readers who do not
+#: know the ``g1``/``g2``/``g3`` shorthand. Three entries, which is what the
+#: yahoo figures pass; :func:`group_display` extends it to any ``K``.
 GROUP_DISPLAY = {"g1": "Group 1", "g2": "Group 2", "g3": "Group 3"}
+
+
+def group_display(k: int, names: Sequence[str] | None = None) -> dict[str, str]:
+    """``{g1: label, ...}`` for a ``k``-vertex simplex.
+
+    *names* supplies the corpus's own labels — the ``group_display`` field of its
+    ``DataSimplexSpec``, e.g. ``("en", "es", "ru", "zh")``. Without them the
+    generic ``Group N`` is used, which is what the yahoo figures have always
+    shown.
+    """
+    if names is not None:
+        if len(names) != k:
+            raise ValueError(f"{len(names)} display names for {k} groups")
+        return {f"g{i + 1}": n for i, n in enumerate(names)}
+    return {f"g{i + 1}": f"Group {i + 1}" for i in range(k)}
 
 
 def align_to_simplex(
     coords: np.ndarray,
     model_ids: Sequence[str],
-    centre: str = CENTRE_LABEL,
-    up: str = "100/0/0",
-    right: str = "0/100/0",
+    centre: str | None = None,
+    up: str | None = None,
+    right: str | None = None,
 ) -> np.ndarray:
     """Put a 2-D embedding in the simplex's own frame.
 
@@ -278,10 +363,24 @@ def align_to_simplex(
 
     This is a similarity transform: distances, stress and any barycentric
     projection are unchanged. It only chooses where to stand.
+
+    The three landmarks default to the even mixture, pure g1 and pure g2, spelled
+    for whatever ``K`` these ids carry — ``33/33/33`` at three groups,
+    ``25/25/25/25`` at four. All three recipes exist in every one of these
+    simplexes, so the frame is as well defined at four vertices as at three; only
+    the strings change. Deriving them rather than defaulting to the 3-group
+    spellings is what stops every 4-vertex panel from silently taking
+    :func:`_in_simplex_frame`'s unaligned fallback.
     """
     coords = np.asarray(coords, dtype=float)
     if coords.shape[1] != 2:
         raise ValueError(f"align_to_simplex needs a 2-D embedding, got {coords.shape}")
+
+    if centre is None or up is None or right is None:
+        d_centre, d_up, d_right = frame_labels(len(mixture_weights(model_ids[0])))
+        centre = d_centre if centre is None else centre
+        up = d_up if up is None else up
+        right = d_right if right is None else right
 
     pos = {}
     for wanted in (centre, up, right):
@@ -357,7 +456,22 @@ def ternary_legend(
     the sampled mixtures are placed **radially outward from the centre** rather
     than at a fixed offset, which is what keeps sixteen of them legible on a
     triangle this small.
+
+    **Three groups only.** ``_bary_to_xy`` maps onto a triangle and this function
+    labels three corners; a tetrahedron has no honest 2-D barycentric picture, so
+    a 4-vertex collection has to skip the legend rather than be projected into
+    one. Callers guard on the group count and say why they skipped; this raises
+    so that a caller which forgot cannot draw a triangle of the wrong simplex.
     """
+    if model_ids:
+        k = len(mixture_weights(model_ids[0]))
+        if k != 3:
+            raise ValueError(
+                f"ternary_legend draws a 2-simplex and these ids carry {k} groups. "
+                f"A simplex above 2-D has no barycentric plane, so skip the legend "
+                f"rather than projecting it -- the MDS panels still carry the full "
+                f"mixture in their point colours."
+            )
     # Fill: rasterize the triangle, colouring each pixel by its own barycentric
     # weights, then mask everything outside.
     xs = np.linspace(0.0, 1.0, resolution)
@@ -680,26 +794,36 @@ def crosslevel_mds(
     bold = {"fontweight": "bold", "fontfamily": family}
 
     n = len(panels)
-    fig = plt.figure(figsize=(panel_w * (n + 1) + 0.4, panel_h + 1.15),
+    ids = next((p[1].model_ids for p in panels), None)
+    # The mixture key is a filled triangle, so it exists only at three groups.
+    # Above that the panels stand alone: their point colours still carry the full
+    # weight vector, and a tetrahedron has no barycentric plane to draw beside
+    # them. Dropping the column rather than leaving it blank is what keeps the
+    # figure's proportions right.
+    n_g = len(mixture_weights(ids[0])) if ids else 3
+    with_key = n_g == 3
+    cols = n + (1 if with_key else 0)
+    fig = plt.figure(figsize=(panel_w * cols + 0.4, panel_h + 1.15),
                      layout="constrained")
     # The legend column is wider than a panel: the triangle carries sixteen
     # labels plus three vertex names, and it is the key everything else is read
     # through, so it should not be the smallest thing in the figure.
-    gs = fig.add_gridspec(1, n + 1, width_ratios=[1.28] + [1.0] * n)
+    gs = fig.add_gridspec(1, cols,
+                          width_ratios=([1.28] if with_key else []) + [1.0] * n)
 
-    lax = fig.add_subplot(gs[0, 0])
-    ids = next((p[1].model_ids for p in panels), None)
-    ternary_legend(lax, ids, anchors, label_models=True,
-                   vertex_names=GROUP_DISPLAY, show_topics=False,
-                   label_size=7.5, vertex_size=11, marker_size=34,
-                   fontweight="bold", fontfamily=family)
-    lax.set_title("Mixture key", fontsize=13, pad=10, **bold)
+    if with_key:
+        lax = fig.add_subplot(gs[0, 0])
+        ternary_legend(lax, ids, anchors, label_models=True,
+                       vertex_names=group_display(n_g), show_topics=False,
+                       label_size=7.5, vertex_size=11, marker_size=34,
+                       fontweight="bold", fontfamily=family)
+        lax.set_title("Mixture key", fontsize=13, pad=10, **bold)
 
     keep = set(label_points)
     for k, panel in enumerate(panels):
         name, dm, dcor = panel[:3]
         procrustes = panel[3] if len(panel) > 3 else None
-        ax = fig.add_subplot(gs[0, k + 1])
+        ax = fig.add_subplot(gs[0, k + (1 if with_key else 0)])
         geo = fit_geometry(dm, "mds", 2, random_state=random_state)
         xy = align_to_simplex(geo.coordinates, geo.model_ids)
 

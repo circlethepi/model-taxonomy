@@ -1,16 +1,29 @@
 #!/usr/bin/env python
-"""Cross-model comparison of the four yahoo simplex3 runs.
+"""Cross-model comparison of the simplex3 runs, one figure set per corpus.
 
 Every simplex3 suite scores each taxonomy level against the ground-truth
 mixture geometry and writes the result to ``crosslevel_scores.csv``. Each of
-those files describes one base model in isolation. This driver reads all four
-back and puts them on shared axes, so the question stops being "how well does
-this level recover the mixture for Llama?" and becomes "does the *same* level
-recover it for every base model, or is the answer architecture-dependent?".
+those files describes one base model in isolation. This driver reads them back
+and puts each corpus's models on shared axes, so the question stops being "how
+well does this level recover the mixture for Llama?" and becomes "does the
+*same* level recover it for every base model, or is the answer
+architecture-dependent?".
 
-Nothing is recomputed here. The scores are read straight out of the four CSVs
-the suites already wrote, which is why this script runs in a second on a login
-node and needs no cache, no GPU and no adapters.
+**One figure set per corpus, not one across all twelve.** Four models on a radar
+is already crowded; twelve is unreadable. More to the point the corpora are not
+on one axis: yahoo mixes three topic groups and dolly and oasst1 mix four, so
+their ground truths live in different dimensions and their disparities are not
+the same measurement. The cross-corpus question — does a level that recovers a
+topic simplex also recover a task or language one — is answered by reading the
+three figure sets side by side, each internally comparable.
+
+A corpus whose suites have not run yet is **skipped with a note** rather than
+being an error, so this driver is runnable from the moment the first corpus
+finishes.
+
+Nothing is recomputed here. The scores are read straight out of the CSVs the
+suites already wrote, which is why this script runs in a second on a login node
+and needs no cache, no GPU and no adapters.
 
 Perspectives
 ------------
@@ -36,7 +49,11 @@ directions:
 * ``dcor``       distance correlation with the ground-truth geometry, 0 → 1,
                  higher is better.
 * ``procrustes`` Procrustes disparity against the same geometry, 1 → 0,
-                 **lower** is better.
+                 **lower** is better. This is the disparity at the truth's own
+                 dimension, ``d = K-1``: ``d2`` for yahoo's three vertices,
+                 ``d3`` for the four-vertex corpora. The axis label says which,
+                 because a d2 and a d3 disparity are not comparable numbers —
+                 which is a second reason the corpora get separate figures.
 
 The procrustes figures plot the raw disparity, so on those a *small* polygon
 and *short* bars are the good result. Both use a fixed 0–1 radial/y range so
@@ -90,6 +107,32 @@ MODELS = [
     ("mistralai/Mistral-Nemo-Instruct-2407", "simplex3_nemo",    "#D55E00", "s", "--"),   # 12B, vermillion
 ]
 
+#: The same four models over each corpus, and the directory each one's scores
+#: are in. Built from MODELS rather than restated, so the colour, marker and
+#: parameter-count ordering above stay the single source of all three — a model
+#: keeps its encoding across every corpus, which is what lets the figure sets be
+#: read side by side.
+#:
+#: ``file_token`` is appended to the output filenames. Yahoo's is empty, so its
+#: six figures keep the names they are tracked under.
+#: base model -> the suite tag its trees and drivers are named with. Yahoo's
+#: directories predate the tag scheme and are named individually in MODELS, so
+#: this is used only for the corpora added later.
+SUITE_TAG = {
+    "allenai/OLMo-2-0425-1B-Instruct": "olmo2",
+    "Qwen/Qwen3.5-4B": "qwen",
+    "meta-llama/Llama-3.1-8B-Instruct": "llama3i",
+    "mistralai/Mistral-Nemo-Instruct-2407": "nemo",
+}
+
+CORPORA = {
+    "yahoo": ("", MODELS),
+    "dolly": ("_dolly", [(m, f"simplex3_dolly_{SUITE_TAG[m]}", c, k, l)
+                         for m, _, c, k, l in MODELS]),
+    "oasst1": ("_oasst1", [(m, f"simplex3_oasst1_{SUITE_TAG[m]}", c, k, l)
+                           for m, _, c, k, l in MODELS]),
+}
+
 
 def label_of(base_model: str) -> str:
     """Legend name for a base model: the HF repo id without its org prefix."""
@@ -123,10 +166,15 @@ SCORES = {
 }
 
 
-def collect(figures_root: Path) -> dict[str, dict[str, dict[str, float]]]:
-    """``{model: {version: {perspective: score}}}`` for every model in MODELS."""
+def collect(figures_root: Path, models) -> dict[str, dict[str, dict[str, float]]]:
+    """``{model: {version: {perspective: score}}}`` for every model in *models*.
+
+    Raises ``FileNotFoundError`` if any of the corpus's suites has not run;
+    :func:`main` turns that into a skip, since a corpus mid-flight is the normal
+    state of this directory rather than an error.
+    """
     out: dict[str, dict[str, dict[str, float]]] = {}
-    for base_model, subdir, *_ in MODELS:
+    for base_model, subdir, *_ in models:
         rows = read_scores_csv(figures_root / subdir / "crosslevel_scores.csv")
         out[label_of(base_model)] = {
             version: {
@@ -140,7 +188,7 @@ def collect(figures_root: Path) -> dict[str, dict[str, dict[str, float]]]:
     return out
 
 
-def _series(scores, version, labels, marker=None, linestyle=None):
+def _series(scores, models, version, labels, marker=None, linestyle=None):
     """One PlotSeries per model, values ordered to match *labels*.
 
     *marker* and *linestyle* override the per-model encodings in MODELS for
@@ -153,12 +201,14 @@ def _series(scores, version, labels, marker=None, linestyle=None):
             marker=marker if marker is not None else mkr,
             linestyle=linestyle if linestyle is not None else ls,
         )
-        for base_model, _, color, mkr, ls in MODELS
+        for base_model, _, color, mkr, ls in models
     ]
 
 
-def draw_radar(scores, version: str, outdir: Path) -> Path:
+def draw_radar(scores, models, version: str, outdir: Path, token: str,
+               axis_note: str) -> Path:
     _, _, axis_label = SCORES[version]
+    axis_label += axis_note
     labels = [p[0] for p in PERSPECTIVES]
     set_style("one_col", fig_width=4.4, fig_height=3.7)
     fig, ax = plt.subplots(subplot_kw={"projection": "polar"})
@@ -166,7 +216,7 @@ def draw_radar(scores, version: str, outdir: Path) -> Path:
         #   Solid unmarked outlines: with four polygons crowded into the outer
         #   fifth of the range, markers and dashes read as texture rather than as
         #   identity, and colour alone separates the four cleanly enough.
-        _series(scores, version, labels, marker="none", linestyle="-"),
+        _series(scores, models, version, labels, marker="none", linestyle="-"),
         axis_labels=labels,
         ax=ax,
         start_angle=90.0,      # Data at the top ...
@@ -190,18 +240,20 @@ def draw_radar(scores, version: str, outdir: Path) -> Path:
     #   long words, so the axes box is narrowed to leave them room rather than
     #   relying on the tight bbox to find them.
     ax.set_position([0.16, 0.06, 0.62, 0.82])
-    path = outdir / f"fig_taxonomy_radar_{version}.png"
+    path = outdir / f"fig_taxonomy_radar_{version}{token}.png"
     fig.savefig(path, pad_inches=0.25)
     plt.close(fig)
     return path
 
 
-def draw_bars(scores, version: str, outdir: Path) -> Path:
+def draw_bars(scores, models, version: str, outdir: Path, token: str,
+              axis_note: str) -> Path:
     _, _, axis_label = SCORES[version]
+    axis_label += axis_note
     set_style("one_col", fig_width=6.5, fig_height=3.6)
     fig, ax = plt.subplots()
     plot_grouped_bars(
-        _series(scores, version, BAR_ORDER),
+        _series(scores, models, version, BAR_ORDER),
         group_labels=BAR_ORDER,
         ax=ax,
         ylabel=axis_label,
@@ -220,7 +272,7 @@ def draw_bars(scores, version: str, outdir: Path) -> Path:
                        "ncol": 4, "frameon": False},
         savefig=False,
     )
-    path = outdir / f"fig_taxonomy_bars_{version}.png"
+    path = outdir / f"fig_taxonomy_bars_{version}{token}.png"
     fig.savefig(path)
     plt.close(fig)
     return path
@@ -231,13 +283,41 @@ def main() -> None:
     ap.add_argument("--figures-root", type=Path, default=REPO_ROOT / "figures",
                     help="directory holding the per-model simplex3 figure dirs")
     ap.add_argument("--outdir", type=Path, default=HERE)
+    ap.add_argument("--corpus", action="append", choices=list(CORPORA),
+                    help="restrict to one or more corpora (default: all that "
+                         "have run)")
     args = ap.parse_args()
 
     args.outdir.mkdir(parents=True, exist_ok=True)
-    scores = collect(args.figures_root)
-    for version in SCORES:
-        print(draw_radar(scores, version, args.outdir))
-        print(draw_bars(scores, version, args.outdir))
+    wanted = args.corpus or list(CORPORA)
+    drawn = 0
+    for corpus in wanted:
+        token, models = CORPORA[corpus]
+        try:
+            scores = collect(args.figures_root, models)
+        except FileNotFoundError as exc:
+            # The normal state of a corpus whose suites are still queued. Named,
+            # so a missing figure set is never mistaken for an empty result.
+            print(f"{corpus}: skipped — {Path(exc.filename or '?').parent.name}"
+                  f"/crosslevel_scores.csv not written yet")
+            continue
+        # The disparity is reported at the truth's own dimension, K-1, and a d2
+        # number is not comparable with a d3 one. Read it off the CSV rather than
+        # inferring it from the corpus name.
+        rows = read_scores_csv(args.figures_root / models[0][1]
+                               / "crosslevel_scores.csv")
+        dims = sorted(int(k.split("_d")[1]) for k in rows[0]
+                      if k.startswith("procrustes_d"))
+        note = f" (d={dims[-1]})" if dims and "procrustes" in "".join(SCORES) else ""
+        for version in SCORES:
+            axis_note = note if "procrustes" in version else ""
+            print(draw_radar(scores, models, version, args.outdir, token, axis_note))
+            print(draw_bars(scores, models, version, args.outdir, token, axis_note))
+        drawn += 1
+    if not drawn:
+        raise SystemExit(
+            "no corpus has a complete set of crosslevel_scores.csv files; "
+            "run the per-model drivers first.")
 
 
 if __name__ == "__main__":

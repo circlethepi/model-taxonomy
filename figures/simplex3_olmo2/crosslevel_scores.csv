@@ -1,4 +1,4 @@
-level,surrogate,metric,dcor,procrustes,stress,n_models,matrix_sha256
+level,surrogate,metric,dcor,procrustes_d2,stress_d2,n_models,matrix_sha256
 behavioral,R=16 · per generation,cosine,0.939809,0.086905,0.313721,16,6236cb38f1a72adc
 behavioral,R=16 · per query,cosine,0.938347,0.074729,0.286578,16,8af81cea3b98344c
 behavioral,R=16 · per generation,euclidean,0.935952,0.745573,0.350775,16,f627ba552af07083

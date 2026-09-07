@@ -410,6 +410,52 @@ def variant_report(rows) -> str:
             f"  dCor* under variant A is {reading}")
 
 
+def check_matrices(matrices, ids) -> int:
+    """Plan verification step 6: are the pool matrices fit to score?
+
+    *Complete* means every model the cache scan found has a row -- a pool whose
+    training or extraction half died partway still produces a perfectly valid
+    smaller matrix, and nothing downstream would notice the models that are
+    missing from it.  *Symmetric with a zero diagonal* means what came back is a
+    distance matrix and not a partly filled buffer.
+
+    Returns a process exit status, so a bad pool stops the pipeline instead of
+    being scored with holes in it.
+    """
+    want = set(ids)
+    bad = 0
+    for level, dm in sorted(matrices.items()):
+        a = np.asarray(dm.matrix, dtype=float)
+        have = list(dm.model_ids)
+        problems = []
+        missing = [m for m in ids if m not in set(have)]
+        if missing:
+            problems.append(
+                f"{len(missing)} missing row(s), e.g. {missing[:3]}")
+        extra = [m for m in have if m not in want]
+        if extra:
+            problems.append(f"{len(extra)} unexpected row(s), e.g. {extra[:3]}")
+        if not np.isfinite(a).all():
+            problems.append(
+                f"{int((~np.isfinite(a)).sum())} non-finite entr(ies)")
+        else:
+            asym = float(np.abs(a - a.T).max())
+            diag = float(np.abs(np.diag(a)).max())
+            if asym > 1e-9:
+                problems.append(f"asymmetric by {asym:.3e}")
+            if diag > 1e-9:
+                problems.append(f"diagonal up to {diag:.3e}")
+        if problems:
+            bad += 1
+            print(f"  FAIL  {level:<18}  " + "; ".join(problems))
+        else:
+            print(f"  ok    {level:<18}  {a.shape[0]}x{a.shape[1]}, "
+                  "symmetric, zero diagonal")
+    n = len(matrices)
+    print(f"\n{n - bad}/{n} matrix/matrices complete over {len(ids)} model(s)")
+    return 1 if bad else 0
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(
         description=__doc__.split("Usage")[0],
@@ -430,6 +476,10 @@ def main() -> None:
     ap.add_argument("--replicates", type=int, default=100)
     ap.add_argument("--seed", type=int, default=0,
                     help="seed for the permute-and-partition shuffles")
+    ap.add_argument("--check-matrices", action="store_true",
+                    help="build the pool matrices, verify they are complete, "
+                         "symmetric and zero-diagonal, then exit without "
+                         "scoring (plan verification step 6)")
     ap.add_argument("--no-cache", action="store_true",
                     help="recompute the pool matrices, ignoring 07_collections "
                          "(still writes them back)")
@@ -474,6 +524,9 @@ def main() -> None:
     print(f"building {len(levels)} pool matrix/matrices over {len(ids)} models")
     matrices = pool_matrices(index, ids, cache_root, levels,
                              use_cache=not args.no_cache)
+
+    if args.check_matrices:
+        raise SystemExit(check_matrices(matrices, ids))
 
     n_grid = [int(x) for x in args.n_grid.split(",") if x.strip()]
     rows = sweep(matrices, ids, weights, n_grid, args.replicates, args.seed,

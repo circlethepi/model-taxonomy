@@ -141,6 +141,19 @@ def samples_seen() -> int:
 
 
 SEEDS = list(range(10))
+
+
+def sweep_seeds() -> list[int]:
+    """The seeds the sample-size sweep runs at, for the bound spec.
+
+    ``SEEDS`` is the sweep the three original corpora ran; a spec may narrow it,
+    and a spec that sets it empty drops the sweep altogether.  Read through this
+    rather than off ``SEEDS`` directly, so that a corpus which does not want the
+    sweep does not silently emit ten jobs' worth of it.
+    """
+    return SEEDS if SPEC.sweep_seeds is None else list(SPEC.sweep_seeds)
+
+
 LORA_RANK, LORA_INIT_SEED = 16, 0
 
 REPLICATES = 16
@@ -197,14 +210,15 @@ def proportions() -> list[tuple[str, tuple[int, ...]]]:
     determined, which is the order the original hand-written triple loop
     produced.  It is load-bearing only for byte-parity with the trees already on
     disk, but that is reason enough not to change it.
+
+    Under a spec carrying ``n_mixtures`` the enumeration is *sampled* instead --
+    a fixed-size uniform draw without replacement from the non-vertex grid
+    points, with the vertices and the even mixture appended as references.  The
+    enumeration itself lives on the spec (``DataSimplexSpec.mixture_pcts``), so
+    the two modes cannot drift apart and the analysis side can reproduce the pool
+    without importing this generator.
     """
-    step = 100 // SPEC.grid
-    out = [(name_for(tuple(part * step for part in parts)),
-            tuple(part * step for part in parts))
-           for parts in _compositions(SPEC.grid, SPEC.n_groups)]
-    if not SPEC.even_is_grid_point:
-        out.append((name_for(SPEC.even_pct), SPEC.even_pct))
-    return out
+    return [(name_for(pct), pct) for pct in SPEC.mixture_pcts()]
 
 
 def proportions_for(spec: DataSimplexSpec) -> list[tuple[str, tuple[int, ...]]]:
@@ -219,16 +233,6 @@ def proportions_for(spec: DataSimplexSpec) -> list[tuple[str, tuple[int, ...]]]:
         return proportions()
     finally:
         SPEC = was
-
-
-def _compositions(total: int, parts: int):
-    """Every way to write *total* as an ordered sum of *parts* non-negative ints."""
-    if parts == 1:
-        yield (total,)
-        return
-    for first in range(total + 1):
-        for rest in _compositions(total - first, parts - 1):
-            yield (first,) + rest
 
 
 def name_for(pct: tuple[int, ...]) -> str:
@@ -487,7 +491,7 @@ fine_tuning:
 
 # One (1, 768) centroid per draw. The surrogate is authored, not derived -- the
 # full (N, 768) matrix is never stored and `mean` is not invertible -- so adding a
-# second representation later means re-embedding all {len(props) * len(SEEDS) * len(sizes)}.
+# second representation later means re-embedding all {len(props) * len(sweep_seeds()) * len(sizes)}.
 extraction:
   models: []
   device: cuda
@@ -1128,6 +1132,35 @@ SUITES = {
         # costs only queue priority, while eight invented numbers cost a reader's
         # trust in all of them.  Trim after the first run measures actual walls.
     ).for_model("allenai/OLMo-2-0425-1B-Instruct"),
+    #: The olmo2 suite, stripped to the four canonical perspectives, for the
+    #: 1004-model pool the group-size sweep subsamples from.
+    #:
+    #: Only two fields differ from ``olmo2`` and both are subtractions.  The
+    #: log-probability level is dropped: no canonical perspective reads it, and
+    #: it is priced per adapter, so at 1004 adapters it would cost more than the
+    #: measurement it is not part of.  The temperature sweep is dropped by the
+    #: spec, for the same reason (``YAHOO_POOL.temperature_sweep`` is ``()``,
+    #: which ``main`` applies over whatever the suite carries).
+    #:
+    #: Everything else is deliberately identical, because the point of the pool
+    #: is to be the same experiment at a different *size*: a wall or a batch that
+    #: differed here would make the group-size axis a hardware axis too. The
+    #: shard counts are the exception and are not set here at all --
+    #: ``_suite_for_dataset`` derives them from the adapter count at the cadence
+    #: every existing wall was tuned against, giving 251 train shards and 502
+    #: behavioural shards rather than one job 63x longer than any that has run.
+    "olmo2_pool": Suite(
+        tag="olmo2_pool",
+        query_sets=("question_only",),
+        job_tokens={"question_only": "qonly"},
+        emit_embed_jobs=False,
+        emit_build_job=False,
+        job_prefix="s3po2",
+        emit_logprob_jobs=False,
+        emit_gen_activation_job=True,
+        # See the olmo2 entry: l40s is not safe for TRAINING this model, only for
+        # extraction. Submit training with `sbatch --partition=h200,h100`.
+    ).for_model("allenai/OLMo-2-0425-1B-Instruct"),
 }
 
 
@@ -1145,6 +1178,7 @@ _SUITE_PREFIXES = {
     ("oasst1", "llama3i"): "s3oli",
     ("oasst1", "nemo"): "s3onm",
     ("oasst1", "olmo2"): "s3oo2",
+    ("yahoo_pool", "olmo2_pool"): "s3po2",
 }
 
 #: Adapters per shard, held at the value every existing wall was tuned against.
@@ -1232,8 +1266,8 @@ def main() -> None:
             print(f"  {name}   {pct}   {groups} = {ratio}")
         sizes = len(SPEC.sweep_size_list)
         print(f"\n{len(props)} proportions "
-              f"x {len(SEEDS)} seeds x {sizes} sizes = "
-              f"{len(props) * len(SEEDS) * sizes} draws; {len(props)} adapters")
+              f"x {len(sweep_seeds())} seeds x {sizes} sizes = "
+              f"{len(props) * len(sweep_seeds()) * sizes} draws; {len(props)} adapters")
         return
 
     if args.data_tree:
@@ -1319,7 +1353,7 @@ def main() -> None:
     #    embedding, so this job is a fail-fast gate rather than the sampling work:
     #    640 recipe blocks are resolved and hashed before any GPU is held.
     if SUITE.emit_embed_jobs:
-        for seed in SEEDS:
+        for seed in sweep_seeds():
             emit(exp / f"sweep_s{seed:02d}.yaml", write_sweep(seed))
             emit(jobs / f"02_embed_s{seed:02d}.sh", sbatch(
                 f"{SUITE.job_prefix}_embed_s{seed:02d}", SUITE.gpu_partitions, True,
@@ -1352,7 +1386,7 @@ def main() -> None:
             "\n".join(
                 f"python scripts/run_experiment.py"
                 f" experiments/{tree}/sweep_s{seed:02d}.yaml --steps build"
-                for seed in SEEDS
+                for seed in sweep_seeds()
             ),
             logs,
         ))
@@ -1487,9 +1521,27 @@ def main() -> None:
     print(f"  {len(list(exp.glob('*.yaml')))} configs in {exp}")
     print(f"  {len(list(jobs.glob('*.sh')))} scripts in {jobs}")
     n_sizes = len(SPEC.sweep_size_list)
-    print(f"\n{len(props)} proportions, {len(props) * len(SEEDS) * n_sizes} draws, "
+    print(f"\n{len(props)} proportions, {len(props) * len(sweep_seeds()) * n_sizes} draws, "
           f"{len(props)} adapters.")
     print(f"Submit with: bash {jobs}/submit_all.sh")
+
+
+def _embed_sweep_submit() -> str:
+    """The sample-size sweep's submit block, or nothing when it was not emitted.
+
+    Returned as text rather than inlined because ``for s in ; do`` is a bash
+    syntax error, not an empty loop -- a spec that drops the sweep would emit a
+    submit script that fails on its first line.
+    """
+    seeds = sweep_seeds()
+    if not seeds:
+        return ""
+    return f"""for s in {' '.join(f'{s:02d}' for s in seeds)}; do
+  J=$(sb --dependency=afterok:$BUILD 02_embed_s$s.sh)
+  echo "embed   s$s   $J"
+done
+
+"""
 
 
 def write_data_tree(root: Path) -> None:
@@ -1524,7 +1576,7 @@ def write_data_tree(root: Path) -> None:
         path.write_text(text)
         written.append(str(path))
 
-    for seed in SEEDS:
+    for seed in sweep_seeds():
         emit(exp / f"sweep_s{seed:02d}.yaml", write_sweep(seed))
         emit(jobs / f"02_embed_s{seed:02d}.sh", sbatch(
             f"{SUITE.job_prefix}_embed_s{seed:02d}", SUITE.gpu_partitions, True,
@@ -1541,12 +1593,18 @@ def write_data_tree(root: Path) -> None:
         f" --steps build extract --taxonomy dataset_embedding",
         logs,
     ))
+    # The build gate covers whichever configs this tree actually emitted.  A
+    # corpus that drops the sweep still has `embed_matrix.yaml` to fail fast on,
+    # and joining over an empty seed list would otherwise emit a job body that
+    # runs nothing while the embed jobs still declare a dependency on it.
+    build_configs = [f"sweep_s{seed:02d}.yaml" for seed in sweep_seeds()]
+    build_configs.append("embed_matrix.yaml")
     emit(jobs / "01_build.sh", sbatch(
         f"{SUITE.job_prefix}_build", CPU_PARTITION, False, 32, "1:00:00",
         "\n".join(
             f"python scripts/run_experiment.py"
-            f" experiments/{tree}/sweep_s{seed:02d}.yaml --steps build"
-            for seed in SEEDS
+            f" experiments/{tree}/{cfg} --steps build"
+            for cfg in build_configs
         ),
         logs,
     ))
@@ -1575,18 +1633,13 @@ mkdir -p {output_dir()}/logs
 
 sb() {{ sbatch --parsable "$@"; }}
 
-# One cheap CPU job: it writes {len(props) * len(SEEDS) * n_sizes} recipe blocks and nothing else, so it is a
+# One cheap CPU job: it writes {len(props) * len(sweep_seeds()) * n_sizes} recipe blocks and nothing else, so it is a
 # fail-fast gate rather than the sampling work. Draws are materialised on demand
 # by the sample cache during embedding.
 BUILD=$(sb 01_build.sh)
 echo "build         $BUILD"
 
-for s in {' '.join(f'{seed:02d}' for seed in SEEDS)}; do
-  J=$(sb --dependency=afterok:$BUILD 02_embed_s$s.sh)
-  echo "embed   s$s   $J"
-done
-
-J=$(sb --dependency=afterok:$BUILD 02_embed_matrix.sh)
+{_embed_sweep_submit()}J=$(sb --dependency=afterok:$BUILD 02_embed_matrix.sh)
 echo "embed   mat   $J"
 
 echo
@@ -1597,24 +1650,30 @@ echo "Submitted. Watch with: squeue -u $USER -o '%.10i %.14j %.9P %.2t %.10M %R'
     print(f"Wrote {len(written)} files:")
     print(f"  {len(list(exp.glob('*.yaml')))} configs in {exp}")
     print(f"  {len(list(jobs.glob('*.sh')))} scripts in {jobs}")
-    print(f"\n{len(props)} proportions x {len(SEEDS)} seeds x {n_sizes} sizes = "
-          f"{len(props) * len(SEEDS) * n_sizes} draws, plus {len(props)} for embed_matrix.")
+    print(f"\n{len(props)} proportions x {len(sweep_seeds())} seeds x {n_sizes} sizes = "
+          f"{len(props) * len(sweep_seeds()) * n_sizes} draws, plus {len(props)} for embed_matrix.")
     print(f"Submit with: bash {jobs}/submit_all.sh")
 
 
 #: Job-name prefixes for the dataset build trees.  They land in sacct history and
 #: in log filenames and are effectively permanent, so they are written down here
 #: rather than derived from the dataset name.
-_DATA_TREE_PREFIXES = {"dolly": "s3dd", "oasst1": "s3od"}
+#:
+#: Keyed on ``suffix`` rather than ``name_prefix`` because the suffix is what
+#: names the tree, and the two came apart once a spec appeared that shares
+#: yahoo's adapter names -- deliberately, so its reference adapters are reused --
+#: while writing a tree of its own.  Both existing entries are unchanged: dolly's
+#: suffix is ``_dolly`` and oasst1's is ``_oasst1``.
+_DATA_TREE_PREFIXES = {"_dolly": "s3dd", "_oasst1": "s3od", "_pool": "s3pd"}
 
 
 def _data_tree_prefix() -> str:
     try:
-        return _DATA_TREE_PREFIXES[SPEC.name_prefix]
+        return _DATA_TREE_PREFIXES[SPEC.suffix]
     except KeyError:
         raise SystemExit(
-            f"--data-tree has no job prefix for {SPEC.name_prefix!r}. Add one to "
-            f"_DATA_TREE_PREFIXES, checking it collides with none of "
+            f"--data-tree has no job prefix for suffix {SPEC.suffix!r}. Add one "
+            f"to _DATA_TREE_PREFIXES, checking it collides with none of "
             f"{sorted(_DATA_TREE_PREFIXES.values())} or the suite prefixes."
         ) from None
 
@@ -1687,7 +1746,7 @@ def _submit_build() -> str:
 BUILD=$(sb 01_build.sh)
 echo "build         $BUILD"
 
-for s in {' '.join(f'{s:02d}' for s in SEEDS)}; do
+for s in {' '.join(f'{s:02d}' for s in sweep_seeds())}; do
   J=$(sb --dependency=afterok:$BUILD 02_embed_s$s.sh)
   echo "embed   s$s   $J"
 done

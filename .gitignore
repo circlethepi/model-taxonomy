@@ -24,3 +24,12 @@ figures/simplex3_qwen-05temp/*
 !figures/simplex3_qwen-05temp/make_temperature_curves.py
 
 docs/notes/
+
+# The per-shard configs and sbatch scripts. `scripts/gen_simplex3.py --suite <s>`
+# writes them, they differ from one another only in a shard number and a strided
+# slice of the adapter list, and there are 888 of them across thirteen trees --
+# enough to bury every hand-written file in `experiments/` and `jobs/` in a diff.
+# The generator, the Suite and the DataSimplexSpec stay tracked, so the tree is
+# still reproducible from one command; what is no longer tracked is its output.
+experiments/*/*_shard*.yaml
+jobs/*/*_shard*.sh

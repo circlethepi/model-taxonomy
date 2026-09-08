@@ -77,6 +77,14 @@ N_LAYERS = 32
 DRAW = {"recipe_hash": "9eccebfa74184124", "n_samples": 100, "seed": 1,
         "prompt_format_id": "f5444e61"}
 
+#: The embedder both new corpora were built with. nomic-embed-text-v2-moe is
+#: multilingual, which oasst1 requires -- its vertices are languages, and a
+#: monolingual embedder would make that geometry an artefact of the measuring
+#: instrument. dolly uses it too so the two corpora are mutually comparable from
+#: the start. yahoo's v1.5 hashes stay the suite defaults; these override them.
+EMBEDDER = "0b579825f703fb21"
+DATASET_EMBEDDER = "a831922612fddb96"
+
 
 def _grid(rows, cols):
     """Every (surrogate, metric) pair in a full rectangle."""
@@ -146,6 +154,8 @@ def main() -> None:
         crosslevel_only=True,
         n_expected=N_EXPECTED,
         datasets=DATASETS,
+        embedder=EMBEDDER,
+        dataset_embedder=DATASET_EMBEDDER,
         source="figures/simplex3_dolly_llama3i/make_figures.py",
     )
 

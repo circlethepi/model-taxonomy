@@ -173,6 +173,12 @@ SOURCE = "src/plots/simplex_suite.py"
 #: the question-only query draw both inference stages used
 DRAW = {"recipe_hash": "6149cf8055bac2c1", "n_samples": 100, "seed": 1,
         "prompt_format_id": "ea27ccee"}
+#: Defaults, not fixtures: the corpus decides the embedder, and ``run_suite``
+#: replaces both from its *embedder* / *dataset_embedder* arguments. These two
+#: are yahoo's. dolly and oasst1 use nomic-embed-text-v2-moe -- 0b579825f703fb21
+#: behavioral, a831922612fddb96 dataset -- because oasst1's vertices are
+#: languages and a monolingual embedder would make that geometry its own
+#: artefact. A hash is per-corpus, not per-base-model.
 EMBEDDER = "a3c1f067c13d3cc8"          # nomic-embed-text-v1.5, search_document
 DATASET_EMBEDDER = "b37e80a31644dc03"  # authored by the 8B run; recipe-keyed
 SAMP_GREEDY, SAMP_SAMPLED = "6f000f01", "58d3f985"
@@ -684,10 +690,50 @@ def functional_cells(idx, ids, rows, cols=None):
     return list(rows), cells
 
 
-#: `matrix` keeps all 1000 per-document embeddings; `mean` is the (1, 768)
-#: centroid that was the only stored surrogate until 2026-08-24.
+#: `matrix` keeps all per-document embeddings; `mean` is the (1, 768) centroid
+#: that was the only stored surrogate until 2026-08-24.
+#:
+#: The `n_samples`/`seed` here are **defaults for the row label only**. Lookup
+#: never reads them -- ``_dataset_embedding_reps`` keys on the entry's own
+#: ``n_samples``/``seed`` and takes just ``embedder_hash`` and
+#: ``representation`` out of the selector -- and ``dataset_rows`` replaces both
+#: with the draw the index actually holds. They stay here so the dicts are
+#: readable on their own.
 DATASET_MEAN = {"n_samples": 1000, "seed": 0, "representation": "mean"}
 DATASET_MATRIX = {"n_samples": 1000, "seed": 0, "representation": "matrix"}
+
+
+def dataset_draw(idx):
+    """The ``(n_samples, seed)`` every indexed recipe was embedded at.
+
+    The row label has to name a draw, and until now it named ``n1000_s00`` as a
+    string literal. That was yahoo's draw written down, not the index's: dolly
+    trained at n=1000 and agreed by luck, oasst1 trained at n=500 and could not
+    match the key whatever it asked for. Reading the draw off the entries makes
+    the label true per corpus, and leaves every yahoo suite byte-identical
+    because those indexes are all ``(1000, 0)``.
+
+    Returns ``None`` when the entries disagree or carry no draw, which is the
+    caller's cue to fall back to the module defaults rather than assert a draw
+    that only some of the rows were built at.
+    """
+    draws = {(e.n_samples, e.seed) for e in idx.entries}
+    draws.discard((None, None))
+    if len(draws) != 1:
+        return None
+    (n_samples, seed), = draws
+    if n_samples is None or seed is None:
+        return None
+    return n_samples, seed
+
+
+def _dataset_selector(base, draw):
+    """*base* with its draw replaced by *draw*, and the matching label suffix."""
+    if draw is None:
+        n_samples, seed = base["n_samples"], base["seed"]
+        return dict(base), f"n{n_samples}_s{seed:02d}"
+    n_samples, seed = draw
+    return {**base, "n_samples": n_samples, "seed": seed}, f"n{n_samples}_s{seed:02d}"
 
 
 def dataset_rows(idx, ids, surrogates=True):
@@ -697,21 +743,29 @@ def dataset_rows(idx, ids, surrogates=True):
     ``docs/notes/dataset_embedding_layout.md`` §4 — so it exists only if the
     re-embed job has run. Its rows are omitted with a printed note rather than
     raising, so the no-GPU surrogates still render on a cache that predates it.
+
+    The un-centered rows are labelled with the draw :func:`dataset_draw` reads
+    off *idx*, so a driver asks for ``n500_s00`` on oasst1 and ``n1000_s00`` on
+    dolly and yahoo, and each is the truth about the rows underneath it.
     """
-    rows = {"dataset text · mean · n1000_s00": (DATASET_MEAN, None)}
+    draw = dataset_draw(idx)
+    mean_sel, suffix = _dataset_selector(DATASET_MEAN, draw)
+    matrix_sel, _ = _dataset_selector(DATASET_MATRIX, draw)
+
+    rows = {f"dataset text · mean · {suffix}": (mean_sel, None)}
     if not surrogates:
         return rows
     # The 16 centroids share one large "Yahoo answer register" direction, which
     # puts every raw cosine distance in 0.00-0.03. Removing it makes the mixture
     # geometry the whole of what is measured rather than a perturbation on it.
-    rows["dataset text · mean · centered"] = (DATASET_MEAN, centered("grand"))
+    rows["dataset text · mean · centered"] = (mean_sel, centered("grand"))
 
     if _dataset_matrix_available(idx, ids):
         # `grand`, not `rowwise`: row i is the i-th sampled document of *this*
         # recipe. Two recipes' row i are unrelated documents, so a per-row fleet
         # mean would be an average over 16 arbitrary texts.
-        rows["dataset text · matrix · n1000_s00"] = (DATASET_MATRIX, None)
-        rows["dataset text · matrix · centered"] = (DATASET_MATRIX, centered("grand"))
+        rows[f"dataset text · matrix · {suffix}"] = (matrix_sel, None)
+        rows["dataset text · matrix · centered"] = (matrix_sel, centered("grand"))
     else:
         print("    no 'matrix' dataset surrogate in the cache — skipping those "
               "rows. Run jobs/simplex3_qwen/02_embed_matrix.sh to author it.")
@@ -1685,7 +1739,8 @@ def _selected_level(idx, ids, names, level, chosen, surrogates):
 def run_suite(*, base_model, draw, outdir, cache_root=None, levels=None,
               skip_sweep=False, skip_detail=False, surrogates=False,
               no_cache=False, select=None, source=None, n_expected=16,
-              crosslevel_only=False, datasets=None):
+              crosslevel_only=False, datasets=None, embedder=None,
+              dataset_embedder=None):
     """Build the figure suite for one run.
 
     This is the old ``main()`` body with the argument parsing lifted out, so the
@@ -1714,20 +1769,32 @@ def run_suite(*, base_model, draw, outdir, cache_root=None, levels=None,
     they would in a full run. Use it for a suite that exists to be compared with
     others rather than read on its own.
 
-    The run coordinates other than *base_model* and *draw* — the samplers, the
-    embedders, ``MAX_NEW_TOKENS`` — are deliberately **not** parameters. They are
-    module constants shared by every simplex3 suite, and the three runs agree on
-    all of them; a driver that needed to differ would be a different experiment,
-    not a different argument.
+    *embedder* and *dataset_embedder* name the ``embedder_hash`` the behavioral
+    and dataset_embedding levels read. They default to ``None``, which keeps the
+    module constants and so keeps every yahoo suite exactly what it was. They
+    exist because the corpus decides the embedder: yahoo was embedded with
+    nomic-embed-text-v1.5, and dolly and oasst1 with the multilingual v2-moe,
+    because oasst1's language vertices must not be an artefact of a monolingual
+    embedder. A hash is per-corpus, not per-base-model, so the eight new drivers
+    pass the same two.
+
+    The remaining run coordinates — the samplers, ``MAX_NEW_TOKENS`` — are
+    deliberately **not** parameters. They are module constants shared by every
+    simplex3 suite, and every run agrees on them; a driver that needed to differ
+    would be a different experiment, not a different argument.
     """
     global CACHE_ROOT, ADAPTER_ROOT, SUITE_CACHE
-    global BASE_MODEL, BASE_SLUG, DRAW, SOURCE
+    global BASE_MODEL, BASE_SLUG, DRAW, SOURCE, EMBEDDER, DATASET_EMBEDDER
 
     BASE_MODEL = base_model
     BASE_SLUG = BASE_MODEL.replace("/", "--")
     DRAW = dict(draw)
     if source is not None:
         SOURCE = source
+    if embedder is not None:
+        EMBEDDER = embedder
+    if dataset_embedder is not None:
+        DATASET_EMBEDDER = dataset_embedder
 
     arch = architecture(BASE_MODEL)
     apply_architecture(arch)

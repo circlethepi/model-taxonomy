@@ -68,7 +68,7 @@ DATASETS = ["dolly"]
 N_EXPECTED = 35
 
 #: Decoder layers, from the checkpoint's own config.
-N_LAYERS = 36
+N_LAYERS = 32
 
 #: The query draw both inference stages used: the even mixture at n=100, seed 1,
 #: question-only, rendered through this corpus's chat projection. Read off the
@@ -76,6 +76,14 @@ N_LAYERS = 36
 #: so the format id is not the yahoo suites'.
 DRAW = {"recipe_hash": "9eccebfa74184124", "n_samples": 100, "seed": 1,
         "prompt_format_id": "f5444e61"}
+
+#: The embedder both new corpora were built with. nomic-embed-text-v2-moe is
+#: multilingual, which oasst1 requires -- its vertices are languages, and a
+#: monolingual embedder would make that geometry an artefact of the measuring
+#: instrument. dolly uses it too so the two corpora are mutually comparable from
+#: the start. yahoo's v1.5 hashes stay the suite defaults; these override them.
+EMBEDDER = "0b579825f703fb21"
+DATASET_EMBEDDER = "a831922612fddb96"
 
 
 def _grid(rows, cols):
@@ -98,21 +106,38 @@ SELECT = {
         + [("R=16 · per generation", m) for m in ("frobenius", "euclidean")]
     ),
     "functional": _grid(
-        [f"h{N_LAYERS} · final hidden state", "late third",
+        # Four rows to the uniform-attention drivers' three: `full-attn outputs` is
+        # a real, distinct surrogate on a hybrid stack and definitionally absent
+        # on the others.
+        [f"h{N_LAYERS} · final hidden state", "late third", "full-attn outputs",
          f"all {N_LAYERS + 1} layers (reference)"],
         ["cosine", "cka", "frobenius", "euclidean", "bw"],
     ),
+    # Hybrid attention renames this level. Qwen3.5-4B interleaves 8 full-attention
+    # layers with 24 linear-attention ones, so a bare "late third" is ambiguous --
+    # there are two families and two late thirds -- and `structural_group_specs`
+    # prefixes every family-scoped row `full-attn · ` / `linear-attn · `. Two rows
+    # are renamed outright as well, because the group is defined by the input
+    # dimension the two families happen to share: `q,k,v (dim-pure)` is
+    # `full-attn · q,k,v (d_in 2560)`, and `output projections` is
+    # `output projections (d_in 4096)`, which is o_proj *and* the linear-attn
+    # out_proj. The uniform-attention names the other six drivers use do not exist
+    # here, so this list cannot be shared with them.
     "structural": [
-        ("late third", "cosine"),
-        ("q_proj (whole)", "cosine"),
+        # The last layer on its own. Layer 31 is a full-attention layer, so the
+        # single cell is available at the top of the stack rather than at the last
+        # full-attn layer below it.
+        (f"full-attn · layer {N_LAYERS - 1} · o_proj", "cosine"),
         ("all layers · all projections", "cosine"),
-        ("q,k,v (dim-pure)", "cosine"),
-        ("middle third", "cosine"),
-        ("k_proj", "cosine"),
-        ("late third", "frobenius"),
-        ("v_proj", "cosine"),
-        ("output projections", "cosine"),
-        ("early third", "cosine"),
+        ("full-attn · late third", "cosine"),
+        ("full-attn · q_proj (whole)", "cosine"),
+        ("full-attn · q,k,v (d_in 2560)", "cosine"),
+        ("full-attn · middle third", "cosine"),
+        ("full-attn · k_proj", "cosine"),
+        ("full-attn · late third", "frobenius"),
+        ("full-attn · v_proj", "cosine"),
+        ("output projections (d_in 4096)", "cosine"),
+        ("full-attn · early third", "cosine"),
     ],
     "dataset_embedding": [
         ("dataset text · mean · n1000_s00", m)
@@ -146,6 +171,8 @@ def main() -> None:
         crosslevel_only=True,
         n_expected=N_EXPECTED,
         datasets=DATASETS,
+        embedder=EMBEDDER,
+        dataset_embedder=DATASET_EMBEDDER,
         source="figures/simplex3_dolly_qwen/make_figures.py",
     )
 

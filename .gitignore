@@ -33,3 +33,4 @@ docs/notes/
 # still reproducible from one command; what is no longer tracked is its output.
 experiments/*/*_shard*.yaml
 jobs/*/*_shard*.sh
+**shard**.sh

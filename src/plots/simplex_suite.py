@@ -1443,11 +1443,21 @@ def select_score(
     ``figures/simplex3_qwen_v4/make_figures.py``). Pass ``None`` when the level
     has a single surrogate.
 
+    *field* is one of ``_SCORE_FIELDS`` or a per-dimension column such as
+    ``"procrustes_d2"``. The unsuffixed ``"procrustes"`` is the truth's own
+    dimension, ``K-1``, whatever that is for the corpus the rows came from (see
+    :func:`read_scores_csv`); naming a dimension explicitly is how a figure asks
+    for the *same* dimension across corpora whose truths differ in width.
+
     Raises if the selection is not exactly one row, so a renamed or missing
     perspective fails loudly instead of silently plotting the wrong cell.
     """
-    if field not in _SCORE_FIELDS:
-        raise ValueError(f"field must be one of {_SCORE_FIELDS}, got {field!r}")
+    if field not in _SCORE_FIELDS and not (
+            field.startswith(("procrustes_d", "stress_d"))
+            and field.split("_d")[1].isdigit()):
+        raise ValueError(
+            f"field must be one of {_SCORE_FIELDS} or a per-dimension column "
+            f"such as 'procrustes_d2', got {field!r}")
     hits = [
         r for r in rows
         if r["level"] == level and r["metric"] == metric
@@ -1740,7 +1750,7 @@ def run_suite(*, base_model, draw, outdir, cache_root=None, levels=None,
               skip_sweep=False, skip_detail=False, surrogates=False,
               no_cache=False, select=None, source=None, n_expected=16,
               crosslevel_only=False, datasets=None, embedder=None,
-              dataset_embedder=None):
+              dataset_embedder=None, mixtures=None):
     """Build the figure suite for one run.
 
     This is the old ``main()`` body with the argument parsing lifted out, so the
@@ -1768,6 +1778,17 @@ def run_suite(*, base_model, draw, outdir, cache_root=None, levels=None,
     ``crosslevel_agreement.md`` and ``crosslevel_scores.csv`` rank exactly what
     they would in a full run. Use it for a suite that exists to be compared with
     others rather than read on its own.
+
+    *mixtures* restricts the scan further, to an explicit list of mixture
+    labels (``CacheEntry.mixture``, e.g. ``"yahoo_025g1_050g2_025g3"``). It is
+    the finer companion to *datasets*: a corpus filter separates two experiments
+    that share a base model, and this separates two experiments that share both.
+    That happens as soon as a second run trains adapters on the *same* corpus
+    and the same base model at a different mixture resolution -- the group-size
+    sweep put 1004 further yahoo mixtures in the OLMo cache, so an unfiltered
+    scan there returns 1015 models where the simplex3 suite wants its own 16.
+    ``None`` keeps every mixture the corpus filter left, which is what every
+    driver did before such a pool existed.
 
     *embedder* and *dataset_embedder* name the ``embedder_hash`` the behavioral
     and dataset_embedding levels read. They default to ``None``, which keeps the
@@ -1832,6 +1853,8 @@ def run_suite(*, base_model, draw, outdir, cache_root=None, levels=None,
     idx = scan_cache(str(CACHE_ROOT), base_model_id=BASE_MODEL,
                      behavioral_draw=DRAW, functional_draw=DRAW,
                      datasets=datasets)
+    if mixtures is not None:
+        idx = idx.filter(mixture=list(mixtures))
     # The count guard runs before sort_by_mixture, not after: a mixed-corpus
     # scan is the likeliest reason for a wrong count, and sorting would raise on
     # the mixed widths first with a message about weight arrays rather than

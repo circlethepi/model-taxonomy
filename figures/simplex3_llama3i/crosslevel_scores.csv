@@ -29,8 +29,10 @@ functional,all 33 layers (reference),bw,0.962307,0.028538,0.230896,16,69df3b399d
 functional,late third,cka,0.842345,0.147040,0.159397,16,73a49673c3a4fa9b
 functional,h32 · final hidden state,cka,0.783789,0.195784,0.151905,16,29d12ffb5b5e7201
 functional,all 33 layers (reference),cka,0.781213,0.280179,0.180304,16,f346e98ab3d48c33
+structural,layer 31 · o_proj,cosine,0.971491,0.014192,0.130437,16,2baa7adb1c63d49b
 structural,output projections,cosine,0.962916,0.010656,0.152706,16,f1b1e9525adf230c
 structural,v_proj,cosine,0.962015,0.011051,0.151198,16,881143839579bd06
+structural,layer 31 · o_proj,frobenius,0.961061,0.034624,0.237627,16,79f3a91d54b54c86
 structural,all layers · all projections,cosine,0.957533,0.012262,0.163609,16,e9add162decc9e10
 structural,middle third,cosine,0.957304,0.011848,0.166853,16,39793a60c6fc531e
 structural,"q,k,v (dim-pure)",cosine,0.954150,0.013261,0.169357,16,195db9cd449b168d

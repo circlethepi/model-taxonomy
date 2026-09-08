@@ -75,6 +75,8 @@
 | 0.9387 | 0.0577 | full-attn · early third | frobenius |
 | 0.9386 | 0.0382 | full-attn · v_proj | frobenius |
 | 0.9352 | 0.0341 | output projections (d_in 4096) | frobenius |
+| 0.9292 | 0.0144 | full-attn · layer 31 · o_proj | cosine |
+| 0.9090 | 0.1759 | full-attn · layer 31 · o_proj | frobenius |
 
 ### dataset_embedding
 

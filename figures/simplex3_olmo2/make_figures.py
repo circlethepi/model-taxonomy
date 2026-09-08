@@ -72,6 +72,25 @@ BASE_MODEL = "allenai/OLMo-2-0425-1B-Instruct"
 #: corpora and `n_expected` would trip.
 DATASETS = ["yahoo"]
 
+#: The sixteen mixtures this suite is about: the quarter-step grid over three
+#: groups plus the 1/3-1/3-1/3 centroid. Not optional any more, and for the same
+#: reason DATASETS is not: the group-size sweep trained 999 further yahoo
+#: mixtures on this same base model at a one-percent resolution, so an
+#: unfiltered scan of `03_adapters/allenai--OLMo-2-0425-1B-Instruct` returns
+#: 1015 models and `n_expected` trips. A corpus filter cannot separate them --
+#: both pools are yahoo -- so the mixtures are named. The other three yahoo
+#: suites need no such list; no second experiment shares their base model.
+MIXTURES = [
+    "yahoo_000g1_000g2_100g3", "yahoo_000g1_025g2_075g3",
+    "yahoo_000g1_050g2_050g3", "yahoo_000g1_075g2_025g3",
+    "yahoo_000g1_100g2_000g3", "yahoo_025g1_000g2_075g3",
+    "yahoo_025g1_025g2_050g3", "yahoo_025g1_050g2_025g3",
+    "yahoo_025g1_075g2_000g3", "yahoo_033g1_033g2_033g3",
+    "yahoo_050g1_000g2_050g3", "yahoo_050g1_025g2_025g3",
+    "yahoo_050g1_050g2_000g3", "yahoo_075g1_000g2_025g3",
+    "yahoo_075g1_025g2_000g3", "yahoo_100g1_000g2_000g3",
+]
+
 
 #: Decoder layers, from the checkpoint's own config. Uniform softmax attention,
 #: no `full_attention_interval` and no `attn_output_gate`, so the suite emits
@@ -125,6 +144,12 @@ SELECT = {
         ("late third", "frobenius"),
         ("v_proj", "cosine"),
         ("output projections", "cosine"),
+        # The last decoder layer's output projection alone, the finest
+        # structural handle in the standing per-level default set. The
+        # all-layer `output projections` row above is the same
+        # projection pooled over the whole stack; the pair says whether
+        # the recipe is legible at one layer or only across them.
+        (f"layer {N_LAYERS - 1} · o_proj", "cosine"),
         ("early third", "cosine"),
     ],
     # Three non-transform perspectives exist in total, so "top ten" is all of them.
@@ -161,6 +186,7 @@ def main() -> None:
         select={k: v for k, v in SELECT.items() if k in levels},
         crosslevel_only=True,
         datasets=DATASETS,
+        mixtures=MIXTURES,
         source="figures/simplex3_olmo2/make_figures.py",
     )
 

@@ -52,6 +52,8 @@ structural,full-attn · k_proj,frobenius,0.945353,0.032356,0.257191,16,5ee455a31
 structural,full-attn · early third,frobenius,0.938710,0.057729,0.274796,16,6a1c878b69d13c52
 structural,full-attn · v_proj,frobenius,0.938586,0.038207,0.260818,16,fa118c10169b6413
 structural,output projections (d_in 4096),frobenius,0.935188,0.034100,0.263233,16,8487b6eb64208333
+structural,full-attn · layer 31 · o_proj,cosine,0.929154,0.014416,0.176614,16,80d1521f520a0ede
+structural,full-attn · layer 31 · o_proj,frobenius,0.908989,0.175857,0.278144,16,73cd2c075a531cbe
 dataset_embedding,dataset text · mean · n1000_s00,frobenius,0.979952,0.015251,0.013959,16,9aa61ba7b0d93a57
 dataset_embedding,dataset text · mean · n1000_s00,euclidean,0.979718,0.015227,0.013489,16,0a6cf5360b0557ab
 dataset_embedding,dataset text · mean · n1000_s00,cosine,0.937095,0.075994,0.253430,16,49782cfdbdb340b8

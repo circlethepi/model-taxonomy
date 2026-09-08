@@ -47,6 +47,8 @@ structural,early third,cosine,0.927483,0.025089,0.224425,16,fe1e6006b62a65a8
 structural,q_proj (whole),frobenius,0.925953,0.040786,0.281101,16,42a391a33b877782
 structural,k_proj,frobenius,0.925532,0.041458,0.277438,16,518918d982fb8783
 structural,early third,frobenius,0.911763,0.129668,0.298981,16,80f4d25c3ab0b75f
+structural,layer 39 · o_proj,cosine,0.869846,0.027755,0.221736,16,a9f394b84f6c99bb
+structural,layer 39 · o_proj,frobenius,0.843070,0.084663,0.292979,16,ff94d614271fafb6
 dataset_embedding,dataset text · mean · n1000_s00,frobenius,0.979952,0.015251,0.013959,16,9aa61ba7b0d93a57
 dataset_embedding,dataset text · mean · n1000_s00,euclidean,0.979718,0.015227,0.013489,16,0a6cf5360b0557ab
 dataset_embedding,dataset text · mean · n1000_s00,cosine,0.937095,0.075994,0.253430,16,49782cfdbdb340b8

@@ -46,7 +46,9 @@ structural,early third,cosine,0.907359,0.409450,0.055347,0.260057,0.156306,35,fc
 structural,output projections,frobenius,0.902841,0.409867,0.091347,0.311662,0.214948,35,32500bad260e1079
 structural,early third,frobenius,0.901804,0.404106,0.092892,0.326845,0.229567,35,ee53cb1c353fdf75
 structural,v_proj,cosine,0.899000,0.412411,0.054194,0.242778,0.138047,35,8fc701c5d6efd2fc
+structural,layer 31 · o_proj,cosine,0.894875,0.436839,0.072969,0.225597,0.123017,35,ad44dd1afcabc134
 structural,v_proj,frobenius,0.891308,0.413614,0.111768,0.313425,0.218966,35,e06535bcd23490ca
+structural,layer 31 · o_proj,frobenius,0.890622,0.473191,0.106746,0.309324,0.209073,35,aa90f127ee3e9393
 dataset_embedding,dataset text · mean · n1000_s00,euclidean,0.911929,0.364227,0.061189,0.160243,0.019208,35,13688a5b94216cf0
 dataset_embedding,dataset text · mean · n1000_s00,frobenius,0.903759,0.366586,0.064463,0.159505,0.020879,35,0eba9e6e7c5aca74
 dataset_embedding,dataset text · mean · n1000_s00,cosine,0.852710,0.424423,0.224795,0.225146,0.208855,35,d467c0a9194b5f96

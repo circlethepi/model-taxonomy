@@ -70,6 +70,8 @@
 | 0.9008 | 0.1426 | late third | frobenius |
 | 0.8988 | 0.0509 | v_proj | cosine |
 | 0.8915 | 0.1761 | v_proj | frobenius |
+| 0.8669 | 0.0802 | layer 39 · o_proj | cosine |
+| 0.8614 | 0.1795 | layer 39 · o_proj | frobenius |
 
 ### dataset_embedding
 

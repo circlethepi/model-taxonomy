@@ -109,6 +109,12 @@ SELECT = {
         ("full-attn · late third", "frobenius"),
         ("full-attn · v_proj", "cosine"),
         ("output projections (d_in 4096)", "cosine"),
+        # The last decoder layer's output projection alone, the finest
+        # structural handle in the standing per-level default set. The
+        # all-layer `output projections` row above is the same
+        # projection pooled over the whole stack; the pair says whether
+        # the recipe is legible at one layer or only across them.
+        ("full-attn · layer 31 · o_proj", "cosine"),
         ("full-attn · early third", "cosine"),
     ],
     "dataset_embedding": [

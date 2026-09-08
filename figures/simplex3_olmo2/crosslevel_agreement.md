@@ -70,6 +70,8 @@
 | 0.9526 | 0.0302 | q_proj (whole) | frobenius |
 | 0.9522 | 0.0277 | output projections | frobenius |
 | 0.9441 | 0.0357 | early third | frobenius |
+| 0.9306 | 0.0157 | layer 15 · o_proj | cosine |
+| 0.9104 | 0.0471 | layer 15 · o_proj | frobenius |
 
 ### dataset_embedding
 

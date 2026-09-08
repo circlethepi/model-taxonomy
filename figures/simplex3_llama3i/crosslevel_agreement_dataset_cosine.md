@@ -1,8 +1,8 @@
 | level | dCor vs ground truth | Procrustes residual at d=2 (lower=better) | surrogate | metric |
 |---|---|---|---|---|
 | behavioral | 0.9343 | 0.4623 | R=16 · per generation | bw |
-| functional | 0.9763 | 0.0112 | h32 · final hidden state | cosine |
-| structural | 0.9629 | **0.0107** | output projections | cosine |
+| functional | 0.9763 | **0.0112** | h32 · final hidden state | cosine |
+| structural | 0.9715 | 0.0142 | layer 31 · o_proj | cosine |
 | dataset_embedding | 0.9371 | 0.0760 | dataset text · mean · n1000_s00 | cosine |
 
 

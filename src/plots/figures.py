@@ -409,6 +409,8 @@ def plot_radar(
     tick_len: float = 0.018,
     rlabel_spoke: int | None = 0,
     rlabel_pad: float = 5.0,
+    spoke_groups: list[tuple[str, int]] | None = None,
+    group_pad: float = 0.18,
     title: str | None = None,
     legend: bool = True,
     legend_kwargs: dict | None = None,
@@ -439,6 +441,16 @@ def plot_radar(
     the line and of the tick marks; the offset is perpendicular and measured on
     the page, so every label clears by the same amount whatever its radius.
 
+    *spoke_groups* names a partition of the spokes, as ``(label, n_spokes)``
+    pairs whose counts sum to ``len(axis_labels)``, in spoke order.  Each group
+    gets its label set outside the ring, centred on the arc its spokes span, and
+    a faint radial rule is drawn on each boundary between two groups.  It is for
+    a radar whose spokes are a nested category -- three corpora within each of
+    four models, say -- where the spoke label should carry only the inner name
+    and the outer one would otherwise have to be repeated on every spoke.
+    *group_pad* is how far past the outer ring the group labels sit, as a
+    fraction of the radial range.
+
     ``NaN`` values are drawn as gaps rather than pulling the polygon to zero.
     Passing *rlim* fixes the radial range, which is what makes two radars
     comparable; leaving it ``None`` autoscales each figure independently.
@@ -449,6 +461,12 @@ def plot_radar(
     n = len(axis_labels)
     if n < 3:
         raise ValueError(f"a radar needs at least 3 spokes, got {n}")
+    if spoke_groups is not None:
+        total = sum(c for _, c in spoke_groups)
+        if total != n:
+            raise ValueError(
+                f"spoke_groups covers {total} spoke(s) for {n} axis labels"
+            )
 
     if ax is None:
         fig, ax = plt.subplots(subplot_kw={"projection": "polar"})
@@ -492,6 +510,9 @@ def plot_radar(
         _draw_spoke_axes(ax, theta, tick_len, rlabel_spoke, rlabel_pad,
                          start_angle, direction)
 
+    if spoke_groups:
+        _draw_spoke_groups(ax, theta, spoke_groups, group_pad)
+
     if title:
         ax.set_title(title)
     if legend and any(s.label for s in series):
@@ -501,6 +522,48 @@ def plot_radar(
     if savefig:
         _save(fig, _resolve_savepath(savepath, title))
     return fig, ax
+
+
+def _draw_spoke_groups(ax, theta, spoke_groups, group_pad):
+    """Outer group labels and boundary rules for :func:`plot_radar`.
+
+    The label goes at the circular mean of its group's spoke angles, which for a
+    contiguous run is simply the midpoint, and is rotated to sit tangentially so
+    a long model name does not overhang its neighbours.  Text below the
+    horizontal is flipped so it never reads upside down.
+
+    The boundary rule is placed halfway between the last spoke of one group and
+    the first of the next, so it separates the groups without landing on a
+    spoke.  There is one rule per *seam*, not one per group: the seam after the
+    final group is the same seam as the one before the first.
+    """
+    rmin, rmax = ax.get_ylim()
+    span = rmax - rmin
+    step = 2 * np.pi / len(theta)
+    start = 0
+    for label, count in spoke_groups:
+        mid = theta[start] + (count - 1) * step / 2
+        #   Horizontal, not tangential: a group label is a name to be read, and
+        #   at four or five groups there is room for it. The anchor is chosen
+        #   from the direction it sits in, so the text grows away from the ring
+        #   rather than across it -- a label to the right of the figure is
+        #   left-aligned, one below it is top-aligned, and so on.
+        #   The theta offset and direction are applied on the display side, so
+        #   the drawn angle is what decides the quadrant, not the index order.
+        angle = ax.get_theta_direction() * mid + ax.get_theta_offset()
+        dx, dy = np.cos(angle), np.sin(angle)
+        ha = "center" if abs(dx) < 0.25 else ("left" if dx > 0 else "right")
+        va = "center" if abs(dy) < 0.25 else ("bottom" if dy > 0 else "top")
+        ax.text(mid, rmax + span * group_pad, label,
+                ha=ha, va=va, clip_on=False, zorder=5)
+        #   The seam sits between two groups' spokes and stops just past the
+        #   ring: long enough to read as a division, short enough not to run out
+        #   into the legend.
+        seam = theta[start] - step / 2
+        ax.plot([seam, seam], [rmin, rmax * 1.04],
+                color="0.8", linewidth=0.6, linestyle=(0, (2, 2)),
+                clip_on=False, zorder=1)
+        start += count
 
 
 def _draw_spoke_axes(ax, theta, tick_len, rlabel_spoke, rlabel_pad,

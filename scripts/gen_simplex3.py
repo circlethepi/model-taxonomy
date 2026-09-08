@@ -129,15 +129,40 @@ def output_dir() -> str:
     return f"{REPO}/results/{slug()}"
 
 
-def samples_seen() -> int:
+def samples_seen(n: int | None = None) -> int:
     """The ``_b5008`` token every adapter is named for.
 
     Derived from the suite's effective batch rather than written down: the budget
     quantizes up to a whole number of steps, so the number in the name is not the
     number in the config, and a suite at another effective batch would otherwise
     be named for a budget it never saw.
+
+    *n* is the training draw size, and changes the answer only under a spec in
+    budget mode -- where the budget is a fixed number of epochs, so each rung of
+    an nsweep carries its own token (``_b64``, ``_b512``, ``_b5008``,
+    ``_b50000``).  Omitting it means "this spec's single draw", which is what
+    every non-nsweep call site means.
     """
-    return SPEC.samples_seen(SUITE.effective_batch)
+    return SPEC.samples_seen(SUITE.effective_batch, n)
+
+
+def train_targets() -> list[tuple[str, int, int]]:
+    """Every adapter this tree trains, as ``(proportion name, n_samples, seed)``.
+
+    Ordered rung-major, then by seed, then by proportion, because that is the
+    order the shards are cut in: a training shard must be one wall, and the walls
+    differ by ~750x between the smallest and largest rung, so a shard may never
+    straddle two values of n.  A contiguous slice of this list is within one
+    rung by construction.
+
+    For a spec that never set a training grid this is the 16 proportions at the
+    one draw it has always trained, which is the list the generator used to build
+    inline.
+    """
+    props = [name for name, _ in proportions()]
+    return [(name, n, seed)
+            for n, seed in SPEC.train_grid()
+            for name in props]
 
 
 SEEDS = list(range(10))
@@ -345,16 +370,25 @@ def query_blocks(which: str) -> str:
                          text_fields=list(SPEC.query_fields))
 
 
-def adapter_name(name: str) -> str:
+def adapter_name(name: str, n: int | None = None, seed: int | None = None) -> str:
     """The adapter's directory leaf.
 
     The ``_f{format_id}`` suffix appears only for a non-raw prompt format, so
     every existing adapter name is unchanged, and two suites that wrap the same
     base model differently cannot land on the same path.  Downstream joins strip
     it the way they already strip the ``_b{samples}`` budget token.
+
+    *n* and *seed* name the training draw.  They default to the spec's single
+    draw, so the template is unchanged for every tree that has already run --
+    and because the template already carried both, an nsweep needs no new naming
+    scheme: its 640 adapters are distinct by construction, and its 16
+    ``_n1000_s00_..._b5008`` adapters collide, deliberately, with the ones the
+    yahoo tree already trained.
     """
-    stem = (f"{name}_n{SPEC.train_n}_s{SPEC.train_seed:02d}"
-            f"_r{LORA_RANK}_i{LORA_INIT_SEED:02d}_b{samples_seen()}")
+    n = SPEC.train_n if n is None else n
+    seed = SPEC.train_seed if seed is None else seed
+    stem = (f"{name}_n{n}_s{seed:02d}"
+            f"_r{LORA_RANK}_i{LORA_INIT_SEED:02d}_b{samples_seen(n)}")
     return f"{stem}_f{format_id()}" if format_id() else stem
 
 
@@ -382,8 +416,8 @@ def prompt_format_block() -> dict | None:
     }
 
 
-def adapter_path(name: str) -> str:
-    return f"{CACHE_DIR}/03_adapters/{SUITE.model_slug}/{adapter_name(name)}"
+def adapter_path(name: str, n: int | None = None, seed: int | None = None) -> str:
+    return f"{CACHE_DIR}/03_adapters/{SUITE.model_slug}/{adapter_name(name, n, seed)}"
 
 
 def prompt_format_yaml() -> str:
@@ -592,23 +626,57 @@ extraction:
     return body
 
 
-def write_train(shard: int, names: list[str]) -> str:
+def write_train(shard: int, targets: list[tuple[str, int, int]]) -> str:
+    """One training shard.
+
+    *targets* are ``(proportion name, n_samples, seed)`` triples that all share
+    one ``n_samples`` -- the shard planner guarantees it, because a shard is one
+    wall and the rungs differ by ~750x in training time.
+
+    A shard may still span several seeds of that one rung, which is what makes
+    the 80-adapter shards at the cheap rungs possible: ``n_samples_sweep`` and
+    ``seeds`` on a dataset block expand to ``{base}_n{n}_s{seed:02d}`` entries
+    each carrying their own ``n_samples`` and ``seed``, and the trainer reads
+    those per-dataset rather than the ``fine_tuning:`` globals
+    (finetune_lora.py, "Per-dataset overrides for n_samples and seed").  The
+    globals below are the fallback for a config with no sweep, and are what the
+    single-draw trees have always emitted.
+    """
+    n = targets[0][1]
+    seeds_for: dict[str, list[int]] = {}
+    for name, _, seed in targets:
+        seeds_for.setdefault(name, []).append(seed)
+    names = list(seeds_for)
+    budget = SPEC.budget(n)
+    n_adapters = len(targets)
+    # The single-draw trees must regenerate byte-for-byte, so their header is the
+    # sentence they already carry.  An nsweep shard says which rung it is instead,
+    # because "only n=1000" would be false of the tree and useless on the shard.
+    if SPEC.train_grid() == ((SPEC.train_n, SPEC.train_seed),):
+        rung_note = (
+            f"# Only n={SPEC.train_n}, seed={SPEC.train_seed} is trained on. "
+            f"total_train_samples\n")
+    else:
+        rung_note = (
+            f"# Rung n={n}, seed(s) {min(s for v in seeds_for.values() for s in v)}"
+            f"-{max(s for v in seeds_for.values() for s in v)}. Five epochs of a "
+            f"{n}-row draw, so total_train_samples\n")
     body = HEADER + (
-        f"# Training shard {shard} of {SUITE.train_shards}: {len(names)} adapters.\n"
-        f"# Only n={SPEC.train_n}, seed={SPEC.train_seed} is trained on. total_train_samples\n"
-        f"# {SPEC.total_train_samples} quantizes UP to a step boundary at effective batch "
+        f"# Training shard {shard} of {SUITE.train_shards}: {n_adapters} adapters.\n"
+        + rung_note +
+        f"# {budget} quantizes UP to a step boundary at effective batch "
         f"{SUITE.effective_batch}:\n"
-        f"# ceil({SPEC.total_train_samples}/{SUITE.effective_batch}) = "
-        f"{SPEC.steps(SUITE.effective_batch)} steps, so {samples_seen()} samples seen and the\n"
-        f"# adapter is named _b{samples_seen()}. Every LoRA parameter matches the existing 3B\n"
+        f"# ceil({budget}/{SUITE.effective_batch}) = "
+        f"{SPEC.steps(SUITE.effective_batch, n)} steps, so {samples_seen(n)} samples seen and the\n"
+        f"# adapter is named _b{samples_seen(n)}. Every LoRA parameter matches the existing 3B\n"
         f"# adapters; only the base model and the data differ.\n"
         f"#\n"
         f"# {SPEC.caveats.get('train', '').replace(chr(10), chr(10) + '# ')}\n\n"
     ) + preamble(f"simplex3_train_shard{shard}")
     body += "datasets:\n"
     body += "\n".join(
-        dataset_block(name, pct, sweep=f"[{SPEC.train_n}]", seeds=[SPEC.train_seed])
-        for name, pct in proportions() if name in names
+        dataset_block(name, pct, sweep=f"[{n}]", seeds=sorted(seeds_for[name]))
+        for name, pct in proportions() if name in seeds_for
     )
     body += f"""
 base_models:
@@ -618,9 +686,9 @@ base_models:
   enabled: true
   datasets:
 """
-    body += "".join(f"    - {n}\n" for n in names)
-    body += f"""  n_samples: {SPEC.train_n}
-  seed: {SPEC.train_seed}
+    body += "".join(f"    - {nm}\n" for nm in names)
+    body += f"""  n_samples: {n}
+  seed: {sorted(seeds_for[names[0]])[0]}
   lora_rank: {LORA_RANK}
   lora_alpha: 32
   target_modules: [{', '.join(SUITE.target_modules)}]
@@ -631,7 +699,7 @@ base_models:
   gradient_accumulation_steps: {SUITE.gradient_accumulation_steps}
   max_seq_length: 512
   torch_dtype: {SUITE.torch_dtype}
-  total_train_samples: {SPEC.total_train_samples}
+  total_train_samples: {budget}
 
 extraction:
   models: []
@@ -692,9 +760,14 @@ def write_extract(
     level: str,
     query: str,
     shard: int | None,
-    names: list[str],
+    names: list[tuple[str, int, int]],
     temperature: float | None = None,
 ) -> str:
+    # *names* are ``(proportion, n_samples, seed)`` triples -- every adapter this
+    # job extracts from.  For a single-draw tree the triple is the one draw it has
+    # always trained and the rendered path is unchanged; for an nsweep the same
+    # list carries all four rungs, because inference does not depend on how much
+    # the adapter was trained on and so is not sharded by rung.
     qname = query_full_context_name() if query == "full_context" else query_question_only_name()
     if SUITE.prompt_format:
         # Under a chat template with completion-only loss the training prompt IS
@@ -825,7 +898,7 @@ def write_extract(
     body += prompt_format_yaml()
     body += "fine_tuning:\n  enabled: false\n\n"
     body += "extraction:\n  models:\n"
-    body += "".join(f"    - {adapter_path(n)}\n" for n in names)
+    body += "".join(f"    - {adapter_path(*t)}\n" for t in names)
     body += f"""  queries_dataset: {qname}
   n_queries: {SPEC.query_n}
   device: cuda
@@ -1176,6 +1249,33 @@ SUITES = {
         # See the olmo2 entry: l40s is not safe for TRAINING this model, only for
         # extraction. Submit training with `sbatch --partition=h200,h100`.
     ).for_model("allenai/OLMo-2-0425-1B-Instruct"),
+
+    #: The **nsweep** suite: the training-data-size axis, over the same 16-point
+    #: simplex as ``olmo2``.  Three fields differ from it and all three are
+    #: subtractions -- the log-probability level, the generated-activation job and
+    #: the temperature sweep (the last via ``YAHOO_NSWEEP.temperature_sweep``).
+    #: None of the five canonical perspectives reads any of them, and all three
+    #: are priced per adapter, so at 640 adapters they would cost ~230 GPU-hours
+    #: on top of a ~75 GPU-hour experiment that does not use them.
+    #:
+    #: ``train_time`` is the one addition.  The default 2:00:00 was tuned against
+    #: a 4-adapter ``_b5008`` shard; the N=10000 rung's shard is ~1:04, which does
+    #: not leave enough headroom under a wall nobody has re-measured.  3:00:00 is
+    #: the value the llama suite already carries, so it is precedented rather than
+    #: invented, and it is charged only in queue priority.
+    "olmo2_nsweep": Suite(
+        tag="olmo2_nsweep",
+        query_sets=("question_only",),
+        job_tokens={"question_only": "qonly"},
+        emit_embed_jobs=False,
+        emit_build_job=False,
+        job_prefix="s3no2",
+        emit_logprob_jobs=False,
+        emit_gen_activation_job=False,
+        train_time="3:00:00",
+        # See the olmo2 entry: l40s is not safe for TRAINING this model, only for
+        # extraction. Submit training with `sbatch --partition=h200,h100`.
+    ).for_model("allenai/OLMo-2-0425-1B-Instruct"),
 }
 
 
@@ -1194,6 +1294,7 @@ _SUITE_PREFIXES = {
     ("oasst1", "nemo"): "s3onm",
     ("oasst1", "olmo2"): "s3oo2",
     ("yahoo_pool", "olmo2_pool"): "s3po2",
+    ("yahoo_nsweep", "olmo2_nsweep"): "s3no2",
 }
 
 #: Adapters per shard, held at the value every existing wall was tuned against.
@@ -1208,6 +1309,61 @@ _SUITE_PREFIXES = {
 #: ``Suite`` defaults at yahoo's 16 adapters, which is why yahoo needs no branch.
 TRAIN_ADAPTERS_PER_SHARD = 4
 BEHAVIORAL_ADAPTERS_PER_SHARD = 2
+
+#: Adapters per training shard **by rung**, for a spec that carries a training
+#: grid.  A shard is one wall, and training time is proportional to the budget,
+#: so a single number cannot serve four rungs that span ~750x: at 4 per shard the
+#: cheap rungs would emit 40 near-instant jobs each, and at 80 per shard the
+#: N=10000 rung would need 21 hours.
+#:
+#: Sized from the measured `s3o2_train` walls -- a 4-adapter `_b5008` shard ran
+#: 6:12, so 1.55 min/adapter there -- scaled by samples seen and with ~0.5 min of
+#: assumed per-adapter fixed cost:
+#:
+#:     N=10    _b64     0.52 min/adapter   80/shard -> ~0:42
+#:     N=100   _b512    0.66 min/adapter   80/shard -> ~0:53
+#:     N=1000  _b5008   2.05 min/adapter   16/shard -> ~0:33
+#:     N=10000 _b50000  16.0 min/adapter    4/shard -> ~1:04
+#:
+#: 54 shards rather than the 160 a flat 4-per-shard would give.  The fixed cost
+#: is assumed, not measured -- it cannot be separated from the marginal cost with
+#: one budget -- but it only ever makes the large shards look worse than they
+#: are, so the smoke run can lower these numbers and never has to raise them.
+TRAIN_ADAPTERS_PER_SHARD_BY_N = {10: 80, 100: 80, 1000: 16, 10000: 4}
+
+#: Behavioral sharding for a tree with a training grid.  Inference cost does not
+#: depend on the training draw, so this is one number for all four rungs.  At
+#: ~2.45 min/adapter measured, 16 per shard is a ~40 min wall; the default of 2
+#: would emit 320 near-identical job files for 640 adapters.
+NSWEEP_BEHAVIORAL_ADAPTERS_PER_SHARD = 16
+
+
+def _has_train_grid() -> bool:
+    """Whether this spec sweeps the training draw at all."""
+    return bool(SPEC.train_sizes or SPEC.train_seeds)
+
+
+def train_shard_plan(train_shards: int | None = None) -> list[list[tuple[str, int, int]]]:
+    """The training shards, as lists of ``(proportion, n_samples, seed)``.
+
+    Without a training grid the shards are strided over the proportions, which is
+    what the existing trees carry and must keep carrying.  With one they are cut
+    **within a rung**: contiguous chunks of ``TRAIN_ADAPTERS_PER_SHARD_BY_N[n]``,
+    so no shard ever mixes two budgets and every shard is one wall.
+
+    *train_shards* lets a caller pass the count before ``SUITE`` exists, which is
+    how the suite's own ``train_shards`` field gets computed.
+    """
+    targets = train_targets()
+    if not _has_train_grid():
+        k = SUITE.train_shards if train_shards is None else train_shards
+        return [targets[i::k] for i in range(k)]
+    plan: list[list[tuple[str, int, int]]] = []
+    for n in SPEC.train_sizes or (SPEC.train_n,):
+        rung = [t for t in targets if t[1] == n]
+        size = TRAIN_ADAPTERS_PER_SHARD_BY_N.get(n, TRAIN_ADAPTERS_PER_SHARD)
+        plan += [rung[i:i + size] for i in range(0, len(rung), size)]
+    return plan
 
 
 def _suite_for_dataset(suite: Suite, dataset: str, suite_name: str,
@@ -1233,11 +1389,20 @@ def _suite_for_dataset(suite: Suite, dataset: str, suite_name: str,
             f"to _SUITE_PREFIXES, checking it collides with none of "
             f"{sorted(_SUITE_PREFIXES.values())} nor with s3, s3q, s3li, s3nm, s3o2."
         ) from None
+    # With a training grid the adapter count is the grid's, not the simplex's,
+    # and the training shards are cut per rung rather than by one flat divisor.
+    if _has_train_grid():
+        n_all = n_adapters * len(SPEC.train_grid())
+        train_shards = len(train_shard_plan())
+        behavioral_shards = -(-n_all // NSWEEP_BEHAVIORAL_ADAPTERS_PER_SHARD)
+    else:
+        train_shards = -(-n_adapters // TRAIN_ADAPTERS_PER_SHARD)
+        behavioral_shards = -(-n_adapters // BEHAVIORAL_ADAPTERS_PER_SHARD)
     return replace(
         suite,
         job_prefix=prefix,
-        train_shards=-(-n_adapters // TRAIN_ADAPTERS_PER_SHARD),
-        behavioral_shards=-(-n_adapters // BEHAVIORAL_ADAPTERS_PER_SHARD),
+        train_shards=train_shards,
+        behavioral_shards=behavioral_shards,
         emit_build_job=False,
         emit_embed_jobs=False,
         emit_embed_matrix_job=False,
@@ -1407,8 +1572,12 @@ def main() -> None:
         ))
 
     # 3. Training, four adapters per shard.
-    names = [n for n, _ in props]
-    shards = [names[i::SUITE.train_shards] for i in range(SUITE.train_shards)]
+    # Every adapter as a (proportion, n_samples, seed) triple. Without a training
+    # grid this is the 16 proportions at the one draw the tree has always
+    # trained, in the same order, so the strided shards below are the ones the
+    # existing trees already carry.
+    names = train_targets()
+    shards = train_shard_plan()
     for i, shard_names in enumerate(shards):
         emit(exp / f"train_shard{i}.yaml", write_train(i, shard_names))
         emit(jobs / f"03_train_shard{i}.sh", sbatch(
@@ -1536,8 +1705,16 @@ def main() -> None:
     print(f"  {len(list(exp.glob('*.yaml')))} configs in {exp}")
     print(f"  {len(list(jobs.glob('*.sh')))} scripts in {jobs}")
     n_sizes = len(SPEC.sweep_size_list)
+    # The adapter count is the simplex crossed with the training grid, which is
+    # the simplex itself for every tree without one.  Printed rather than assumed
+    # because it is the number the GPU budget is a function of.
+    n_adapters = len(props) * len(SPEC.train_grid())
+    grid_note = ""
+    if _has_train_grid():
+        grid_note = (f" ({len(props)} x {len(SPEC.train_grid())} training draws,"
+                     f" {len(train_shard_plan())} train shards)")
     print(f"\n{len(props)} proportions, {len(props) * len(sweep_seeds()) * n_sizes} draws, "
-          f"{len(props)} adapters.")
+          f"{n_adapters} adapters{grid_note}.")
     print(f"Submit with: bash {jobs}/submit_all.sh")
 
 

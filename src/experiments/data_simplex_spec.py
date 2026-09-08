@@ -153,6 +153,30 @@ class DataSimplexSpec:
     #: derived from this and the suite's effective batch, never written down.
     total_train_samples: int = 5000
 
+    #: **The training grid** -- an *nsweep* is a sweep over ``n_samples``, the
+    #: size of the *training* draw, holding the mixture grid, the seeds and every
+    #: optimizer setting fixed.  Empty means "the single draw named by
+    #: ``train_n`` and ``train_seed``", which is what every spec that has already
+    #: run carries and what keeps their trees byte-identical.  Non-empty is the
+    #: cross product, so ``len(train_sizes) * len(train_seeds)`` draws of every
+    #: mixture get trained.
+    #:
+    #: Not to be confused with ``sweep_sizes`` above, which varies the draw a
+    #: *dataset representation* is computed over and exists at every size
+    #: regardless of what was trained.  The two are independent axes that both
+    #: render as an ``n``, which is the trap; see docs/terminology.md.
+    train_sizes: tuple[int, ...] = ()
+    train_seeds: tuple[int, ...] = ()
+
+    #: **Budget mode.**  ``None`` keeps the fixed ``total_train_samples`` budget
+    #: for every draw, which is what a single-draw spec wants.  An int makes the
+    #: budget ``budget_per_sample * n``, i.e. a fixed number of *epochs* rather
+    #: than a fixed number of samples, so every rung of an nsweep sees its own
+    #: data the same number of times.  Without this a 10-row draw and a
+    #: 10000-row draw would differ in two things at once and neither could be
+    #: read as the effect of size.
+    budget_per_sample: int | None = None
+
     query_n: int = 100
     query_seed: int = 1
 
@@ -327,19 +351,48 @@ class DataSimplexSpec:
         """
         return self.grid % self.n_groups == 0
 
-    def samples_seen(self, effective_batch: int) -> int:
+    def train_grid(self) -> tuple[tuple[int, int], ...]:
+        """The ``(n_samples, seed)`` training draws this spec asks for.
+
+        A spec that never set ``train_sizes``/``train_seeds`` yields exactly the
+        one pair it has always trained, so the grid is not a new concept for the
+        four specs that predate it -- it is the old behaviour spelled as a
+        one-element case.
+        """
+        sizes = self.train_sizes or (self.train_n,)
+        seeds = self.train_seeds or (self.train_seed,)
+        return tuple((n, s) for n in sizes for s in seeds)
+
+    def budget(self, n: int | None = None) -> int:
+        """The fine-tuning budget for a training draw of *n* rows.
+
+        Under the default (``budget_per_sample is None``) the budget is the flat
+        ``total_train_samples``, whatever the draw size -- which is what every
+        existing spec means.  Under budget mode it is proportional to the draw,
+        so the epoch count rather than the sample count is what is held fixed.
+        """
+        if self.budget_per_sample is None:
+            return self.total_train_samples
+        return self.budget_per_sample * (self.train_n if n is None else n)
+
+    def samples_seen(self, effective_batch: int, n: int | None = None) -> int:
         """The budget rounded UP to a step boundary -- the ``_b5008`` token.
 
-        ``total_train_samples`` quantizes up because the trainer runs whole
-        steps, so the number in the adapter's name is not the number in the
-        config.  Derived rather than written down: it is the token the
-        cross-suite join is keyed on, and a suite at another effective batch
-        would otherwise be named for a budget it never saw.
-        """
-        return -(-self.total_train_samples // effective_batch) * effective_batch
+        The budget quantizes up because the trainer runs whole steps, so the
+        number in the adapter's name is not the number in the config.  Derived
+        rather than written down: it is the token the cross-suite join is keyed
+        on, and a suite at another effective batch would otherwise be named for a
+        budget it never saw.
 
-    def steps(self, effective_batch: int) -> int:
-        return -(-self.total_train_samples // effective_batch)
+        *n* is the training draw size, and only matters under budget mode.  It
+        defaults to ``None`` so that every existing call site keeps naming the
+        adapter it always named -- which is what makes the 16 ``_b5008`` yahoo
+        adapters resolve from cache when the nsweep tree asks for them again.
+        """
+        return -(-self.budget(n) // effective_batch) * effective_batch
+
+    def steps(self, effective_batch: int, n: int | None = None) -> int:
+        return -(-self.budget(n) // effective_batch)
 
 
 #: Yahoo, the original.  Every field is the module constant it replaced in
@@ -507,7 +560,43 @@ YAHOO_POOL = replace(
 )
 
 
+#: The **nsweep**: the same 16-point 25% grid as ``YAHOO``, crossed with ten
+#: dataset seeds and four training-draw sizes.  It exists to answer one question
+#: -- how much does the amount of *training* data change how well each taxonomy
+#: level recovers the simplex -- and everything not on that axis is held fixed,
+#: including the LoRA rank, the init seed, the mixture grid and the 100-query
+#: 33/33/33 test set.
+#:
+#: ``budget_per_sample=5`` is five epochs at every rung.  At ``n=1000`` it
+#: reproduces ``total_train_samples=5000`` exactly, which is not a coincidence
+#: and is load-bearing: the sixteen ``_n1000_s00_r16_i00_b5008`` adapters the
+#: yahoo tree already trained are hit by cache identity, so 624 of the 640 are
+#: new and the remaining 16 double as a regression test that nothing about the
+#: naming moved.
+#:
+#: ``name_prefix`` stays ``yahoo`` for that reuse; ``suffix`` is what keeps the
+#: *trees* apart, exactly as for ``YAHOO_POOL``.
+#:
+#: ``sweep_sizes`` gains 10000 so the dataset level has an embedding of the
+#: largest training draw.  It is the *embedding* sweep, a different axis from
+#: ``train_sizes`` despite both being sizes -- see the field comments.
+YAHOO_NSWEEP = replace(
+    YAHOO,
+    suffix="_nsweep",
+    train_sizes=(10, 100, 1000, 10000),
+    train_seeds=tuple(range(10)),
+    budget_per_sample=5,
+    sweep_sizes=[1, 10, 100, 1000, 10000],
+    # Priced per adapter and not read by any of the five canonical perspectives,
+    # so at 640 adapters they would dominate a suite whose whole point is the
+    # size axis.  Same reasoning as YAHOO_POOL, same two fields.
+    temperature_sweep=(),
+    subtitle=("Mixtures from 3 topic groupings of the Yahoo Answers Dataset, "
+              "trained at four dataset sizes over ten seeds"),
+)
+
+
 #: The corpora this generator knows how to emit.  ``yahoo`` is the one that
 #: already ran and must regenerate unchanged.
 SPECS = {"yahoo": YAHOO, "dolly": DOLLY, "oasst1": OASST1,
-         "yahoo_pool": YAHOO_POOL}
+         "yahoo_pool": YAHOO_POOL, "yahoo_nsweep": YAHOO_NSWEEP}

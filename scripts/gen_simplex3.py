@@ -50,7 +50,7 @@ from __future__ import annotations
 
 import argparse
 import sys
-from math import gcd
+from math import ceil, gcd
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -521,6 +521,21 @@ def _render_sweep_sizes() -> str:
 def _num_word(n: int) -> str:
     """Small numbers spelled out, for prose emitted into a comment."""
     return {2: "two", 3: "three", 4: "four", 5: "five"}.get(n, str(n))
+
+
+def _embed_walltime() -> str:
+    """Wall clock for the dataset-embedding job, scaled to the number of draws.
+
+    Every suite before the group-size pool embedded at most 52 mixtures, so the
+    flat two hours this used to request was never the binding constraint.  The
+    pool embeds 1004, and a draw costs ~7.7 s of sentence-transformer time on an
+    idle card; that puts the real requirement just over two hours, which is how
+    job 325171 came to die at 702/1004 against exactly that wall.  Budget 12
+    s/draw so a contended card still fits, round up to the hour, and never ask
+    for less than the historical two -- so every existing suite keeps the
+    "2:00:00" it has today and only a pool-sized tree asks for more.
+    """
+    return f"{max(2, ceil(len(proportions()) * 12 / 3600) + 1)}:00:00"
 
 
 def write_embed_matrix() -> str:
@@ -1374,7 +1389,7 @@ def main() -> None:
         emit(exp / "embed_matrix.yaml", write_embed_matrix())
         emit(jobs / "02_embed_matrix.sh", sbatch(
             f"{SUITE.job_prefix}_embed_matrix", SUITE.gpu_partitions, True,
-            48, "2:00:00",
+            48, _embed_walltime(),
             f"python scripts/run_experiment.py experiments/{tree}/embed_matrix.yaml"
             f" --steps build extract --taxonomy dataset_embedding",
             logs,
@@ -1588,7 +1603,7 @@ def write_data_tree(root: Path) -> None:
     emit(exp / "embed_matrix.yaml", write_embed_matrix())
     emit(jobs / "02_embed_matrix.sh", sbatch(
         f"{SUITE.job_prefix}_embed_matrix", SUITE.gpu_partitions, True,
-        48, "2:00:00",
+        48, _embed_walltime(),
         f"python scripts/run_experiment.py experiments/{tree}/embed_matrix.yaml"
         f" --steps build extract --taxonomy dataset_embedding",
         logs,

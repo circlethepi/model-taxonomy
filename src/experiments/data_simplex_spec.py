@@ -28,11 +28,20 @@ field" says where it lives and not what it does.
 
 **Grid denominator** -- the integer ``grid`` such that mixtures are drawn at
 every multiple of ``1/grid``.  All three datasets use 4, i.e. the 25% grid.
+
+**Sampled mixtures** -- ``grid`` alone decides the *resolution*, and the
+enumeration then decides the *count*, which for an exhaustive grid is not a
+free choice: ``C(grid + K - 1, K - 1)`` grows fast, so a 1% grid over three
+groups is 5151 mixtures and there is no grid denominator that yields exactly
+1000.  ``n_mixtures`` decouples the two by drawing a fixed-size subset of the
+grid points instead, which is how the group-size sweep builds a pool of a
+chosen size.  See ``docs/notes/group_size_sweep.md``.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+import random
+from dataclasses import dataclass, field, replace
 
 #: Repository root, absolute, so a job started from a worktree still finds the
 #: derived sources.  Mirrors ``gen_simplex3.REPO``, which cannot be imported
@@ -44,6 +53,16 @@ _REPO = "/weka/scratch/jhu/cpriebe1/MO/model-taxonomy"
 #: ``validate`` guards it on ``num_rows`` alone -- which is why the ``v1`` is in
 #: the path.  See that script's docstring.
 OASST1_PAIRS = f"{_REPO}/results/shared_cache/00_sources/oasst1_pairs_v1"
+
+
+def _compositions(total: int, parts: int):
+    """Every way to write *total* as an ordered sum of *parts* non-negative ints."""
+    if parts == 1:
+        yield (total,)
+        return
+    for first in range(total + 1):
+        for rest in _compositions(total - first, parts - 1):
+            yield (first,) + rest
 
 
 @dataclass(frozen=True)
@@ -103,6 +122,26 @@ class DataSimplexSpec:
     #: **Grid denominator.**  Mixtures are the compositions of this many parts.
     grid: int = 4
 
+    #: **Sampled mixture mode.**  ``None`` enumerates every grid point, which is
+    #: what all three original corpora do.  An integer instead draws that many
+    #: *distinct* grid points uniformly without replacement, which is the only
+    #: way to reach a pool of hundreds of mixtures: the exhaustive enumeration is
+    #: ``C(grid + K - 1, K - 1)``, so a 1% grid over three groups is 5151 points,
+    #: not 1000.
+    #:
+    #: The sample excludes the ``K`` pure vertices, which are then appended
+    #: alongside the even mixture as *reference* mixtures.  So a sampled spec
+    #: yields ``n_mixtures + K + 1`` proportions at K not dividing ``grid``, the
+    #: sampled block carries no pure endpoint -- which is what makes
+    #: ``simplex_geometry`` rather than the barycentric route the only way to
+    #: score it -- and the references keep the names their adapters already have
+    #: on disk, so a pool built this way retrains none of them.
+    n_mixtures: int | None = None
+
+    #: Seed for that draw.  Load-bearing: it names which 1000 of the 5151 points
+    #: were trained, so changing it invalidates every adapter in the pool.
+    mixture_seed: int = 0
+
     #: The draw sizes of the embedding sweep, rendered into
     #: ``n_samples_sweep:``.  A string renders literally (``tens 3`` expands to
     #: ``[1, 10, 100, 1000]``); a list renders as itself.
@@ -124,6 +163,18 @@ class DataSimplexSpec:
     #: measuring, not about the model, which is why it can be overridden here.
     temperature_sweep: tuple[float, ...] | None = None
 
+    #: The sample-size sweep's seeds.  ``None`` inherits the generator's ten,
+    #: ``()`` drops the sweep entirely and leaves only the ``embed_matrix`` job
+    #: that embeds the training draws themselves -- the same None-inherits /
+    #: empty-drops idiom as ``temperature_sweep`` above, for the same reason.
+    #:
+    #: It exists because the sweep is quadratic in the wrong thing: it embeds
+    #: ``proportions x seeds x sizes`` draws, which is 640 for a 16-point corpus
+    #: and 40,160 for a 1004-point one.  A pool built to measure *group size* has
+    #: no use for the sample-size sweep, and paying for it would cost more GPU
+    #: time than the fine-tuning does.
+    sweep_seeds: tuple[int, ...] | None = None
+
     #: Prose hazards emitted into this dataset's YAML, by where they belong.
     #: Keys: ``query`` (appended to the query-set description in every
     #: extraction config), ``train`` (the truncation note in the training
@@ -143,6 +194,88 @@ class DataSimplexSpec:
     #: question *is* the training prompt, so the two sets' roles invert and one
     #: description cannot serve both paths.
     query_desc: dict = field(default_factory=dict)
+
+    # -- the mixtures this spec names ------------------------------------------
+
+    @property
+    def step_pct(self) -> int:
+        """Percentage points between adjacent grid points.
+
+        Mixtures are labelled in whole percent -- ``100g1_000g2_000g3`` -- and
+        that label is a component of every adapter directory on disk, so the grid
+        must land on integer percentages or the names cannot express it.  A grid
+        denominator that does not divide 100 is therefore rejected here rather
+        than silently floored to zero.
+        """
+        if 100 % self.grid:
+            raise ValueError(
+                f"grid={self.grid} does not divide 100, so its mixtures have no "
+                "whole-percent label. Adapter directory names are built from a "
+                "three-digit percentage per group, so only grids dividing 100 "
+                "(4, 5, 10, 20, 25, 50, 100) can be named."
+            )
+        return 100 // self.grid
+
+    def grid_pcts(self) -> list[tuple[int, ...]]:
+        """Every grid point, as whole-percent tuples, in enumeration order.
+
+        Lexicographic on the first ``K-1`` parts with the last determined, which
+        is the order the original hand-written triple loop in
+        ``scripts/gen_simplex3.py`` produced.  Load-bearing only for byte-parity
+        with the trees already on disk, but that is reason enough.
+        """
+        step = self.step_pct
+        return [tuple(part * step for part in parts)
+                for parts in _compositions(self.grid, self.n_groups)]
+
+    def vertex_pcts(self) -> list[tuple[int, ...]]:
+        """The ``K`` pure mixtures, in group order."""
+        k = self.n_groups
+        return [tuple(100 if i == j else 0 for i in range(k)) for j in range(k)]
+
+    def mixture_pcts(self) -> list[tuple[int, ...]]:
+        """The mixtures this spec asks for, exhaustive or sampled.
+
+        Exhaustive (``n_mixtures is None``) is the grid plus the even mixture
+        when the even mixture is not already a grid point -- unchanged from the
+        enumeration the three original corpora ran under.
+
+        Sampled draws ``n_mixtures`` distinct grid points uniformly without
+        replacement from the **non-vertex** grid points, then appends the ``K``
+        vertices and the even mixture.  Three consequences worth stating:
+
+        * the sampled block contains no pure endpoint, so the vertices are
+          *reference* models rather than members of the sample;
+        * the appended references carry exactly the names an exhaustive run at a
+          coarser grid already gave them, so their adapters, activations and
+          generations are reused rather than retrained;
+        * the draw is taken in enumeration order after sorting the chosen
+          indices, so the emitted list depends on ``mixture_seed`` and on nothing
+          else -- not on the iteration order of any set.
+        """
+        grid_pcts = self.grid_pcts()
+        if self.n_mixtures is None:
+            out = list(grid_pcts)
+            if not self.even_is_grid_point:
+                out.append(self.even_pct)
+            return out
+
+        vertices = self.vertex_pcts()
+        vertex_set = set(vertices)
+        pool = [pct for pct in grid_pcts if pct not in vertex_set]
+        if self.n_mixtures > len(pool):
+            raise ValueError(
+                f"n_mixtures={self.n_mixtures} exceeds the {len(pool)} non-vertex "
+                f"points of the 1/{self.grid} grid over {self.n_groups} groups. "
+                "Raise `grid` to a finer denominator that still divides 100."
+            )
+        rng = random.Random(self.mixture_seed)
+        chosen = sorted(rng.sample(range(len(pool)), self.n_mixtures))
+        out = [pool[i] for i in chosen]
+        out.extend(vertices)
+        if not self.even_is_grid_point:
+            out.append(self.even_pct)
+        return out
 
     @property
     def n_groups(self) -> int:
@@ -336,6 +469,45 @@ OASST1 = DataSimplexSpec(
     },
 )
 
+#: Yahoo again, at 1% resolution, with the mixtures **sampled** rather than
+#: enumerated -- the pool the group-size sweep subsamples from.
+#:
+#: Three fields carry the whole design and each is load-bearing:
+#:
+#: ``grid=100`` is the finest resolution the naming scheme can express.  Adapter
+#: directories label a mixture as three digits of *percent*
+#: (``yahoo_100g1_000g2_000g3``), so a 0.1% grid has no name.  It costs nothing
+#: scientifically: at ``train_n=1000`` a 1% weight is exactly 10 rows, so
+#: ``_allocate_counts`` allocates with zero remainder and the realized mixture
+#: equals the requested one, which was the only reason a fine grid was wanted.
+#:
+#: ``n_mixtures=1000`` draws 1000 of the 5148 non-vertex grid points.  The
+#: exhaustive grid has no denominator yielding 1000, which is why the count is
+#: decoupled from the resolution at all.
+#:
+#: ``name_prefix`` stays ``yahoo``, which is what makes the four reference models
+#: free.  The three vertices and the even mixture are appended by
+#: ``mixture_pcts`` under exactly the names their adapters already carry in
+#: ``03_adapters/allenai--OLMo-2-0425-1B-Instruct/``, so they are reused rather
+#: than retrained -- as is any of the other twelve 25%-grid points the draw
+#: happens to land on.  ``suffix`` is what keeps the *trees* apart.
+YAHOO_POOL = replace(
+    YAHOO,
+    suffix="_pool",
+    grid=100,
+    n_mixtures=1000,
+    mixture_seed=0,
+    # Neither is used by any of the four canonical perspectives this pool exists
+    # to measure, and both are priced per adapter, so at 1004 adapters they would
+    # dominate a suite whose entire point is that it is affordable.
+    temperature_sweep=(),
+    sweep_seeds=(),
+    subtitle=("1000 sampled mixtures from 3 topic groupings of the Yahoo Answers "
+              "Dataset, on the 1% grid"),
+)
+
+
 #: The corpora this generator knows how to emit.  ``yahoo`` is the one that
 #: already ran and must regenerate unchanged.
-SPECS = {"yahoo": YAHOO, "dolly": DOLLY, "oasst1": OASST1}
+SPECS = {"yahoo": YAHOO, "dolly": DOLLY, "oasst1": OASST1,
+         "yahoo_pool": YAHOO_POOL}

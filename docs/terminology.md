@@ -171,6 +171,30 @@ design, because a `06_pairwise` handle addresses exactly one **perspective**.
 | **surrogate** | What a selector produces: the representation view being compared. One **row** of the figure grid, e.g. `late third · centered`. |
 | **perspective** | A surrogate together with a similarity metric. One **cell** of the figure grid, e.g. `late third · centered` × `cosine`. |
 
+**Canonical perspective** — the one perspective designated as the *default
+reading* of a taxonomy level, so that levels can be compared one-to-one without
+sweeping metrics. There are exactly four, one per level:
+
+| level | surrogate | metric |
+|---|---|---|
+| dataset embedding | mean embedding (`representation="mean"`, n=1000, seed 0) | euclidean |
+| structural | last layer, all four LoRA projections | cosine |
+| functional | last hidden state (`h{N_LAYERS}`), input mode, mean pooling | cosine |
+| behavioral | per-query replicate mean at R=16 | cosine |
+
+They are fixed in `canonical_perspectives()` in `scripts/sweep_group_size.py`
+and are the standing default for new experiments: compute these four, score each
+against the ground-truth simplex with dcorr and Procrustes disparity, and add a
+fifth only after asking.
+
+Two things this term is **not**. It is unrelated to `_canonical(dm)` in
+`src/analysis/comparison.py`, which means a distance matrix's *sorted row order*
+— a different layer of the problem entirely, which is why this is always written
+as the two-word phrase and never as bare "canonical". And it is not a claim that
+the chosen perspective is the *best* one at its level; it is the one the project
+agreed to read by default, chosen so that a level's number means the same thing
+across runs.
+
 **`rung` is retired**, replaced by `surrogate`. This was a unification rather
 than a rename: `surrogate` already meant "a read-time view of a stored artifact,
 computed on demand and written back", the module applying fleet transforms was

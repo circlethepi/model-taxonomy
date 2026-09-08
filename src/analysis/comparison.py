@@ -1229,13 +1229,39 @@ def _structural_matrix(
             f"{missing[0]}. Filter with index.with_available('structural_weights')."
         )
 
-    root = index.cache_root
-    if root is None:
-        raise ValueError("index has no cache_root; cannot locate adapter weights")
+    # Scoped to **this base model's** adapter directory, not to `03_adapters`.
+    # That is a correctness fix, not a tidy-up: every simplex3 suite trains the
+    # same recipes, so an adapter's directory *name* is identical across base
+    # models -- `yahoo_000g1_000g2_100g3_..._b5008_fea27ccee` exists under
+    # `Qwen--Qwen3.5-4B` and `meta-llama--Llama-3.1-8B-Instruct` alike. Handed
+    # the unscoped root, `_find_safetensors` scans one level down and returns
+    # the *first* slug carrying the name, so the llama structural level once
+    # silently read qwen's weights and reported qwen's score to four decimals.
+    # `src.plots.simplex_suite._load_weights` scopes for the same reason.
+    #
+    # The directory comes from the entries themselves rather than from a slug
+    # rebuilt out of `base_model_id`, so it is the directory the scan actually
+    # read and cannot disagree with it.
+    roots = {e.adapter_dir.parent for e in entries if e.adapter_dir is not None}
+    if len(roots) == 1:
+        adapter_root = roots.pop()
+    elif len(roots) > 1:
+        raise ValueError(
+            f"these {len(entries)} adapters live under {len(roots)} different "
+            f"base models ({sorted(str(r.name) for r in roots)}), so there is no "
+            "one weight directory to read them from. Scan with base_model_id=..."
+        )
+    else:
+        root = index.cache_root
+        if root is None:
+            raise ValueError(
+                "index has no cache_root and its entries carry no adapter_dir; "
+                "cannot locate adapter weights")
+        adapter_root = Path(root) / "03_adapters"
 
     weights = load_lora_weights(
         [e.adapter_name for e in entries],
-        adapter_root=Path(root) / "03_adapters",
+        adapter_root=adapter_root,
         layer_indices=layers if layers is not None else "last",
         projections=projections if projections is not None else "o",
     )

@@ -309,6 +309,117 @@ def t_dcor_bias():
     )
 
 
+@check("dcor: the two readings of scoring a subset are different numbers")
+def t_dcor_restricted():
+    """`distance_correlation_restricted` is not `distance_correlation` on a subset.
+
+    The design question it answers: a group of `n` models is scored inside a
+    matrix that also holds a few *reference* models, which are meant to inform
+    the configuration without being scored themselves. There are two readings.
+
+    **Restrict-then-score** cuts both matrices down to the `n` first. A pairwise
+    distance depends only on its two models, so the extra rows are genuinely
+    invisible and the result equals what a collection of the `n` alone would
+    give -- pinned below as an exact identity.
+
+    **Centre-then-restrict** U-centres over all rows present and then sums over
+    the block. dCor* never embeds, so the centring term is the *only* channel by
+    which an unscored model could inform the score; the reference rows enter
+    every row's centring term on both sides, and the number differs.
+
+    Both are pinned because an earlier draft of the group-size sweep asserted
+    they were provably equal and reported the statistic once. They are equal only
+    under the first reading.
+    """
+    from src.analysis.matrices import distance_correlation_restricted
+
+    a = _random_dm(24, seed=5)
+    b = _random_dm(24, seed=6)
+    keep = [f"m{i}" for i in range(16)]
+
+    # restrict-then-score IS the sub-collection, exactly
+    sub_a, sub_b = a.reindex(keep), b.reindex(keep)
+    restrict_then_score = distance_correlation(sub_a, sub_b)
+    assert abs(distance_correlation_restricted(sub_a, sub_b, keep)
+               - restrict_then_score) < 1e-12
+
+    # centre-then-restrict sees the eight extra rows
+    centre_then_restrict = distance_correlation_restricted(a, b, keep)
+    gap = abs(centre_then_restrict - restrict_then_score)
+    assert gap > 1e-6, gap
+
+    # keeping everything is just dCor*
+    everything = [f"m{i}" for i in range(24)]
+    assert abs(distance_correlation_restricted(a, b, everything)
+               - distance_correlation(a, b)) < 1e-12
+
+    # a model outside the shared set is an error, not a silent drop
+    try:
+        distance_correlation_restricted(a, b, keep + ["nope"])
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("an unknown id in `keep` should raise")
+
+    return (f"restrict-then-score={restrict_then_score:+.4f}, "
+            f"centre-then-restrict={centre_then_restrict:+.4f}, "
+            f"gap={gap:.3e}")
+
+
+@check("simplex spec: sampled mixtures, and the exhaustive grid unchanged")
+def t_data_simplex_spec_sampling():
+    """`n_mixtures` draws a pool; `None` reproduces the enumeration that ran.
+
+    The second half is the regression that matters: three corpora's trees are
+    already on disk and their mixtures must not move by a byte, so the exhaustive
+    path is pinned against the counts and the exact enumeration order the
+    hand-written triple loop produced.
+    """
+    from dataclasses import replace
+
+    from src.experiments.data_simplex_spec import (
+        DOLLY, OASST1, YAHOO, YAHOO_POOL,
+    )
+
+    # -- exhaustive: unchanged -----------------------------------------------
+    assert len(YAHOO.mixture_pcts()) == 16
+    assert len(DOLLY.mixture_pcts()) == 35
+    assert len(OASST1.mixture_pcts()) == 35
+    assert YAHOO.mixture_pcts()[0] == (0, 0, 100)
+    assert YAHOO.mixture_pcts()[-1] == (33, 33, 33)   # even appended, sums to 99
+    assert all(sum(p) == 100 for p in DOLLY.mixture_pcts())  # K divides grid
+
+    # -- sampled --------------------------------------------------------------
+    pcts = YAHOO_POOL.mixture_pcts()
+    assert len(pcts) == 1004, len(pcts)
+    assert len(set(pcts)) == 1004                     # distinct
+    k = YAHOO_POOL.n_groups
+    vertices = YAHOO_POOL.vertex_pcts()
+    assert pcts[-k - 1:-1] == vertices                # references appended
+    assert pcts[-1] == YAHOO_POOL.even_pct
+    sampled = pcts[:-k - 1]
+    assert not (set(sampled) & set(vertices))         # no pure endpoint sampled
+    assert all(sum(p) == 100 for p in sampled)
+    # every weight lands on a whole number of the 1000 training rows
+    assert all(p * YAHOO_POOL.train_n % 100 == 0 for pct in sampled for p in pct)
+
+    # deterministic in the seed, and only in the seed
+    assert YAHOO_POOL.mixture_pcts() == pcts
+    other = replace(YAHOO_POOL, mixture_seed=1).mixture_pcts()
+    assert other != pcts and len(other) == 1004
+
+    # a grid that cannot be named in whole percent is refused
+    try:
+        replace(YAHOO, grid=3).step_pct
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("grid=3 does not divide 100 and should raise")
+
+    return (f"exhaustive 16/35/35 unchanged; sampled pool {len(pcts)} = "
+            f"{len(sampled)} drawn + {k} vertices + 1 even, all on the 1% grid")
+
+
 @check("dcor: exact enumeration, and a calibrated null")
 def t_dcor_test():
     # 5! = 120 <= 999, so every relabelling is enumerated and p is exact.
@@ -6111,6 +6222,7 @@ SYNTHETIC = [
     t_anchor_fixed, t_similarity_invariance, t_affine_invariance_in_hull,
     t_known_mixture, t_simplex_high_dim, t_degenerate_anchors, t_compare_simplices,
     t_mantel, t_dcor_bias, t_dcor_test, t_dcor_unsigned, t_dcor_u_centering_symmetry,
+    t_dcor_restricted, t_data_simplex_spec_sampling,
     t_procrustes, t_procrustes_vs_scipy, t_per_point_residuals,
     t_dispersion, t_quality, t_correlation_table, t_match_models, t_fit_geometry,
     t_similarity_conversion, t_simplex_roundtrip, t_cosine_equivalence,

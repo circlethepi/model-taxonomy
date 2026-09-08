@@ -33,3 +33,11 @@ docs/notes/
 # still reproducible from one command; what is no longer tracked is its output.
 experiments/*/*_shard*.yaml
 jobs/*/*_shard*.sh
+
+# The nsweep tree, whole. Every file in it is written by
+# `scripts/gen_simplex3.py --suite olmo2_nsweep` -- 54 train shards, 40
+# behavioral shards, and the handful of non-shard drivers beside them -- so
+# unlike the older suites there is nothing hand-written left to keep. The two
+# rules above would leave the drivers tracked; these ignore the directories.
+experiments/simplex3_nsweep_*/
+jobs/simplex3_nsweep_*/

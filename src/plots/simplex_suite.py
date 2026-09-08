@@ -1055,6 +1055,75 @@ def truth_weights(ids):
     return np.vstack([mixture_weights(m) for m in ids])
 
 
+def realized_truth_weights(ids, n_samples):
+    """The ground truth as the training draw actually realized it.
+
+    ``truth_weights`` parses what a model's name *asked for*. At a small draw
+    that is not what it got: the sampler allocates whole rows by largest
+    remainder, so a requested ``(25, 50, 25)`` at n=10 becomes 2/5/3 rows, i.e.
+    ``(20, 50, 30)`` — a 5-point error on a 25-point grid. Scoring against the
+    requested simplex would charge that discretisation to the taxonomy level, as
+    if the representation had failed to recover a geometry the training data
+    never had.
+
+    The two converge as the draw grows and are identical wherever ``n_samples``
+    divides evenly, which is why this has never mattered before: every simplex
+    to date trained at n=1000, where a 1% grid is exact. It is the *nsweep* — a
+    sweep over the training draw size — that makes the gap real, and it is
+    largest at exactly the rung whose scores are most interesting.
+
+    Returns the same ``(n, K)`` array shape as ``truth_weights``, normalized to
+    sum to 1 per row, so every downstream consumer is unchanged.
+    """
+    from src.datasets.mixed_dataset import _allocate_counts
+
+    ids = list(ids)
+    n_groups(ids)
+    rows = []
+    for m in ids:
+        w = list(mixture_weights(m))
+        counts = _allocate_counts(w, n_samples)
+        total = sum(counts)
+        if total <= 0:
+            raise ValueError(
+                f"Realized mixture for {m!r} at n_samples={n_samples} allocates "
+                f"no rows at all; the draw is too small for {len(w)} groups.")
+        rows.append([c / total for c in counts])
+    return np.vstack(rows)
+
+
+def check_realized_truth(ids, n_samples, tol=1e-12):
+    """Assert the realized mixture is never more than one row off the requested.
+
+    This is the guard on :func:`realized_truth_weights`, and it is deliberately
+    *not* "the two agree at a large draw". They do not, and cannot: the centre of
+    a 3-group simplex is spelled ``033g1_033g2_033g3``, whose parts sum to 99 and
+    normalize to exactly 1/3 each, so it is realizable only when ``n_samples`` is
+    divisible by 3. At n=10000 it is off by one row and stays off however far the
+    draw grows. Asserting convergence there would fail on the one mixture that
+    sits at the centre of every figure.
+
+    What is true at every rung is that largest-remainder allocation is off by at
+    most one row per group, so no weight moves by more than ``1/n_samples``. That
+    bounds the discretisation for real, holds at n=10 as well as n=10000, and
+    fails loudly if the allocator is ever swapped for one without the property.
+
+    Returns the observed maximum deviation, so a caller can log it.
+    """
+    ids = list(ids)
+    delta = np.abs(realized_truth_weights(ids, n_samples) - truth_weights(ids))
+    worst = float(delta.max())
+    bound = 1.0 / n_samples
+    if worst > bound + tol:
+        j, k = np.unravel_index(delta.argmax(), delta.shape)
+        raise AssertionError(
+            f"realized mixture for {ids[j]!r} is off by {worst:.6g} in group "
+            f"{k + 1} at n_samples={n_samples}, above the one-row bound "
+            f"{bound:.6g}. Largest-remainder allocation should never do this; "
+            f"_allocate_counts has changed.")
+    return worst
+
+
 def truth_dm(ids):
     """Pairwise distances on the ground-truth simplex, in *ids* order.
 
@@ -1070,6 +1139,20 @@ def truth_dm(ids):
 def truth_geometry(ids):
     """Where each model sits on the ground-truth simplex — the Procrustes target."""
     return simplex_geometry(truth_weights(ids), list(ids), vertices(ids))
+
+
+def realized_truth_dm(ids, n_samples):
+    """``truth_dm`` against the mixture the draw realized. See
+    :func:`realized_truth_weights`."""
+    return simplex_distance_matrix(
+        realized_truth_weights(ids, n_samples), list(ids), vertices(ids))
+
+
+def realized_truth_geometry(ids, n_samples):
+    """``truth_geometry`` against the mixture the draw realized. See
+    :func:`realized_truth_weights`."""
+    return simplex_geometry(
+        realized_truth_weights(ids, n_samples), list(ids), vertices(ids))
 
 
 # ── Restricting a level to a chosen set of perspectives ───────────────────────

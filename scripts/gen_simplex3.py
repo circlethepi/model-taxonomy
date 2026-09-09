@@ -1316,25 +1316,42 @@ BEHAVIORAL_ADAPTERS_PER_SHARD = 2
 #: cheap rungs would emit 40 near-instant jobs each, and at 80 per shard the
 #: N=10000 rung would need 21 hours.
 #:
-#: Sized from the measured `s3o2_train` walls -- a 4-adapter `_b5008` shard ran
-#: 6:12, so 1.55 min/adapter there -- scaled by samples seen and with ~0.5 min of
-#: assumed per-adapter fixed cost:
+#: Sized from the 2026-09-08 smoke shards, which measured both ends of the range
+#: rather than extrapolating either: 80 adapters at N=10 in 4:29 (3.4 s each) and
+#: 4 at N=10000 in 1:31:44 (22.8 min each).  Those two fix the model used for the
+#: rest -- ``ceil(5N/16)`` optimizer steps at ~2.2 it/s, plus a per-adapter fixed
+#: cost of ~1.3 s for the model load and roughly ``N/1100`` s to build the draw.
 #:
-#:     N=10    _b64     0.52 min/adapter   80/shard -> ~0:42
-#:     N=100   _b512    0.66 min/adapter   80/shard -> ~0:53
-#:     N=1000  _b5008   2.05 min/adapter   16/shard -> ~0:33
-#:     N=10000 _b50000  16.0 min/adapter    4/shard -> ~1:04
+#:     N=10     _b64        3.4 s/adapter   80/shard -> 0:04:29  (measured)
+#:     N=20     _b112       4.5 s/adapter   80/shard -> ~0:06
+#:     N=50     _b256       8.6 s/adapter   80/shard -> ~0:12
+#:     N=100    _b512      ~18  s/adapter   80/shard -> ~0:24
+#:     N=200    _b1008      30  s/adapter   80/shard -> ~0:40
+#:     N=500    _b2512      73  s/adapter   40/shard -> ~0:49
+#:     N=1000   _b5008     ~2.5 min/adapter 16/shard -> ~0:40
+#:     N=2000   _b10000     4.8 min/adapter 16/shard -> ~1:17
+#:     N=5000   _b25008    11.9 min/adapter  8/shard -> ~1:35
+#:     N=10000  _b50000    22.8 min/adapter  4/shard -> 1:31:44  (measured)
 #:
-#: 54 shards rather than the 160 a flat 4-per-shard would give.  The fixed cost
-#: is assumed, not measured -- it cannot be separated from the marginal cost with
-#: one budget -- but it only ever makes the large shards look worse than they
-#: are, so the smoke run can lower these numbers and never has to raise them.
-TRAIN_ADAPTERS_PER_SHARD_BY_N = {10: 80, 100: 80, 1000: 16, 10000: 4}
+#: 94 shards rather than the 1600 a flat 4-per-shard would give, every one inside
+#: the suite's 3:00:00 wall with the largest at just over half of it.
+#:
+#: An earlier version of this comment claimed the assumed fixed cost could only
+#: make large shards look worse than they are, so that a smoke run "can lower
+#: these numbers and never has to raise them".  That was wrong: N=10000 measured
+#: 22.8 min/adapter against 16.0 assumed, because the marginal cost per step was
+#: underestimated, not the fixed cost.  4/shard survived only because it had
+#: headroom.  Do not treat a shard size here as safe without a measured wall at
+#: that rung or one above it.
+TRAIN_ADAPTERS_PER_SHARD_BY_N = {
+    10: 80, 20: 80, 50: 80, 100: 80, 200: 80,
+    500: 40, 1000: 16, 2000: 16, 5000: 8, 10000: 4,
+}
 
 #: Behavioral sharding for a tree with a training grid.  Inference cost does not
-#: depend on the training draw, so this is one number for all four rungs.  At
+#: depend on the training draw, so this is one number for all ten rungs.  At
 #: ~2.45 min/adapter measured, 16 per shard is a ~40 min wall; the default of 2
-#: would emit 320 near-identical job files for 640 adapters.
+#: would emit 800 near-identical job files for 1600 adapters.
 NSWEEP_BEHAVIORAL_ADAPTERS_PER_SHARD = 16
 
 

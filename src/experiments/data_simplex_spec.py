@@ -579,11 +579,20 @@ YAHOO_POOL = replace(
 #:
 #: ``sweep_sizes`` gains 10000 so the dataset level has an embedding of the
 #: largest training draw.  It is the *embedding* sweep, a different axis from
-#: ``train_sizes`` despite both being sizes -- see the field comments.
+#: ``train_sizes`` despite both being sizes -- see the field comments.  It is
+#: deliberately left at five values while ``train_sizes`` has ten: it feeds the
+#: corpus build tree, not this model tree, and no shard emitted here reads it.
 YAHOO_NSWEEP = replace(
     YAHOO,
     suffix="_nsweep",
-    train_sizes=(10, 100, 1000, 10000),
+    # Deliberately NOT sorted.  `train_shard_plan` walks this tuple in order and
+    # cuts shards rung by rung, so a shard's index is a function of the position
+    # of its rung here.  The first four ran first; the six added on 2026-09-08
+    # are appended rather than interleaved so that every already-generated and
+    # already-submitted shard keeps the number -- and therefore the adapter list
+    # -- it was submitted against.  Sorting this tuple would silently renumber
+    # them.  Read it as "the original rungs, then the infill".
+    train_sizes=(10, 100, 1000, 10000, 20, 50, 200, 500, 2000, 5000),
     train_seeds=tuple(range(10)),
     budget_per_sample=5,
     sweep_sizes=[1, 10, 100, 1000, 10000],
@@ -592,7 +601,7 @@ YAHOO_NSWEEP = replace(
     # size axis.  Same reasoning as YAHOO_POOL, same two fields.
     temperature_sweep=(),
     subtitle=("Mixtures from 3 topic groupings of the Yahoo Answers Dataset, "
-              "trained at four dataset sizes over ten seeds"),
+              "trained at ten dataset sizes over ten seeds"),
 )
 
 

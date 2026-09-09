@@ -165,6 +165,21 @@ def train_targets() -> list[tuple[str, int, int]]:
             for name in props]
 
 
+def extract_targets() -> list[tuple[str, int, int]]:
+    """The adapters extraction runs over -- ``train_targets`` minus the rungs
+    ``extract_sizes`` excludes.
+
+    Separate from ``train_targets`` because a declined rung must still be
+    trainable later at the shard index it was generated with: the training
+    shards keep naming it, and only the extraction configs stop.  For every spec
+    that trains its whole grid the two are the same list.
+    """
+    props = [name for name, _ in proportions()]
+    return [(name, n, seed)
+            for n, seed in SPEC.extract_grid()
+            for name in props]
+
+
 SEEDS = list(range(10))
 
 
@@ -1273,6 +1288,12 @@ SUITES = {
         emit_logprob_jobs=False,
         emit_gen_activation_job=False,
         train_time="3:00:00",
+        # The functional pass is unsharded, and this suite gives it 1440 adapters
+        # rather than the 16 the 2:00:00 default was written for.  The pool suite
+        # measured 4.4 s/model over 1004 adapters (job 325766, 1:13:26), so 1440
+        # is ~1:46 -- inside the default, but not by enough to survive a slower
+        # card.  Charged only in queue priority.
+        func_time="3:00:00",
         # See the olmo2 entry: l40s is not safe for TRAINING this model, only for
         # extraction. Submit training with `sbatch --partition=h200,h100`.
     ).for_model("allenai/OLMo-2-0425-1B-Instruct"),
@@ -1409,9 +1430,13 @@ def _suite_for_dataset(suite: Suite, dataset: str, suite_name: str,
     # With a training grid the adapter count is the grid's, not the simplex's,
     # and the training shards are cut per rung rather than by one flat divisor.
     if _has_train_grid():
-        n_all = n_adapters * len(SPEC.train_grid())
         train_shards = len(train_shard_plan())
-        behavioral_shards = -(-n_all // NSWEEP_BEHAVIORAL_ADAPTERS_PER_SHARD)
+        # The behavioral shards are cut over the adapters that get EXTRACTED, not
+        # over every adapter the grid declares: a rung excluded from extraction
+        # contributes no work, and counting it would emit shards whose whole
+        # adapter list is missing from disk.
+        n_extract = n_adapters * len(SPEC.extract_grid())
+        behavioral_shards = -(-n_extract // NSWEEP_BEHAVIORAL_ADAPTERS_PER_SHARD)
     else:
         train_shards = -(-n_adapters // TRAIN_ADAPTERS_PER_SHARD)
         behavioral_shards = -(-n_adapters // BEHAVIORAL_ADAPTERS_PER_SHARD)
@@ -1605,12 +1630,16 @@ def main() -> None:
             logs,
         ))
 
-    # 4-7. Extraction, one pair of stages per query set.
-    bshards = [names[i::SUITE.behavioral_shards] for i in range(SUITE.behavioral_shards)]
+    # 4-7. Extraction, one pair of stages per query set.  Over `extracted`, not
+    # `names`: a rung excluded by `extract_sizes` is trained (or, having been
+    # declined, is not) but never read.
+    extracted = extract_targets()
+    bshards = [extracted[i::SUITE.behavioral_shards]
+               for i in range(SUITE.behavioral_shards)]
     for k, q in enumerate(SUITE.query_sets):
         tok = SUITE.job_token(q)
         num = 4 + 2 * k
-        emit(exp / f"functional_{tok}.yaml", write_extract("functional", q, None, names))
+        emit(exp / f"functional_{tok}.yaml", write_extract("functional", q, None, extracted))
         emit(jobs / f"0{num}_functional_{tok}.sh", sbatch(
             f"{SUITE.job_prefix}_func_{tok}", SUITE.gpu_partitions, True,
             SUITE.extract_mem_gb, SUITE.func_time,
@@ -1638,7 +1667,7 @@ def main() -> None:
     #    against ~50 for the sampled runs, so 16 adapters fit comfortably in an hour.
     for q in SUITE.query_sets:
         tok = SUITE.job_token(q)
-        emit(exp / f"greedy_{tok}.yaml", write_extract("greedy", q, None, names))
+        emit(exp / f"greedy_{tok}.yaml", write_extract("greedy", q, None, extracted))
         emit(jobs / f"08_greedy_{tok}.sh", sbatch(
             f"{SUITE.job_prefix}_greedy_{tok}", SUITE.gpu_partitions, True,
             SUITE.extract_mem_gb, SUITE.greedy_time,
@@ -1653,7 +1682,7 @@ def main() -> None:
         for q in SUITE.query_sets:
             tok = SUITE.job_token(q)
             emit(exp / f"logprob_input_{tok}.yaml",
-                 write_extract("logprob", q, None, names))
+                 write_extract("logprob", q, None, extracted))
             emit(jobs / f"09_logprob_input_{tok}.sh", sbatch(
                 f"{SUITE.job_prefix}_lp_input", SUITE.gpu_partitions, True,
                 SUITE.extract_mem_gb, SUITE.logprob_time,
@@ -1666,7 +1695,7 @@ def main() -> None:
     # 10. The temperature sweep: one job per (temperature, shard). This is the
     #     expensive half of the addition -- ten decoding points over 16 adapters.
     if SUITE.temperature_sweep:
-        sshards = [names[i::SUITE.sweep_shards] for i in range(SUITE.sweep_shards)]
+        sshards = [extracted[i::SUITE.sweep_shards] for i in range(SUITE.sweep_shards)]
         for q in SUITE.query_sets:
             tok = SUITE.job_token(q)
             for t in SUITE.temperature_sweep:
@@ -1689,7 +1718,7 @@ def main() -> None:
         for q in SUITE.query_sets:
             tok = SUITE.job_token(q)
             emit(exp / f"greedy_logprob_{tok}.yaml",
-                 write_extract("greedy_logprob", q, None, names))
+                 write_extract("greedy_logprob", q, None, extracted))
             emit(jobs / f"11_greedy_logprob_{tok}.sh", sbatch(
                 f"{SUITE.job_prefix}_greedy_lp_{tok}", SUITE.gpu_partitions, True,
                 SUITE.extract_mem_gb, SUITE.greedy_time,
@@ -1705,7 +1734,7 @@ def main() -> None:
         for q in SUITE.query_sets:
             tok = SUITE.job_token(q)
             emit(exp / f"functional_gen_{tok}.yaml",
-                 write_extract("functional_gen", q, None, names))
+                 write_extract("functional_gen", q, None, extracted))
             emit(jobs / f"12_functional_gen_{tok}.sh", sbatch(
                 f"{SUITE.job_prefix}_func_gen_{tok}", SUITE.gpu_partitions, True,
                 SUITE.extract_mem_gb, SUITE.func_gen_time,
@@ -1821,7 +1850,7 @@ def write_data_tree(root: Path) -> None:
     props = proportions()
     n_sizes = len(SPEC.sweep_size_list)
     emit(jobs / "submit_all.sh", f"""#!/bin/bash
-# GENERATED BY scripts/gen_simplex3.py --dataset {SPEC.name_prefix} --data-tree
+# GENERATED BY scripts/gen_simplex3.py --dataset {_spec_key()} --data-tree
 # -- do not edit by hand.
 #
 # The {SPEC.name_prefix} dataset level, built once and shared by every model suite over
@@ -1873,7 +1902,21 @@ echo "Submitted. Watch with: squeue -u $USER -o '%.10i %.14j %.9P %.2t %.10M %R'
 #: yahoo's adapter names -- deliberately, so its reference adapters are reused --
 #: while writing a tree of its own.  Both existing entries are unchanged: dolly's
 #: suffix is ``_dolly`` and oasst1's is ``_oasst1``.
-_DATA_TREE_PREFIXES = {"_dolly": "s3dd", "_oasst1": "s3od", "_pool": "s3pd"}
+_DATA_TREE_PREFIXES = {"_dolly": "s3dd", "_oasst1": "s3od", "_pool": "s3pd",
+                       "_nsweep": "s3nd"}
+
+
+def _spec_key() -> str:
+    """The ``--dataset`` value that selects the bound spec.
+
+    ``SPEC.name_prefix`` is the corpus ("yahoo"), which is not the same thing:
+    ``yahoo``, ``yahoo_pool`` and ``yahoo_nsweep`` all carry it, and only the key
+    regenerates the tree that is being written.
+    """
+    for key, spec in SPECS.items():
+        if spec is SPEC:
+            return key
+    return SPEC.name_prefix
 
 
 def _data_tree_prefix() -> str:

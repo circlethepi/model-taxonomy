@@ -168,6 +168,18 @@ class DataSimplexSpec:
     train_sizes: tuple[int, ...] = ()
     train_seeds: tuple[int, ...] = ()
 
+    #: The rungs of ``train_sizes`` that extraction covers.  Empty means "every
+    #: rung", which is what a spec whose whole grid gets trained means and what
+    #: keeps the existing trees byte-identical.  It exists because a rung can be
+    #: *declared* and not *bought*: the N=10000 rung is priced into
+    #: ``train_sizes`` -- and must stay there, since a shard's index is a
+    #: function of its rung's position in that tuple -- but was declined, so its
+    #: 160 adapters will never exist.  An extraction config naming them would
+    #: point every shard at a missing adapter directory.  Restricting extraction
+    #: rather than training is what lets the declined rung be bought later
+    #: without renumbering a single training shard.
+    extract_sizes: tuple[int, ...] = ()
+
     #: **Budget mode.**  ``None`` keeps the fixed ``total_train_samples`` budget
     #: for every draw, which is what a single-draw spec wants.  An int makes the
     #: budget ``budget_per_sample * n``, i.e. a fixed number of *epochs* rather
@@ -362,6 +374,25 @@ class DataSimplexSpec:
         sizes = self.train_sizes or (self.train_n,)
         seeds = self.train_seeds or (self.train_seed,)
         return tuple((n, s) for n in sizes for s in seeds)
+
+    def extract_grid(self) -> tuple[tuple[int, int], ...]:
+        """The ``(n_samples, seed)`` draws extraction runs over.
+
+        ``train_grid`` filtered by ``extract_sizes``; the whole grid when that is
+        empty.  Ordered as ``train_grid`` orders it, so the adapter lists the
+        extraction configs carry stay rung-major.
+        """
+        grid = self.train_grid()
+        if not self.extract_sizes:
+            return grid
+        keep = set(self.extract_sizes)
+        unknown = keep - set(n for n, _ in grid)
+        if unknown:
+            raise ValueError(
+                f"extract_sizes={self.extract_sizes} names rung(s) "
+                f"{sorted(unknown)} that the training grid does not train."
+            )
+        return tuple((n, s) for n, s in grid if n in keep)
 
     def budget(self, n: int | None = None) -> int:
         """The fine-tuning budget for a training draw of *n* rows.
@@ -577,11 +608,11 @@ YAHOO_POOL = replace(
 #: ``name_prefix`` stays ``yahoo`` for that reuse; ``suffix`` is what keeps the
 #: *trees* apart, exactly as for ``YAHOO_POOL``.
 #:
-#: ``sweep_sizes`` gains 10000 so the dataset level has an embedding of the
-#: largest training draw.  It is the *embedding* sweep, a different axis from
-#: ``train_sizes`` despite both being sizes -- see the field comments.  It is
-#: deliberately left at five values while ``train_sizes`` has ten: it feeds the
-#: corpus build tree, not this model tree, and no shard emitted here reads it.
+#: ``sweep_sizes`` is the nine bought rungs, so the dataset level has an embedding
+#: of every draw an adapter was trained on.  It is the *embedding* sweep, a
+#: different axis from ``train_sizes`` despite both being sizes -- see the field
+#: comments.  It feeds the corpus build tree, not this model tree, and no shard
+#: emitted here reads it.
 YAHOO_NSWEEP = replace(
     YAHOO,
     suffix="_nsweep",
@@ -595,7 +626,17 @@ YAHOO_NSWEEP = replace(
     train_sizes=(10, 100, 1000, 10000, 20, 50, 200, 500, 2000, 5000),
     train_seeds=tuple(range(10)),
     budget_per_sample=5,
-    sweep_sizes=[1, 10, 100, 1000, 10000],
+    # The nine rungs that were bought.  N=10000 stays in `train_sizes` -- removing
+    # it would renumber every shard after 13 -- but was declined on 2026-09-09, so
+    # nothing downstream may name its adapters.
+    extract_sizes=(10, 20, 50, 100, 200, 500, 1000, 2000, 5000),
+    # One embedded draw per *trained* draw, which is what the dataset level of the
+    # figure compares.  Not `tens 3` and not the yahoo sweep: those cover 1/10/100/
+    # 1000 regardless of what was trained, so they miss the six infill rungs
+    # entirely and pay for an n=1 draw nothing reads.  Same nine rungs as
+    # `extract_sizes`, for the same reason -- an embedding of a draw no adapter was
+    # trained on has no row to sit in.
+    sweep_sizes=[10, 20, 50, 100, 200, 500, 1000, 2000, 5000],
     # Priced per adapter and not read by any of the five canonical perspectives,
     # so at 640 adapters they would dominate a suite whose whole point is the
     # size axis.  Same reasoning as YAHOO_POOL, same two fields.

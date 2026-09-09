@@ -561,7 +561,7 @@ def _draw_spoke_groups(ax, theta, spoke_groups, group_pad):
         #   into the legend.
         seam = theta[start] - step / 2
         ax.plot([seam, seam], [rmin, rmax * 1.04],
-                color="0.8", linewidth=0.6, linestyle=(0, (2, 2)),
+                color="darkgray", linewidth=0.6, linestyle=(0, (2, 2)),
                 clip_on=False, zorder=1)
         start += count
 

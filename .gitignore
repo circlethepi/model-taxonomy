@@ -34,3 +34,4 @@ docs/notes/
 experiments/*/*_shard*.yaml
 jobs/*/*_shard*.sh
 **shard**.sh
+figures/simplex_collection_size/.fanout/

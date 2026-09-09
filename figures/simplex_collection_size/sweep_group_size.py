@@ -26,10 +26,13 @@ Terminology
 **perspective**
     A surrogate together with a similarity metric -- one cell of the grid.
 **canonical perspective**
-    The single perspective designated as the default reading of a taxonomy
-    level, so levels can be compared one-to-one without sweeping metrics.  The
-    four are fixed in :data:`CANONICAL` and are the standing default recorded in
+    A perspective designated as a default reading of a taxonomy level, so levels
+    can be compared one-to-one without sweeping metrics.  The seven are fixed in
+    :func:`canonical_perspectives` and are the standing default recorded in
     ``docs/terminology.md``.
+**scope**
+    How much of a model a surrogate reads -- which layers, which projections.  A
+    level with more than one canonical perspective has one per scope.
 **variant A / variant B**
     Two ways of forming the matrices for a sampled group; see `The two variants`_.
 **permute-and-partition**
@@ -66,33 +69,48 @@ away a real effect.
 
 What is deliberately not swept
 ------------------------------
-One perspective per level, no metric sweep, no fleet transform.  The point of
-this suite is the *size* axis, so anything else that moves would confound it.
-Cost per group is milliseconds, and the pool is what was expensive.
+The standing per-level defaults and nothing else: no metric sweep, no fleet
+transform, no layer sweep.  The point of this suite is the *size* axis, so
+anything else that moves would confound it.  Cost per group is milliseconds, and
+the pool is what was expensive.
+
+Seven perspectives over five levels, not one per level: the structural level is
+read at three scopes and the functional level at two, because "all of the stack
+versus the end of it" is a question this axis can answer and the scopes do not
+have to move together as ``n`` grows.
 
 Usage
 -----
 ::
 
-    python scripts/sweep_group_size.py \\
-        --base-model allenai/OLMo-2-0425-1B-Instruct \\
-        --outdir figures/simplex3_pool_olmo2_pool
+    # the whole suite, scores and figures
+    python figures/simplex_collection_size/make_figures.py
 
-    # the M=20 dry run, on whatever pool is already in the cache
-    python scripts/sweep_group_size.py --n-grid 5,10,20 --replicates 20
+    # scores only
+    python figures/simplex_collection_size/sweep_group_size.py
+
+    # add a size the first run skipped, keeping every row already on disk
+    python figures/simplex_collection_size/sweep_group_size.py \\
+        --n-grid 999 --append
+
+    # the dry run, on whatever pool is already in the cache
+    python figures/simplex_collection_size/sweep_group_size.py \\
+        --n-grid 5,10,20 --replicates 20
 """
 
 from __future__ import annotations
 
 import argparse
 import csv
+import json
+import re
 import sys
 import time
 from pathlib import Path
 
 import numpy as np
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from src.analysis.bridge import fit_geometry  # noqa: E402
 from src.analysis.comparison import build_taxonomy_artifacts  # noqa: E402
@@ -104,49 +122,119 @@ from src.analysis.matrices import distance_correlation_restricted  # noqa: E402
 from src.plots import simplex_suite as suite  # noqa: E402
 from src.plots.simplex import mixture_weights, sort_by_mixture  # noqa: E402
 
+#: This suite's own directory: the default place for its scores and figures.
+HERE = Path(__file__).resolve().parent
+
 #: The MDS seed every disparity here is fitted under.  Shared with the figure
 #: suite so a score from this sweep and a score from ``crosslevel_scores.csv``
 #: describe configurations fitted the same way.
 MDS_SEED = suite.MDS_SEED
 
 
-# ── the four canonical perspectives ───────────────────────────────────────────
+# ── the canonical perspectives ────────────────────────────────────────────────
 
 def canonical_perspectives() -> dict[str, dict]:
-    """``level -> {metric, and the selector keywords build_taxonomy_artifacts wants}``.
+    """``perspective -> {taxonomy, metric, label, and the selector keywords}``.
 
-    Fixed rather than swept, and identical to the standing per-level defaults:
-    the dataset level's mean embedding under euclidean, the structural and
-    functional levels' last layer under cosine, and the behavioral level's
-    per-query replicate mean under cosine.
+    The standing per-level defaults, not a sweep: one row per *scope* a level is
+    read at, and nothing else.  Seven rows over five levels, because two levels
+    are read at more than one scope and the contrast between the scopes is the
+    point.
 
-    Read after ``suite.apply_architecture``: "the last layer" is a *position* in
-    a stack, so it is derived from the checkpoint's layer count rather than
-    written down.  Hidden states are indexed ``0..N_LAYERS`` with ``h0`` the
-    embedding, so the final state is ``N_STATES - 1``; LoRA layers are indexed
-    ``0..N_LAYERS-1``, so the final adapter layer is ``N_LAYERS - 1``.
+    ================== ============================================= ==========
+    perspective        surrogate                                     metric
+    ================== ============================================= ==========
+    dataset_embedding  mean embedding of the training draw           euclidean
+    structural_all_o   every layer, output projections only          cosine
+    structural_all_qkvo every layer, all four projections            cosine
+    structural_last_o  the last decoder layer's output projection    cosine
+    functional_all     every hidden state                            cosine
+    functional_last    the final hidden state alone                  cosine
+    behavioral         per-query replicate mean, R=16                cosine
+    ================== ============================================= ==========
+
+    Two things worth stating, because neither is visible in the table:
+
+    * **The functional rows mirror the structural ones on the only axis the
+      level has.**  Structural narrows by layer *and* by projection; the
+      functional level reads hidden states, which have no projection axis, so
+      its mirror of "all layers versus the last one" is exactly the two rows
+      here.  Asking for a functional output projection would name something the
+      cache does not hold.
+    * **"The last layer" is a position, not a number.**  It is derived from the
+      checkpoint's own layer count after ``suite.apply_architecture``, because a
+      literal 31 names the final layer only on a 32-layer model.  Hidden states
+      are indexed ``0..N_LAYERS`` with ``h0`` the embedding, so the final state
+      is ``N_STATES - 1``; LoRA layers are indexed ``0..N_LAYERS-1``, so the
+      final adapter layer is ``N_LAYERS - 1``.
+
+    The dataset level is read under ``euclidean`` alone -- plain row-wise L2
+    between the mean vectors, ``FrobeniusDistanceMetric(normalize=False)``.  Its
+    normalised sibling ``frobenius`` is a legitimate second reading of "euclidean
+    norm" and the simplex3 drivers carry both; this suite does not, because the
+    axis it measures is group size and every extra row is another curve to read
+    against it rather than another reading of the level.
     """
+    fsel = {"draw": suite.DRAW, "mode": "input", "pooling": "mean",
+            "view": "concat", "normalize": "layer", "max_new_tokens": None}
+
+    # **The two levels read `layers=None` differently, and only one of them
+    # means "all".**  `_functional_reps` treats None as every stored hidden
+    # state, which is what `simplex_suite._fsel(None)` labels "all N states
+    # (reference)".  `_structural_matrix` does not: it forwards
+    # ``layer_indices=layers if layers is not None else "last"`` to
+    # `load_lora_weights`, so a structural None loads the **last layer alone**
+    # and the "all layers" rows would have been silent duplicates of the
+    # last-layer one.  The tell was the clock -- 63 s for sixteen layers when one
+    # layer took 58 -- not the numbers, which are perfectly plausible.  Hence the
+    # explicit range here, matching `simplex_suite.structural_group_specs`, which
+    # spells its all-layer selections `range(N_LAYERS)` for the same reason.
+    all_layers = list(range(suite.N_LAYERS))
     return {
         "dataset_embedding": {
+            "taxonomy": "dataset_embedding",
+            "label": "Dataset embedding\nmean · euclidean",
             "metric": "euclidean",
             "dataset_selector": {"n_samples": 1000, "seed": 0,
                                  "representation": "mean"},
             "embedder_hash": suite.DATASET_EMBEDDER,
         },
-        "structural": {
+        "structural_all_o": {
+            "taxonomy": "structural",
+            "label": f"Structural (a)\nall {suite.N_LAYERS} layers · o_proj · cosine",
             "metric": "cosine",
-            "layers": [suite.N_LAYERS - 1],
+            "layers": all_layers,
+            "projections": ["o"],
+        },
+        "structural_all_qkvo": {
+            "taxonomy": "structural",
+            "label": f"Structural (b)\nall {suite.N_LAYERS} layers · q,k,v,o · cosine",
+            "metric": "cosine",
+            "layers": all_layers,
             "projections": ["q", "k", "v", "o"],
         },
-        "functional": {
+        "structural_last_o": {
+            "taxonomy": "structural",
+            "label": f"Structural (c)\nlayer {suite.N_LAYERS - 1} · o_proj · cosine",
             "metric": "cosine",
-            "functional_selector": {
-                "draw": suite.DRAW, "mode": "input", "pooling": "mean",
-                "layers": [suite.N_STATES - 1], "view": "concat",
-                "normalize": "layer", "max_new_tokens": None,
-            },
+            "layers": [suite.N_LAYERS - 1],
+            "projections": ["o"],
+        },
+        "functional_all": {
+            "taxonomy": "functional",
+            "label": f"Functional (a)\nall {suite.N_STATES} states · cosine",
+            "metric": "cosine",
+            "functional_selector": {**fsel, "layers": None},
+        },
+        "functional_last": {
+            "taxonomy": "functional",
+            "label": f"Functional (b)\nh{suite.N_STATES - 1} · final state · cosine",
+            "metric": "cosine",
+            "functional_selector": {**fsel, "layers": [suite.N_STATES - 1]},
         },
         "behavioral": {
+            "taxonomy": "behavioral",
+            "label": "Behavioral\nR=16 per query · cosine",
             "metric": "cosine",
             "behavioral_selector": {
                 "draw": suite.DRAW, "max_new_tokens": suite.MAX_NEW_TOKENS,
@@ -158,6 +246,10 @@ def canonical_perspectives() -> dict[str, dict]:
             },
         },
     }
+
+
+#: Keys of :func:`canonical_perspectives` that are not selector keywords.
+_META_KEYS = ("taxonomy", "metric", "label")
 
 
 # ── the pool ──────────────────────────────────────────────────────────────────
@@ -195,8 +287,101 @@ def reference_ids(ids: list[str], weights: np.ndarray) -> list[str]:
     return refs
 
 
-def pool_matrices(index, ids, cache_root, levels, *, use_cache=True):
-    """One M x M distance matrix per level, at that level's canonical perspective.
+#: The corpus-and-mixture head of an adapter directory name, up to the training
+#: draw that follows it (``..._n1000_s00_r16_...``).
+_LABEL_RE = re.compile(r"^(.*?_\d+g\d+(?:_\d+g\d+)*)_n\d+_s\d+")
+
+
+def pin_pool(index, *, train_n=None, train_seed=None, exclude=None):
+    """Cut a scan down to the models this experiment's pool is made of.
+
+    Three filters, each answering a way the cache has already been shown to
+    return more than this suite asked for:
+
+    * **``train_n`` / ``train_seed``** -- the training recipe.  The
+      dataset-size sweep trains the *same* mixtures on the same base model at
+      other row counts, so an unfiltered scan of this base model returns those
+      too and the sweep would score a pool that mixes training sizes.
+    * **``exclude``** -- named mixtures.  A corpus filter cannot separate two
+      experiments that share a corpus; the simplex3 grid and this pool are both
+      yahoo on the same checkpoint, so the grid's non-reference points are
+      removed by name.
+
+    Filtering here rather than at ``scan_cache`` keeps the exclusion a property
+    of the *pool definition*, visible in ``run_config.json``, rather than a
+    scan argument that leaves no trace in the output.
+    """
+    from src.analysis.discovery import CacheIndex
+
+    entries = list(index.entries)
+    if train_n:
+        entries = [e for e in entries if e.n_samples == train_n]
+    if train_seed is not None and train_seed >= 0:
+        entries = [e for e in entries if e.seed == train_seed]
+    if exclude:
+        drop = set(exclude)
+        entries = [e for e in entries if mixture_of(e.model_id) not in drop]
+    n_before = len(index.entries)
+    if len(entries) != n_before:
+        print(f"pool pinned: {n_before} -> {len(entries)} model(s)"
+              + (f" (train_n={train_n}" if train_n else " (")
+              + (f", seed={train_seed}" if train_seed is not None
+                 and train_seed >= 0 else "")
+              + (f", {len(exclude)} mixture(s) excluded" if exclude else "")
+              + ")")
+    return CacheIndex(entries, index.cache_root)
+
+
+def write_csv(path: Path, fields, rows) -> None:
+    with path.open("w", newline="") as fh:
+        w = csv.DictWriter(fh, fieldnames=fields)
+        w.writeheader()
+        w.writerows(rows)
+
+
+def merge_rows(path: Path, new, key=("perspective", "n"), fields=None):
+    """Existing rows from *path* that *new* does not supersede, plus *new*.
+
+    What makes the CSV editable rather than write-once.  A row already on disk
+    survives unless this run recomputed its whole ``key`` cell -- so
+    ``--n-grid 999 --append`` adds one group size to a finished sweep without
+    touching the eight already there, and re-running one perspective replaces
+    exactly that perspective.
+
+    Returns ``(rows, n_kept)``.  Rows come back as strings from the CSV and as
+    floats from the sweep; both are written through ``csv.DictWriter``, which
+    formats either identically, so the round trip does not change a value.
+    """
+    with path.open() as fh:
+        old = list(csv.DictReader(fh))
+    superseded = {tuple(str(r[k]) for k in key) for r in new}
+    kept = [r for r in old
+            if tuple(str(r.get(k, "")) for k in key) not in superseded]
+    fields = fields or FIELDS
+    kept = [{f: r.get(f, "") for f in fields} for r in kept]
+    return kept + list(new), len(kept)
+
+
+def mixture_of(model_id: str) -> str:
+    """``yahoo_050g1_025g2_025g3`` out of a full adapter path.
+
+    Used for the membership record and for pinning the pool, so a group written
+    today can be re-read after the cache has moved.  Falls back to the bare
+    directory name on anything that does not carry a mixture, rather than
+    raising: a pool with an unparseable member should still record what it drew.
+    """
+    name = Path(model_id).name
+    m = _LABEL_RE.match(name)
+    return m.group(1) if m else name
+
+
+def pool_matrices(index, ids, cache_root, perspectives, *, use_cache=True):
+    """One M x M distance matrix per **perspective**, in declaration order.
+
+    Keyed on the perspective name rather than on the taxonomy level, because two
+    levels are read at more than one scope: ``structural`` alone contributes
+    three matrices, and keying on the level would have the last of them silently
+    overwrite the first two.
 
     Goes through :func:`~src.analysis.comparison.build_taxonomy_artifacts`, which
     computes with the plain ``_distances`` double loop and stores the assembled
@@ -210,20 +395,20 @@ def pool_matrices(index, ids, cache_root, levels, *, use_cache=True):
     metric calls.  The stored matrix is ~8 MB.
     """
     out = {}
-    for level, spec in canonical_perspectives().items():
-        if level not in levels:
+    for name, spec in canonical_perspectives().items():
+        if name not in perspectives:
             continue
-        kwargs = {k: v for k, v in spec.items() if k != "metric"}
+        kwargs = {k: v for k, v in spec.items() if k not in _META_KEYS}
         t0 = time.time()
         dm, _ = build_taxonomy_artifacts(
-            index, level, spec["metric"], cache_root=cache_root,
+            index, spec["taxonomy"], spec["metric"], cache_root=cache_root,
             n_components=(2,), use_cache=use_cache, id_scheme="model_id",
             label="group-size pool", **kwargs,
         )
         dm = dm.reindex(list(ids))
-        print(f"  {level:<18} {dm.matrix.shape[0]:>5} models  "
-              f"{spec['metric']:<10} {time.time() - t0:6.1f}s")
-        out[level] = dm
+        print(f"  {name:<20} {dm.matrix.shape[0]:>5} models  "
+              f"{spec['metric']:<10} {time.time() - t0:7.1f}s", flush=True)
+        out[name] = dm
     return out
 
 
@@ -332,12 +517,30 @@ def score_group(dm, group, refs, weights_of, vertex_names):
 
 # ── the sweep ─────────────────────────────────────────────────────────────────
 
-FIELDS = ["level", "n", "replicate", "shuffle_id", "n_disjoint", "n_refs",
+FIELDS = ["perspective", "taxonomy", "n", "replicate", "shuffle_id",
+          "n_disjoint", "n_refs",
           "dcor_A", "dcor_B", "disparity_A", "disparity_B", "hull_area"]
 
+#: ``group_members.csv``: which models each replicate actually drew.
+#:
+#: Written beside the scores because the shuffle seed alone reproduces a group
+#: only against an *identical pool in an identical order* -- add one adapter to
+#: the cache and every permutation downstream of it changes.  The membership
+#: file is the record that does not depend on that, and it is what makes a later
+#: ``--n-grid 999 --append`` comparable with what is already here rather than
+#: merely similar.  Members are written as **mixture labels**, which are short,
+#: readable, and stable across cache moves in a way absolute paths are not.
+GROUP_FIELDS = ["n", "replicate", "shuffle_id", "n_disjoint", "members"]
 
-def sweep(matrices, ids, weights, n_grid, n_replicates, seed, vertex_names):
-    """One row per (level, n, replicate).  Returns the rows and the pool split."""
+
+def sweep(matrices, ids, weights, n_grid, n_replicates, seed, vertex_names,
+          specs=None):
+    """One row per (perspective, n, replicate).
+
+    Returns ``(score_rows, group_rows)`` -- the scores, and the membership record
+    that says which models each replicate drew.
+    """
+    specs = specs or canonical_perspectives()
     weights_of = {m: w for m, w in zip(ids, weights)}
     refs = reference_ids(ids, weights)
     pool = [m for m in ids if m not in set(refs)]
@@ -347,14 +550,20 @@ def sweep(matrices, ids, weights, n_grid, n_replicates, seed, vertex_names):
         print(f"  note: only {len(refs)} reference model(s) found; variant A "
               f"adds that many rather than {weights.shape[1] + 1}.")
 
-    rows = []
+    rows, group_rows = [], []
     for n in n_grid:
         if n > len(pool):
             print(f"  n={n} skipped: larger than the {len(pool)}-model pool")
             continue
         drawn = groups_for(pool, n, n_replicates, seed)
+        for r, (group, shuffle, n_disjoint) in enumerate(drawn):
+            group_rows.append({
+                "n": n, "replicate": r, "shuffle_id": shuffle,
+                "n_disjoint": n_disjoint,
+                "members": " ".join(mixture_of(m) for m in group),
+            })
         t0 = time.time()
-        for level, dm in matrices.items():
+        for pname, dm in matrices.items():
             # Memoized on membership, because the scores are a function of the
             # *set* and an MDS fit is the expensive part -- ~34 s at n=1000.  It
             # pays for itself at the top of the grid, where there is only one
@@ -369,21 +578,24 @@ def sweep(matrices, ids, weights, n_grid, n_replicates, seed, vertex_names):
                             dm, group, refs, weights_of, vertex_names)
                     a, b, da, db, area = seen[key]
                 except Exception as exc:
-                    print(f"    {level} n={n} rep={r} skipped -- "
+                    print(f"    {pname} n={n} rep={r} skipped -- "
                           f"{type(exc).__name__}: {exc}")
                     continue
                 rows.append({
-                    "level": level, "n": n, "replicate": r,
+                    "perspective": pname,
+                    "taxonomy": specs[pname]["taxonomy"],
+                    "n": n, "replicate": r,
                     "shuffle_id": shuffle, "n_disjoint": n_disjoint,
                     "n_refs": len(refs),
                     "dcor_A": a, "dcor_B": b,
                     "disparity_A": da, "disparity_B": db, "hull_area": area,
                 })
         distinct = len({frozenset(g) for g, _, _ in drawn})
-        print(f"  n={n:<5} {len(drawn)} replicate(s) x {len(matrices)} level(s)"
-              f"  ({distinct} distinct group(s), {n_disjoint_of(pool, n)} "
-              f"disjoint per shuffle)  {time.time() - t0:6.1f}s")
-    return rows
+        print(f"  n={n:<5} {len(drawn)} replicate(s) x {len(matrices)} "
+              f"perspective(s)  ({distinct} distinct group(s), "
+              f"{n_disjoint_of(pool, n)} disjoint per shuffle)  "
+              f"{time.time() - t0:7.1f}s", flush=True)
+    return rows, group_rows
 
 
 def variant_report(rows) -> str:
@@ -463,16 +675,32 @@ def main() -> None:
     ap.add_argument("--base-model", default="allenai/OLMo-2-0425-1B-Instruct")
     ap.add_argument("--cache-root", default=None,
                     help=f"shared cache root (default: {suite.CACHE_ROOT})")
-    ap.add_argument("--outdir", default="figures/simplex3_pool_olmo2_pool")
-    ap.add_argument("--level", action="append", dest="levels",
-                    choices=sorted(canonical_perspectives()),
-                    help="restrict to one level; repeat for several")
+    ap.add_argument("--outdir", default=str(HERE))
+    ap.add_argument("--perspective", action="append", dest="perspectives",
+                    help="restrict to one perspective; repeat for several "
+                         "(default: all seven)")
     ap.add_argument("--dataset", action="append", dest="datasets",
                     default=None,
                     help="restrict the scan to a corpus, by recipe-name prefix "
                          "or dataset_id; repeat for several")
+    ap.add_argument("--train-n", type=int, default=1000,
+                    help="keep only adapters trained on this many rows; the "
+                         "pool's own training size (0 disables the filter)")
+    ap.add_argument("--train-seed", type=int, default=0,
+                    help="keep only adapters at this data seed (-1 disables)")
+    ap.add_argument("--exclude-mixture", action="append", dest="exclude",
+                    default=None,
+                    help="drop a mixture label from the pool; repeat. Use for "
+                         "models that share the pool's recipe but were trained "
+                         "for another experiment")
     ap.add_argument("--n-grid", default="5,10,20,50,100,200,500,1000",
                     help="comma-separated group sizes")
+    ap.add_argument("--append", action="store_true",
+                    help="merge into an existing group_size_scores.csv rather "
+                         "than replacing it: rows for a (perspective, n) this "
+                         "run computed are replaced, every other row is kept. "
+                         "This is how a size the first run skipped is added "
+                         "later without recomputing the rest")
     ap.add_argument("--replicates", type=int, default=100)
     ap.add_argument("--seed", type=int, default=0,
                     help="seed for the permute-and-partition shuffles")
@@ -511,6 +739,8 @@ def main() -> None:
                        behavioral_draw=suite.DRAW,
                        functional_draw=suite.DRAW,
                        datasets=args.datasets)
+    index = pin_pool(index, train_n=args.train_n, train_seed=args.train_seed,
+                     exclude=args.exclude)
     ids = sort_by_mixture([e.model_id for e in index.entries])
     if len(ids) < 5:
         raise SystemExit(
@@ -520,26 +750,58 @@ def main() -> None:
     weights = np.vstack([mixture_weights(m) for m in ids])
     vertex_names = [f"g{j + 1}" for j in range(weights.shape[1])]
 
-    levels = args.levels or list(canonical_perspectives())
-    print(f"building {len(levels)} pool matrix/matrices over {len(ids)} models")
-    matrices = pool_matrices(index, ids, cache_root, levels,
+    specs = canonical_perspectives()
+    unknown = set(args.perspectives or ()) - set(specs)
+    if unknown:
+        raise SystemExit(f"unknown perspective(s) {sorted(unknown)}. "
+                         f"Choose from {sorted(specs)}")
+    names = args.perspectives or list(specs)
+    print(f"building {len(names)} pool matrix/matrices over {len(ids)} models")
+    matrices = pool_matrices(index, ids, cache_root, names,
                              use_cache=not args.no_cache)
 
     if args.check_matrices:
         raise SystemExit(check_matrices(matrices, ids))
 
     n_grid = [int(x) for x in args.n_grid.split(",") if x.strip()]
-    rows = sweep(matrices, ids, weights, n_grid, args.replicates, args.seed,
-                 vertex_names)
+    rows, group_rows = sweep(matrices, ids, weights, n_grid, args.replicates,
+                             args.seed, vertex_names, specs=specs)
 
     outdir = Path(args.outdir)
     outdir.mkdir(parents=True, exist_ok=True)
     out = outdir / "group_size_scores.csv"
-    with out.open("w", newline="") as fh:
-        w = csv.DictWriter(fh, fieldnames=FIELDS)
-        w.writeheader()
-        w.writerows(rows)
-    print(f"\nwrote {len(rows)} row(s) to {out}")
+    n_kept = 0
+    if args.append and out.exists():
+        rows, n_kept = merge_rows(out, rows)
+    write_csv(out, FIELDS, rows)
+    groups = outdir / "group_members.csv"
+    if args.append and groups.exists():
+        group_rows, _ = merge_rows(groups, group_rows,
+                                   key=("n", "replicate"), fields=GROUP_FIELDS)
+    write_csv(groups, GROUP_FIELDS, group_rows)
+
+    record = {
+        "base_model": args.base_model,
+        "cache_root": str(cache_root),
+        "datasets": args.datasets,
+        "train_n": args.train_n, "train_seed": args.train_seed,
+        "excluded_mixtures": sorted(args.exclude or []),
+        "pool_size": len(ids),
+        "n_grid": n_grid, "replicates": args.replicates,
+        "shuffle_seed": args.seed,
+        "mds_seed": MDS_SEED,
+        "draw": suite.DRAW,
+        "perspectives": {k: {"taxonomy": v["taxonomy"], "metric": v["metric"],
+                             "label": v["label"].replace("\n", " · ")}
+                         for k, v in specs.items() if k in names},
+        "pool": [mixture_of(m) for m in ids],
+    }
+    (outdir / "run_config.json").write_text(json.dumps(record, indent=2) + "\n")
+
+    print(f"\nwrote {len(rows)} row(s) to {out}"
+          + (f" ({n_kept} kept from the previous run)" if args.append else ""))
+    print(f"wrote {len(group_rows)} group(s) to {groups}")
+    print(f"wrote {outdir / 'run_config.json'}")
     print(variant_report(rows))
 
 

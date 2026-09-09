@@ -48,6 +48,20 @@ taxonomy = StructuralTaxonomy(
 the conventions of `load_lora_weights`. Pass `layer_names` when you need explicit
 control; it takes precedence over both.
 
+> **`layers=None` does not mean "all layers" at the comparison layer.**
+> `load_lora_weights` reads `layer_indices=None` as every layer, but
+> `_structural_matrix` in `src/analysis/comparison.py` forwards
+> `layer_indices=layers if layers is not None else "last"`, so a `layers=None`
+> passed to `build_taxonomy_artifacts` or `compare_taxonomy` selects the **last
+> layer alone** (and `projections=None` likewise defaults to `"o"`). This is a
+> live footgun: an "all layers" perspective spelled `None` is a silent duplicate
+> of the last-layer one, and the numbers it produces are entirely plausible — the
+> only tell is that it runs as fast as a one-layer selection. Spell all-layer
+> selections `list(range(N_LAYERS))`, as `simplex_suite.structural_group_specs`
+> and `figures/simplex_collection_size/sweep_group_size.py` both do. The
+> functional level does **not** share this behaviour: `_functional_reps` reads
+> `layers=None` as every stored hidden state.
+
 Cache priority: `lora_cache` is checked first; `cache` (flat `DiskCache`) is used as a fallback if set.
 
 ---

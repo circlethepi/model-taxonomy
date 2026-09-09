@@ -1,7 +1,7 @@
 #!/usr/bin/env python
-"""Score against group size, one panel per taxonomy level.
+"""Score against group size, one panel per perspective.
 
-Reads ``group_size_scores.csv`` from :mod:`scripts.sweep_group_size` and draws
+Reads ``group_size_scores.csv`` from :mod:`sweep_group_size` and draws
 the two estimators on separate rows, because they run in **opposite
 directions**: a high dCor* means strong dependence on the ground truth, while a
 Procrustes disparity of **0** means identical shape.  Putting them on one axis
@@ -27,7 +27,7 @@ Usage
 -----
 ::
 
-    python scripts/plot_group_size.py --outdir figures/simplex3_pool_olmo2_pool
+    python figures/simplex_collection_size/plot_group_size.py
 """
 
 from __future__ import annotations
@@ -40,7 +40,7 @@ from pathlib import Path
 
 import numpy as np
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 import matplotlib  # noqa: E402
 matplotlib.use("Agg")
@@ -54,14 +54,30 @@ from src.plots.figures import save_figure  # noqa: E402
 #: is a judgement call and is drawn, not hidden: the band goes dashed here.
 DEFLATED_BELOW = 4
 
-#: Level order and display names.  Fixed rather than read off the CSV so two
-#: runs' figures put the same level in the same column.
+#: Column order and display names, one column per **perspective**.  Fixed rather
+#: than read off the CSV so two runs' figures put the same perspective in the
+#: same column, and grouped by taxonomy level so the three structural scopes sit
+#: side by side and can be read against each other.
+#:
+#: A perspective the CSV does not carry is drawn as an empty panel rather than
+#: dropped, so a partial run is visibly partial instead of quietly narrower.
+#: A perspective the CSV carries and this list does not is appended on the right
+#: under its own name, so nothing measured goes unplotted.
 LEVELS = [
     ("dataset_embedding", "Dataset embedding\nmean · euclidean"),
-    ("structural", "Structural\nlast layer · cosine"),
-    ("functional", "Functional\nlast layer · cosine"),
-    ("behavioral", "Behavioral\nR=16 per query · cosine"),
+    ("structural_all_o", "Structural (a)\nall layers · o_proj"),
+    ("structural_all_qkvo", "Structural (b)\nall layers · q,k,v,o"),
+    ("structural_last_o", "Structural (c)\nlast layer · o_proj"),
+    ("functional_all", "Functional (a)\nall hidden states"),
+    ("functional_last", "Functional (b)\nfinal hidden state"),
+    ("behavioral", "Behavioral\nR=16 per query"),
 ]
+
+#: Column heading for the perspective key.  ``perspective`` since 2026-09-09,
+#: when the suite grew to seven perspectives over five levels; ``level`` before
+#: that, when there was exactly one perspective per level.  Both are read, so an
+#: older CSV still plots.
+KEY_COLUMNS = ("perspective", "level")
 
 #: ``(column, axis label, whether high is good)`` per row of the grid.
 SCORES = [
@@ -75,11 +91,17 @@ def read_rows(path: Path) -> list[dict]:
         rows = list(csv.DictReader(fh))
     if not rows:
         raise SystemExit(f"{path} has no rows")
+    key = next((c for c in KEY_COLUMNS if c in rows[0]), None)
+    if key is None:
+        raise SystemExit(
+            f"{path} has no {' or '.join(KEY_COLUMNS)} column; its header is "
+            f"{sorted(rows[0])}")
+    text = {key, "taxonomy"}
     out = []
     for r in rows:
-        rec = {"level": r["level"]}
+        rec = {"level": r[key], "taxonomy": r.get("taxonomy", "")}
         for k, v in r.items():
-            if k == "level":
+            if k in text:
                 continue
             try:
                 rec[k] = float(v) if "." in v or "e" in v.lower() or v in ("nan", "") \
@@ -88,6 +110,18 @@ def read_rows(path: Path) -> list[dict]:
                 rec[k] = float("nan")
         out.append(rec)
     return out
+
+
+def columns_for(rows):
+    """``(key, title)`` per panel: the declared order, then anything unexpected.
+
+    Keeps a figure honest in both directions -- a perspective in :data:`LEVELS`
+    that the CSV lacks still gets its (empty) panel, and a perspective the CSV
+    has that nobody declared is plotted under its bare key rather than dropped.
+    """
+    present = {r["level"] for r in rows}
+    known = {k for k, _ in LEVELS}
+    return list(LEVELS) + [(k, k) for k in sorted(present - known)]
 
 
 def summarise(rows, level, column):
@@ -113,14 +147,20 @@ def summarise(rows, level, column):
 
 def draw(rows, variants, outdir: Path, suffix: str = "") -> Path:
     set_style("two_col_full")
-    fig, axes = plt.subplots(len(SCORES), len(LEVELS),
-                             figsize=(4.0 * len(LEVELS), 3.4 * len(SCORES)),
-                             squeeze=False)
+    cols = columns_for(rows)
+    fig, axes = plt.subplots(len(SCORES), len(cols),
+                             figsize=(2.9 * len(cols), 3.4 * len(SCORES)),
+                             # One y scale per estimator row.  With seven
+                             # columns the question is which perspective sits
+                             # higher, and independent scales would let a level
+                             # that never leaves 0.2 look like one that reaches
+                             # 0.9.
+                             sharey="row", squeeze=False)
     colours = {"A": "#1f77b4", "B": "#d62728"}
     labels = {"A": "variant A (references in the matrix)",
               "B": "variant B (sampled models only)"}
 
-    for col, (level, title) in enumerate(LEVELS):
+    for col, (level, title) in enumerate(cols):
         for row, (score, ylabel, _high_good) in enumerate(SCORES):
             ax = axes[row][col]
             drew = False
@@ -153,7 +193,7 @@ def draw(rows, variants, outdir: Path, suffix: str = "") -> Path:
             ax.set_xscale("log")
             ax.grid(True, which="both", alpha=0.25)
             if row == 0:
-                ax.set_title(title, fontsize=9)
+                ax.set_title(title, fontsize=8)
             if row == len(SCORES) - 1:
                 ax.set_xlabel("models in the group, $n$")
             if col == 0:
@@ -163,7 +203,7 @@ def draw(rows, variants, outdir: Path, suffix: str = "") -> Path:
     if handles:
         fig.legend(handles, labs, loc="lower center", ncol=len(handles),
                    frameon=False, fontsize=8, bbox_to_anchor=(0.5, -0.015))
-    fig.suptitle("Score against group size, at each level's canonical perspective",
+    fig.suptitle("Score against collection size, at each level's standing perspectives",
                  fontsize=11, y=0.995)
     fig.text(0.5, 0.945,
              "Band = interquartile range across replicates, not a confidence "
@@ -184,7 +224,7 @@ def write_summary(rows, variants, outdir: Path) -> Path:
              "`n_disjoint` is how many disjoint groups one shuffle of the pool "
              "yields at that size — the honest ceiling on how independent the "
              "replicates are.", ""]
-    for level, title in LEVELS:
+    for level, title in columns_for(rows):
         got = summarise(rows, level, f"dcor_{variants[0]}")
         if got is None:
             continue
@@ -211,7 +251,7 @@ def write_summary(rows, variants, outdir: Path) -> Path:
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__.split("Usage")[0],
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--outdir", default="figures/simplex3_pool_olmo2_pool",
+    ap.add_argument("--outdir", default=str(Path(__file__).resolve().parent),
                     help="directory holding group_size_scores.csv, and where "
                          "the figure is written")
     ap.add_argument("--csv", default=None,
@@ -228,7 +268,7 @@ def main() -> None:
     csv_path = Path(args.csv) if args.csv else outdir / "group_size_scores.csv"
     if not csv_path.exists():
         raise SystemExit(f"no scores at {csv_path}. Run "
-                         "scripts/sweep_group_size.py first.")
+                         "sweep_group_size.py first.")
     outdir.mkdir(parents=True, exist_ok=True)
     rows = read_rows(csv_path)
     variants = args.variants or ["A", "B"]

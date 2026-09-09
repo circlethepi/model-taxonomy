@@ -35,3 +35,10 @@ experiments/*/*_shard*.yaml
 jobs/*/*_shard*.sh
 
 .history*
+
+# The write-ups and figures under src/interp/measurements/ are tracked -- they
+# are what the interpolation runs found. The safetensors and the gram cache are
+# not: they are large and regenerable. A bare `results` (line 7) does not catch
+# anything under this name, so these have to be spelled out.
+src/interp/measurements/gram_cache/
+src/interp/measurements/**/*.safetensors

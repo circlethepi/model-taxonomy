@@ -793,7 +793,8 @@ def write_extract(
     else:
         qdesc = _qdesc(query)
     token = SUITE.job_token(query)
-    n_shards = SUITE.sweep_shards if level == "sweep" else SUITE.behavioral_shards
+    n_shards = {"sweep": SUITE.sweep_shards,
+                "greedy": SUITE.greedy_shards}.get(level, SUITE.behavioral_shards)
     label = (
         f"simplex3_{level}_{token}"
         + ("" if temperature is None else f"_{temp_token(temperature)}")
@@ -896,9 +897,15 @@ def write_extract(
             f"# This also means greedy lands in its own cache entry and cannot collide\n"
             f"# with the R={REPLICATES} runs over the same adapters and draw.\n"
             f"#\n"
-            f"# One job, unsharded: {SPEC.query_n} queries at batch {GREEDY_BATCH_SIZE} is ~7 generate()\n"
-            f"# calls per adapter against ~50 for the sampled runs, so all 16 adapters\n"
-            f"# finish in well under an hour.\n\n"
+            + (f"# One job, unsharded: {SPEC.query_n} queries at batch {GREEDY_BATCH_SIZE} is ~7 generate()\n"
+               f"# calls per adapter against ~50 for the sampled runs, so all 16 adapters\n"
+               f"# finish in well under an hour.\n\n"
+               if shard is None else
+               f"# {SPEC.query_n} queries at batch {GREEDY_BATCH_SIZE} is ~7 generate() calls per adapter\n"
+               f"# against ~50 for the sampled runs -- but that cheapness does not survive\n"
+               f"# a training grid: ~17.7 s/model (measured on the 1004-adapter pool, job\n"
+               f"# 325767) over {len(SPEC.extract_grid()) * len(proportions())} adapters is ~7 hours against a 1:30 wall, which is\n"
+               f"# how that pool job died. {SUITE.greedy_shards} shards of {len(names)} is ~{round(len(names) * 17.7 / 60)} min each.\n\n")
         )
     else:
         body += (
@@ -1375,6 +1382,12 @@ TRAIN_ADAPTERS_PER_SHARD_BY_N = {
 #: would emit 800 near-identical job files for 1600 adapters.
 NSWEEP_BEHAVIORAL_ADAPTERS_PER_SHARD = 16
 
+#: Greedy sharding for a tree with a training grid.  One continuation per query
+#: rather than sixteen, measured at ~17.7 s/model on the pool, so 90 per shard is
+#: a ~27 min wall -- comfortably inside the 1:30 the greedy jobs already ask for,
+#: and 16 shards rather than the 90 that matching the behavioral cut would emit.
+NSWEEP_GREEDY_ADAPTERS_PER_SHARD = 90
+
 
 def _has_train_grid() -> bool:
     """Whether this spec sweeps the training draw at all."""
@@ -1437,14 +1450,17 @@ def _suite_for_dataset(suite: Suite, dataset: str, suite_name: str,
         # adapter list is missing from disk.
         n_extract = n_adapters * len(SPEC.extract_grid())
         behavioral_shards = -(-n_extract // NSWEEP_BEHAVIORAL_ADAPTERS_PER_SHARD)
+        greedy_shards = -(-n_extract // NSWEEP_GREEDY_ADAPTERS_PER_SHARD)
     else:
         train_shards = -(-n_adapters // TRAIN_ADAPTERS_PER_SHARD)
         behavioral_shards = -(-n_adapters // BEHAVIORAL_ADAPTERS_PER_SHARD)
+        greedy_shards = suite.greedy_shards
     return replace(
         suite,
         job_prefix=prefix,
         train_shards=train_shards,
         behavioral_shards=behavioral_shards,
+        greedy_shards=greedy_shards,
         emit_build_job=False,
         emit_embed_jobs=False,
         emit_embed_matrix_job=False,
@@ -1667,14 +1683,23 @@ def main() -> None:
     #    against ~50 for the sampled runs, so 16 adapters fit comfortably in an hour.
     for q in SUITE.query_sets:
         tok = SUITE.job_token(q)
-        emit(exp / f"greedy_{tok}.yaml", write_extract("greedy", q, None, extracted))
-        emit(jobs / f"08_greedy_{tok}.sh", sbatch(
-            f"{SUITE.job_prefix}_greedy_{tok}", SUITE.gpu_partitions, True,
-            SUITE.extract_mem_gb, SUITE.greedy_time,
-            f"python scripts/run_experiment.py experiments/{tree}/greedy_{tok}.yaml"
-            f" --steps build extract --taxonomy behavioral",
-            logs,
-        ))
+        # `greedy_shards == 1` emits the single unsharded job the four existing
+        # trees already carry, under the name they already carry, so a suite that
+        # never sharded greedy regenerates byte-identical.
+        gshards = ([(None, extracted)] if SUITE.greedy_shards == 1 else
+                   [(i, extracted[i::SUITE.greedy_shards])
+                    for i in range(SUITE.greedy_shards)])
+        for i, shard_names in gshards:
+            stem = f"greedy_{tok}" + ("" if i is None else f"_shard{i}")
+            emit(exp / f"{stem}.yaml", write_extract("greedy", q, i, shard_names))
+            emit(jobs / f"08_{stem}.sh", sbatch(
+                f"{SUITE.job_prefix}_greedy_{tok}" + ("" if i is None else str(i)),
+                SUITE.gpu_partitions, True,
+                SUITE.extract_mem_gb, SUITE.greedy_time,
+                f"python scripts/run_experiment.py experiments/{tree}/{stem}.yaml"
+                f" --steps build extract --taxonomy behavioral",
+                logs,
+            ))
 
     # 9. Input log-probabilities, one unsharded job per query set. Nothing is
     #    decoded, so this is the cheapest GPU job in the suite.

@@ -114,6 +114,15 @@ class Suite:
     train_shards: int = 4
     behavioral_shards: int = 8
 
+    #: Shards for the greedy run.  One -- i.e. unsharded -- for every suite that
+    #: has 16 adapters to decode, which is what "~7 generate() calls per adapter
+    #: against ~50 for the sampled runs" buys.  It stops being true once a tree
+    #: has a training grid: the same ~17.7 s/model over 1440 adapters is ~7
+    #: hours, and the greedy wall is 1:30.  Sharding is the fix rather than a
+    #: longer wall, because greedy shards write to disjoint adapter directories
+    #: and short slots backfill.
+    greedy_shards: int = 1
+
     emit_embed_jobs: bool = True
     #: The ``matrix`` re-embed of the trained draws.  Unlike the sweep above this
     #: defaults on for every suite, because it authors a surrogate that does not

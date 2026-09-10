@@ -168,22 +168,26 @@ class DataSimplexSpec:
     train_sizes: tuple[int, ...] = ()
     train_seeds: tuple[int, ...] = ()
 
-    #: The rungs of ``train_sizes`` that extraction covers.  Empty means "every
-    #: rung", which is what a spec whose whole grid gets trained means and what
-    #: keeps the existing trees byte-identical.  It exists because a rung can be
-    #: *declared* and not *bought*: the N=10000 rung is priced into
+    #: The ``nsamples_train`` values of ``train_sizes`` that extraction covers.
+    #: Empty means "every one", which is what a spec whose whole grid gets trained
+    #: means and what keeps the existing trees byte-identical.  It exists because
+    #: an ``nsamples_train`` can be *declared* and not *bought*: N=10000 is priced
+    #: into
     #: ``train_sizes`` -- and must stay there, since a shard's index is a
-    #: function of its rung's position in that tuple -- but was declined, so its
+    #: function of its ``nsamples_train``'s position in that tuple -- but was
+    #: declined, so its
     #: 160 adapters will never exist.  An extraction config naming them would
     #: point every shard at a missing adapter directory.  Restricting extraction
-    #: rather than training is what lets the declined rung be bought later
+    #: rather than training is what lets the declined ``nsamples_train`` be bought
+    #: later
     #: without renumbering a single training shard.
     extract_sizes: tuple[int, ...] = ()
 
     #: **Budget mode.**  ``None`` keeps the fixed ``total_train_samples`` budget
     #: for every draw, which is what a single-draw spec wants.  An int makes the
     #: budget ``budget_per_sample * n``, i.e. a fixed number of *epochs* rather
-    #: than a fixed number of samples, so every rung of an nsweep sees its own
+    #: than a fixed number of samples, so every ``nsamples_train`` of an nsweep sees
+    #: its own
     #: data the same number of times.  Without this a 10-row draw and a
     #: 10000-row draw would differ in two things at once and neither could be
     #: read as the effect of size.
@@ -380,7 +384,7 @@ class DataSimplexSpec:
 
         ``train_grid`` filtered by ``extract_sizes``; the whole grid when that is
         empty.  Ordered as ``train_grid`` orders it, so the adapter lists the
-        extraction configs carry stay rung-major.
+        extraction configs carry stay ``nsamples_train``-major.
         """
         grid = self.train_grid()
         if not self.extract_sizes:
@@ -389,7 +393,7 @@ class DataSimplexSpec:
         unknown = keep - set(n for n, _ in grid)
         if unknown:
             raise ValueError(
-                f"extract_sizes={self.extract_sizes} names rung(s) "
+                f"extract_sizes={self.extract_sizes} names nsamples_train value(s) "
                 f"{sorted(unknown)} that the training grid does not train."
             )
         return tuple((n, s) for n, s in grid if n in keep)
@@ -598,7 +602,7 @@ YAHOO_POOL = replace(
 #: including the LoRA rank, the init seed, the mixture grid and the 100-query
 #: 33/33/33 test set.
 #:
-#: ``budget_per_sample=5`` is five epochs at every rung.  At ``n=1000`` it
+#: ``budget_per_sample=5`` is five epochs at every ``nsamples_train``.  At ``n=1000`` it
 #: reproduces ``total_train_samples=5000`` exactly, which is not a coincidence
 #: and is load-bearing: the sixteen ``_n1000_s00_r16_i00_b5008`` adapters the
 #: yahoo tree already trained are hit by cache identity, so 624 of the 640 are
@@ -608,7 +612,8 @@ YAHOO_POOL = replace(
 #: ``name_prefix`` stays ``yahoo`` for that reuse; ``suffix`` is what keeps the
 #: *trees* apart, exactly as for ``YAHOO_POOL``.
 #:
-#: ``sweep_sizes`` is the nine bought rungs, so the dataset level has an embedding
+#: ``sweep_sizes`` is the nine bought ``nsamples_train`` values, so the dataset
+#: level has an embedding
 #: of every draw an adapter was trained on.  It is the *embedding* sweep, a
 #: different axis from ``train_sizes`` despite both being sizes -- see the field
 #: comments.  It feeds the corpus build tree, not this model tree, and no shard
@@ -617,23 +622,23 @@ YAHOO_NSWEEP = replace(
     YAHOO,
     suffix="_nsweep",
     # Deliberately NOT sorted.  `train_shard_plan` walks this tuple in order and
-    # cuts shards rung by rung, so a shard's index is a function of the position
-    # of its rung here.  The first four ran first; the six added on 2026-09-08
+    # cuts shards one `nsamples_train` at a time, so a shard's index is a function
+    # of the position of its `nsamples_train` here.  The first four ran first; the six added on 2026-09-08
     # are appended rather than interleaved so that every already-generated and
     # already-submitted shard keeps the number -- and therefore the adapter list
     # -- it was submitted against.  Sorting this tuple would silently renumber
-    # them.  Read it as "the original rungs, then the infill".
+    # them.  Read it as "the original `nsamples_train` values, then the infill".
     train_sizes=(10, 100, 1000, 10000, 20, 50, 200, 500, 2000, 5000),
     train_seeds=tuple(range(10)),
     budget_per_sample=5,
-    # The nine rungs that were bought.  N=10000 stays in `train_sizes` -- removing
+    # The nine `nsamples_train` values that were bought.  N=10000 stays in `train_sizes` -- removing
     # it would renumber every shard after 13 -- but was declined on 2026-09-09, so
     # nothing downstream may name its adapters.
     extract_sizes=(10, 20, 50, 100, 200, 500, 1000, 2000, 5000),
     # One embedded draw per *trained* draw, which is what the dataset level of the
     # figure compares.  Not `tens 3` and not the yahoo sweep: those cover 1/10/100/
-    # 1000 regardless of what was trained, so they miss the six infill rungs
-    # entirely and pay for an n=1 draw nothing reads.  Same nine rungs as
+    # 1000 regardless of what was trained, so they miss the six infill values
+    # entirely and pay for an n=1 draw nothing reads.  Same nine values as
     # `extract_sizes`, for the same reason -- an embedding of a draw no adapter was
     # trained on has no row to sit in.
     sweep_sizes=[10, 20, 50, 100, 200, 500, 1000, 2000, 5000],

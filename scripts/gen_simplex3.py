@@ -138,7 +138,7 @@ def samples_seen(n: int | None = None) -> int:
     be named for a budget it never saw.
 
     *n* is the training draw size, and changes the answer only under a spec in
-    budget mode -- where the budget is a fixed number of epochs, so each rung of
+    budget mode -- where the budget is a fixed number of epochs, so each `nsamples_train` of
     an nsweep carries its own token (``_b64``, ``_b512``, ``_b5008``,
     ``_b50000``).  Omitting it means "this spec's single draw", which is what
     every non-nsweep call site means.
@@ -149,11 +149,11 @@ def samples_seen(n: int | None = None) -> int:
 def train_targets() -> list[tuple[str, int, int]]:
     """Every adapter this tree trains, as ``(proportion name, n_samples, seed)``.
 
-    Ordered rung-major, then by seed, then by proportion, because that is the
+    Ordered `nsamples_train`-major, then by seed, then by proportion, because that is the
     order the shards are cut in: a training shard must be one wall, and the walls
-    differ by ~750x between the smallest and largest rung, so a shard may never
+    differ by ~750x between the smallest and largest `nsamples_train`, so a shard may never
     straddle two values of n.  A contiguous slice of this list is within one
-    rung by construction.
+    `nsamples_train` by construction.
 
     For a spec that never set a training grid this is the 16 proportions at the
     one draw it has always trained, which is the list the generator used to build
@@ -166,10 +166,10 @@ def train_targets() -> list[tuple[str, int, int]]:
 
 
 def extract_targets() -> list[tuple[str, int, int]]:
-    """The adapters extraction runs over -- ``train_targets`` minus the rungs
+    """The adapters extraction runs over -- ``train_targets`` minus the `nsamples_train` values
     ``extract_sizes`` excludes.
 
-    Separate from ``train_targets`` because a declined rung must still be
+    Separate from ``train_targets`` because a declined `nsamples_train` must still be
     trainable later at the shard index it was generated with: the training
     shards keep naming it, and only the extraction configs stop.  For every spec
     that trains its whole grid the two are the same list.
@@ -646,10 +646,10 @@ def write_train(shard: int, targets: list[tuple[str, int, int]]) -> str:
 
     *targets* are ``(proportion name, n_samples, seed)`` triples that all share
     one ``n_samples`` -- the shard planner guarantees it, because a shard is one
-    wall and the rungs differ by ~750x in training time.
+    wall and the `nsamples_train` values differ by ~750x in training time.
 
-    A shard may still span several seeds of that one rung, which is what makes
-    the 80-adapter shards at the cheap rungs possible: ``n_samples_sweep`` and
+    A shard may still span several seeds of that one `nsamples_train`, which is what makes
+    the 80-adapter shards at the cheap `nsamples_train` values possible: ``n_samples_sweep`` and
     ``seeds`` on a dataset block expand to ``{base}_n{n}_s{seed:02d}`` entries
     each carrying their own ``n_samples`` and ``seed``, and the trainer reads
     those per-dataset rather than the ``fine_tuning:`` globals
@@ -665,20 +665,20 @@ def write_train(shard: int, targets: list[tuple[str, int, int]]) -> str:
     budget = SPEC.budget(n)
     n_adapters = len(targets)
     # The single-draw trees must regenerate byte-for-byte, so their header is the
-    # sentence they already carry.  An nsweep shard says which rung it is instead,
+    # sentence they already carry.  An nsweep shard says which `nsamples_train` it is instead,
     # because "only n=1000" would be false of the tree and useless on the shard.
     if SPEC.train_grid() == ((SPEC.train_n, SPEC.train_seed),):
-        rung_note = (
+        size_note = (
             f"# Only n={SPEC.train_n}, seed={SPEC.train_seed} is trained on. "
             f"total_train_samples\n")
     else:
-        rung_note = (
-            f"# Rung n={n}, seed(s) {min(s for v in seeds_for.values() for s in v)}"
+        size_note = (
+            f"# nsamples_train={n}, seed(s) {min(s for v in seeds_for.values() for s in v)}"
             f"-{max(s for v in seeds_for.values() for s in v)}. Five epochs of a "
             f"{n}-row draw, so total_train_samples\n")
     body = HEADER + (
         f"# Training shard {shard} of {SUITE.train_shards}: {n_adapters} adapters.\n"
-        + rung_note +
+        + size_note +
         f"# {budget} quantizes UP to a step boundary at effective batch "
         f"{SUITE.effective_batch}:\n"
         f"# ceil({budget}/{SUITE.effective_batch}) = "
@@ -781,8 +781,8 @@ def write_extract(
     # *names* are ``(proportion, n_samples, seed)`` triples -- every adapter this
     # job extracts from.  For a single-draw tree the triple is the one draw it has
     # always trained and the rendered path is unchanged; for an nsweep the same
-    # list carries all four rungs, because inference does not depend on how much
-    # the adapter was trained on and so is not sharded by rung.
+    # list carries all four `nsamples_train` values, because inference does not depend on how much
+    # the adapter was trained on and so is not sharded by `nsamples_train`.
     qname = query_full_context_name() if query == "full_context" else query_question_only_name()
     if SUITE.prompt_format:
         # Under a chat template with completion-only loss the training prompt IS
@@ -1281,7 +1281,7 @@ SUITES = {
     #: on top of a ~75 GPU-hour experiment that does not use them.
     #:
     #: ``train_time`` is the one addition.  The default 2:00:00 was tuned against
-    #: a 4-adapter ``_b5008`` shard; the N=10000 rung's shard is ~1:04, which does
+    #: a 4-adapter ``_b5008`` shard; the N=10000 `nsamples_train`'s shard is ~1:04, which does
     #: not leave enough headroom under a wall nobody has re-measured.  3:00:00 is
     #: the value the llama suite already carries, so it is precedented rather than
     #: invented, and it is charged only in queue priority.
@@ -1338,11 +1338,11 @@ _SUITE_PREFIXES = {
 TRAIN_ADAPTERS_PER_SHARD = 4
 BEHAVIORAL_ADAPTERS_PER_SHARD = 2
 
-#: Adapters per training shard **by rung**, for a spec that carries a training
+#: Adapters per training shard **by `nsamples_train`**, for a spec that carries a training
 #: grid.  A shard is one wall, and training time is proportional to the budget,
-#: so a single number cannot serve four rungs that span ~750x: at 4 per shard the
-#: cheap rungs would emit 40 near-instant jobs each, and at 80 per shard the
-#: N=10000 rung would need 21 hours.
+#: so a single number cannot serve four `nsamples_train` values that span ~750x: at 4 per shard the
+#: cheap `nsamples_train` values would emit 40 near-instant jobs each, and at 80 per shard the
+#: N=10000 `nsamples_train` would need 21 hours.
 #:
 #: Sized from the 2026-09-08 smoke shards, which measured both ends of the range
 #: rather than extrapolating either: 80 adapters at N=10 in 4:29 (3.4 s each) and
@@ -1370,14 +1370,14 @@ BEHAVIORAL_ADAPTERS_PER_SHARD = 2
 #: 22.8 min/adapter against 16.0 assumed, because the marginal cost per step was
 #: underestimated, not the fixed cost.  4/shard survived only because it had
 #: headroom.  Do not treat a shard size here as safe without a measured wall at
-#: that rung or one above it.
+#: that `nsamples_train` or one above it.
 TRAIN_ADAPTERS_PER_SHARD_BY_N = {
     10: 80, 20: 80, 50: 80, 100: 80, 200: 80,
     500: 40, 1000: 16, 2000: 16, 5000: 8, 10000: 4,
 }
 
 #: Behavioral sharding for a tree with a training grid.  Inference cost does not
-#: depend on the training draw, so this is one number for all ten rungs.  At
+#: depend on the training draw, so this is one number for all ten `nsamples_train` values.  At
 #: ~2.45 min/adapter measured, 16 per shard is a ~40 min wall; the default of 2
 #: would emit 800 near-identical job files for 1600 adapters.
 NSWEEP_BEHAVIORAL_ADAPTERS_PER_SHARD = 16
@@ -1399,7 +1399,7 @@ def train_shard_plan(train_shards: int | None = None) -> list[list[tuple[str, in
 
     Without a training grid the shards are strided over the proportions, which is
     what the existing trees carry and must keep carrying.  With one they are cut
-    **within a rung**: contiguous chunks of ``TRAIN_ADAPTERS_PER_SHARD_BY_N[n]``,
+    **within a `nsamples_train`**: contiguous chunks of ``TRAIN_ADAPTERS_PER_SHARD_BY_N[n]``,
     so no shard ever mixes two budgets and every shard is one wall.
 
     *train_shards* lets a caller pass the count before ``SUITE`` exists, which is
@@ -1411,9 +1411,9 @@ def train_shard_plan(train_shards: int | None = None) -> list[list[tuple[str, in
         return [targets[i::k] for i in range(k)]
     plan: list[list[tuple[str, int, int]]] = []
     for n in SPEC.train_sizes or (SPEC.train_n,):
-        rung = [t for t in targets if t[1] == n]
+        block = [t for t in targets if t[1] == n]
         size = TRAIN_ADAPTERS_PER_SHARD_BY_N.get(n, TRAIN_ADAPTERS_PER_SHARD)
-        plan += [rung[i:i + size] for i in range(0, len(rung), size)]
+        plan += [block[i:i + size] for i in range(0, len(block), size)]
     return plan
 
 
@@ -1441,11 +1441,11 @@ def _suite_for_dataset(suite: Suite, dataset: str, suite_name: str,
             f"{sorted(_SUITE_PREFIXES.values())} nor with s3, s3q, s3li, s3nm, s3o2."
         ) from None
     # With a training grid the adapter count is the grid's, not the simplex's,
-    # and the training shards are cut per rung rather than by one flat divisor.
+    # and the training shards are cut per `nsamples_train` rather than by one flat divisor.
     if _has_train_grid():
         train_shards = len(train_shard_plan())
         # The behavioral shards are cut over the adapters that get EXTRACTED, not
-        # over every adapter the grid declares: a rung excluded from extraction
+        # over every adapter the grid declares: a `nsamples_train` excluded from extraction
         # contributes no work, and counting it would emit shards whose whole
         # adapter list is missing from disk.
         n_extract = n_adapters * len(SPEC.extract_grid())
@@ -1647,7 +1647,7 @@ def main() -> None:
         ))
 
     # 4-7. Extraction, one pair of stages per query set.  Over `extracted`, not
-    # `names`: a rung excluded by `extract_sizes` is trained (or, having been
+    # `names`: a `nsamples_train` excluded by `extract_sizes` is trained (or, having been
     # declined, is not) but never read.
     extracted = extract_targets()
     bshards = [extracted[i::SUITE.behavioral_shards]

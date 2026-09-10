@@ -4,11 +4,12 @@
 **nsweep** -- a sweep over ``n_samples``, the size of the training draw, holding
 everything else fixed.  See ``docs/terminology.md``.
 
-**Rung** -- one value of ``n_samples`` in this sweep, i.e. one of the nine
-training draw sizes.  Note this is *not* the ``rung`` that ``docs/terminology.md``
-retired in favour of ``surrogate``; that one meant a step on the ladder of
-representations a level can be read at.  The two senses share a word and nothing
-else, and the collision is unresolved -- see the note.
+**nsamples_train** -- one value of ``n_samples``, i.e. one of the nine training
+draw sizes this sweep varies.  Named rather than called a "rung" because that
+word already carries two other senses in this project: the retired one
+``docs/terminology.md`` replaced with ``surrogate`` (a step on the ladder of
+representations a level is read at), and the scale ladder of base model sizes
+(the "1B rung", the "12B rung").
 
 The question: how do dCor* and Procrustes agreement, between each taxonomy level
 and the ground-truth mixture simplex, respond to the amount of data an adapter
@@ -123,7 +124,7 @@ def main() -> None:
     ap.add_argument("--perspective", action="append", dest="perspectives",
                     help="repeatable; default is every canonical perspective")
     ap.add_argument("--spec", default="yahoo_nsweep",
-                    help="DataSimplexSpec key naming the mixtures and the rungs")
+                    help="DataSimplexSpec key naming the mixtures and the draw sizes")
     ap.add_argument("--n-expected", type=int, default=16,
                     help="models per slice; a slice of any other size is fatal")
     ap.add_argument("--no-cache", action="store_true")
@@ -157,18 +158,19 @@ def main() -> None:
 
     slices = index.slices(by=("n_samples", "seed"))
 
-    # Only the rungs that were actually bought. `extract_sizes` is the spec's
+    # Only the `nsamples_train` values that were actually bought. `extract_sizes` is the spec's
     # own record of that -- N=10000 stays in `train_sizes`, because a train
-    # shard's index is its rung's position there and renumbering would orphan
+    # shard's index is its `nsamples_train`'s position there and renumbering
+    # would orphan
     # already-submitted shards, but it was declined after the smoke shard, so
     # the cache holds 4 of its 160 adapters. Reading `train_sizes` here would
-    # trip the completeness guard below on a rung nobody paid for.
+    # trip the completeness guard below on a draw size nobody paid for.
     bought = set(spec.extract_sizes or spec.train_sizes)
     dropped = sorted({n for n, _ in slices} - bought)
     slices = {k: v for k, v in slices.items() if k[0] in bought}
-    rungs = sorted({n for n, _ in slices})
-    print(f"{len(slices)} slices over rungs {rungs}"
-          + (f"; dropped unbought rung(s) {dropped}" if dropped else ""),
+    sizes = sorted({n for n, _ in slices})
+    print(f"{len(slices)} slices over nsamples_train {sizes}"
+          + (f"; dropped unbought size(s) {dropped}" if dropped else ""),
           flush=True)
 
     bad = {k: len(v.model_ids) for k, v in slices.items()

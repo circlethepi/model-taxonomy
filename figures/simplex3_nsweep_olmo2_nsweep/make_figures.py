@@ -4,11 +4,12 @@
 **nsweep** -- a sweep over ``n_samples``, the size of the training draw, holding
 everything else fixed.  See ``docs/terminology.md``.
 
-**Rung** -- one value of ``n_samples`` in this sweep, i.e. one of the nine
-training draw sizes.  Note this is *not* the ``rung`` that ``docs/terminology.md``
-retired in favour of ``surrogate``; that one meant a step on the ladder of
-representations a level can be read at.  The two senses share a word and nothing
-else, and the collision is unresolved -- see the note.
+**nsamples_train** -- one value of ``n_samples``, i.e. one of the nine training
+draw sizes this sweep varies.  Named rather than called a "rung" because that
+word already carries two other senses in this project: the retired one
+``docs/terminology.md`` replaced with ``surrogate`` (a step on the ladder of
+representations a level is read at), and the scale ladder of base model sizes
+(the "1B rung", the "12B rung").
 
 Ninety collections: the same 16-point 25% simplex over three yahoo topic groups,
 trained at nine draw sizes x ten dataset seeds on OLMo-2-0425-1B-Instruct.
@@ -26,7 +27,7 @@ curves would read backwards.
 Four things the figure says out loud, each a property of the design rather than
 of the data:
 
-* **The x axis is logarithmic** and the rungs are roughly geometric, so equal
+* **The x axis is logarithmic** and the draw sizes are roughly geometric, so equal
   horizontal steps are equal *ratios* of training data.
 
 * **The band is an interquartile range across the ten dataset seeds**, and here
@@ -47,9 +48,10 @@ of the data:
   10, so the whole draw is one batch and the run is ~4 optimizer steps over a
   single full-batch gradient; it also trains 6.4 epochs rather than 5, because
   the 5N budget rounds up to a step boundary.  The optimizer was held fixed at
-  every rung deliberately -- lowering the batch at small N would have varied the
-  optimizer along the same axis as the data, and a difference between rungs
-  would no longer be attributable to N.  The rung is marked on the axis.
+  every ``nsamples_train`` deliberately -- lowering the batch at small N would
+  have varied the optimizer along the same axis as the data, and a difference
+  between draw sizes would no longer be attributable to N.  It is marked on the
+  axis.
 
 Usage
 -----
@@ -110,7 +112,8 @@ TRUTHS = [
     ("realized", "realized mixture", "#C1553B", "--"),
 ]
 
-#: The rung where the effective batch (16) exceeds the whole draw, so the run is
+#: The ``nsamples_train`` where the effective batch (16) exceeds the whole draw,
+#: so the run is
 #: a handful of steps on one full-batch gradient. Annotated, not dropped.
 DEGENERATE_AT = 10
 
@@ -210,7 +213,7 @@ def main() -> None:
     fig.suptitle(
         "Taxonomy agreement with the mixture simplex vs. training draw size\n"
         "OLMo-2-1B-Instruct · yahoo 3-group 25% simplex · 16 models × 10 seeds "
-        "per rung · band = IQR over seeds",
+        "per draw size · band = IQR over seeds",
         fontsize=8.5)
     fig.tight_layout(rect=(0, 0.035, 1, 0.99))
 

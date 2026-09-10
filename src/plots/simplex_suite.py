@@ -1070,7 +1070,7 @@ def realized_truth_weights(ids, n_samples):
     divides evenly, which is why this has never mattered before: every simplex
     to date trained at n=1000, where a 1% grid is exact. It is the *nsweep* — a
     sweep over the training draw size — that makes the gap real, and it is
-    largest at exactly the rung whose scores are most interesting.
+    largest at exactly the ``nsamples_train`` whose scores are most interesting.
 
     Returns the same ``(n, K)`` array shape as ``truth_weights``, normalized to
     sum to 1 per row, so every downstream consumer is unchanged.
@@ -1103,7 +1103,8 @@ def check_realized_truth(ids, n_samples, tol=1e-12):
     draw grows. Asserting convergence there would fail on the one mixture that
     sits at the centre of every figure.
 
-    What is true at every rung is that largest-remainder allocation is off by at
+    What is true at every ``nsamples_train`` is that largest-remainder allocation
+    is off by at
     most one row per group, so no weight moves by more than ``1/n_samples``. That
     bounds the discretisation for real, holds at n=10 as well as n=10000, and
     fails loudly if the allocator is ever swapped for one without the property.

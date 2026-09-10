@@ -221,12 +221,29 @@ the chosen perspective is the *best* one at its level; it is the one the project
 agreed to read by default, chosen so that a level's number means the same thing
 across runs.
 
+**nsamples_train** — one value of `n_samples`, i.e. one size of the *training*
+draw, as varied by an [nsweep](#nsweep). Named on 2026-09-10, replacing the
+"rung" this axis had been called informally in `docs/notes/nsweep_dataset_size.md`
+since 2026-09-07. The rename is because `rung` was already carrying two unrelated
+senses in this project — see the note directly below — and a third would have
+made the word useless. It reaches code as the `train_sizes` / `extract_sizes`
+tuples on `DataSimplexSpec`, not as a field of its own; the term names the axis,
+not a variable.
+
 **`rung` is retired**, replaced by `surrogate`. This was a unification rather
 than a rename: `surrogate` already meant "a read-time view of a stored artifact,
 computed on demand and written back", the module applying fleet transforms was
 already `src/analysis/surrogates.py`, and the figure suite's own docstring
 section was already headed "Surrogate rungs". The two words were describing one
 thing at two layers.
+
+One live use survives the retirement and is *not* covered by it: the **scale
+ladder** of base model sizes, where `src/models/profiles/olmo2.py` calls itself
+"the 1B rung" and `mistral_nemo.py` "the 12B rung" of a 1B/4B/8B/12B family. That
+is a third sense again — neither a way of reading a level nor a training draw
+size — and it is left alone because it is confined to the model profiles and
+`docs/guides/experiment_suites.md`, where no other ladder is in scope. If it ever
+leaves those files, rename it there rather than reviving `rung` generally.
 
 One caveat to keep in mind: the cached `surrogates/{hash}/` in `04`/`05` covers
 view, pooling and normalize, while the *fleet* transform is applied later in

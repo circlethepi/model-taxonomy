@@ -1,9 +1,11 @@
 # Training-draw-size sweep (`nsweep`) — results
 
 **nsweep** — a sweep over `n_samples`, the size of the *training* draw, holding
-the mixture grid, the seeds and every optimizer setting fixed. **Rung** — one
-value of `n_samples`; note this is not the `rung` that `docs/terminology.md`
-retired in favour of `surrogate`.
+the mixture grid, the seeds and every optimizer setting fixed.
+**`nsamples_train`** — one value of `n_samples`, i.e. one of the nine training
+draw sizes this sweep varies. Named rather than called a "rung" because that
+word already means two other things here: the sense `docs/terminology.md`
+retired in favour of `surrogate`, and the base-model scale ladder.
 
 90 collections: the 16-point 25% simplex over three yahoo topic groups, trained
 at nine draw sizes × ten dataset seeds on OLMo-2-0425-1B-Instruct. Scored by
@@ -45,7 +47,7 @@ climb is non-monotonic (0.549 at N=200, dipping to 0.464 at N=500).
 
 **Greedy decoding is the fix, and the gap is large.** The deterministic control
 reaches 0.815 by N=100 and holds 0.83–0.86 thereafter — 0.24–0.39 dCor above
-the sampled row at every rung. The two differ by *nothing but decoding*: same
+the sampled row at every draw size. The two differ by *nothing but decoding*: same
 draw, same queries, same embedder, same pooling. So the sampled behavioral row
 is sampling-noise-limited, not perspective-limited.
 
@@ -62,7 +64,8 @@ N-effect being measured. **The requested/realized distinction can be dropped
 from future figures** — the second scoring is nearly free, but it answers a
 question whose answer is now known.
 
-`check_realized_truth` passed at every rung; the worst weight deviation is
+`check_realized_truth` passed at every `nsamples_train`; the worst weight
+deviation is
 exactly 2/3 of the `1/N` bound at each (0.0667 at N=10 → 0.000133 at N=5000).
 
 ## Open
@@ -73,5 +76,5 @@ down to 0.083 at N=200, back up to 0.295 at N=5000, while dCor stays flat at
 about direction is worth a look before this panel is used for a claim; the MDS
 fit is the likeliest suspect.
 
-**N=10000 was declined** and is not on any curve. Every rung here is 160
-adapters; that one holds 4.
+**N=10000 was declined** and is not on any curve. Every `nsamples_train` here is
+160 adapters; that one holds 4.

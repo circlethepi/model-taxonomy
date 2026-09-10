@@ -1993,13 +1993,7 @@ TRAIN=${{TRAIN#:}}
 # Extraction depends only on training, so every extraction job is eligible at
 # once and the queue orders them.
 {_submit_extract()}
-# Greedy: the deterministic control, one job per query set. Its own cache entries
-# (GREEDY_SAMPLING nulls the sampling fields), so it cannot collide with the
-# R={REPLICATES} runs over the same adapters and draw.
-for q in {' '.join(SUITE.job_token(q) for q in SUITE.query_sets)}; do
-  J=$(sb --dependency=afterok:$TRAIN 08_greedy_$q.sh)
-  echo "greedy  $q     $J"
-done
+{_submit_greedy()}
 {_submit_logprob()}
 echo
 echo "Submitted. Watch with: squeue -u $USER -o '%.10i %.14j %.9P %.2t %.10M %R'"
@@ -2095,6 +2089,46 @@ def _submit_logprob() -> str:
 
 def _train_dep() -> str:
     return ":$BUILD" if SUITE.emit_build_job else ""
+
+
+def _submit_greedy() -> str:
+    """The greedy stanza, sharded or not.
+
+    ``greedy_shards == 1`` reproduces the single-job loop the suites that have
+    already run were generated with, byte for byte.  A suite that shards greedy
+    gets one submission per shard instead.
+
+    This exists because the emitter and the submitter disagreed.  ``dd70b48``
+    taught :func:`write_extract` to cut greedy into ``greedy_shards`` files but
+    left this stanza naming the unsharded ``08_greedy_{tok}.sh``, so a sharded
+    tree wrote sixteen ``_shard{i}`` scripts and then submitted a seventeenth
+    name that does not exist -- ``submit_all.sh`` died on the first greedy line.
+    The nsweep tree is the only sharded one today, and its greedy pass was
+    submitted by hand, which is why the mismatch survived a full run.
+    """
+    toks = " ".join(SUITE.job_token(q) for q in SUITE.query_sets)
+    if SUITE.greedy_shards == 1:
+        return (
+            "# Greedy: the deterministic control, one job per query set. Its own cache entries\n"
+            "# (GREEDY_SAMPLING nulls the sampling fields), so it cannot collide with the\n"
+            f"# R={REPLICATES} runs over the same adapters and draw.\n"
+            f"for q in {toks}; do\n"
+            "  J=$(sb --dependency=afterok:$TRAIN 08_greedy_$q.sh)\n"
+            '  echo "greedy  $q     $J"\n'
+            "done"
+        )
+    idx = " ".join(str(i) for i in range(SUITE.greedy_shards))
+    return (
+        f"# Greedy: the deterministic control, {SUITE.greedy_shards} shards per query set. Its own\n"
+        "# cache entries (GREEDY_SAMPLING nulls the sampling fields), so it cannot collide\n"
+        f"# with the R={REPLICATES} runs over the same adapters and draw.\n"
+        f"for q in {toks}; do\n"
+        f"  for i in {idx}; do\n"
+        "    J=$(sb --dependency=afterok:$TRAIN 08_greedy_${q}_shard$i.sh)\n"
+        '    echo "greedy  $q $i   $J"\n'
+        "  done\n"
+        "done"
+    )
 
 
 def _submit_extract() -> str:

@@ -286,6 +286,31 @@ def canonical_perspectives() -> dict[str, dict]:
                 "renormalize": True,
             },
         },
+        # The deterministic control for the row above, and the *only* pair in
+        # this suite that differs by nothing but decoding: same draw, same
+        # queries, same embedder, same pooling.  It is here because the sampled
+        # row is noise-limited rather than perspective-limited, and that claim
+        # is only legible next to a run with no sampling noise in it at all.
+        #
+        # `replicates` MUST be 1: BehavioralTaxonomy refuses R > 1 under
+        # ``do_sample: false`` rather than storing R copies of one greedy
+        # continuation.  ``replicate_reduction`` is then a no-op, kept only so
+        # the selector reads the same shape as its sibling.  Greedy nulls
+        # temperature/top_p/top_k in its sampling hash, so it lands in its own
+        # cache entry and cannot collide with the R=16 rows over the same draw.
+        "behavioral_greedy": {
+            "taxonomy": "behavioral",
+            "label": "Behavioral (greedy)\nR=1 deterministic · cosine",
+            "metric": "cosine",
+            "behavioral_selector": {
+                "draw": suite.DRAW, "max_new_tokens": suite.MAX_NEW_TOKENS,
+                "replicates": 1, "sampling_hash": suite.SAMP_GREEDY,
+                "embedder_hash": suite.EMBEDDER,
+                "replicate_reduction": "mean", "view": "matrix",
+                "normalize": "none", "representation": "matrix",
+                "renormalize": True,
+            },
+        },
     }
 
 

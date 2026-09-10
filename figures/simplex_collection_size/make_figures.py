@@ -82,7 +82,15 @@ LEVELS = [
     ("functional_all", "Functional (a)\nall hidden states"),
     ("functional_last", "Functional (b)\nfinal hidden state"),
     ("behavioral", "Behavioral\nR=16 per query"),
+    ("behavioral_greedy", "Behavioral (greedy)\nR=1 deterministic"),
 ]
+
+#: Panels that differ from their neighbour by **decoding alone** -- same draw,
+#: same queries, same embedder, same pooling -- and so are the one pair in this
+#: figure that may be read against each other directly.  Drawn with a divider to
+#: their left so the eye does not group the greedy panel with the six
+#: perspectives that have nothing to do with generation.
+DECODING_PAIR = ("behavioral", "behavioral_greedy")
 
 #: Column heading for the perspective key.  ``perspective`` since 2026-09-09,
 #: when the suite grew to seven perspectives over five levels; ``level`` before
@@ -241,6 +249,24 @@ def draw(rows, variants, outdir: Path, suffix: str = "") -> Path:
              "deflation dominates.",
              ha="center", va="top", fontsize=7, color="0.35", linespacing=1.5)
     fig.tight_layout(rect=(0, 0.03, 1, 0.905))
+
+    # The decoding pair, marked only if both its panels are actually present:
+    # a divider promising a comparison that one half of is missing would be
+    # worse than no divider at all.
+    keys = [k for k, _ in cols]
+    if all(k in keys for k in DECODING_PAIR):
+        j = keys.index(DECODING_PAIR[1])
+        left = axes[0][j - 1].get_position()
+        right = axes[0][j].get_position()
+        x = (left.x1 + right.x0) / 2
+        bottom = axes[-1][j].get_position().y0
+        top = axes[0][j].get_position().y1
+        fig.add_artist(plt.Line2D([x, x], [bottom, top + 0.035],
+                                  color="0.55", lw=0.9, ls=(0, (4, 3)),
+                                  transform=fig.transFigure))
+        fig.text(x, top + 0.045, "same draw, decoding only",
+                 ha="center", va="bottom", fontsize=6.5, color="0.45")
+
     return save_figure(fig, outdir / f"fig_collection_size{suffix}.png")
 
 

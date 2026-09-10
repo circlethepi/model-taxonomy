@@ -35,3 +35,7 @@ experiments/*/*_shard*.yaml
 jobs/*/*_shard*.sh
 **shard**.sh
 figures/simplex_collection_size/.fanout/
+
+# Generated greedy shard configs for figures/simplex_collection_size;
+# regenerate with figures/simplex_collection_size/make_greedy_shards.py
+experiments/simplex_collection_size_greedy/

@@ -40,20 +40,10 @@
     "prompt_format_id": "ea27ccee"
   },
   "perspectives": {
-    "behavioral": {
-      "taxonomy": "behavioral",
-      "metric": "cosine",
-      "label": "Behavioral \u00b7 R=16 per query \u00b7 cosine"
-    },
     "dataset_embedding": {
       "taxonomy": "dataset_embedding",
       "metric": "euclidean",
       "label": "Dataset embedding \u00b7 mean \u00b7 euclidean"
-    },
-    "functional_last": {
-      "taxonomy": "functional",
-      "metric": "cosine",
-      "label": "Functional (b) \u00b7 h16 \u00b7 final state \u00b7 cosine"
     },
     "structural_all_o": {
       "taxonomy": "structural",
@@ -69,6 +59,21 @@
       "taxonomy": "structural",
       "metric": "cosine",
       "label": "Structural (c) \u00b7 layer 15 \u00b7 o_proj \u00b7 cosine"
+    },
+    "functional_all": {
+      "taxonomy": "functional",
+      "metric": "cosine",
+      "label": "Functional (a) \u00b7 all 17 states \u00b7 cosine"
+    },
+    "functional_last": {
+      "taxonomy": "functional",
+      "metric": "cosine",
+      "label": "Functional (b) \u00b7 h16 \u00b7 final state \u00b7 cosine"
+    },
+    "behavioral": {
+      "taxonomy": "behavioral",
+      "metric": "cosine",
+      "label": "Behavioral \u00b7 R=16 per query \u00b7 cosine"
     }
   },
   "pool": [
@@ -1075,6 +1080,5 @@
     "yahoo_000g1_002g2_098g3",
     "yahoo_000g1_001g2_099g3",
     "yahoo_000g1_000g2_100g3"
-  ],
-  "partial": "missing: functional_all"
+  ]
 }

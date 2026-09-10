@@ -47,3 +47,7 @@ experiments/simplex_collection_size_greedy/
 # rules above would leave the drivers tracked; these ignore the directories.
 experiments/simplex3_nsweep_*/
 jobs/simplex3_nsweep_*/
+
+# Run logs from the nsweep scoring sweep. The CSV it writes is the artifact;
+# these are just the per-slice progress lines.
+figures/simplex3_nsweep_olmo2_nsweep/logs/

@@ -118,7 +118,9 @@ assembled from do not agree on either by default, because each was written for a
 figure it was the whole of, and side by side in one frame that difference reads
 as emphasis rather than as provenance. The single exception is the vertex and
 centre labels annotated *inside* the MDS panels, which take one step down (see
-:data:`POINT_LABEL_SIZE`) because they sit among the points they name.
+:data:`POINT_LABEL_SIZE`) because they sit among the points they name, and the
+mixture key's sixteen labels, which are smaller again (see
+:data:`KEY_LABEL_SIZE`) because sixteen of them share one triangle.
 
 Usage
 -----
@@ -234,6 +236,14 @@ POINT_LABEL_SIZE = FONT_SIZE - 2
 
 #: The names of the two axes every top-row panel is drawn in.
 MDS_AXES = ("MDS 1", "MDS 2")
+
+#: The mixture key's sixteen labels, which are the one thing in the figure that
+#: cannot be set at :data:`FONT_SIZE`. They name every sampled point on a
+#: triangle the width of one panel, so at 13 pt ``75/0/25`` runs into
+#: ``75/25/0`` and the bottom row of five is a single smear. The key is a dense
+#: legend rather than a panel, and this is the size at which it is readable as
+#: one. The three vertex *names* are unaffected and stay at FONT_SIZE.
+KEY_LABEL_SIZE = 8
 
 
 # ── The four levels, in every form the nine panels need them ──────────────────
@@ -399,7 +409,8 @@ def draw_top_row(fig, gs, levels: list[Level], cells, ids) -> None:
     kax = fig.add_subplot(gs[0, 0])
     ternary_legend(kax, ids, label_models=True,
                    vertex_names=group_display(3), show_topics=False,
-                   label_size=FONT_SIZE, vertex_size=FONT_SIZE, marker_size=34,
+                   label_size=KEY_LABEL_SIZE, vertex_size=FONT_SIZE,
+                   marker_size=34,
                    fontweight="bold", fontfamily=bold_capable_family())
     for k, label in enumerate(PANEL_ORDER):
         ax = crosslevel_panel(fig.add_subplot(gs[0, k + 1]), by_label[label].label,

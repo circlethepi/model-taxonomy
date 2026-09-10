@@ -756,6 +756,87 @@ def mds_grid(
 
 # ── Cross-taxonomy panel ──────────────────────────────────────────────────────
 
+def crosslevel_panel(
+    ax: plt.Axes,
+    name: str,
+    dm,
+    dcor: float | None = None,
+    procrustes: float | None = None,
+    anchors: Mapping[str, str] = ANCHORS,
+    marker_size: int = 130,
+    random_state: int = 0,
+    label_points: Sequence[str] = VERTEX_LABELS + (CENTRE_LABEL,),
+    title_size: float | None = None,
+) -> plt.Axes:
+    """One cross-level MDS panel, drawn into *ax*.
+
+    Lifted out of :func:`crosslevel_mds` so a figure that owns its own layout —
+    the aggregate in ``figures/figure2`` puts this row above four score panels —
+    can draw the same panel without inheriting that function's one-row figure.
+    Everything about the panel is unchanged by the move: the same MDS fit under
+    *random_state*, the same :func:`align_to_simplex` frame, the same symmetric
+    1:1 limits, and the same four annotated points.
+
+    *dcor* is what makes the title a score line. With it (and optionally
+    *procrustes*) the title is the level name above ``dCor … · stress …``,
+    exactly as the suite writes it. Left at ``None`` the title is *name* alone,
+    which is the aggregate figure's convention: there the panel is a column of a
+    larger figure and the numbers it would otherwise carry are in the score
+    panels underneath it.
+    """
+    from src.analysis.bridge import fit_geometry
+    from src.analysis.quality import kruskal_stress
+    from src.plots.config import bold_capable_family
+
+    family = bold_capable_family()
+    bold = {"fontweight": "bold", "fontfamily": family}
+    keep = set(label_points)
+
+    geo = fit_geometry(dm, "mds", 2, random_state=random_state)
+    xy = align_to_simplex(geo.coordinates, geo.model_ids)
+
+    ax.axhline(0.0, color="0.88", lw=1.0, zorder=0)
+    ax.axvline(0.0, color="0.88", lw=1.0, zorder=0)
+    ax.scatter(xy[:, 0], xy[:, 1], c=model_colors(geo.model_ids, anchors),
+               s=marker_size, zorder=3, edgecolors="0.2", linewidths=1.0)
+
+    for (x, y), mid in zip(xy, geo.model_ids):
+        label = mixture_label(mid)
+        if label in keep:
+            ax.annotate(label, xy=(x, y), xytext=(0, 11),
+                        textcoords="offset points", ha="center",
+                        fontsize=9, color="0.1", zorder=4, **bold)
+
+    # Three scores do not fit on one line of a 3.5" panel — at 13 pt they
+    # run past the axes and collide with the neighbouring panel's title. So
+    # the third one wraps, and the whole block drops a point. The two-score
+    # form is left exactly as it was, on one line at 13 pt.
+    if dcor is None:
+        title, size = name, 13
+    elif procrustes is None:
+        stress = kruskal_stress(dm, geo)
+        title = f"{name}\ndCor {dcor:.3f}  ·  stress {stress:.3f}"
+        size = 13
+    else:
+        stress = kruskal_stress(dm, geo)
+        title = (f"{name}\ndCor {dcor:.3f}  ·  Procrustes {procrustes:.3f}"
+                 f"\nstress {stress:.3f}")
+        size = 12
+    ax.set_title(title, fontsize=title_size or size, pad=10, **bold)
+
+    # Symmetric about the origin, which the frame has already made the
+    # centre mixture, so 1:1 scaling does not push the layout off-centre.
+    r = float(np.abs(xy).max()) * 1.28
+    ax.set_xlim(-r, r)
+    ax.set_ylim(-r, r)
+    ax.set_aspect("equal", adjustable="box")
+    ax.tick_params(labelsize=8.5)
+    for lbl in ax.get_xticklabels() + ax.get_yticklabels():
+        lbl.set_fontweight("bold")
+        lbl.set_fontfamily(family)
+    return ax
+
+
 def crosslevel_mds(
     panels: Sequence[tuple[str, object, float] | tuple[str, object, float, float]],
     title: str,
@@ -805,8 +886,6 @@ def crosslevel_mds(
     shared limit would render three of the four as a dot at the origin. What is
     comparable across panels is the arrangement, not the size.
     """
-    from src.analysis.bridge import fit_geometry
-    from src.analysis.quality import kruskal_stress
     from src.plots.config import bold_capable_family
 
     # Libre Franklin is registered at a single weight (Thin), so `fontweight`
@@ -841,50 +920,15 @@ def crosslevel_mds(
                        fontweight="bold", fontfamily=family)
         lax.set_title("Mixture key", fontsize=13, pad=10, **bold)
 
-    keep = set(label_points)
     for k, panel in enumerate(panels):
         name, dm, dcor = panel[:3]
         procrustes = panel[3] if len(panel) > 3 else None
-        ax = fig.add_subplot(gs[0, k + (1 if with_key else 0)])
-        geo = fit_geometry(dm, "mds", 2, random_state=random_state)
-        xy = align_to_simplex(geo.coordinates, geo.model_ids)
-
-        ax.axhline(0.0, color="0.88", lw=1.0, zorder=0)
-        ax.axvline(0.0, color="0.88", lw=1.0, zorder=0)
-        ax.scatter(xy[:, 0], xy[:, 1], c=model_colors(geo.model_ids, anchors),
-                   s=marker_size, zorder=3, edgecolors="0.2", linewidths=1.0)
-
-        for (x, y), mid in zip(xy, geo.model_ids):
-            label = mixture_label(mid)
-            if label in keep:
-                ax.annotate(label, xy=(x, y), xytext=(0, 11),
-                            textcoords="offset points", ha="center",
-                            fontsize=9, color="0.1", zorder=4, **bold)
-
-        # Three scores do not fit on one line of a 3.5" panel — at 13 pt they
-        # run past the axes and collide with the neighbouring panel's title. So
-        # the third one wraps, and the whole block drops a point. The two-score
-        # form is left exactly as it was, on one line at 13 pt.
-        stress = kruskal_stress(dm, geo)
-        if procrustes is None:
-            scores = f"dCor {dcor:.3f}  ·  stress {stress:.3f}"
-            size = 13
-        else:
-            scores = (f"dCor {dcor:.3f}  ·  Procrustes {procrustes:.3f}"
-                      f"\nstress {stress:.3f}")
-            size = 12
-        ax.set_title(f"{name}\n{scores}", fontsize=size, pad=10, **bold)
-
-        # Symmetric about the origin, which the frame has already made the
-        # centre mixture, so 1:1 scaling does not push the layout off-centre.
-        r = float(np.abs(xy).max()) * 1.28
-        ax.set_xlim(-r, r)
-        ax.set_ylim(-r, r)
-        ax.set_aspect("equal", adjustable="box")
-        ax.tick_params(labelsize=8.5)
-        for lbl in ax.get_xticklabels() + ax.get_yticklabels():
-            lbl.set_fontweight("bold")
-            lbl.set_fontfamily(family)
+        crosslevel_panel(
+            fig.add_subplot(gs[0, k + (1 if with_key else 0)]),
+            name, dm, dcor=dcor, procrustes=procrustes, anchors=anchors,
+            marker_size=marker_size, random_state=random_state,
+            label_points=label_points,
+        )
 
     fig.suptitle(
         title + (f"\n{subtitle}" if subtitle else ""),

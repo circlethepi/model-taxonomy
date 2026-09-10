@@ -1834,7 +1834,8 @@ def run_suite(*, base_model, draw, outdir, cache_root=None, levels=None,
               skip_sweep=False, skip_detail=False, surrogates=False,
               no_cache=False, select=None, source=None, n_expected=16,
               crosslevel_only=False, datasets=None, embedder=None,
-              dataset_embedder=None, train_draw=None, mixtures=None):
+              dataset_embedder=None, train_draw=None, mixtures=None,
+              closer=True):
     """Build the figure suite for one run.
 
     This is the old ``main()`` body with the argument parsing lifted out, so the
@@ -1883,6 +1884,15 @@ def run_suite(*, base_model, draw, outdir, cache_root=None, levels=None,
     ``crosslevel_agreement.md`` and ``crosslevel_scores.csv`` rank exactly what
     they would in a full run. Use it for a suite that exists to be compared with
     others rather than read on its own.
+
+    *closer* turns the cross-level closer itself off. Together with
+    ``crosslevel_only=True`` that is a call which writes no figure and no table
+    at all, which is what a caller wanting only the computed matrices needs:
+    :func:`run_suite` returns ``(per_level, ids)``, so
+    ``figures/figure2/make_figures.py`` draws the four MDS panels into its own
+    layout rather than re-deriving the cells or reading a picture back off
+    disk. Every perspective is still built, scored and cached; it is the
+    writing that stops.
 
     *mixtures* restricts the scan further, to an explicit list of mixture
     labels (``CacheEntry.mixture``, e.g. ``"yahoo_025g1_050g2_025g3"``). It is
@@ -2110,7 +2120,7 @@ def run_suite(*, base_model, draw, outdir, cache_root=None, levels=None,
                             detail_title)
             per_level["dataset_embedding"] = cells
 
-    if len(per_level) > 1:
+    if len(per_level) > 1 and closer:
         print("cross-level …")
         cross_level(per_level, ids, outdir)
         # The same comparison with the dataset level read under cosine instead of
@@ -2131,3 +2141,4 @@ def run_suite(*, base_model, draw, outdir, cache_root=None, levels=None,
     n = len(list(outdir.glob("*.png")))
     print(f"\nwrote {n} figures to {outdir}")
     print(SUITE_CACHE.report())
+    return per_level, ids

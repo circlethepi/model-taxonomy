@@ -123,6 +123,16 @@ datasets.
 **Slice** — a sub-collection grouped by named fields, usually `(n_samples,
 seed)`, from `CacheIndex.slices()`. The unit a taxonomy comparison runs over.
 
+**nsweep** — a sweep over `n_samples`, the size of the *training* draw, holding
+the mixture grid, the seeds and every optimizer setting fixed. The word predates
+the simplex work: `results/yahoo_topics_mean_cosine_10seeds_nsweep` and
+`experiments/archive/yahoo_topics_mean_cosine_{3,10}seeds_nsweep.yaml` are a
+two-vertex, dataset-level-only version of the same axis. The trap is that a
+training nsweep is not the same object as the *embedding* sweep already spelled
+`n_samples_sweep:` in every emitted build config — that one varies the draw a
+dataset representation is computed over, and exists at every `n` regardless of
+what was trained. See `docs/notes/nsweep_dataset_size.md`.
+
 **Prompt format** — an optional `_f{fmt}` suffix on a draw directory, recording
 which chat template was applied. Deliberately kept out of `recipe_hash`, which
 would otherwise change the identity of every cached draw at once.

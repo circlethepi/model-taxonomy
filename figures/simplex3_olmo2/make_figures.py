@@ -62,6 +62,7 @@ REPO_ROOT = HERE.parents[1]
 sys.path.insert(0, str(REPO_ROOT))
 
 from src.plots import simplex_suite as suite  # noqa: E402
+from src.experiments.data_simplex_spec import SPECS  # noqa: E402
 
 BASE_MODEL = "allenai/OLMo-2-0425-1B-Instruct"
 
@@ -72,24 +73,14 @@ BASE_MODEL = "allenai/OLMo-2-0425-1B-Instruct"
 #: corpora and `n_expected` would trip.
 DATASETS = ["yahoo"]
 
-#: The sixteen mixtures this suite is about: the quarter-step grid over three
-#: groups plus the 1/3-1/3-1/3 centroid. Not optional any more, and for the same
-#: reason DATASETS is not: the group-size sweep trained 999 further yahoo
-#: mixtures on this same base model at a one-percent resolution, so an
-#: unfiltered scan of `03_adapters/allenai--OLMo-2-0425-1B-Instruct` returns
-#: 1015 models and `n_expected` trips. A corpus filter cannot separate them --
-#: both pools are yahoo -- so the mixtures are named. The other three yahoo
-#: suites need no such list; no second experiment shares their base model.
-MIXTURES = [
-    "yahoo_000g1_000g2_100g3", "yahoo_000g1_025g2_075g3",
-    "yahoo_000g1_050g2_050g3", "yahoo_000g1_075g2_025g3",
-    "yahoo_000g1_100g2_000g3", "yahoo_025g1_000g2_075g3",
-    "yahoo_025g1_025g2_050g3", "yahoo_025g1_050g2_025g3",
-    "yahoo_025g1_075g2_000g3", "yahoo_033g1_033g2_033g3",
-    "yahoo_050g1_000g2_050g3", "yahoo_050g1_025g2_025g3",
-    "yahoo_050g1_050g2_000g3", "yahoo_075g1_000g2_025g3",
-    "yahoo_075g1_025g2_000g3", "yahoo_100g1_000g2_000g3",
-]
+#: Which mixtures this driver plots. `datasets` is no longer enough on its own:
+#: the 1004-adapter group-size pool is also yahoo, also on this base model, and
+#: also trained at (n_samples=1000, seed=0), so a scan filtered only by corpus
+#: returns 1020 models and `n_expected` trips. It is drawn from the 1% grid while
+#: this figure's simplex is the 25% grid plus the centre, so the mixture is the
+#: only thing that separates them. Taken from the spec rather than written out,
+#: so the figure cannot drift from the tree that produced it.
+MIXTURES = SPECS["yahoo"].mixture_pcts()
 
 
 #: Decoder layers, from the checkpoint's own config. Uniform softmax attention,

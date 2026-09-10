@@ -115,7 +115,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
 import numpy as np  # noqa: E402
 
-from src.analysis import datasets_present, scan_cache  # noqa: E402
+from src.analysis import CacheIndex, datasets_present, scan_cache  # noqa: E402
 from src.analysis.bridge import as_distance_matrix, fit_geometry  # noqa: E402
 from src.analysis.comparison import (  # noqa: E402
     _distances, _distances_via_pairs, resolve_ordered,
@@ -1055,6 +1055,75 @@ def truth_weights(ids):
     return np.vstack([mixture_weights(m) for m in ids])
 
 
+def realized_truth_weights(ids, n_samples):
+    """The ground truth as the training draw actually realized it.
+
+    ``truth_weights`` parses what a model's name *asked for*. At a small draw
+    that is not what it got: the sampler allocates whole rows by largest
+    remainder, so a requested ``(25, 50, 25)`` at n=10 becomes 2/5/3 rows, i.e.
+    ``(20, 50, 30)`` — a 5-point error on a 25-point grid. Scoring against the
+    requested simplex would charge that discretisation to the taxonomy level, as
+    if the representation had failed to recover a geometry the training data
+    never had.
+
+    The two converge as the draw grows and are identical wherever ``n_samples``
+    divides evenly, which is why this has never mattered before: every simplex
+    to date trained at n=1000, where a 1% grid is exact. It is the *nsweep* — a
+    sweep over the training draw size — that makes the gap real, and it is
+    largest at exactly the rung whose scores are most interesting.
+
+    Returns the same ``(n, K)`` array shape as ``truth_weights``, normalized to
+    sum to 1 per row, so every downstream consumer is unchanged.
+    """
+    from src.datasets.mixed_dataset import _allocate_counts
+
+    ids = list(ids)
+    n_groups(ids)
+    rows = []
+    for m in ids:
+        w = list(mixture_weights(m))
+        counts = _allocate_counts(w, n_samples)
+        total = sum(counts)
+        if total <= 0:
+            raise ValueError(
+                f"Realized mixture for {m!r} at n_samples={n_samples} allocates "
+                f"no rows at all; the draw is too small for {len(w)} groups.")
+        rows.append([c / total for c in counts])
+    return np.vstack(rows)
+
+
+def check_realized_truth(ids, n_samples, tol=1e-12):
+    """Assert the realized mixture is never more than one row off the requested.
+
+    This is the guard on :func:`realized_truth_weights`, and it is deliberately
+    *not* "the two agree at a large draw". They do not, and cannot: the centre of
+    a 3-group simplex is spelled ``033g1_033g2_033g3``, whose parts sum to 99 and
+    normalize to exactly 1/3 each, so it is realizable only when ``n_samples`` is
+    divisible by 3. At n=10000 it is off by one row and stays off however far the
+    draw grows. Asserting convergence there would fail on the one mixture that
+    sits at the centre of every figure.
+
+    What is true at every rung is that largest-remainder allocation is off by at
+    most one row per group, so no weight moves by more than ``1/n_samples``. That
+    bounds the discretisation for real, holds at n=10 as well as n=10000, and
+    fails loudly if the allocator is ever swapped for one without the property.
+
+    Returns the observed maximum deviation, so a caller can log it.
+    """
+    ids = list(ids)
+    delta = np.abs(realized_truth_weights(ids, n_samples) - truth_weights(ids))
+    worst = float(delta.max())
+    bound = 1.0 / n_samples
+    if worst > bound + tol:
+        j, k = np.unravel_index(delta.argmax(), delta.shape)
+        raise AssertionError(
+            f"realized mixture for {ids[j]!r} is off by {worst:.6g} in group "
+            f"{k + 1} at n_samples={n_samples}, above the one-row bound "
+            f"{bound:.6g}. Largest-remainder allocation should never do this; "
+            f"_allocate_counts has changed.")
+    return worst
+
+
 def truth_dm(ids):
     """Pairwise distances on the ground-truth simplex, in *ids* order.
 
@@ -1070,6 +1139,20 @@ def truth_dm(ids):
 def truth_geometry(ids):
     """Where each model sits on the ground-truth simplex — the Procrustes target."""
     return simplex_geometry(truth_weights(ids), list(ids), vertices(ids))
+
+
+def realized_truth_dm(ids, n_samples):
+    """``truth_dm`` against the mixture the draw realized. See
+    :func:`realized_truth_weights`."""
+    return simplex_distance_matrix(
+        realized_truth_weights(ids, n_samples), list(ids), vertices(ids))
+
+
+def realized_truth_geometry(ids, n_samples):
+    """``truth_geometry`` against the mixture the draw realized. See
+    :func:`realized_truth_weights`."""
+    return simplex_geometry(
+        realized_truth_weights(ids, n_samples), list(ids), vertices(ids))
 
 
 # ── Restricting a level to a chosen set of perspectives ───────────────────────
@@ -1750,7 +1833,7 @@ def run_suite(*, base_model, draw, outdir, cache_root=None, levels=None,
               skip_sweep=False, skip_detail=False, surrogates=False,
               no_cache=False, select=None, source=None, n_expected=16,
               crosslevel_only=False, datasets=None, embedder=None,
-              dataset_embedder=None, mixtures=None):
+              dataset_embedder=None, train_draw=None, mixtures=None):
     """Build the figure suite for one run.
 
     This is the old ``main()`` body with the argument parsing lifted out, so the
@@ -1770,6 +1853,27 @@ def run_suite(*, base_model, draw, outdir, cache_root=None, levels=None,
     a Qwen cache holding both yahoo and dolly returns 51 models and the
     ``n_expected`` guard below trips. ``None`` scans everything, which is what
     every driver did before a second corpus existed.
+
+    *train_draw* restricts the scan to one training draw, as an
+    ``(n_samples, seed)`` pair. It is the same kind of guard *datasets* is, one
+    axis further in: ``03_adapters/<base_slug>`` holds every adapter for a base
+    model whatever it was trained on **and however much it was trained on**, so
+    once the nsweep tree lands, a yahoo-filtered scan of the OLMo cache returns
+    656 models rather than 16 and the ``n_expected`` guard trips. ``None`` scans
+    every draw, which is what every driver did before a second training size
+    existed. A driver over a training grid passes one pair per figure — or, more
+    usefully, iterates ``idx.slices(by=("n_samples", "seed"))`` and calls this
+    once per cell, so the guard checks 40 collections of 16 rather than one of
+    640.
+
+    *mixtures* restricts the scan to a named set of mixtures, as raw integer
+    percentage tuples like ``(25, 50, 25)``. It is the filter of last resort, for
+    when nothing coarser separates two experiments: the 16-point 25%-grid simplex
+    and the 1004-point 1%-grid pool share the yahoo corpus, the OLMo base model
+    *and* the ``(n_samples=1000, seed=0)`` training draw, so ``datasets`` and
+    ``train_draw`` both return all 1020 and only the mixture itself tells them
+    apart. Pass ``spec.mixture_pcts`` from the ``DataSimplexSpec`` the figure is
+    about. ``None`` keeps every mixture.
 
     *crosslevel_only* keeps the cross-level closer and drops every other output:
     the per-level grids, the per-metric detail panels, the functional layer sweep
@@ -1853,22 +1957,50 @@ def run_suite(*, base_model, draw, outdir, cache_root=None, levels=None,
     idx = scan_cache(str(CACHE_ROOT), base_model_id=BASE_MODEL,
                      behavioral_draw=DRAW, functional_draw=DRAW,
                      datasets=datasets)
+    if train_draw is not None:
+        n_samples, seed = train_draw
+        idx = idx.filter(n_samples=n_samples, seed=seed)
     if mixtures is not None:
-        idx = idx.filter(mixture=list(mixtures))
+        from src.plots.simplex import raw_mixture_pcts
+        wanted = {tuple(m) for m in mixtures}
+        idx = CacheIndex([e for e in idx.entries
+                          if raw_mixture_pcts(e.model_id) in wanted],
+                         idx.cache_root)
     # The count guard runs before sort_by_mixture, not after: a mixed-corpus
     # scan is the likeliest reason for a wrong count, and sorting would raise on
     # the mixed widths first with a message about weight arrays rather than
     # about the cache.
     if len(idx.model_ids) != n_expected:
         found = datasets_present(idx)
+        draws = sorted({(e.n_samples, e.seed) for e in idx.entries
+                        if e.n_samples is not None})
+        if len(found) > 1:
+            why = ("The cache holds more than one dataset under this base model, "
+                   "which is by design -- pass datasets=[...] to say which one "
+                   "this figure is about.")
+        elif len(draws) > 1:
+            # The nsweep case: one corpus, one base model, several training
+            # draws.  Worth naming separately, because datasets=[...] is the
+            # obvious thing to reach for here and it will not help.
+            why = (f"The cache holds {len(draws)} training draws of this corpus "
+                   f"{draws[:4]}{'...' if len(draws) > 4 else ''}, which is by "
+                   f"design -- pass train_draw=(n_samples, seed) to say which "
+                   f"one this figure is about.")
+        elif len(idx.model_ids) > n_expected:
+            # One corpus, one base model, one draw, still too many: two mixture
+            # grids share all three.  This is the simplex-vs-pool collision, and
+            # neither datasets= nor train_draw= can help with it.
+            why = ("The cache holds more mixtures of this corpus than this "
+                   "figure is about -- a finer mixture grid over the same "
+                   "corpus, base model and training draw is indistinguishable "
+                   "by any of them. Pass mixtures=spec.mixture_pcts to say "
+                   "which grid this figure is about.")
+        else:
+            why = "Cache incomplete?"
         raise SystemExit(
             f"expected {n_expected} models, found {len(idx.model_ids)}"
             + (f" across {len(found)} corpora {found}" if len(found) > 1 else "")
-            + ". "
-            + ("The cache holds more than one dataset under this base model, "
-               "which is by design -- pass datasets=[...] to say which one this "
-               "figure is about."
-               if len(found) > 1 else "Cache incomplete?")
+            + ". " + why
         )
     ids = sort_by_mixture(idx.model_ids)
     names = [Path(m).name for m in ids]

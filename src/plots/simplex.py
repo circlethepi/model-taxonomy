@@ -146,6 +146,28 @@ def mixture_weights(model_id: str) -> tuple[float, ...]:
     return tuple(raw / total)
 
 
+def raw_mixture_pcts(model_id: str) -> tuple[int, ...]:
+    """The mixture in an adapter id as the integers the id spells.
+
+    ``mixture_weights`` normalizes, which is what every geometric use wants and
+    what makes the ``033g1_033g2_033g3`` centre sit at the centre.  Selecting a
+    *set* of mixtures wants the opposite: the integers as written, so that
+    membership is exact rather than a float comparison.
+
+    The two coexist because one 25%-grid simplex and one 1%-grid pool can share a
+    corpus, a base model and a training draw -- which they do, under
+    ``allenai--OLMo-2-0425-1B-Instruct`` -- and then nothing but the mixture
+    itself tells their adapters apart.
+    """
+    m = _MIX_RUN_RE.search(model_id)
+    if m is None:
+        raise ValueError(
+            f"No mixture found in {model_id!r}; "
+            "expected a '_NNNg1_NNNg2_..._NNNgK_' segment."
+        )
+    return tuple(int(p) for p, _ in _MIX_PART_RE.findall(m.group(1)))
+
+
 def n_groups(model_ids: Sequence[str]) -> int:
     """The ``K`` these ids share, raising if they do not share one.
 

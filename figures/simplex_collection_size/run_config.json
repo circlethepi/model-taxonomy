@@ -40,40 +40,10 @@
     "prompt_format_id": "ea27ccee"
   },
   "perspectives": {
-    "dataset_embedding": {
-      "taxonomy": "dataset_embedding",
-      "metric": "euclidean",
-      "label": "Dataset embedding \u00b7 mean \u00b7 euclidean"
-    },
-    "structural_all_o": {
-      "taxonomy": "structural",
-      "metric": "cosine",
-      "label": "Structural (a) \u00b7 all 16 layers \u00b7 o_proj \u00b7 cosine"
-    },
-    "structural_all_qkvo": {
-      "taxonomy": "structural",
-      "metric": "cosine",
-      "label": "Structural (b) \u00b7 all 16 layers \u00b7 q,k,v,o \u00b7 cosine"
-    },
-    "structural_last_o": {
-      "taxonomy": "structural",
-      "metric": "cosine",
-      "label": "Structural (c) \u00b7 layer 15 \u00b7 o_proj \u00b7 cosine"
-    },
-    "functional_all": {
-      "taxonomy": "functional",
-      "metric": "cosine",
-      "label": "Functional (a) \u00b7 all 17 states \u00b7 cosine"
-    },
-    "functional_last": {
-      "taxonomy": "functional",
-      "metric": "cosine",
-      "label": "Functional (b) \u00b7 h16 \u00b7 final state \u00b7 cosine"
-    },
-    "behavioral": {
+    "behavioral_greedy": {
       "taxonomy": "behavioral",
       "metric": "cosine",
-      "label": "Behavioral \u00b7 R=16 per query \u00b7 cosine"
+      "label": "Behavioral (greedy) \u00b7 R=1 deterministic \u00b7 cosine"
     }
   },
   "pool": [

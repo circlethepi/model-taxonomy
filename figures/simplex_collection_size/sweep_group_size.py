@@ -941,6 +941,11 @@ def main() -> None:
     outdir = Path(args.outdir)
     outdir.mkdir(parents=True, exist_ok=True)
     out = outdir / "group_size_scores.csv"
+    #: The variant check is arithmetic on floats, and ``merge_rows`` hands back
+    #: the kept rows as strings from the CSV (see its docstring).  Report on the
+    #: rows this run actually scored: the kept ones were reported when they were
+    #: computed, and re-checking them here would only re-derive that.
+    scored = rows
     n_kept = 0
     if args.append and out.exists():
         rows, n_kept = merge_rows(out, rows)
@@ -973,7 +978,7 @@ def main() -> None:
           + (f" ({n_kept} kept from the previous run)" if args.append else ""))
     print(f"wrote {len(group_rows)} group(s) to {groups}")
     print(f"wrote {outdir / 'run_config.json'}")
-    print(variant_report(rows))
+    print(variant_report(scored))
 
 
 if __name__ == "__main__":

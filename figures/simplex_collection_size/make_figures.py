@@ -96,6 +96,14 @@ SCORES = [
     ("disparity", "Procrustes disparity  (0 = identical shape)", False),
 ]
 
+#: Fixed y limits, per score row.  Procrustes disparity is pinned to its full
+#: ``[0, 1]`` range rather than auto-scaled: the estimator is bounded, so an
+#: autoscaled axis makes a level that never leaves 0.01 fill the panel exactly
+#: like one that reaches 0.5, and the panels stop being comparable to anything
+#: outside this figure.  dCor* is left to autoscale, which on this data already
+#: spans nearly the whole ``[0, 1]``.
+YLIM = {"disparity": (0.0, 1.0)}
+
 
 def read_rows(path: Path) -> list[dict]:
     with path.open() as fh:
@@ -202,6 +210,8 @@ def draw(rows, variants, outdir: Path, suffix: str = "") -> Path:
                 ax.text(0.5, 0.5, "no rows", ha="center", va="center",
                         transform=ax.transAxes, color="0.5")
             ax.set_xscale("log")
+            if score in YLIM:
+                ax.set_ylim(*YLIM[score])
             ax.grid(True, which="both", alpha=0.25)
             if row == 0:
                 ax.set_title(title, fontsize=8)

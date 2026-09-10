@@ -767,6 +767,9 @@ def crosslevel_panel(
     random_state: int = 0,
     label_points: Sequence[str] = VERTEX_LABELS + (CENTRE_LABEL,),
     title_size: float | None = None,
+    font_size: float | None = None,
+    point_label_size: float | None = None,
+    bold: bool = True,
 ) -> plt.Axes:
     """One cross-level MDS panel, drawn into *ax*.
 
@@ -783,14 +786,34 @@ def crosslevel_panel(
     which is the aggregate figure's convention: there the panel is a column of a
     larger figure and the numbers it would otherwise carry are in the score
     panels underneath it.
+
+    *font_size* sets the title, the tick labels and the annotated point labels
+    to one size. The three are otherwise deliberately different — a score line
+    should outrank a tick — which is right for a panel that is a figure in its
+    own right and wrong for one that is a cell of a larger figure whose other
+    panels are typeset at a single size. ``None`` keeps the per-element sizes;
+    *title_size* still names the title alone and wins over this, as
+    *point_label_size* does for the annotated vertex and centre labels — those
+    sit *inside* the axes among the points they name, so they are the one piece
+    of text a panel usually wants a step below everything around it.
+
+    *bold* is on by default, which is what the suite's panels have always been:
+    the title, the four point labels and the tick labels are all set in a
+    family chosen for having a real bold face (see
+    :func:`~src.plots.config.bold_capable_family`). Turn it off for a figure
+    that sets everything in one weight, and the panel follows the configured
+    ``font.family`` at its normal weight like every other axes in that figure —
+    mixing the two faces inside one figure reads as emphasis that is not
+    meant.
     """
     from src.analysis.bridge import fit_geometry
     from src.analysis.quality import kruskal_stress
     from src.plots.config import bold_capable_family
 
-    family = bold_capable_family()
-    bold = {"fontweight": "bold", "fontfamily": family}
+    family = bold_capable_family() if bold else None
+    weight = {"fontweight": "bold", "fontfamily": family} if bold else {}
     keep = set(label_points)
+    label_size = point_label_size or font_size or 9
 
     geo = fit_geometry(dm, "mds", 2, random_state=random_state)
     xy = align_to_simplex(geo.coordinates, geo.model_ids)
@@ -805,7 +828,7 @@ def crosslevel_panel(
         if label in keep:
             ax.annotate(label, xy=(x, y), xytext=(0, 11),
                         textcoords="offset points", ha="center",
-                        fontsize=9, color="0.1", zorder=4, **bold)
+                        fontsize=label_size, color="0.1", zorder=4, **weight)
 
     # Three scores do not fit on one line of a 3.5" panel — at 13 pt they
     # run past the axes and collide with the neighbouring panel's title. So
@@ -822,7 +845,8 @@ def crosslevel_panel(
         title = (f"{name}\ndCor {dcor:.3f}  ·  Procrustes {procrustes:.3f}"
                  f"\nstress {stress:.3f}")
         size = 12
-    ax.set_title(title, fontsize=title_size or size, pad=10, **bold)
+    ax.set_title(title, fontsize=title_size or font_size or size, pad=10,
+                 **weight)
 
     # Symmetric about the origin, which the frame has already made the
     # centre mixture, so 1:1 scaling does not push the layout off-centre.
@@ -830,10 +854,11 @@ def crosslevel_panel(
     ax.set_xlim(-r, r)
     ax.set_ylim(-r, r)
     ax.set_aspect("equal", adjustable="box")
-    ax.tick_params(labelsize=8.5)
-    for lbl in ax.get_xticklabels() + ax.get_yticklabels():
-        lbl.set_fontweight("bold")
-        lbl.set_fontfamily(family)
+    ax.tick_params(labelsize=font_size if font_size is not None else 8.5)
+    if bold:
+        for lbl in ax.get_xticklabels() + ax.get_yticklabels():
+            lbl.set_fontweight("bold")
+            lbl.set_fontfamily(family)
     return ax
 
 

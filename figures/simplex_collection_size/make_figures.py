@@ -96,13 +96,19 @@ SCORES = [
     ("disparity", "Procrustes disparity  (0 = identical shape)", False),
 ]
 
-#: Fixed y limits, per score row.  Procrustes disparity is pinned to its full
-#: ``[0, 1]`` range rather than auto-scaled: the estimator is bounded, so an
-#: autoscaled axis makes a level that never leaves 0.01 fill the panel exactly
-#: like one that reaches 0.5, and the panels stop being comparable to anything
-#: outside this figure.  dCor* is left to autoscale, which on this data already
-#: spans nearly the whole ``[0, 1]``.
-YLIM = {"disparity": (0.0, 1.0)}
+#: Fixed y limits, per score row.  Both estimators are pinned to their full
+#: ``[0, 1]`` range rather than auto-scaled, because both are bounded: an
+#: autoscaled axis makes a level that never leaves 0.01 fill its panel exactly
+#: like one that reaches 0.5, and the panels stop being comparable either to
+#: each other or to any figure outside this one.
+#:
+#: The cost is real and worth stating: dCor* separates the flat perspectives by
+#: ~0.04 (structural (a) at 0.984 against (c) at 0.940), and on a full-range
+#: axis that difference is four percent of the panel height.  It is legible in
+#: ``collection_size_summary.md``, which is the table to read for it.  The
+#: figure's job here is the shape of each curve against ``n`` and the gap
+#: between the levels, and both survive the fixed range.
+YLIM = {"dcor": (0.0, 1.0), "disparity": (0.0, 1.0)}
 
 
 def read_rows(path: Path) -> list[dict]:

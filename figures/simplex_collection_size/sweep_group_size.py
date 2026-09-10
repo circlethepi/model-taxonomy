@@ -83,11 +83,11 @@ Usage
 -----
 ::
 
-    # the whole suite, scores and figures
-    python figures/simplex_collection_size/make_figures.py
+    # the scores: every default here is this suite's pool and grid
+    python figures/simplex_collection_size/sweep_group_size.py --jobs 7
 
-    # scores only
-    python figures/simplex_collection_size/sweep_group_size.py
+    # then the figure, which only reads group_size_scores.csv
+    python figures/simplex_collection_size/make_figures.py
 
     # add a size the first run skipped, keeping every row already on disk
     python figures/simplex_collection_size/sweep_group_size.py \\
@@ -104,6 +104,7 @@ import argparse
 import csv
 import json
 import re
+import shutil
 import sys
 import time
 from pathlib import Path
@@ -124,6 +125,46 @@ from src.plots.simplex import mixture_weights, sort_by_mixture  # noqa: E402
 
 #: This suite's own directory: the default place for its scores and figures.
 HERE = Path(__file__).resolve().parent
+REPO_ROOT = HERE.parents[1]
+
+BASE_MODEL = "allenai/OLMo-2-0425-1B-Instruct"
+
+#: The canonical checkout's cache.  A worktree has no ``results/`` of its own and
+#: ``suite.CACHE_ROOT`` is derived from this module's location, so a run from one
+#: would otherwise resolve to a directory that does not exist.
+CACHE_ROOT = Path("/weka/scratch/jhu/cpriebe1/MO/model-taxonomy/results/shared_cache")
+
+#: The twelve ``figures/simplex3_olmo2`` mixtures that are **not** this pool's
+#: reference models: the quarter-step grid minus the three vertices and the
+#: 33/33/33 centroid.
+#:
+#: They have to be named, because no scan argument separates them from the pool:
+#: that suite trains them on the same checkpoint, the same corpus, the same
+#: recipe and the same draw as the 999.  Four of its sixteen *are* this pool's
+#: references and are kept; a pool that also carried the other twelve would mix
+#: 999 uniform draws with twelve grid points and stop being a uniform sample of
+#: the simplex.  Named rather than derived, so that adding a mixture to that
+#: suite cannot silently add one here.
+SIMPLEX3_EXTRA = [
+    "yahoo_000g1_025g2_075g3", "yahoo_000g1_050g2_050g3",
+    "yahoo_000g1_075g2_025g3", "yahoo_025g1_000g2_075g3",
+    "yahoo_025g1_025g2_050g3", "yahoo_025g1_050g2_025g3",
+    "yahoo_025g1_075g2_000g3", "yahoo_050g1_000g2_050g3",
+    "yahoo_050g1_025g2_025g3", "yahoo_050g1_050g2_000g3",
+    "yahoo_075g1_000g2_025g3", "yahoo_075g1_025g2_000g3",
+]
+
+#: Group sizes.  Roughly geometric, because the ``1/(n(n-3))`` factor in dCor*
+#: and the similarity-transform degeneracy in Procrustes both live on a ratio
+#: scale.  It stops at 500 rather than 1000: the sampled pool is 999 models, so
+#: 1000 is not available at all, and 999 would be a single group -- one
+#: measurement with no spread, drawn a hundred times.  To add it later::
+#:
+#:     python figures/simplex_collection_size/sweep_group_size.py \
+#:         --n-grid 999 --append
+#:
+#: which keeps every row already on disk and appends that size alone.
+DEFAULT_N_GRID = "5,10,20,50,100,200,500"
 
 #: The MDS seed every disparity here is fitted under.  Shared with the figure
 #: suite so a score from this sweep and a score from ``crosslevel_scores.csv``
@@ -668,19 +709,90 @@ def check_matrices(matrices, ids) -> int:
     return 1 if bad else 0
 
 
+def fan_out(argv: list[str], jobs: int, tmp: Path, outdir: Path) -> None:
+    """Score one perspective per process, then merge into one CSV.
+
+    Worth having rather than doing by hand, because the cost here is **MDS, and
+    MDS does not parallelise inside one process**.  At ``n=500`` the pool yields
+    a single disjoint group per shuffle, so the membership memo never hits and
+    every replicate is its own fit: ~1400 fits at 500 points for the whole
+    suite, hours of one core.  Perspectives are completely independent -- they
+    share only the pool matrices, which are read from ``07_collections`` -- so
+    splitting on them is exact rather than approximate.
+
+    The scores are those of a serial run: the groups are a function of the pool
+    and the shuffle seed, not of which process drew them.  Only the row *order*
+    differs, since the merge concatenates one perspective at a time where a
+    serial run interleaves them, and nothing downstream reads row order.  What
+    the merge has to repair is ``run_config.json``, which each process writes
+    listing only the perspective it was given.
+    """
+    import subprocess
+
+    tmp.mkdir(parents=True, exist_ok=True)
+    names = list(canonical_perspectives())
+    running: list[tuple[str, subprocess.Popen]] = []
+
+    def reap(limit: int) -> None:
+        while len(running) >= limit:
+            for i, (nm, p) in enumerate(list(running)):
+                if p.poll() is not None:
+                    running.pop(i)
+                    if p.returncode != 0:
+                        raise SystemExit(
+                            f"{nm} failed with exit {p.returncode}; see "
+                            f"{tmp / nm}.log")
+                    print(f"  done: {nm}", flush=True)
+                    break
+            else:
+                time.sleep(2)
+
+    for nm in names:
+        reap(jobs)
+        (tmp / nm).mkdir(parents=True, exist_ok=True)
+        log = (tmp / f"{nm}.log").open("w")
+        cmd = [sys.executable, str(HERE / "sweep_group_size.py"), *argv,
+               "--jobs", "1", "--outdir", str(tmp / nm), "--perspective", nm]
+        print(f"  start: {nm}", flush=True)
+        running.append((nm, subprocess.Popen(
+            cmd, stdout=log, stderr=subprocess.STDOUT, cwd=REPO_ROOT)))
+    reap(1)
+
+    header, body, config = None, [], None
+    for nm in names:
+        lines = (tmp / nm / "group_size_scores.csv").read_text().splitlines()
+        header = header or lines[0]
+        body += lines[1:]
+        cfg = json.loads((tmp / nm / "run_config.json").read_text())
+        if config is None:
+            config = cfg
+        else:
+            config["perspectives"].update(cfg["perspectives"])
+    outdir.mkdir(parents=True, exist_ok=True)
+    (outdir / "group_size_scores.csv").write_text(
+        "\n".join([header, *body]) + "\n")
+    # Membership does not depend on the perspective, so any process's copy is
+    # the whole record; taking the first is not a shortcut.
+    shutil.copy(tmp / names[0] / "group_members.csv",
+                outdir / "group_members.csv")
+    (outdir / "run_config.json").write_text(json.dumps(config, indent=2) + "\n")
+    print(f"merged {len(body)} row(s) from {len(names)} perspective(s) "
+          f"into {outdir / 'group_size_scores.csv'}")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(
         description=__doc__.split("Usage")[0],
         formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--base-model", default="allenai/OLMo-2-0425-1B-Instruct")
-    ap.add_argument("--cache-root", default=None,
-                    help=f"shared cache root (default: {suite.CACHE_ROOT})")
+    ap.add_argument("--base-model", default=BASE_MODEL)
+    ap.add_argument("--cache-root", default=str(CACHE_ROOT),
+                    help="shared cache root")
     ap.add_argument("--outdir", default=str(HERE))
     ap.add_argument("--perspective", action="append", dest="perspectives",
                     help="restrict to one perspective; repeat for several "
                          "(default: all seven)")
     ap.add_argument("--dataset", action="append", dest="datasets",
-                    default=None,
+                    default=["yahoo"],
                     help="restrict the scan to a corpus, by recipe-name prefix "
                          "or dataset_id; repeat for several")
     ap.add_argument("--train-n", type=int, default=1000,
@@ -689,12 +801,23 @@ def main() -> None:
     ap.add_argument("--train-seed", type=int, default=0,
                     help="keep only adapters at this data seed (-1 disables)")
     ap.add_argument("--exclude-mixture", action="append", dest="exclude",
-                    default=None,
+                    default=list(SIMPLEX3_EXTRA),
                     help="drop a mixture label from the pool; repeat. Use for "
                          "models that share the pool's recipe but were trained "
-                         "for another experiment")
-    ap.add_argument("--n-grid", default="5,10,20,50,100,200,500,1000",
+                         "for another experiment (default: the twelve "
+                         "simplex3_olmo2 grid points that are not this pool's "
+                         "reference models)")
+    ap.add_argument("--keep-simplex3", action="store_true",
+                    help="do not drop the simplex3_olmo2 grid points, i.e. "
+                         "clear the --exclude-mixture default")
+    ap.add_argument("--n-grid", default=DEFAULT_N_GRID,
                     help="comma-separated group sizes")
+    ap.add_argument("--jobs", type=int, default=1,
+                    help="score this many perspectives at once, in separate "
+                         "processes, then merge. Same scores as a serial run; "
+                         "MDS is the cost and does not thread")
+    ap.add_argument("--tmp", default=None,
+                    help="scratch directory for --jobs (default: <outdir>/.fanout)")
     ap.add_argument("--append", action="store_true",
                     help="merge into an existing group_size_scores.csv rather "
                          "than replacing it: rows for a (perspective, n) this "
@@ -716,6 +839,29 @@ def main() -> None:
     ap.add_argument("--draw-seed", type=int, default=suite.DRAW["seed"])
     ap.add_argument("--draw-format-id", default=suite.DRAW["prompt_format_id"])
     args = ap.parse_args()
+    if args.keep_simplex3:
+        args.exclude = None
+
+    if args.jobs > 1 and not args.check_matrices:
+        # Re-dispatch to one process per perspective.  argv is forwarded intact
+        # apart from the flags fan_out sets itself, so every knob keeps meaning
+        # what it means here.
+        drop = {"--jobs", "--outdir", "--perspective", "--tmp"}
+        argv, skip = [], False
+        for tok in sys.argv[1:]:
+            if skip:
+                skip = False
+                continue
+            if tok in drop:
+                skip = True
+                continue
+            if any(tok.startswith(d + "=") for d in drop):
+                continue
+            argv.append(tok)
+        outdir = Path(args.outdir)
+        fan_out(argv, args.jobs,
+                Path(args.tmp) if args.tmp else outdir / ".fanout", outdir)
+        return
 
     cache_root = Path(args.cache_root).expanduser().resolve() \
         if args.cache_root else suite.CACHE_ROOT

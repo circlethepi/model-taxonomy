@@ -1,245 +1,293 @@
 #!/usr/bin/env python
-"""The collection-size suite: how many models a taxonomy score needs.
+"""
+procrustes disparity and dcorr vs number of models in the collection
 
-Every other figure in this project scores a **16-model** collection.  This one
-holds the taxonomy fixed and moves the collection size instead, so that a score
-can be read as "this level recovers the simplex" rather than "this level
-recovers the simplex *at sixteen models*".
+999 models trained on randomly selected mixings of group 1, group 2,
+group 3 for the yahoo Q&A task.
 
-The pool
---------
-999 yahoo mixtures drawn without replacement from the non-vertex points of the
-one-percent grid over three groups, each fine-tuned on OLMo-2-0425-1B-Instruct
-with the same recipe (1000 rows, seed 0, LoRA rank 16), plus the three vertices
-and the 33/33/33 centroid as **reference models** -- 1003 in all.
+this file is purely plotting, all values are read from
+group_size_scores.csv. Scores calculated in sweep_group_size.py.
 
-Two filters make that pool, and neither is optional:
+Reading the figure
+------------------
+The two estimators are on separate rows because they run in **opposite
+directions**: a high dCor* means strong dependence on the ground truth, while a
+Procrustes disparity of **0** means identical shape. On one axis, one of the
+curves would read backwards.
 
-* **The training recipe.**  ``03_adapters/allenai--OLMo-2-0425-1B-Instruct``
-  holds every adapter ever trained on this checkpoint, and the dataset-size
-  sweep trains other row counts there.  ``--train-n 1000 --train-seed 0`` keeps
-  this pool's own recipe.
-* **The simplex3 grid, by name.**  ``figures/simplex3_olmo2`` trains sixteen
-  quarter-step mixtures on the same checkpoint, the same corpus and the same
-  recipe, so no scan argument separates them from the pool.  Four of the sixteen
-  *are* this suite's reference models and are kept; :data:`SIMPLEX3_EXTRA` names
-  the other twelve and they are dropped, because a pool that mixes 999 uniform
-  draws with twelve grid points is no longer a uniform sample of the simplex.
+Three things the figure says out loud, each a property of the design rather
+than of the data:
 
-What is scored
---------------
-The seven standing perspectives, in ``sweep_group_size.canonical_perspectives``:
-the dataset level's mean embedding under euclidean, the structural level at
-three scopes, the functional level at two, and the behavioral level's per-query
-replicate mean -- each against the simplex ground truth under dCor* and
-Procrustes disparity, and each under both reference variants.
-
-Outputs, all in this directory
-------------------------------
-``group_size_scores.csv``   one row per (perspective, n, replicate)
-``group_members.csv``       which models each replicate drew
-``run_config.json``         pool, grid, seeds and perspectives of the run
-``fig_group_size.png``      the figure
-``group_size_summary.md``   the same medians as a table
+* **The x axis is logarithmic** and the grid is roughly geometric, so equal
+  horizontal steps are equal *ratios* of collection size. That is the scale the
+  ``1/(n(n-3))`` factor in dCor* and the similarity-transform degeneracy in
+  Procrustes both live on.
+* **The band is an interquartile range across replicates, not a confidence
+  interval.** Replicates are drawn without replacement from one shared pool, so
+  they overlap in membership and the spread is deflated by construction.
+* **Past ``n_disjoint = 1`` the band is not a measurement at all**: every
+  replicate is the same collection, so the spread is exactly zero. Those points
+  are drawn hollow, with the band dashed from the last size that had at least a
+  handful of disjoint groups, so a reader cannot mistake "no independence left"
+  for "very precise".
 
 Usage
 -----
 ::
 
     python figures/simplex_collection_size/make_figures.py
-    python figures/simplex_collection_size/make_figures.py --plot-only
+    python figures/simplex_collection_size/make_figures.py --variant B
 """
 
 from __future__ import annotations
 
 import argparse
-import json
-import os
-import shutil
-import subprocess
+import csv
 import sys
-import time
+from collections import defaultdict
 from pathlib import Path
 
-# Pinned before numpy loads its BLAS -- see the note in src/plots/simplex_suite.py.
-os.environ.setdefault("MODEL_TAXONOMY_THREADS", "1")
+import numpy as np
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+import matplotlib  # noqa: E402
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt  # noqa: E402
+
+from src.plots.config import set_style  # noqa: E402
+from src.plots.figures import save_figure  # noqa: E402
 
 HERE = Path(__file__).resolve().parent
-REPO_ROOT = HERE.parents[1]
 
-BASE_MODEL = "allenai/OLMo-2-0425-1B-Instruct"
+#: Below this many disjoint groups per shuffle, the replicates share so many
+#: models that their spread describes the pool rather than the sampling.  Four
+#: is a judgement call and is drawn, not hidden: the band goes dashed here.
+DEFLATED_BELOW = 4
 
-#: The canonical checkout's cache.  A worktree has no ``results/`` of its own and
-#: ``suite.CACHE_ROOT`` is derived from the module's location, so a run from one
-#: would otherwise resolve to a directory that does not exist.
-CACHE_ROOT = Path("/weka/scratch/jhu/cpriebe1/MO/model-taxonomy/results/shared_cache")
-
-#: The twelve ``figures/simplex3_olmo2`` mixtures that are **not** this pool's
-#: reference models: the quarter-step grid minus the three vertices and the
-#: centroid.  Named rather than derived so that adding a mixture to that suite
-#: cannot silently add one here.
-SIMPLEX3_EXTRA = [
-    "yahoo_000g1_025g2_075g3", "yahoo_000g1_050g2_050g3",
-    "yahoo_000g1_075g2_025g3", "yahoo_025g1_000g2_075g3",
-    "yahoo_025g1_025g2_050g3", "yahoo_025g1_050g2_025g3",
-    "yahoo_025g1_075g2_000g3", "yahoo_050g1_000g2_050g3",
-    "yahoo_050g1_025g2_025g3", "yahoo_050g1_050g2_000g3",
-    "yahoo_075g1_000g2_025g3", "yahoo_075g1_025g2_000g3",
+#: Column order and display names, one column per **perspective**.  Fixed rather
+#: than read off the CSV so two runs' figures put the same perspective in the
+#: same column, and grouped by taxonomy level so the three structural scopes sit
+#: side by side and can be read against each other.
+#:
+#: A perspective the CSV does not carry is drawn as an empty panel rather than
+#: dropped, so a partial run is visibly partial instead of quietly narrower.
+#: A perspective the CSV carries and this list does not is appended on the right
+#: under its own name, so nothing measured goes unplotted.
+LEVELS = [
+    ("dataset_embedding", "Dataset embedding\nmean · euclidean"),
+    ("structural_all_o", "Structural (a)\nall layers · o_proj"),
+    ("structural_all_qkvo", "Structural (b)\nall layers · q,k,v,o"),
+    ("structural_last_o", "Structural (c)\nlast layer · o_proj"),
+    ("functional_all", "Functional (a)\nall hidden states"),
+    ("functional_last", "Functional (b)\nfinal hidden state"),
+    ("behavioral", "Behavioral\nR=16 per query"),
 ]
 
-#: Group sizes.  Roughly geometric, because the ``1/(n(n-3))`` factor in dCor*
-#: and the similarity-transform degeneracy in Procrustes both live on a ratio
-#: scale.  It stops at 500 rather than 1000: the sampled pool is 999 models, so
-#: 1000 is not available at all, and 999 would be a single group -- one
-#: measurement with no spread, drawn a hundred times.  To add it later::
-#:
-#:     python figures/simplex_collection_size/sweep_group_size.py \\
-#:         --n-grid 999 --append
-#:
-#: which keeps every row already on disk and appends that size alone.
-N_GRID = "5,10,20,50,100,200,500"
+#: Column heading for the perspective key.  ``perspective`` since 2026-09-09,
+#: when the suite grew to seven perspectives over five levels; ``level`` before
+#: that, when there was exactly one perspective per level.  Both are read, so an
+#: older CSV still plots.
+KEY_COLUMNS = ("perspective", "level")
 
-REPLICATES = 100
-
-#: Seed for the permute-and-partition shuffles.  Reproduces the groups only
-#: against an identical pool in an identical order, which is why
-#: ``group_members.csv`` records the membership itself as well.
-SEED = 0
+#: ``(column, axis label, whether high is good)`` per row of the grid.
+SCORES = [
+    ("dcor", "dCor*  (1 = strong dependence)", True),
+    ("disparity", "Procrustes disparity  (0 = identical shape)", False),
+]
 
 
-def run(script: str, extra: list[str]) -> None:
-    cmd = [sys.executable, str(HERE / script), *extra]
-    print("$ " + " ".join(cmd), flush=True)
-    subprocess.run(cmd, check=True, cwd=REPO_ROOT)
+def read_rows(path: Path) -> list[dict]:
+    with path.open() as fh:
+        rows = list(csv.DictReader(fh))
+    if not rows:
+        raise SystemExit(f"{path} has no rows")
+    key = next((c for c in KEY_COLUMNS if c in rows[0]), None)
+    if key is None:
+        raise SystemExit(
+            f"{path} has no {' or '.join(KEY_COLUMNS)} column; its header is "
+            f"{sorted(rows[0])}")
+    text = {key, "taxonomy"}
+    out = []
+    for r in rows:
+        rec = {"level": r[key], "taxonomy": r.get("taxonomy", "")}
+        for k, v in r.items():
+            if k in text:
+                continue
+            try:
+                rec[k] = float(v) if "." in v or "e" in v.lower() or v in ("nan", "") \
+                    else int(v)
+            except ValueError:
+                rec[k] = float("nan")
+        out.append(rec)
+    return out
 
 
-def perspective_names() -> list[str]:
-    """The perspectives the sweep would score, without importing its whole module."""
-    sys.path.insert(0, str(HERE))
-    sys.path.insert(0, str(REPO_ROOT))
-    from sweep_group_size import canonical_perspectives  # noqa: E402
-    from src.plots import simplex_suite as suite  # noqa: E402
+def columns_for(rows):
+    """``(key, title)`` per panel: the declared order, then anything unexpected.
 
-    suite.apply_architecture(suite.architecture(BASE_MODEL))
-    return list(canonical_perspectives())
-
-
-def fan_out(sweep_args: list[str], jobs: int, tmp: Path) -> None:
-    """Score one perspective per process, then merge into one CSV.
-
-    Worth having rather than doing by hand, because the cost here is **MDS, and
-    MDS does not parallelise inside one process**.  At ``n=500`` the pool yields
-    a single disjoint group per shuffle, so the membership memo never hits and
-    every replicate is its own fit: ~1400 fits at 500 points for the whole
-    suite, hours of one core.  Perspectives are completely independent -- they
-    share only the pool matrices, which are read from ``07_collections`` -- so
-    splitting on them is exact rather than approximate.
-
-    The scores are those of a serial run -- the groups are a function of the pool
-    and the shuffle seed, not of which process drew them -- and only the row
-    *order* differs, since the merge concatenates one perspective at a time
-    where a serial run interleaves them.  Nothing downstream reads row order.
-    What the merge has to repair is ``run_config.json``, which each process
-    writes listing only the one perspective it was given.
+    Keeps a figure honest in both directions -- a perspective in :data:`LEVELS`
+    that the CSV lacks still gets its (empty) panel, and a perspective the CSV
+    has that nobody declared is plotted under its bare key rather than dropped.
     """
-    tmp.mkdir(parents=True, exist_ok=True)
-    names = perspective_names()
-    running: list[tuple[str, subprocess.Popen]] = []
+    present = {r["level"] for r in rows}
+    known = {k for k, _ in LEVELS}
+    return list(LEVELS) + [(k, k) for k in sorted(present - known)]
 
-    def reap(limit: int) -> None:
-        while len(running) >= limit:
-            for i, (nm, p) in enumerate(list(running)):
-                if p.poll() is not None:
-                    running.pop(i)
-                    if p.returncode != 0:
-                        raise SystemExit(
-                            f"{nm} failed with exit {p.returncode}; see "
-                            f"{tmp / nm}.log")
-                    print(f"  done: {nm}", flush=True)
-                    break
-            else:
-                time.sleep(2)
 
-    for nm in names:
-        reap(jobs)
-        out = tmp / nm
-        out.mkdir(parents=True, exist_ok=True)
-        log = (tmp / f"{nm}.log").open("w")
-        cmd = [sys.executable, str(HERE / "sweep_group_size.py"),
-               *sweep_args, "--perspective", nm]
-        cmd[cmd.index("--outdir") + 1] = str(out)
-        print(f"  start: {nm}", flush=True)
-        p = subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT,
-                             cwd=REPO_ROOT)
-        running.append((nm, p))
-    reap(1)
+def summarise(rows, level, column):
+    """``(n, median, q1, q3, n_disjoint)`` arrays for one level and one column."""
+    by_n = defaultdict(list)
+    disjoint = {}
+    for r in rows:
+        if r["level"] != level:
+            continue
+        v = r[column]
+        if np.isfinite(v):
+            by_n[r["n"]].append(v)
+        disjoint[r["n"]] = r["n_disjoint"]
+    ns = sorted(by_n)
+    if not ns:
+        return None
+    med = np.array([np.median(by_n[n]) for n in ns])
+    q1 = np.array([np.percentile(by_n[n], 25) for n in ns])
+    q3 = np.array([np.percentile(by_n[n], 75) for n in ns])
+    return (np.array(ns, dtype=float), med, q1, q3,
+            np.array([disjoint[n] for n in ns]))
 
-    scores, config = [], None
-    for nm in names:
-        with (tmp / nm / "group_size_scores.csv").open() as fh:
-            rows = fh.read().splitlines()
-        scores.append((rows[0], rows[1:]))
-        cfg = json.loads((tmp / nm / "run_config.json").read_text())
-        if config is None:
-            config = cfg
-        else:
-            config["perspectives"].update(cfg["perspectives"])
-    header = scores[0][0]
-    body = [line for _, lines in scores for line in lines]
-    (HERE / "group_size_scores.csv").write_text(
-        "\n".join([header, *body]) + "\n")
-    # Membership does not depend on the perspective, so any process's copy is
-    # the whole record; taking the first is not a shortcut.
-    shutil.copy(tmp / names[0] / "group_members.csv", HERE / "group_members.csv")
-    (HERE / "run_config.json").write_text(json.dumps(config, indent=2) + "\n")
-    print(f"merged {len(body)} row(s) from {len(names)} perspective(s)")
+
+def draw(rows, variants, outdir: Path, suffix: str = "") -> Path:
+    set_style("two_col_full")
+    cols = columns_for(rows)
+    fig, axes = plt.subplots(len(SCORES), len(cols),
+                             figsize=(2.9 * len(cols), 3.4 * len(SCORES)),
+                             # One y scale per estimator row.  With seven
+                             # columns the question is which perspective sits
+                             # higher, and independent scales would let a level
+                             # that never leaves 0.2 look like one that reaches
+                             # 0.9.
+                             sharey="row", squeeze=False)
+    colours = {"A": "#1f77b4", "B": "#d62728"}
+    labels = {"A": "variant A (references in the matrix)",
+              "B": "variant B (sampled models only)"}
+
+    for col, (level, title) in enumerate(cols):
+        for row, (score, ylabel, _high_good) in enumerate(SCORES):
+            ax = axes[row][col]
+            drew = False
+            for variant in variants:
+                got = summarise(rows, level, f"{score}_{variant}")
+                if got is None:
+                    continue
+                ns, med, q1, q3, nd = got
+                drew = True
+                c = colours[variant]
+                solid = nd >= DEFLATED_BELOW
+                ax.fill_between(ns, q1, q3, color=c, alpha=0.18, linewidth=0)
+                if (~solid).any():
+                    # Redraw the deflated tail's edges dashed, so the band there
+                    # reads as "no independence left" rather than as precision.
+                    tail = ~solid
+                    if solid.any():          # bridge the last solid point
+                        tail[np.argmax(~solid) - 1] = True
+                    ax.plot(ns[tail], q1[tail], color=c, ls="--", lw=0.8)
+                    ax.plot(ns[tail], q3[tail], color=c, ls="--", lw=0.8)
+                ax.plot(ns[solid], med[solid], color=c, marker="o", ms=4,
+                        lw=1.6, label=labels[variant] if row == 0 and col == 0
+                        else None)
+                if (~solid).any():
+                    ax.plot(ns[~solid], med[~solid], color=c, marker="o", ms=4,
+                            mfc="white", lw=1.6, ls="--")
+            if not drew:
+                ax.text(0.5, 0.5, "no rows", ha="center", va="center",
+                        transform=ax.transAxes, color="0.5")
+            ax.set_xscale("log")
+            ax.grid(True, which="both", alpha=0.25)
+            if row == 0:
+                ax.set_title(title, fontsize=8)
+            if row == len(SCORES) - 1:
+                ax.set_xlabel("models in the collection, $n$")
+            if col == 0:
+                ax.set_ylabel(ylabel, fontsize=8)
+
+    handles, labs = axes[0][0].get_legend_handles_labels()
+    if handles:
+        fig.legend(handles, labs, loc="lower center", ncol=len(handles),
+                   frameon=False, fontsize=8, bbox_to_anchor=(0.5, -0.015))
+    fig.suptitle("Score against collection size, at each level's standing perspectives",
+                 fontsize=11, y=0.995)
+    fig.text(0.5, 0.945,
+             "Band = interquartile range across replicates, not a confidence "
+             "interval: replicates are drawn without replacement from one pool, "
+             "so they share models and the spread is deflated.\n"
+             f"Hollow markers and a dashed band mark sizes with fewer than "
+             f"{DEFLATED_BELOW} disjoint groups per shuffle, where that "
+             "deflation dominates.",
+             ha="center", va="top", fontsize=7, color="0.35", linespacing=1.5)
+    fig.tight_layout(rect=(0, 0.03, 1, 0.905))
+    return save_figure(fig, outdir / f"fig_collection_size{suffix}.png")
+
+
+def write_summary(rows, variants, outdir: Path) -> Path:
+    """A small markdown table beside the figure, for reading without the image."""
+    lines = ["# Score against collection size", "",
+             "Both variants; median over replicates.",
+             "`n_disjoint` is how many disjoint groups one shuffle of the pool "
+             "yields at that size — the honest ceiling on how independent the "
+             "replicates are.", ""]
+    for level, title in columns_for(rows):
+        got = summarise(rows, level, f"dcor_{variants[0]}")
+        if got is None:
+            continue
+        lines += [f"## {title.replace(chr(10), ' — ')}", "",
+                  "| n | n_disjoint | "
+                  + " | ".join(f"{s}_{v}" for s, _, _ in SCORES
+                               for v in variants) + " |",
+                  "|---" * (2 + len(SCORES) * len(variants)) + "|"]
+        ns = got[0]
+        for i, n in enumerate(ns):
+            cells = []
+            for score, _, _ in SCORES:
+                for v in variants:
+                    g = summarise(rows, level, f"{score}_{v}")
+                    cells.append(f"{g[1][i]:.4f}" if g is not None else "—")
+            lines.append(f"| {int(n)} | {int(got[4][i])} | "
+                         + " | ".join(cells) + " |")
+        lines.append("")
+    path = outdir / "collection_size_summary.md"
+    path.write_text("\n".join(lines))
+    return path
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(
-        description=__doc__.split("Usage")[0],
-        formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--plot-only", action="store_true",
-                    help="redraw from the existing group_size_scores.csv")
-    ap.add_argument("--sweep-only", action="store_true",
-                    help="score without redrawing")
-    ap.add_argument("--n-grid", default=N_GRID)
-    ap.add_argument("--replicates", type=int, default=REPLICATES)
-    ap.add_argument("--check-matrices", action="store_true",
-                    help="build the pool matrices, report whether they are "
-                         "complete, symmetric and zero-diagonal, and stop")
-    ap.add_argument("--jobs", type=int, default=1,
-                    help="score this many perspectives at once, in separate "
-                         "processes, then merge. The output is identical to a "
-                         "serial run; MDS is the cost and does not thread")
-    ap.add_argument("--tmp", default=None,
-                    help="scratch directory for --jobs (default: <outdir>/.fanout)")
-    args, rest = ap.parse_known_args()
+    ap = argparse.ArgumentParser(description=__doc__.split("Usage")[0],
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--outdir", default=str(HERE),
+                    help="directory holding group_size_scores.csv, and where "
+                         "the figure is written")
+    ap.add_argument("--csv", default=None,
+                    help="the scores CSV (default: <outdir>/group_size_scores.csv)")
+    ap.add_argument("--variant", action="append", dest="variants",
+                    choices=["A", "B"],
+                    help="restrict to one variant; repeat for several "
+                         "(default: both)")
+    ap.add_argument("--suffix", default="",
+                    help="appended to the figure filename")
+    args = ap.parse_args()
 
-    sweep_args = [
-        "--base-model", BASE_MODEL,
-        "--cache-root", str(CACHE_ROOT),
-        "--outdir", str(HERE),
-        "--dataset", "yahoo",
-        "--train-n", "1000",
-        "--train-seed", "0",
-        "--n-grid", args.n_grid,
-        "--replicates", str(args.replicates),
-        "--seed", str(SEED),
-    ]
-    for m in SIMPLEX3_EXTRA:
-        sweep_args += ["--exclude-mixture", m]
-    if args.check_matrices:
-        sweep_args.append("--check-matrices")
+    outdir = Path(args.outdir)
+    csv_path = Path(args.csv) if args.csv else outdir / "group_size_scores.csv"
+    if not csv_path.exists():
+        raise SystemExit(f"no scores at {csv_path}. Run sweep_group_size.py "
+                         "first.")
+    outdir.mkdir(parents=True, exist_ok=True)
+    rows = read_rows(csv_path)
+    variants = args.variants or ["A", "B"]
 
-    if not args.plot_only:
-        if args.jobs > 1 and not args.check_matrices:
-            fan_out(sweep_args + rest, args.jobs,
-                    Path(args.tmp) if args.tmp else HERE / ".fanout")
-        else:
-            run("sweep_group_size.py", sweep_args + rest)
-    if not (args.sweep_only or args.check_matrices):
-        run("plot_group_size.py", ["--outdir", str(HERE)])
+    fig_path = draw(rows, variants, outdir, args.suffix)
+    md_path = write_summary(rows, variants, outdir)
+    print(f"wrote {fig_path}")
+    print(f"wrote {md_path}")
 
 
 if __name__ == "__main__":

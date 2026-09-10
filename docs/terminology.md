@@ -171,21 +171,37 @@ design, because a `06_pairwise` handle addresses exactly one **perspective**.
 | **surrogate** | What a selector produces: the representation view being compared. One **row** of the figure grid, e.g. `late third · centered`. |
 | **perspective** | A surrogate together with a similarity metric. One **cell** of the figure grid, e.g. `late third · centered` × `cosine`. |
 
-**Canonical perspective** — the one perspective designated as the *default
-reading* of a taxonomy level, so that levels can be compared one-to-one without
-sweeping metrics. There are exactly four, one per level:
+**Canonical perspective** — a perspective designated as a *default reading* of a
+taxonomy level, so that levels can be compared one-to-one without sweeping
+metrics. There are seven over five levels: one each at the dataset and
+behavioral levels, three **scopes** at the structural level and two at the
+functional one.
 
-| level | surrogate | metric |
-|---|---|---|
-| dataset embedding | mean embedding (`representation="mean"`, n=1000, seed 0) | euclidean |
-| structural | last layer, all four LoRA projections | cosine |
-| functional | last hidden state (`h{N_LAYERS}`), input mode, mean pooling | cosine |
-| behavioral | per-query replicate mean at R=16 | cosine |
+| perspective | level | surrogate | metric |
+|---|---|---|---|
+| `dataset_embedding` | dataset embedding | mean embedding (`representation="mean"`, n=1000, seed 0) | euclidean |
+| `structural_all_o` | structural | every layer, output projections only | cosine |
+| `structural_all_qkvo` | structural | every layer, all four LoRA projections | cosine |
+| `structural_last_o` | structural | the last decoder layer's output projection | cosine |
+| `functional_all` | functional | every hidden state, input mode, mean pooling | cosine |
+| `functional_last` | functional | the final hidden state (`h{N_LAYERS}`) alone | cosine |
+| `behavioral` | behavioral | per-query replicate mean at R=16 | cosine |
 
-They are fixed in `canonical_perspectives()` in `scripts/sweep_group_size.py`
-and are the standing default for new experiments: compute these four, score each
-against the ground-truth simplex with dcorr and Procrustes disparity, and add a
-fifth only after asking.
+A level carries more than one row when it can be read at more than one **scope**
+and the scopes answer different questions — structural narrows by layer *and* by
+projection, functional only by layer, and neither has a reason to move together
+as an experiment's other axes change. The functional level has no projection
+axis at all: it reads hidden states, so its mirror of the structural
+all-versus-last contrast is exactly its two rows.
+
+They are fixed in `canonical_perspectives()` in
+`figures/simplex_collection_size/sweep_group_size.py` and are the standing
+default for new experiments: compute these seven, score each against the
+ground-truth simplex with dcorr and Procrustes disparity, and add an eighth only
+after asking. The dataset level's normalised sibling metric (`frobenius`, which
+L2-normalises each mean before subtracting) is a second legitimate reading of
+"euclidean norm" and the simplex3 drivers carry both; whether a given suite
+wants it is a per-suite decision, not part of this list.
 
 Two things this term is **not**. It is unrelated to `_canonical(dm)` in
 `src/analysis/comparison.py`, which means a distance matrix's *sorted row order*

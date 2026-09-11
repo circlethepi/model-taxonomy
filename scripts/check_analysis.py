@@ -2597,7 +2597,7 @@ def t_adapter_name_agreement():
             want = gen.adapter_name(base)
             got = adapter_dir(
                 Path("/root"), suite.base_model, block,
-                gen.LORA_RANK, gen.LORA_INIT_SEED,
+                suite.lora_rank, gen.LORA_INIT_SEED,
                 samples_seen=seen,
                 prompt_format_id=gen.format_id(),
             ).name

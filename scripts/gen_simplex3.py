@@ -33,6 +33,10 @@ The yahoo tree of every existing suite must regenerate byte-for-byte::
     for s in llama qwen llama3i nemo olmo2; do python scripts/gen_simplex3.py --suite $s; done
     git diff --exit-code experiments jobs
 
+Three axes, not two: a Suite may also sweep the LoRA *rank*, which crosses the
+simplex with ``Suite.lora_ranks`` and makes every adapter list rank-major.  Empty
+for every suite but ``olmo2_rsweep``, so the trees above are untouched.
+
 Note that the number of groups is *not* fixed at three despite this file's name:
 yahoo is a 2-simplex over three groups, dolly and oasst1 are 3-simplexes over
 four.  The name is kept because it is in five directory names, five job-name
@@ -42,6 +46,7 @@ Usage:
     python scripts/gen_simplex3.py                    # yahoo x llama -> experiments/simplex3/
     python scripts/gen_simplex3.py --suite qwen       # yahoo x qwen  -> experiments/simplex3_qwen/
     python scripts/gen_simplex3.py --dataset dolly --suite qwen       # -> simplex3_dolly_qwen/
+    python scripts/gen_simplex3.py --suite olmo2_rsweep  # yahoo x 8 LoRA ranks
     python scripts/gen_simplex3.py --dataset dolly --data-tree        # -> simplex3_dolly_data/
     python scripts/gen_simplex3.py --list             # enumerate the proportions and exit
 """
@@ -146,26 +151,30 @@ def samples_seen(n: int | None = None) -> int:
     return SPEC.samples_seen(SUITE.effective_batch, n)
 
 
-def train_targets() -> list[tuple[str, int, int]]:
-    """Every adapter this tree trains, as ``(proportion name, n_samples, seed)``.
+def train_targets() -> list[tuple[str, int, int, int]]:
+    """Every adapter this tree trains, as ``(proportion, n_samples, seed, rank)``.
 
-    Ordered `nsamples_train`-major, then by seed, then by proportion, because that is the
-    order the shards are cut in: a training shard must be one wall, and the walls
-    differ by ~750x between the smallest and largest `nsamples_train`, so a shard may never
-    straddle two values of n.  A contiguous slice of this list is within one
-    `nsamples_train` by construction.
+    Ordered rank-major, then by `nsamples_train`, then by seed, then by proportion, because
+    that is the order the shards are cut in: a training shard must be one wall,
+    and the walls differ by ~750x between the smallest and largest
+    `nsamples_train`, so a shard may never straddle two values of n.  Rank is
+    outermost for a second reason -- ``lora_rank`` is one scalar in a training
+    config, so a shard *cannot* mix two ranks whatever the walls say.  A
+    contiguous slice of this list is within one rank and one `nsamples_train` by
+    construction.
 
-    For a spec that never set a training grid this is the 16 proportions at the
-    one draw it has always trained, which is the list the generator used to build
-    inline.
+    For a spec that never set a training grid, under a suite that sweeps no rank,
+    this is the 16 proportions at the one draw it has always trained, which is the
+    list the generator used to build inline.
     """
     props = [name for name, _ in proportions()]
-    return [(name, n, seed)
+    return [(name, n, seed, rank)
+            for rank in lora_ranks()
             for n, seed in SPEC.train_grid()
             for name in props]
 
 
-def extract_targets() -> list[tuple[str, int, int]]:
+def extract_targets() -> list[tuple[str, int, int, int]]:
     """The adapters extraction runs over -- ``train_targets`` minus the `nsamples_train` values
     ``extract_sizes`` excludes.
 
@@ -175,7 +184,8 @@ def extract_targets() -> list[tuple[str, int, int]]:
     that trains its whole grid the two are the same list.
     """
     props = [name for name, _ in proportions()]
-    return [(name, n, seed)
+    return [(name, n, seed, rank)
+            for rank in lora_ranks()
             for n, seed in SPEC.extract_grid()
             for name in props]
 
@@ -194,7 +204,47 @@ def sweep_seeds() -> list[int]:
     return SEEDS if SPEC.sweep_seeds is None else list(SPEC.sweep_seeds)
 
 
-LORA_RANK, LORA_INIT_SEED = 16, 0
+#: The LoRA initialisation seed, one value for every tree ever emitted.  Its
+#: companion, the *rank*, moved onto ``Suite`` when the rank sweep was added:
+#: rank is something a run is configured with, and one run now varies it.
+LORA_INIT_SEED = 0
+
+
+def lora_ranks() -> tuple[int, ...]:
+    """The ranks this tree trains the whole simplex at.
+
+    ``(16,)`` for every suite that has run -- ``Suite.lora_ranks`` is empty and
+    ``Suite.lora_rank`` is 16 -- so the emitted trees are unchanged.  A rank sweep
+    sets ``lora_ranks`` and this is its axis.
+    """
+    return SUITE.lora_ranks or (SUITE.lora_rank,)
+
+
+def rank_sweep() -> bool:
+    """Whether rank is an axis of this tree rather than a fixed setting.
+
+    Read wherever emitted *prose* would otherwise assert something true only of a
+    single-rank tree ("all 16 adapters"), so that the thirteen trees already on
+    disk keep the sentences they carry.
+    """
+    return len(lora_ranks()) > 1
+
+
+def lora_alpha(rank: int) -> int:
+    """The LoRA gain's numerator for *rank*.
+
+    Alpha is not a free parameter beside rank: PEFT scales the low-rank update by
+    ``alpha / rank``, and every adapter that has been trained here used 32 at rank
+    16, i.e. a gain of 2.  Returning ``2 * rank`` renders the same 32 for every
+    existing config and holds the gain fixed across a rank sweep, so the sweep
+    varies capacity alone.  Fixing alpha at 32 instead would sweep the gain from
+    32x down to 0.25x alongside it and confound the axis.
+
+    Not in the adapter name, and it does not need to be: the name carries ``_r``,
+    and alpha is a function of it.
+    """
+    return 2 * rank
+
 
 REPLICATES = 16
 MAX_NEW_TOKENS = 128
@@ -385,7 +435,8 @@ def query_blocks(which: str) -> str:
                          text_fields=list(SPEC.query_fields))
 
 
-def adapter_name(name: str, n: int | None = None, seed: int | None = None) -> str:
+def adapter_name(name: str, n: int | None = None, seed: int | None = None,
+                 rank: int | None = None) -> str:
     """The adapter's directory leaf.
 
     The ``_f{format_id}`` suffix appears only for a non-raw prompt format, so
@@ -393,17 +444,18 @@ def adapter_name(name: str, n: int | None = None, seed: int | None = None) -> st
     base model differently cannot land on the same path.  Downstream joins strip
     it the way they already strip the ``_b{samples}`` budget token.
 
-    *n* and *seed* name the training draw.  They default to the spec's single
-    draw, so the template is unchanged for every tree that has already run --
-    and because the template already carried both, an nsweep needs no new naming
-    scheme: its 640 adapters are distinct by construction, and its 16
+    *n* and *seed* name the training draw and *rank* the LoRA rank.  They default
+    to the spec's single draw and the suite's single rank, so the template is
+    unchanged for every tree that has already run -- and because the template
+    already carried the draw, an nsweep needs no new naming scheme: its 640 adapters are distinct by construction, and its 16
     ``_n1000_s00_..._b5008`` adapters collide, deliberately, with the ones the
     yahoo tree already trained.
     """
     n = SPEC.train_n if n is None else n
     seed = SPEC.train_seed if seed is None else seed
+    rank = SUITE.lora_rank if rank is None else rank
     stem = (f"{name}_n{n}_s{seed:02d}"
-            f"_r{LORA_RANK}_i{LORA_INIT_SEED:02d}_b{samples_seen(n)}")
+            f"_r{rank}_i{LORA_INIT_SEED:02d}_b{samples_seen(n)}")
     return f"{stem}_f{format_id()}" if format_id() else stem
 
 
@@ -431,8 +483,10 @@ def prompt_format_block() -> dict | None:
     }
 
 
-def adapter_path(name: str, n: int | None = None, seed: int | None = None) -> str:
-    return f"{CACHE_DIR}/03_adapters/{SUITE.model_slug}/{adapter_name(name, n, seed)}"
+def adapter_path(name: str, n: int | None = None, seed: int | None = None,
+                 rank: int | None = None) -> str:
+    return (f"{CACHE_DIR}/03_adapters/{SUITE.model_slug}/"
+            f"{adapter_name(name, n, seed, rank)}")
 
 
 def prompt_format_yaml() -> str:
@@ -641,12 +695,16 @@ extraction:
     return body
 
 
-def write_train(shard: int, targets: list[tuple[str, int, int]]) -> str:
+def write_train(shard: int, targets: list[tuple[str, int, int, int]]) -> str:
     """One training shard.
 
-    *targets* are ``(proportion name, n_samples, seed)`` triples that all share
-    one ``n_samples`` -- the shard planner guarantees it, because a shard is one
-    wall and the `nsamples_train` values differ by ~750x in training time.
+    *targets* are ``(proportion, n_samples, seed, rank)`` tuples that all share one
+    ``n_samples`` -- the shard planner guarantees it, because a shard is one wall
+    and the `nsamples_train` values differ by ~750x in training time -- and one
+    ``rank``, which the planner also guarantees but which is a *correctness*
+    constraint rather than a scheduling one: ``fine_tuning.lora_rank`` is a single
+    scalar, so a shard holding two ranks would silently train one of them at the
+    other's rank and write it to the other's path.
 
     A shard may still span several seeds of that one `nsamples_train`, which is what makes
     the 80-adapter shards at the cheap `nsamples_train` values possible: ``n_samples_sweep`` and
@@ -658,8 +716,13 @@ def write_train(shard: int, targets: list[tuple[str, int, int]]) -> str:
     single-draw trees have always emitted.
     """
     n = targets[0][1]
+    rank = targets[0][3]
+    assert all(t[3] == rank for t in targets), (
+        f"training shard {shard} mixes ranks {sorted({t[3] for t in targets})}; "
+        f"lora_rank is one scalar per config"
+    )
     seeds_for: dict[str, list[int]] = {}
-    for name, _, seed in targets:
+    for name, _, seed, _ in targets:
         seeds_for.setdefault(name, []).append(seed)
     names = list(seeds_for)
     budget = SPEC.budget(n)
@@ -667,7 +730,13 @@ def write_train(shard: int, targets: list[tuple[str, int, int]]) -> str:
     # The single-draw trees must regenerate byte-for-byte, so their header is the
     # sentence they already carry.  An nsweep shard says which `nsamples_train` it is instead,
     # because "only n=1000" would be false of the tree and useless on the shard.
-    if SPEC.train_grid() == ((SPEC.train_n, SPEC.train_seed),):
+    if rank_sweep():
+        size_note = (
+            f"# LoRA rank {rank} of {{{','.join(str(r) for r in lora_ranks())}}}, the whole "
+            f"{len(proportions())}-point simplex at that one rank.\n"
+            f"# n={SPEC.train_n}, seed={SPEC.train_seed}, as the fixed-rank tree. "
+            f"total_train_samples\n")
+    elif SPEC.train_grid() == ((SPEC.train_n, SPEC.train_seed),):
         size_note = (
             f"# Only n={SPEC.train_n}, seed={SPEC.train_seed} is trained on. "
             f"total_train_samples\n")
@@ -683,9 +752,15 @@ def write_train(shard: int, targets: list[tuple[str, int, int]]) -> str:
         f"{SUITE.effective_batch}:\n"
         f"# ceil({budget}/{SUITE.effective_batch}) = "
         f"{SPEC.steps(SUITE.effective_batch, n)} steps, so {samples_seen(n)} samples seen and the\n"
-        f"# adapter is named _b{samples_seen(n)}. Every LoRA parameter matches the existing 3B\n"
-        f"# adapters; only the base model and the data differ.\n"
-        f"#\n"
+        f"# adapter is named _b{samples_seen(n)}. "
+        + ("Rank and the alpha that scales it are the ONLY\n"
+           f"# things that differ from the r{SUITE.lora_rank} tree: same draws, same seeds, same "
+           f"budget,\n# same targets, same query set. alpha is {lora_alpha(rank)} = 2 x {rank}, "
+           f"holding the gain\n# alpha/rank at the 2 every existing adapter trained under.\n"
+           if rank_sweep() else
+           "Every LoRA parameter matches the existing 3B\n"
+           "# adapters; only the base model and the data differ.\n")
+        + f"#\n"
         f"# {SPEC.caveats.get('train', '').replace(chr(10), chr(10) + '# ')}\n\n"
     ) + preamble(f"simplex3_train_shard{shard}")
     body += "datasets:\n"
@@ -704,8 +779,8 @@ base_models:
     body += "".join(f"    - {nm}\n" for nm in names)
     body += f"""  n_samples: {n}
   seed: {sorted(seeds_for[names[0]])[0]}
-  lora_rank: {LORA_RANK}
-  lora_alpha: 32
+  lora_rank: {rank}
+  lora_alpha: {lora_alpha(rank)}
   target_modules: [{', '.join(SUITE.target_modules)}]
   lora_dropout: 0.05
   lora_init_seed: {LORA_INIT_SEED}
@@ -775,14 +850,15 @@ def write_extract(
     level: str,
     query: str,
     shard: int | None,
-    names: list[tuple[str, int, int]],
+    names: list[tuple[str, int, int, int]],
     temperature: float | None = None,
 ) -> str:
-    # *names* are ``(proportion, n_samples, seed)`` triples -- every adapter this
-    # job extracts from.  For a single-draw tree the triple is the one draw it has
-    # always trained and the rendered path is unchanged; for an nsweep the same
-    # list carries all four `nsamples_train` values, because inference does not depend on how much
-    # the adapter was trained on and so is not sharded by `nsamples_train`.
+    # *names* are ``(proportion, n_samples, seed, rank)`` tuples -- every adapter
+    # this job extracts from.  For a single-draw, single-rank tree the tuple is the
+    # one draw it has always trained and the rendered path is unchanged; for an
+    # nsweep the same list carries all four `nsamples_train` values and for a rank
+    # sweep all eight ranks, because inference does not depend on how the adapter
+    # was trained and so is sharded by neither.
     qname = query_full_context_name() if query == "full_context" else query_question_only_name()
     if SUITE.prompt_format:
         # Under a chat template with completion-only loss the training prompt IS
@@ -806,7 +882,19 @@ def write_extract(
         + ("" if shard is None else f", shard {shard} of {n_shards}")
         + ".\n#\n"
     )
-    if level == "functional":
+    if level == "functional" and rank_sweep():
+        body += (
+            f"# One job for all {len(names)}: HFInferenceTaxonomy loads the base model once\n"
+            f"# and swaps adapters onto it, so every rank amortizes a single load, and\n"
+            f"# input-mode extraction is one forward pass per query with no decoding.\n"
+            f"# Measured at 4.4 s/model on the 1004-adapter pool, so ~{round(len(names) * 4.4 / 60)} min here.\n"
+            f"#\n"
+            f"# Rank is not a dimension of what comes back. The stored activations are\n"
+            f"# hidden states of the base model's width, so the {len(lora_ranks())} ranks are\n"
+            f"# {len(lora_ranks())} points of one comparable fleet rather than {len(lora_ranks())} "
+            f"incomparable ones.\n\n"
+        )
+    elif level == "functional":
         body += (
             "# One job for all 16: HFInferenceTaxonomy loads the base model once and\n"
             "# swaps adapters onto it, so 16 models amortize a single 8B load, and\n"
@@ -898,6 +986,12 @@ def write_extract(
             f"# with the R={REPLICATES} runs over the same adapters and draw.\n"
             f"#\n"
             + (f"# One job, unsharded: {SPEC.query_n} queries at batch {GREEDY_BATCH_SIZE} is ~7 generate()\n"
+               f"# calls per adapter against ~50 for the sampled runs -- ~17.7 s/model\n"
+               f"# measured on the 1004-adapter pool, so ~{round(len(names) * 17.7 / 60)} min for all "
+               f"{len(names)} here, inside\n"
+               f"# the {SUITE.greedy_time} wall.\n\n"
+               if shard is None and rank_sweep() else
+               f"# One job, unsharded: {SPEC.query_n} queries at batch {GREEDY_BATCH_SIZE} is ~7 generate()\n"
                f"# calls per adapter against ~50 for the sampled runs, so all 16 adapters\n"
                f"# finish in well under an hour.\n\n"
                if shard is None else
@@ -1304,6 +1398,69 @@ SUITES = {
         # See the olmo2 entry: l40s is not safe for TRAINING this model, only for
         # extraction. Submit training with `sbatch --partition=h200,h100`.
     ).for_model("allenai/OLMo-2-0425-1B-Instruct"),
+
+    #: The **rsweep** suite: the LoRA-rank axis, over the same 16-point yahoo
+    #: simplex and the same 100-query 33/33/33 draw as ``olmo2``.  Eight ranks,
+    #: 1 to 128 by powers of two, so 128 adapters.
+    #:
+    #: Rank is a Suite axis rather than a spec one -- the corpus, the draws, the
+    #: seeds, the budget, the targets and the query set are all exactly the fixed-
+    #: rank tree's, and ``yahoo`` is the spec unchanged.  That is what makes the
+    #: comparison a comparison: r16 here resolves to the very adapter directories
+    #: ``simplex3_olmo2`` already trained (rank is in the adapter name, and every
+    #: cache is keyed on that name), so the sweep's middle point is not a re-run
+    #: of that tree but the tree itself, and the other seven ranks are the only
+    #: new work.
+    #:
+    #: Levels are the nsweep's, for the nsweep's reason: the log-probability
+    #: level, generation-mode activations and the temperature sweep are dropped
+    #: because no standing representation reads any of them and all three are
+    #: priced per adapter.  What is emitted is what the standing representations
+    #: need -- the adapters themselves (structural reads their weights, with no
+    #: job of its own), input-mode activations, the R=16 sampled behavioral run,
+    #: and greedy.  The dataset level is model-free and already on disk.
+    "olmo2_rsweep": Suite(
+        tag="rsweep_olmo2",
+        lora_ranks=(1, 2, 4, 8, 16, 32, 64, 128),
+        query_sets=("question_only",),
+        job_tokens={"question_only": "qonly"},
+        emit_embed_jobs=False,
+        emit_build_job=False,
+        # The `matrix` re-embed is off here alone among the yahoo suites: it
+        # authors a model-free surrogate that the olmo2 tree has already written,
+        # and two trees emitting it would race for no second artefact.
+        emit_embed_matrix_job=False,
+        job_prefix="s3ro2",
+        # The one field that is NOT the olmo2 tree's: training is pinned off l40s.
+        # Every olmo2 tree before this one says "submit training with
+        # `sbatch --partition=h200,h100`" in a comment, which is a instruction a
+        # reader has to find -- and this tree's training IS driven from
+        # submit_all.sh, across 8 shards, so a comment would be found after the
+        # fact. Extraction keeps the full list: it is forward-only, and a forward
+        # pass through an offloaded module is correct, just slower.
+        train_partitions="h200,h100",
+        emit_logprob_jobs=False,
+        emit_gen_activation_job=False,
+        temperature_sweep=(),
+        # `train_shards` is DERIVED in main() from the rank tuple -- one shard per
+        # rank -- so it is deliberately not written here; a literal would be a
+        # second place to forget when a rank is added.
+        #
+        # 128 adapters at ~2.45 min each (the nsweep's measurement for this 1B at
+        # this draw) is ~5.2 h of sampled decoding: 8 shards of 16 is ~40 min,
+        # which is the cadence every behavioral wall here was tuned against.
+        behavioral_shards=8,
+        # Greedy stays unsharded: ~17.7 s/model over 128 adapters is ~38 min,
+        # inside the 1:30 wall.
+        greedy_shards=1,
+        # As the nsweep suite: the 2:00:00 default was tuned against a 4-adapter
+        # shard, and these are 16-adapter shards (~40 min). 3:00:00 is the value
+        # the llama and nsweep suites already carry, and headroom costs only queue
+        # priority.
+        train_time="3:00:00",
+        # See the olmo2 entry: l40s is not safe for TRAINING this model, only for
+        # extraction. Submit training with `sbatch --partition=h200,h100`.
+    ).for_model("allenai/OLMo-2-0425-1B-Instruct"),
 }
 
 
@@ -1337,6 +1494,16 @@ _SUITE_PREFIXES = {
 #: ``Suite`` defaults at yahoo's 16 adapters, which is why yahoo needs no branch.
 TRAIN_ADAPTERS_PER_SHARD = 4
 BEHAVIORAL_ADAPTERS_PER_SHARD = 2
+
+#: Adapters per training shard for a **rank sweep**: the whole simplex at one
+#: rank, one shard per rank.  Rank cannot be split across shards anyway
+#: (``lora_rank`` is one scalar per config), so the only question is whether one
+#: rank is one wall, and it is: the nsweep measured ~2.5 min/adapter for this 1B
+#: at N=1000/_b5008, so 16 adapters is ~40 min against a 3:00:00 wall.  Rank moves
+#: that number hardly at all -- the LoRA branch is a rounding error beside the
+#: base forward, and the optimizer step count is fixed by the budget, not by the
+#: rank -- so the largest rank sits at the same wall as the smallest.
+TRAIN_ADAPTERS_PER_SHARD_RSWEEP = 16
 
 #: Adapters per training shard **by `nsamples_train`**, for a spec that carries a training
 #: grid.  A shard is one wall, and training time is proportional to the budget,
@@ -1394,26 +1561,30 @@ def _has_train_grid() -> bool:
     return bool(SPEC.train_sizes or SPEC.train_seeds)
 
 
-def train_shard_plan(train_shards: int | None = None) -> list[list[tuple[str, int, int]]]:
-    """The training shards, as lists of ``(proportion, n_samples, seed)``.
+def train_shard_plan(train_shards: int | None = None) -> list[list[tuple[str, int, int, int]]]:
+    """The training shards, as lists of ``(proportion, n_samples, seed, rank)``.
 
-    Without a training grid the shards are strided over the proportions, which is
-    what the existing trees carry and must keep carrying.  With one they are cut
-    **within a `nsamples_train`**: contiguous chunks of ``TRAIN_ADAPTERS_PER_SHARD_BY_N[n]``,
-    so no shard ever mixes two budgets and every shard is one wall.
+    With neither a training grid nor a rank sweep the shards are strided over the
+    proportions, which is what the existing trees carry and must keep carrying.
+    Otherwise they are cut **within one rank and one `nsamples_train`**: contiguous
+    chunks of ``TRAIN_ADAPTERS_PER_SHARD_BY_N[n]`` (or of
+    ``TRAIN_ADAPTERS_PER_SHARD_RSWEEP`` for a rank sweep), so no shard ever mixes
+    two budgets or two ranks, and every shard is one wall.
 
     *train_shards* lets a caller pass the count before ``SUITE`` exists, which is
     how the suite's own ``train_shards`` field gets computed.
     """
     targets = train_targets()
-    if not _has_train_grid():
+    if not _has_train_grid() and not rank_sweep():
         k = SUITE.train_shards if train_shards is None else train_shards
         return [targets[i::k] for i in range(k)]
-    plan: list[list[tuple[str, int, int]]] = []
-    for n in SPEC.train_sizes or (SPEC.train_n,):
-        block = [t for t in targets if t[1] == n]
-        size = TRAIN_ADAPTERS_PER_SHARD_BY_N.get(n, TRAIN_ADAPTERS_PER_SHARD)
-        plan += [block[i:i + size] for i in range(0, len(block), size)]
+    plan: list[list[tuple[str, int, int, int]]] = []
+    for rank in lora_ranks():
+        for n in SPEC.train_sizes or (SPEC.train_n,):
+            block = [t for t in targets if t[1] == n and t[3] == rank]
+            size = (TRAIN_ADAPTERS_PER_SHARD_RSWEEP if not _has_train_grid()
+                    else TRAIN_ADAPTERS_PER_SHARD_BY_N.get(n, TRAIN_ADAPTERS_PER_SHARD))
+            plan += [block[i:i + size] for i in range(0, len(block), size)]
     return plan
 
 
@@ -1532,6 +1703,13 @@ def main() -> None:
         )
     if overrides:
         SUITE = replace(SUITE, **overrides)
+    # A rank sweep's training shards are one rank each, so the count is a function
+    # of the rank tuple. Derived rather than declared because `submit_all.sh`
+    # iterates `range(SUITE.train_shards)` while the files come from
+    # `train_shard_plan()`, and the two disagreeing would submit a job name that
+    # does not exist -- the failure dd70b48 already shipped once for greedy.
+    if rank_sweep():
+        SUITE = replace(SUITE, train_shards=len(train_shard_plan()))
 
     root = Path(args.root)
     tree = slug()
@@ -1639,7 +1817,7 @@ def main() -> None:
     for i, shard_names in enumerate(shards):
         emit(exp / f"train_shard{i}.yaml", write_train(i, shard_names))
         emit(jobs / f"03_train_shard{i}.sh", sbatch(
-            f"{SUITE.job_prefix}_train{i}", SUITE.gpu_partitions, True,
+            f"{SUITE.job_prefix}_train{i}", SUITE.train_gpu_partitions, True,
             SUITE.train_mem_gb, SUITE.train_time,
             f"python scripts/run_experiment.py experiments/{tree}/train_shard{i}.yaml"
             f" --steps build finetune",
@@ -1779,10 +1957,14 @@ def main() -> None:
     # The adapter count is the simplex crossed with the training grid, which is
     # the simplex itself for every tree without one.  Printed rather than assumed
     # because it is the number the GPU budget is a function of.
-    n_adapters = len(props) * len(SPEC.train_grid())
+    n_adapters = len(props) * len(SPEC.train_grid()) * len(lora_ranks())
     grid_note = ""
     if _has_train_grid():
         grid_note = (f" ({len(props)} x {len(SPEC.train_grid())} training draws,"
+                     f" {len(train_shard_plan())} train shards)")
+    elif rank_sweep():
+        grid_note = (f" ({len(props)} x {len(lora_ranks())} ranks"
+                     f" {{{','.join(str(r) for r in lora_ranks())}}},"
                      f" {len(train_shard_plan())} train shards)")
     print(f"\n{len(props)} proportions, {len(props) * len(sweep_seeds()) * n_sizes} draws, "
           f"{n_adapters} adapters{grid_note}.")

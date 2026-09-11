@@ -48,6 +48,14 @@ experiments/simplex_collection_size_greedy/
 experiments/simplex3_nsweep_*/
 jobs/simplex3_nsweep_*/
 
+# The rsweep tree, whole, for the same reason as the nsweep tree above: every
+# file in it is written by `scripts/gen_simplex3.py --suite olmo2_rsweep` -- 8
+# train shards, 8 behavioral shards, and the four non-shard drivers beside them
+# -- so there is nothing hand-written left to keep. The generator, the Suite and
+# the spec stay tracked, so one command rebuilds it.
+experiments/simplex3_rsweep_*/
+jobs/simplex3_rsweep_*/
+
 # Run logs from the nsweep scoring sweep. The CSV it writes is the artifact;
 # these are just the per-slice progress lines.
 figures/simplex3_nsweep_olmo2_nsweep/logs/

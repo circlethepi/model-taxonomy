@@ -54,6 +54,31 @@ class Suite:
     torch_dtype: str = "float16"
     target_modules: tuple[str, ...] = ("q_proj", "k_proj", "v_proj", "o_proj")
 
+    #: The LoRA rank every adapter of this run is trained at.  16 for every suite
+    #: that has run, and that is the regression test as much as the default: the
+    #: rank is inside every adapter's directory name (``..._r16_i00_b5008``), so a
+    #: different value here would repoint the whole tree at paths that do not
+    #: exist.
+    #:
+    #: ``lora_alpha`` is NOT a field beside it.  The generator renders
+    #: ``2 * rank``, which is the 32 every existing config carries at rank 16 --
+    #: alpha is the gain on the low-rank update (PEFT scales ``B @ A`` by
+    #: ``alpha / rank``), so pinning the ratio is what keeps a rank sweep a sweep
+    #: over capacity rather than over update magnitude as well.
+    lora_rank: int = 16
+
+    #: The ranks a **rank sweep** trains, if this suite is one.  Empty means "just
+    #: ``lora_rank``", which is every suite that has run, so the existing trees
+    #: emit exactly the files they already carry.
+    #:
+    #: Non-empty makes rank a fourth axis of the adapter list, alongside the
+    #: proportion, the training draw size and the draw seed: the tree trains the
+    #: whole simplex at each rank and extracts over the union.  It is a Suite
+    #: field rather than a ``DataSimplexSpec`` one because rank describes how a
+    #: run is configured and not what corpus it is run over -- the same reason
+    #: ``target_modules`` and ``torch_dtype`` are here.
+    lora_ranks: tuple[int, ...] = ()
+
     #: ``{}`` renders no ``prompt_format:`` block at all, which is what makes the
     #: raw path byte-identical to the pre-prompt-format generator output.
     prompt_format: dict = field(default_factory=dict)
@@ -173,6 +198,25 @@ class Suite:
     #: skipping the dead name, so every GPU job in the tree failed at submit.
     #: h200 took its place as the large-HBM tier.
     gpu_partitions: str = "h200,h100,l40s,a100"
+
+    #: Partitions for the TRAINING jobs alone, when they may not go everywhere the
+    #: extraction jobs may.  ``None`` means "the same list", which is every suite
+    #: that has run -- their trees must not move by a byte.
+    #:
+    #: It exists because l40s is safe for extraction on some models and not for
+    #: training them: a 48 GB card makes ``device_map="auto"`` offload part of the
+    #: model, the offloaded submodule returns a meta gradient, and the backward
+    #: pass dies with ``expected device meta but got cuda:0`` -- not a clean OOM,
+    #: so it does not read as one in the log.  Thirteen of thirteen train shards
+    #: that landed on an l40s node died this way on 2026-09-05.  Until now the fix
+    #: was to hand-submit training with ``sbatch --partition=h200,h100``, which
+    #: works only for a tree whose training is not driven from ``submit_all.sh``.
+    train_partitions: str | None = None
+
+    @property
+    def train_gpu_partitions(self) -> str:
+        """The partition list the training jobs are emitted with."""
+        return self.train_partitions or self.gpu_partitions
 
     @property
     def model_slug(self) -> str:

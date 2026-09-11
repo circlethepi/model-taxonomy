@@ -133,6 +133,24 @@ training nsweep is not the same object as the *embedding* sweep already spelled
 dataset representation is computed over, and exists at every `n` regardless of
 what was trained. See `docs/notes/nsweep_dataset_size.md`.
 
+**rsweep** — a sweep over the LoRA **rank**, holding the corpus, the mixture
+grid, the training draw, the seeds and every other optimizer setting fixed. Named
+on 2026-09-11 for its parallel with [nsweep](#nsweep) above: `n` there is the
+training draw size, `r` here is the rank. It reaches code as `Suite.lora_ranks`,
+a Suite field rather than a `DataSimplexSpec` one, because rank says how a run is
+configured and not what corpus it is run over — the same split that puts
+`target_modules` and `torch_dtype` on the Suite.
+
+Two things the word does not mean. It is not a sweep over `lora_alpha`: alpha is
+the *gain* on the low-rank update (PEFT scales `B @ A` by `alpha / rank`), and
+the generator renders `2 * rank`, which is the 32 every adapter trained at rank
+16 already carries — so an rsweep holds the gain at 2 and varies capacity alone.
+And it is not a re-run of the fixed-rank tree at its own middle point: rank is
+inside every adapter directory name (`..._r16_i00_b5008_f…`) and every cache is
+keyed on that name, so the `r16` point of an rsweep resolves to the adapters and
+activations `simplex3_olmo2` already wrote. See
+`docs/notes/rank_sweep.md`.
+
 **Prompt format** — an optional `_f{fmt}` suffix on a draw directory, recording
 which chat template was applied. Deliberately kept out of `recipe_hash`, which
 would otherwise change the identity of every cached draw at once.

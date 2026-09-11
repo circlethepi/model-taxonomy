@@ -587,11 +587,15 @@ def draw_sweep(ax, which: str, levels: list[Level], legend: bool) -> None:
 #: top of a panel this tall once every piece of text is at one size.
 YLABEL = "Procrustes Disparity"
 
-#: The gap between the two rows, as a fraction of the figure's height. The rows
-#: read as separate statements -- one figure repeated at four levels, then four
-#: ways that figure moves -- so they get far more air between them than the
-#: constrained layout's 0.02 default leaves. This is the one knob for it.
-ROW_GAP = 0.16
+#: The gap between the two rows, **in inches**. The rows read as separate
+#: statements -- one figure repeated at four levels, then four ways that figure
+#: moves -- so they get far more air between them than a default layout leaves.
+#: This is the one knob for it.
+#:
+#: It is spent as a blank spacer row in the outer grid, not as the constrained
+#: layout's ``hspace``: each row here is a *nested* gridspec, and the engine's
+#: ``hspace`` is inert across a nesting boundary -- setting it moves nothing.
+ROW_GAP = 0.6
 
 #: Shared y range for the whole bottom row, per scale. Fixed rather than fitted
 #: so any two builds of this figure — the ``--behavioral`` and ``--yscale``
@@ -726,19 +730,19 @@ def build(row: str, decoding: str, yscale: str = "log",
     #: rows are given different heights rather than one shared one.
     top_h, bottom_h = 4.1, 3.6
     width = 19.0
-    height = (top_h if want_top else 0) + (bottom_h if want_bottom else 0)
+    both = want_top and want_bottom
+    gap = ROW_GAP if both else 0.0
+    heights = [h for h, want in [(top_h, want_top), (gap, both),
+                                 (bottom_h, want_bottom)] if want]
+    height = sum(heights)
     fig = plt.figure(figsize=(width, height), layout="constrained")
-    fig.get_layout_engine().set(hspace=ROW_GAP)
-    outer = fig.add_gridspec(
-        sum([want_top, want_bottom]), 1,
-        height_ratios=[h for h, want in [(top_h, want_top), (bottom_h, want_bottom)]
-                       if want])
+    outer = fig.add_gridspec(len(heights), 1, height_ratios=heights)
 
     r = 0
     if want_top:
         draw_top_row(fig, outer[r].subgridspec(1, 5, width_ratios=[1.28] + [1.0] * 4),
                      top_levels, cells, ids)
-        r += 1
+        r += 2 if both else 1
     if want_bottom:
         draw_bottom_row(fig, outer[r].subgridspec(1, 4), bar_levels,
                         sweep_levels, yscale)

@@ -23,6 +23,10 @@ figures/simplex3_qwen-05temp/*
 !figures/simplex3_qwen-05temp/make_temperature_figures.py
 !figures/simplex3_qwen-05temp/make_temperature_curves.py
 
+# Same policy for the OLMo sweep: only the driver is tracked.
+figures/simplex3_olmo2-temp/*
+!figures/simplex3_olmo2-temp/make_figures.py
+
 docs/notes/
 
 # The per-shard configs and sbatch scripts. `scripts/gen_simplex3.py --suite <s>`

@@ -453,6 +453,51 @@ def _in_simplex_frame(coords: np.ndarray, model_ids: Sequence[str]) -> np.ndarra
         return np.asarray(coords, dtype=float)
 
 
+def _spread_labels(ax, anns, dirs, pts, marker_size, fixed=(),
+                   step: float = 2.0, max_extra: float = 60.0) -> None:
+    """Push annotated labels out along their own radii until nothing overlaps.
+
+    A fixed offset cannot be right for every point of a triangular grid: the
+    label of a point near a corner has a whole quadrant to itself, and the label
+    of a point in the middle of a row is boxed in by its two neighbours. So the
+    offset starts at the caller's value and grows, one *step* at a time and only
+    for the labels that are still colliding, until every label clears the other
+    labels, the *fixed* texts (the corner names), and every plotted marker.
+
+    Overlap is measured on rendered boxes, so this draws the figure once per
+    pass; *max_extra* caps how far a label may travel, and a label that is still
+    stuck at the cap simply stops, which is the old behaviour for that one label
+    rather than a label halfway across the panel.
+    """
+    fig = ax.figure
+    fig.canvas.draw()
+    renderer = fig.canvas.get_renderer()
+    # A marker's radius is set in points^2; give it a point of slack so a label
+    # does not sit flush against the circle's edge.
+    radius = (np.sqrt(marker_size) / 2.0 + 1.0) * fig.dpi / 72.0
+    xy = ax.transData.transform(pts)
+    base = [np.asarray(a.xyann, dtype=float) for a in anns]
+    extra = np.zeros(len(anns))
+
+    for _ in range(int(max_extra / step)):
+        boxes = [a.get_window_extent(renderer) for a in anns]
+        blocked = [f.get_window_extent(renderer) for f in fixed]
+        hits = [
+            any(i != j and b.overlaps(c) for j, c in enumerate(boxes))
+            or any(b.overlaps(c) for c in blocked)
+            or any(b.x0 - radius < x < b.x1 + radius
+                   and b.y0 - radius < y < b.y1 + radius for x, y in xy)
+            for i, b in enumerate(boxes)
+        ]
+        movable = [i for i, h in enumerate(hits) if h and extra[i] < max_extra]
+        if not movable:
+            return
+        for i in movable:
+            extra[i] += step
+            anns[i].xyann = tuple(base[i] + dirs[i] * extra[i])
+        fig.canvas.draw()
+
+
 def ternary_legend(
     ax: plt.Axes,
     model_ids: Sequence[str] | None = None,
@@ -471,6 +516,7 @@ def ternary_legend(
     pad: float | None = None,
     outline_color: str = "0.35",
     label_offset: float = 9.5,
+    avoid_collisions: bool = False,
 ) -> plt.Axes:
     """Draw the filled simplex that the point colours are read from.
 
@@ -493,7 +539,10 @@ def ternary_legend(
     a figure drawing its own axes usually wants to match them.
     *label_offset* is how far, in points, each mixture label is pushed out along
     its own radius -- the lever for a key whose triangle is drawn small, where
-    the sixteen labels crowd at the default.
+    the sixteen labels crowd at the default. *avoid_collisions* makes that
+    offset a floor rather than a fixed value: a label that still overlaps
+    another label, a corner name or a marker is pushed further out until it does
+    not (see :func:`_spread_labels`).
 
     **Three groups only.** ``_bary_to_xy`` maps onto a triangle and this function
     labels three corners; a tetrahedron has no honest 2-D barycentric picture, so
@@ -541,6 +590,9 @@ def ternary_legend(
     if fontfamily is not None:
         text_kw["fontfamily"] = fontfamily
 
+    mix_anns: list = []
+    mix_dirs: list = []
+    pts = None
     if model_ids:
         pts = _bary_to_xy(np.array([mixture_weights(m) for m in model_ids]))
         if fill_points:
@@ -559,13 +611,13 @@ def ternary_legend(
             for (x, y), mid in zip(pts, model_ids):
                 d = np.array([x, y]) - mid_xy
                 n = np.linalg.norm(d)
-                dx, dy = ((d / n * label_offset) if n > 1e-9
-                          else (0.0, label_offset * 0.85))
-                ax.annotate(
-                    label_fmt(mid), xy=(x, y), xytext=(dx, dy),
+                unit = (d / n) if n > 1e-9 else np.array([0.0, 0.85])
+                mix_dirs.append(unit)
+                mix_anns.append(ax.annotate(
+                    label_fmt(mid), xy=(x, y), xytext=tuple(unit * label_offset),
                     textcoords="offset points", ha="center", va="center",
                     fontsize=label_size, color="0.15", zorder=4, **text_kw,
-                )
+                ))
 
     # Default to the `g1`/`g2`/`g3` shorthand: the dense surrogate x metric grids have
     # no room for "Group 1", and only the cross-taxonomy figure is aimed at a
@@ -575,6 +627,7 @@ def ternary_legend(
     # labelled the vertex name has to clear that label rather than land on top
     # of it. The radial offset above is 9.5pt, so the name goes beyond it.
     up, down = (26, -25) if (model_ids and label_models) else (13, -11)
+    corner_anns: list = []
     for (x, y), key, va, ha in [
         ((0.5, _SQRT3_2), "g1", "bottom", "center"),
         ((1.0, 0.0), "g2", "top", "left"),
@@ -583,13 +636,23 @@ def ternary_legend(
         label = names.get(key, key)
         if show_topics:
             label += "\n[" + ",".join(str(t) for t in GROUP_TOPICS[key]) + "]"
-        ax.annotate(label, xy=(x, y),
-                    xytext=(0, up) if va == "bottom" else (0, down),
-                    textcoords="offset points", ha=ha, va=va,
-                    fontsize=vertex_size, color="0.15", **text_kw)
+        corner_anns.append(ax.annotate(
+            label, xy=(x, y),
+            xytext=(0, up) if va == "bottom" else (0, down),
+            textcoords="offset points", ha=ha, va=va,
+            fontsize=vertex_size, color="0.15", **text_kw))
 
     if pad is None:
         pad = 0.30 if (model_ids and label_models) else 0.22
+    if mix_anns and avoid_collisions:
+        # After the limits are set, not before: the labels are placed in points
+        # off a data point, so where they land depends on the data-to-display
+        # scale this establishes.
+        ax.set_xlim(-pad, 1.0 + pad)
+        ax.set_ylim(-pad, _SQRT3_2 + pad * 0.9)
+        ax.set_aspect("equal")
+        _spread_labels(ax, mix_anns, mix_dirs, pts, marker_size,
+                       fixed=corner_anns)
     ax.set_xlim(-pad, 1.0 + pad)
     ax.set_ylim(-pad, _SQRT3_2 + pad * 0.9)
     ax.set_aspect("equal")

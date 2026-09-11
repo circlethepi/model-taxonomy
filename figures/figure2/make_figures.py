@@ -217,8 +217,8 @@ CORPUS_COLORS = {"yahoo": "#17807A", "dolly": "#4C9A2A", "oasst1": "#5FD3D0"}
 SWEEP_LINESTYLE = "-"
 
 #: The curves carry the panel, so they are drawn heavier than a default line.
-SWEEP_LINEWIDTH = 2.4
-SWEEP_MARKER_SIZE = 5
+SWEEP_LINEWIDTH = 2.1
+SWEEP_MARKER_SIZE = 7
 
 #: The IQR band is context for its curve, not a second series. Faint enough that
 #: two overlapping bands do not read as a third colour.
@@ -257,14 +257,14 @@ MDS_AXES = ("MDS 1", "MDS 2")
 #: ``75/25/0`` and the bottom row of five is a single smear. The key is a dense
 #: legend rather than a panel, and this is the size at which it is readable as
 #: one. The three vertex *names* are unaffected and stay at FONT_SIZE.
-KEY_LABEL_SIZE = 8
+KEY_LABEL_SIZE = 7
 
 #: The *triangle* is drawn smaller than the panels beside it -- it is a legend,
 #: not a fifth measurement -- by widening the margin around it inside an axes
 #: cell the row's grid fixes. Nothing else in the key shrinks with it: the
 #: labels, the vertex names and the markers are text and marks, sized against
 #: the rest of the figure rather than against the triangle they sit on.
-KEY_PAD = 0.5
+KEY_PAD = 0.3
 KEY_VERTEX_SIZE = FONT_SIZE
 
 #: The labels are pushed further out along their radii than the default 9.5 pt,
@@ -279,7 +279,7 @@ KEY_TITLE = "Dataset Mixture"
 #: looks up a point in the key and then finds it in a panel should be looking at
 #: the same mark; the two sources default to 26 and 130, which reads as two
 #: different kinds of thing.
-MIXTURE_MARKER_SIZE = 70
+MIXTURE_MARKER_SIZE = 150
 
 #: The colour of every axis line in the figure -- the MDS crosshairs, the panel
 #: spines, and the key's triangle, which is that key's only frame. One value, so
@@ -462,9 +462,9 @@ def draw_top_row(fig, gs, levels: list[Level], cells, ids) -> None:
     ternary_legend(kax, ids, label_models=True,
                    vertex_names=group_display(3), show_topics=False,
                    label_size=KEY_LABEL_SIZE, vertex_size=KEY_VERTEX_SIZE,
-                   marker_size=MIXTURE_MARKER_SIZE, label_fmt=bracket_label,
+                   marker_size=MIXTURE_MARKER_SIZE, label_fmt=mixture_label,
                    fill_points=True, pad=KEY_PAD, outline_color=AXIS_COLOR,
-                   label_offset=KEY_LABEL_OFFSET,
+                   label_offset=KEY_LABEL_OFFSET, avoid_collisions=True,
                    fontweight="bold", fontfamily=bold_capable_family())
     kax.set_title(KEY_TITLE, fontsize=FONT_SIZE, pad=10,
                   fontweight="bold", fontfamily=bold_capable_family())
@@ -594,6 +594,12 @@ def draw_sweep(ax, which: str, levels: list[Level], legend: bool) -> None:
 #: docstring and the caption carry it, because a longer label is clipped at the
 #: top of a panel this tall once every piece of text is at one size.
 YLABEL = "Procrustes Disparity"
+
+#: The gap between the two rows, as a fraction of the figure's height. The rows
+#: read as separate statements -- one figure repeated at four levels, then four
+#: ways that figure moves -- so they get far more air between them than the
+#: constrained layout's 0.02 default leaves. This is the one knob for it.
+ROW_GAP = 0.16
 
 #: Shared y range for the whole bottom row, per scale. Fixed rather than fitted
 #: so any two builds of this figure — the ``--behavioral`` and ``--yscale``
@@ -730,10 +736,7 @@ def build(row: str, decoding: str, yscale: str = "log",
     width = 19.0
     height = (top_h if want_top else 0) + (bottom_h if want_bottom else 0)
     fig = plt.figure(figsize=(width, height), layout="constrained")
-    #: The two rows read as separate statements -- one figure repeated at four
-    #: levels, then four ways that figure moves -- so they are given more air
-    #: between them than the default 0.02 leaves.
-    fig.get_layout_engine().set(hspace=0.09)
+    fig.get_layout_engine().set(hspace=ROW_GAP)
     outer = fig.add_gridspec(
         sum([want_top, want_bottom]), 1,
         height_ratios=[h for h, want in [(top_h, want_top), (bottom_h, want_bottom)]

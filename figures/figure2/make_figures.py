@@ -158,7 +158,7 @@ from src.plots import make_series, plot_grouped_bars, save_figure, set_style  # 
 from src.plots.config import bold_capable_family  # noqa: E402
 from src.plots import simplex_runs as runs  # noqa: E402
 from src.plots.simplex import crosslevel_panel, ternary_legend  # noqa: E402
-from src.plots.simplex import group_display  # noqa: E402
+from src.plots.simplex import group_display, mixture_label  # noqa: E402
 
 FIGURES_ROOT = REPO_ROOT / "figures"
 
@@ -194,27 +194,35 @@ LEVEL_COLORS = {
 #: these four can be put on that is not arbitrary, so panel 1's bars can be read
 #: left to right within a group.
 #:
-#: A grey ramp rather than four hues: lightness carries the ordering, which no
-#: reader loses to colour vision, and it leaves every saturated colour in the
-#: figure to the taxonomy levels, which are what the figure is about.
+#: A single-hue blue ramp rather than four hues: lightness carries the ordering,
+#: which no reader loses to colour vision, and one hue for the panel says the
+#: four bars in a group differ in degree rather than in kind.
 MODEL_COLORS = {
-    "allenai/OLMo-2-0425-1B-Instruct":      "#CCCCCC",
-    "Qwen/Qwen3.5-4B":                      "#999999",
-    "meta-llama/Llama-3.1-8B-Instruct":     "#666666",
-    "mistralai/Mistral-Nemo-Instruct-2407": "#222222",
+    "allenai/OLMo-2-0425-1B-Instruct":      "#C6DBEF",
+    "Qwen/Qwen3.5-4B":                      "#6BAED6",
+    "meta-llama/Llama-3.1-8B-Instruct":     "#2171B5",
+    "mistralai/Mistral-Nemo-Instruct-2407": "#08306B",
 }
 
 #: Corpus -> colour, in order of increasing distance from a topic mixture:
 #: yahoo mixes topics, dolly mixes instruction tasks, oasst1 mixes languages.
-#: Three saturated hues of equal weight -- the corpora are not ordered, so
-#: nothing here is a ramp -- dark enough to sit beside panel 1's grey bars
-#: without either panel looking like the other's annotation.
-CORPUS_COLORS = {"yahoo": "#B2182B", "dolly": "#762A83", "oasst1": "#35618F"}
+#: Teal, green and turquoise: one neighbourhood of the wheel, like the model
+#: ramp beside it, but three hues at comparable weight rather than a ramp --
+#: nothing orders three corpora, so nothing here should look ordered.
+CORPUS_COLORS = {"yahoo": "#17807A", "dolly": "#4C9A2A", "oasst1": "#5FD3D0"}
 
 #: One line style for every level in panels 3-4. Hue alone separates the four
 #: curves; they are far enough apart vertically that a dash pattern per level
 #: added texture without adding information.
 SWEEP_LINESTYLE = "-"
+
+#: The curves carry the panel, so they are drawn heavier than a default line.
+SWEEP_LINEWIDTH = 2.4
+SWEEP_MARKER_SIZE = 5
+
+#: The IQR band is context for its curve, not a second series. Faint enough that
+#: two overlapping bands do not read as a third colour.
+BAND_ALPHA = 0.09
 
 #: The marker is the same for every level. It marks where a point was measured
 #: — the seven collection sizes, the nine draw sizes — which is a property of
@@ -249,7 +257,42 @@ MDS_AXES = ("MDS 1", "MDS 2")
 #: ``75/25/0`` and the bottom row of five is a single smear. The key is a dense
 #: legend rather than a panel, and this is the size at which it is readable as
 #: one. The three vertex *names* are unaffected and stay at FONT_SIZE.
-KEY_LABEL_SIZE = 8
+KEY_LABEL_SIZE = 6.0
+
+#: The key is drawn a fifth smaller than the panels beside it, in both the
+#: triangle and the text. It is a legend, not a fifth measurement, and at equal
+#: size it reads as the first of five findings; the extra margin is what buys
+#: the shrink, since the axes cell itself is fixed by the row's grid.
+KEY_SCALE = 0.8
+KEY_PAD = 0.5
+KEY_VERTEX_SIZE = FONT_SIZE * KEY_SCALE
+KEY_TITLE = "Dataset Mixture"
+
+#: One marker area for every mixture point in the top row, key included. The
+#: key and the four MDS panels draw the same sixteen models, and a reader who
+#: looks up a point in the key and then finds it in a panel should be looking at
+#: the same mark; the two sources default to 26 and 130, which reads as two
+#: different kinds of thing. The key draws it at KEY_SCALE, like everything else
+#: in the key -- that is an area, so the scale is squared and the two markers
+#: stay the same mark at the two sizes the row is drawn at.
+MIXTURE_MARKER_SIZE = 70
+KEY_MARKER_SIZE = MIXTURE_MARKER_SIZE * KEY_SCALE ** 2
+
+#: The colour of every axis line in the figure -- the MDS crosshairs, the panel
+#: spines, and the key's triangle, which is that key's only frame. One value, so
+#: the nine panels sit in one box rather than in nine.
+AXIS_COLOR = "0.55"
+
+
+def bracket_label(model_id: str) -> str:
+    """``'[25,50,25]'`` -- a mixture written as the vector it is.
+
+    The project's usual form is ``25/50/25``. Bracketed is this figure's, for
+    both the MDS point labels and the key: nine panels in, a reader meets these
+    trios beside axis values and bar heights, and the brackets say *one label,
+    three numbers* where the slashes read as a fraction.
+    """
+    return "[" + ",".join(mixture_label(model_id).split("/")) + "]"
 
 
 # ── The four levels, in every form the nine panels need them ──────────────────
@@ -415,13 +458,18 @@ def draw_top_row(fig, gs, levels: list[Level], cells, ids) -> None:
     kax = fig.add_subplot(gs[0, 0])
     ternary_legend(kax, ids, label_models=True,
                    vertex_names=group_display(3), show_topics=False,
-                   label_size=KEY_LABEL_SIZE, vertex_size=FONT_SIZE,
-                   marker_size=34,
+                   label_size=KEY_LABEL_SIZE, vertex_size=KEY_VERTEX_SIZE,
+                   marker_size=KEY_MARKER_SIZE, label_fmt=bracket_label,
+                   fill_points=True, pad=KEY_PAD, outline_color=AXIS_COLOR,
                    fontweight="bold", fontfamily=bold_capable_family())
+    kax.set_title(KEY_TITLE, fontsize=FONT_SIZE, pad=10,
+                  fontweight="bold", fontfamily=bold_capable_family())
     for k, label in enumerate(PANEL_ORDER):
         ax = crosslevel_panel(fig.add_subplot(gs[0, k + 1]), by_label[label].label,
                               cells[label], font_size=FONT_SIZE,
-                              point_label_size=POINT_LABEL_SIZE, bold=True)
+                              point_label_size=POINT_LABEL_SIZE, bold=True,
+                              label_fmt=bracket_label, axis_color=AXIS_COLOR,
+                              marker_size=MIXTURE_MARKER_SIZE)
         # No ticks. An MDS coordinate has no units and no origin a reader can
         # use -- the configuration is only defined up to rotation, reflection
         # and scale, which is exactly why it is scored by Procrustes -- so the
@@ -523,9 +571,11 @@ def draw_sweep(ax, which: str, levels: list[Level], legend: bool) -> None:
     path, xcol, ycol, title, xlabel, xmax = SWEEPS[which]
     for lv in levels:
         xs, med, q1, q3 = sweep_series(path, xcol, ycol, lv.sweep_key, xmax)
-        ax.fill_between(xs, q1, q3, color=lv.color, alpha=0.15, lw=0, zorder=2)
+        ax.fill_between(xs, q1, q3, color=lv.color, alpha=BAND_ALPHA, lw=0,
+                        zorder=2)
         ax.plot(xs, med, color=lv.color, ls=SWEEP_LINESTYLE,
-                marker=SWEEP_MARKER, ms=4, lw=1.4, label=lv.label, zorder=3)
+                marker=SWEEP_MARKER, ms=SWEEP_MARKER_SIZE, lw=SWEEP_LINEWIDTH,
+                label=lv.label, zorder=3)
     ax.set_xscale("log")
     ax.set_title(title)
     ax.set_xlabel(xlabel)
@@ -620,6 +670,8 @@ def _apply_style() -> None:
         "font.sans-serif": [bold_capable_family(), "DejaVu Sans"],
         "font.weight": "bold", "axes.labelweight": "bold",
         "axes.titleweight": "bold",
+        "axes.edgecolor": AXIS_COLOR,
+        "axes.linewidth": 1.0,
     })
 
 
@@ -685,7 +737,7 @@ def build(row: str, decoding: str, yscale: str = "log",
 
     r = 0
     if want_top:
-        draw_top_row(fig, outer[r].subgridspec(1, 5, width_ratios=[1.28] + [1.0] * 4),
+        draw_top_row(fig, outer[r].subgridspec(1, 5, width_ratios=[1.28 * KEY_SCALE] + [1.0] * 4),
                      top_levels, cells, ids)
         r += 1
     if want_bottom:

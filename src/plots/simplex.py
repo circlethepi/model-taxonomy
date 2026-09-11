@@ -466,6 +466,10 @@ def ternary_legend(
     vertex_size: float = 6,
     fontweight: str = "normal",
     fontfamily: str | None = None,
+    label_fmt: Callable[[str], str] = mixture_label,
+    fill_points: bool = False,
+    pad: float | None = None,
+    outline_color: str = "0.35",
 ) -> plt.Axes:
     """Draw the filled simplex that the point colours are read from.
 
@@ -478,6 +482,14 @@ def ternary_legend(
     the sampled mixtures are placed **radially outward from the centre** rather
     than at a fixed offset, which is what keeps sixteen of them legible on a
     triangle this small.
+
+    *label_fmt* renders a sampled mixture's label; *fill_points* paints each
+    marker in that mixture's own colour -- the colour the same model carries in
+    an MDS panel -- instead of leaving it an open white ring, so a marker on the
+    boundary reads as a full point rather than a hole in the triangle. *pad*
+    overrides the margin left around the triangle, which is what shrinks the
+    drawn key inside a fixed axes; *outline_color* is the triangle's edge, which
+    a figure drawing its own axes usually wants to match them.
 
     **Three groups only.** ``_bary_to_xy`` maps onto a triangle and this function
     labels three corners; a tetrahedron has no honest 2-D barycentric picture, so
@@ -518,7 +530,7 @@ def ternary_legend(
     ax.imshow(rgba, origin="lower", extent=(0.0, 1.0, 0.0, _SQRT3_2), interpolation="bilinear")
     ax.add_patch(Polygon(
         [[0.5, _SQRT3_2], [1.0, 0.0], [0.0, 0.0]],
-        closed=True, fill=False, edgecolor="0.35", linewidth=0.8,
+        closed=True, fill=False, edgecolor=outline_color, linewidth=0.8,
     ))
 
     text_kw = {"fontweight": fontweight}
@@ -527,8 +539,13 @@ def ternary_legend(
 
     if model_ids:
         pts = _bary_to_xy(np.array([mixture_weights(m) for m in model_ids]))
-        ax.scatter(pts[:, 0], pts[:, 1], s=marker_size, facecolors="none",
-                   edgecolors="white", linewidths=0.9, zorder=3)
+        if fill_points:
+            ax.scatter(pts[:, 0], pts[:, 1], s=marker_size,
+                       c=model_colors(model_ids, anchors),
+                       edgecolors="0.2", linewidths=0.9, zorder=3)
+        else:
+            ax.scatter(pts[:, 0], pts[:, 1], s=marker_size, facecolors="none",
+                       edgecolors="white", linewidths=0.9, zorder=3)
         if label_models:
             # Push each label away from the centroid along its own radius. A
             # fixed (3, 3) offset stacks the labels of the four points that share
@@ -540,7 +557,7 @@ def ternary_legend(
                 n = np.linalg.norm(d)
                 dx, dy = (d / n * 9.5) if n > 1e-9 else (0.0, 8.0)
                 ax.annotate(
-                    mixture_label(mid), xy=(x, y), xytext=(dx, dy),
+                    label_fmt(mid), xy=(x, y), xytext=(dx, dy),
                     textcoords="offset points", ha="center", va="center",
                     fontsize=label_size, color="0.15", zorder=4, **text_kw,
                 )
@@ -566,7 +583,8 @@ def ternary_legend(
                     textcoords="offset points", ha=ha, va=va,
                     fontsize=vertex_size, color="0.15", **text_kw)
 
-    pad = 0.30 if (model_ids and label_models) else 0.22
+    if pad is None:
+        pad = 0.30 if (model_ids and label_models) else 0.22
     ax.set_xlim(-pad, 1.0 + pad)
     ax.set_ylim(-pad, _SQRT3_2 + pad * 0.9)
     ax.set_aspect("equal")
@@ -770,6 +788,8 @@ def crosslevel_panel(
     font_size: float | None = None,
     point_label_size: float | None = None,
     bold: bool = True,
+    label_fmt: Callable[[str], str] = mixture_label,
+    axis_color: str = "0.88",
 ) -> plt.Axes:
     """One cross-level MDS panel, drawn into *ax*.
 
@@ -805,6 +825,13 @@ def crosslevel_panel(
     ``font.family`` at its normal weight like every other axes in that figure —
     mixing the two faces inside one figure reads as emphasis that is not
     meant.
+
+    *label_fmt* renders a model id as the text of its point label. It does not
+    choose *which* points are labelled -- *label_points* still does that, and
+    still names them in :func:`mixture_label` form -- so a figure can restyle
+    the four labels without restating which four they are.
+
+    *axis_color* is the colour of the two crosshair lines through the origin.
     """
     from src.analysis.bridge import fit_geometry
     from src.analysis.quality import kruskal_stress
@@ -818,15 +845,15 @@ def crosslevel_panel(
     geo = fit_geometry(dm, "mds", 2, random_state=random_state)
     xy = align_to_simplex(geo.coordinates, geo.model_ids)
 
-    ax.axhline(0.0, color="0.88", lw=1.0, zorder=0)
-    ax.axvline(0.0, color="0.88", lw=1.0, zorder=0)
+    ax.axhline(0.0, color=axis_color, lw=1.0, zorder=0)
+    ax.axvline(0.0, color=axis_color, lw=1.0, zorder=0)
     ax.scatter(xy[:, 0], xy[:, 1], c=model_colors(geo.model_ids, anchors),
                s=marker_size, zorder=3, edgecolors="0.2", linewidths=1.0)
 
     for (x, y), mid in zip(xy, geo.model_ids):
         label = mixture_label(mid)
         if label in keep:
-            ax.annotate(label, xy=(x, y), xytext=(0, 11),
+            ax.annotate(label_fmt(mid), xy=(x, y), xytext=(0, 11),
                         textcoords="offset points", ha="center",
                         fontsize=label_size, color="0.1", zorder=4, **weight)
 

@@ -717,3 +717,103 @@ def plot_grouped_bars(
     if savefig:
         _save(fig, _resolve_savepath(savepath, title))
     return fig, ax
+
+
+# ── uninformed baselines ──────────────────────────────────────────────────────
+
+#: One colour for every uninformed band, on every figure in the project.  Grey,
+#: deliberately: the band is the backdrop a real score is read against, and a
+#: hued band competes with the series it exists to contextualise.
+UNINFORMED_COLOUR = "0.45"
+
+#: The one legend label.  A band drawn without saying which generator produced
+#: it is unreadable, so the generator is always in the label.
+UNINFORMED_LABEL = "uninformed baseline ({generator}, 5–95)"
+
+
+def load_baseline_table(path=None) -> dict:
+    """Parse ``results/baselines/constants.json``, or explain how to make it.
+
+    That path is gitignored, so a fresh clone genuinely does not have it; this
+    fails by naming the command that writes it rather than with a bare
+    ``FileNotFoundError`` four frames deep in a figure driver.
+    """
+    import json
+
+    if path is None:
+        path = Path(__file__).resolve().parents[2] / "results/baselines/constants.json"
+    path = Path(path)
+    if not path.exists():
+        raise SystemExit(
+            f"no uninformed baselines at {path}.\n"
+            "Run `python scripts/make_baselines.py` first (a few seconds); the "
+            "file is generated, not tracked."
+        )
+    with path.open() as fh:
+        return json.load(fh)
+
+
+def draw_uninformed_band(
+    ax: plt.Axes,
+    *,
+    mode: str,
+    generator: str,
+    band,
+    x=None,
+    label: bool = False,
+    colour: str = UNINFORMED_COLOUR,
+    alpha: float = 0.13,
+) -> None:
+    """Shade the level a taxonomy that learned nothing would have scored.
+
+    An **uninformed baseline** is that level; the **uninformed band** is its
+    5–95 interval.  Drawn as a shaded region with a dashed centre line, and one
+    legend entry for the pair — never two.
+
+    Three modes, one per figure shape this project draws:
+
+    ``curve``
+        ``band`` is ``(lo, mid, hi)`` arrays over *x*, for a figure whose x-axis
+        is the collection size.  The only mode where the baseline moves.
+    ``horizontal``
+        ``band`` is one ``(lo, mid, hi)`` triple spanning the whole axis — bar
+        charts, and any sweep that varies something *other* than ``n`` at fixed
+        collection size.
+    ``radial``
+        the same triple closed into a polygon on a radar axis, with *x* the
+        spoke angles.
+
+    The band is drawn **behind** everything already on the axis (``zorder`` below
+    the default 2) so it never occludes a series.
+
+    One caveat this helper cannot enforce, and every caller must state in the
+    figure text: the structure null is scored directly as a configuration and
+    never passes through MDS, so on an MDS-mediated score such as the Procrustes
+    disparity the baseline is mildly optimistic.
+    """
+    lo, mid, hi = band
+    text = UNINFORMED_LABEL.format(generator=generator) if label else None
+
+    if mode == "curve":
+        if x is None:
+            raise ValueError("mode='curve' needs x")
+        ax.fill_between(x, lo, hi, color=colour, alpha=alpha, linewidth=0,
+                        zorder=0.5, label=text)
+        ax.plot(x, mid, color=colour, ls="--", lw=1.0, zorder=0.6)
+    elif mode == "horizontal":
+        ax.axhspan(lo, hi, color=colour, alpha=alpha, linewidth=0,
+                   zorder=0.5, label=text)
+        ax.axhline(mid, color=colour, ls="--", lw=1.0, zorder=0.6)
+    elif mode == "radial":
+        if x is None:
+            raise ValueError("mode='radial' needs x (the spoke angles)")
+        theta = np.concatenate([np.asarray(x), np.asarray(x)[:1]])
+        ax.fill_between(theta, np.full(theta.shape, lo), np.full(theta.shape, hi),
+                        color=colour, alpha=alpha, linewidth=0, zorder=0.5,
+                        label=text)
+        ax.plot(theta, np.full(theta.shape, mid), color=colour, ls="--", lw=1.0,
+                zorder=0.6)
+    else:
+        raise ValueError(
+            f"unknown mode {mode!r}; have 'curve', 'horizontal', 'radial'"
+        )

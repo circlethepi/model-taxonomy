@@ -22,18 +22,28 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+from scipy.spatial.distance import pdist, squareform
+
 from src.analysis import (
+    APPROX_MIN_N,
     align_to_reference,
     anchor_weight_vs_truth,
     as_distance_matrix,
+    band_quantiles,
     barycentric,
     compare_simplices,
     correlation_table,
+    dcor_null_direct,
+    disparity_null_analytic,
+    disparity_null_approx,
+    disparity_null_direct,
     fit_geometry,
     kruskal_stress,
     dcor_test,
     distance_correlation,
     mantel_test,
+    simplex_vertices,
+    truth_singular_values,
     matrix_correlation,
     per_point_residuals,
     point_dispersion,
@@ -606,6 +616,170 @@ def t_procrustes():
     pt = protest(_geometry(coords), _geometry(transformed), n_permutations=999)
     assert pt.p_value < 0.01, pt.p_value
     return f"disparity={res.disparity:.2e}, protest p={pt.p_value:.4f}"
+
+
+# ── uninformed baselines ──────────────────────────────────────────────────────
+#
+# An *uninformed baseline* is the level a taxonomy that learned nothing would
+# score; the *uninformed band* is its 5-95 interval.  These checks are all
+# synthetic on purpose: they build their own ground truth and never read
+# `results/baselines/constants.json`, which is generated and gitignored, so they
+# pass in a fresh clone and in a worktree.
+
+
+def _baseline_truth(n, k, seed=0):
+    """A Dirichlet(1) ground truth at *n* on a *k*-vertex simplex."""
+    rng = np.random.default_rng(seed)
+    return rng.dirichlet(np.ones(k), size=n) @ simplex_vertices(k)
+
+
+@check("uninformed: analytic disparity null matches the full scoring path")
+def t_uninformed_disparity_analytic():
+    """The closed form against a Monte Carlo of draw -> standardise -> superimpose.
+
+    This is the load-bearing check of the whole module: everything else trusts
+    that ``1 - ||L Z||_*^2 / (||Z||_F^2 + W_n)`` really is the disparity's null.
+    Both band edges and the centre, at three n spanning the range, at d=2 and
+    d=3.
+    """
+    worst = 0.0
+    for k, ns in ((3, (5, 50, 500)), (4, (5, 50, 500))):
+        for n in ns:
+            truth = _baseline_truth(n, k, seed=n + k)
+            lam = truth_singular_values(truth)
+            got = np.array(band_quantiles(
+                disparity_null_analytic(n, lam, n_mc=40_000, seed=1)))
+            ref = np.array(band_quantiles(
+                disparity_null_direct(n, truth, n_mc=4_000, seed=2)))
+            worst = max(worst, float(np.abs(got - ref).max()))
+    # 4k direct draws put the Monte Carlo error on a 5th percentile at ~0.01.
+    assert worst < 0.02, f"analytic and direct disagree by {worst:.4f}"
+    return f"max |analytic - direct| = {worst:.4f} over 6 (k, n) cells"
+
+
+@check("uninformed: the large-n approximation holds above its threshold, and "
+       "fails below")
+def t_uninformed_approx_threshold():
+    """``APPROX_MIN_N`` is a tested claim, not a comment.
+
+    The approximation replaces the random denominator with its mean while the
+    numerator's ``Z`` is *inside* that denominator, so it fails at small n --
+    and it has to be shown failing, or the threshold means nothing.
+    """
+    lam = truth_singular_values(_baseline_truth(200, 3, seed=5))
+
+    def err(n):
+        a = np.array(band_quantiles(disparity_null_analytic(n, lam, seed=1)))
+        b = np.array(band_quantiles(disparity_null_approx(n, lam, seed=1)))
+        return float(np.abs(a - b).max())
+
+    above = max(err(n) for n in (APPROX_MIN_N, 50, 100, 500))
+    assert above < 0.01, f"approximation is off by {above:.4f} at n >= {APPROX_MIN_N}"
+    below = err(5)
+    assert below > 0.05, (
+        f"approximation is only off by {below:.4f} at n=5; if it no longer "
+        f"fails there, APPROX_MIN_N={APPROX_MIN_N} is too conservative"
+    )
+    return f"err <= {above:.4f} at n >= {APPROX_MIN_N}, {below:.3f} at n=5"
+
+
+@check("uninformed: a perfect recovery falls outside the band")
+def t_uninformed_separates_truth():
+    """A baseline that cannot separate the truth from noise is broken.
+
+    Scores the truth against itself -- disparity 0, dCor* 1 -- and requires both
+    to sit outside the uninformed band at every n.  This is the check that would
+    catch a band drawn on the wrong scale or with its edges swapped.
+    """
+    for k in (3, 4):
+        for n in (5, 20, 500):
+            truth = _baseline_truth(n, k, seed=n)
+            lam = truth_singular_values(truth)
+            lo, _, hi = band_quantiles(
+                disparity_null_analytic(n, lam, n_mc=20_000, seed=3))
+            assert 0.0 < lo, (
+                f"k={k} n={n}: perfect disparity 0 is inside the band "
+                f"[{lo:.4f}, {hi:.4f}]"
+            )
+            dm = squareform(pdist(truth))
+            dlo, _, dhi = band_quantiles(
+                dcor_null_direct(n, dm, k=k, n_mc=600, seed=4))
+            assert 1.0 > dhi, (
+                f"k={k} n={n}: perfect dCor* 1 is inside the band "
+                f"[{dlo:.4f}, {dhi:.4f}]"
+            )
+    return "disparity 0 and dCor* 1 both clear the band at every (k, n)"
+
+
+@check("uninformed: the dCor structure null has mean zero and a shrinking skew")
+def t_uninformed_dcor_centre():
+    """dCor*'s null is centred at zero *in the mean*, and is right-skewed.
+
+    The analytic claim is about the mean and only the mean: the bias-corrected
+    numerator is an unbiased estimator of dCov^2, which is 0 when the two
+    matrices are independent.  The **median** is a different story and is pinned
+    separately here, because it is the number a band's centre line actually
+    draws.
+
+    dCor* is a ratio with a random denominator, so its null is right-skewed and
+    the median sits *below* the mean.  Measured at k=3, 8000 draws:
+
+    .. code-block:: text
+
+        n        mean      median
+        10     +0.0025    -0.027
+        50     +0.0002    -0.0055
+        200    -0.0001    -0.0014
+
+    The skew is real, not noise -- it is ~10x the median's standard error at
+    every n -- and it decays like 1/n, so it matters only where the band is
+    already ~0.27 wide.  Both facts are pinned: the mean must be ~0 everywhere,
+    and the median's offset must shrink by at least 4x from n=10 to n=200.  A
+    median that stopped shrinking, or a mean that did not sit at 0, would both
+    mean the U-centring was wrong.
+    """
+    means, medians = {}, {}
+    for generator in ("gaussian", "dirichlet"):
+        for n in (10, 50, 200):
+            dm = squareform(pdist(_baseline_truth(n, 3, seed=n)))
+            sample = dcor_null_direct(n, dm, k=3, generator=generator,
+                                      n_mc=4_000, seed=6)
+            means[generator, n] = float(np.mean(sample))
+            medians[generator, n] = float(np.median(sample))
+
+    worst_mean = max(abs(v) for v in means.values())
+    assert worst_mean < 0.01, f"dCor* null mean is {worst_mean:.4f}, not 0"
+
+    for generator in ("gaussian", "dirichlet"):
+        small = abs(medians[generator, 10])
+        large = abs(medians[generator, 200])
+        assert small > 4 * large, (
+            f"{generator}: median offset {small:.4f} at n=10 vs {large:.4f} at "
+            "n=200 — the skew is not shrinking with n"
+        )
+    return (f"max |mean| = {worst_mean:.4f}; median offset "
+            f"{abs(medians['gaussian', 10]):.3f} -> "
+            f"{abs(medians['gaussian', 200]):.4f} from n=10 to 200")
+
+
+@check("uninformed: lambda matches the standardisation Procrustes applies")
+def t_uninformed_lambda_matches_standardize():
+    """``truth_singular_values`` must be the *same* standardisation as the score.
+
+    The analytic law is stated in terms of the singular values of the truth
+    *after* ``_standardize`` -- centred and unit Frobenius norm.  If these two
+    ever diverge the band would be computed for a differently-scaled truth than
+    the one the disparity is measured against, silently.
+    """
+    from src.analysis.configurations import _standardize
+
+    for k in (3, 4):
+        truth = _baseline_truth(37, k, seed=8)
+        mine = truth_singular_values(truth)
+        theirs = np.linalg.svd(_standardize(truth, True)[0], compute_uv=False)
+        assert np.allclose(mine, theirs, atol=1e-12), (mine, theirs)
+        assert abs(float((mine ** 2).sum()) - 1.0) < 1e-12
+    return "identical at k=3 and k=4, and sum(l^2) = 1"
 
 
 @check("procrustes: matches scipy.spatial.procrustes")
@@ -6224,6 +6398,9 @@ SYNTHETIC = [
     t_mantel, t_dcor_bias, t_dcor_test, t_dcor_unsigned, t_dcor_u_centering_symmetry,
     t_dcor_restricted, t_data_simplex_spec_sampling,
     t_procrustes, t_procrustes_vs_scipy, t_per_point_residuals,
+    t_uninformed_disparity_analytic, t_uninformed_approx_threshold,
+    t_uninformed_separates_truth, t_uninformed_dcor_centre,
+    t_uninformed_lambda_matches_standardize,
     t_dispersion, t_quality, t_correlation_table, t_match_models, t_fit_geometry,
     t_similarity_conversion, t_simplex_roundtrip, t_cosine_equivalence,
     t_bures_wasserstein_equivalence, t_bures_wasserstein_invariance,

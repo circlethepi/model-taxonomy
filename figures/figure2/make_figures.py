@@ -116,11 +116,10 @@ Every piece of text in the figure is one size and one weight — see
 :data:`FONT_SIZE` and :func:`_apply_style`. The three sources this figure is
 assembled from do not agree on either by default, because each was written for a
 figure it was the whole of, and side by side in one frame that difference reads
-as emphasis rather than as provenance. The single exception is the vertex and
-centre labels annotated *inside* the MDS panels, which take one step down (see
-:data:`POINT_LABEL_SIZE`) because they sit among the points they name, and the
-mixture key's sixteen labels, which are smaller again (see
-:data:`KEY_LABEL_SIZE`) because sixteen of them share one triangle.
+as emphasis rather than as provenance. The single exception is the labels that
+name a mixture — the four annotated inside each MDS panel and the key's sixteen
+— which are set together at :data:`MIXTURE_LABEL_SIZE`, small enough for the
+densest panel that carries them.
 
 Usage
 -----
@@ -242,22 +241,16 @@ SWEEP_MARKER = "o"
 #: flattened here rather than in either source.
 FONT_SIZE = 13
 
-#: The one exception, for the vertex and centre labels annotated inside the top
-#: row's MDS panels. They sit among the points they name rather than outside the
-#: axes, so at the full size they crowd the configuration they are there to
-#: explain. A step down, not a different register.
-POINT_LABEL_SIZE = FONT_SIZE - 2
+#: The one exception: every label that names a mixture, in the key and in the
+#: four MDS panels alike. These sit among the points they name rather than
+#: outside an axes, and sixteen of them share the key's triangle, so at FONT_SIZE
+#: they crowd the configuration they are there to explain. One value for all of
+#: them -- the same text saying the same thing in five panels -- and it is the
+#: size the densest of those panels can carry.
+MIXTURE_LABEL_SIZE = 7
 
 #: The names of the two axes every top-row panel is drawn in.
 MDS_AXES = ("MDS 1", "MDS 2")
-
-#: The mixture key's sixteen labels, which are the one thing in the figure that
-#: cannot be set at :data:`FONT_SIZE`. They name every sampled point on a
-#: triangle the width of one panel, so at 13 pt ``75/0/25`` runs into
-#: ``75/25/0`` and the bottom row of five is a single smear. The key is a dense
-#: legend rather than a panel, and this is the size at which it is readable as
-#: one. The three vertex *names* are unaffected and stay at FONT_SIZE.
-KEY_LABEL_SIZE = 7
 
 #: The *triangle* is drawn smaller than the panels beside it -- it is a legend,
 #: not a fifth measurement -- by widening the margin around it inside an axes
@@ -287,15 +280,14 @@ MIXTURE_MARKER_SIZE = 150
 AXIS_COLOR = "0.55"
 
 
-def bracket_label(model_id: str) -> str:
-    """``'[25,50,25]'`` -- a mixture written as the vector it is.
+def comma_label(model_id: str) -> str:
+    """``'25,50,25'`` -- a mixture written as the vector it is.
 
-    The project's usual form is ``25/50/25``. Bracketed is this figure's, for
-    both the MDS point labels and the key: nine panels in, a reader meets these
-    trios beside axis values and bar heights, and the brackets say *one label,
-    three numbers* where the slashes read as a fraction.
+    The project's usual form is ``25/50/25``. Commas are this figure's, for both
+    the MDS point labels and the key: nine panels in, a reader meets these trios
+    beside axis values and bar heights, where a slash reads as a fraction.
     """
-    return "[" + ",".join(mixture_label(model_id).split("/")) + "]"
+    return ",".join(mixture_label(model_id).split("/"))
 
 
 # ── The four levels, in every form the nine panels need them ──────────────────
@@ -461,8 +453,8 @@ def draw_top_row(fig, gs, levels: list[Level], cells, ids) -> None:
     kax = fig.add_subplot(gs[0, 0])
     ternary_legend(kax, ids, label_models=True,
                    vertex_names=group_display(3), show_topics=False,
-                   label_size=KEY_LABEL_SIZE, vertex_size=KEY_VERTEX_SIZE,
-                   marker_size=MIXTURE_MARKER_SIZE, label_fmt=mixture_label,
+                   label_size=MIXTURE_LABEL_SIZE, vertex_size=KEY_VERTEX_SIZE,
+                   marker_size=MIXTURE_MARKER_SIZE, label_fmt=comma_label,
                    fill_points=True, pad=KEY_PAD, outline_color=AXIS_COLOR,
                    label_offset=KEY_LABEL_OFFSET, avoid_collisions=True,
                    fontweight="bold", fontfamily=bold_capable_family())
@@ -471,8 +463,8 @@ def draw_top_row(fig, gs, levels: list[Level], cells, ids) -> None:
     for k, label in enumerate(PANEL_ORDER):
         ax = crosslevel_panel(fig.add_subplot(gs[0, k + 1]), by_label[label].label,
                               cells[label], font_size=FONT_SIZE,
-                              point_label_size=POINT_LABEL_SIZE, bold=True,
-                              label_fmt=bracket_label, axis_color=AXIS_COLOR,
+                              point_label_size=MIXTURE_LABEL_SIZE, bold=True,
+                              label_fmt=comma_label, axis_color=AXIS_COLOR,
                               marker_size=MIXTURE_MARKER_SIZE)
         # No ticks. An MDS coordinate has no units and no origin a reader can
         # use -- the configuration is only defined up to rotation, reflection

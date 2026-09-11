@@ -193,22 +193,28 @@ LEVEL_COLORS = {
 #: Base model -> colour, in ascending parameter count. Size is the one axis
 #: these four can be put on that is not arbitrary, so panel 1's bars can be read
 #: left to right within a group.
+#:
+#: A grey ramp rather than four hues: lightness carries the ordering, which no
+#: reader loses to colour vision, and it leaves every saturated colour in the
+#: figure to the taxonomy levels, which are what the figure is about.
 MODEL_COLORS = {
-    "allenai/OLMo-2-0425-1B-Instruct":      "#000000",
-    "Qwen/Qwen3.5-4B":                      "#56B4E9",
-    "meta-llama/Llama-3.1-8B-Instruct":     "#CC79A7",
-    "mistralai/Mistral-Nemo-Instruct-2407": "#882255",
+    "allenai/OLMo-2-0425-1B-Instruct":      "#CCCCCC",
+    "Qwen/Qwen3.5-4B":                      "#999999",
+    "meta-llama/Llama-3.1-8B-Instruct":     "#666666",
+    "mistralai/Mistral-Nemo-Instruct-2407": "#222222",
 }
 
 #: Corpus -> colour, in order of increasing distance from a topic mixture:
 #: yahoo mixes topics, dolly mixes instruction tasks, oasst1 mixes languages.
-CORPUS_COLORS = {"yahoo": "#44AA99", "dolly": "#AA4499", "oasst1": "#999999"}
+#: Three saturated hues of equal weight -- the corpora are not ordered, so
+#: nothing here is a ramp -- dark enough to sit beside panel 1's grey bars
+#: without either panel looking like the other's annotation.
+CORPUS_COLORS = {"yahoo": "#B2182B", "dolly": "#762A83", "oasst1": "#35618F"}
 
-#: One dash pattern per level, so the four curves in panels 3-4 survive a
-#: greyscale print and a reader who cannot separate the hues. It travels with
-#: the level, not with its position.
-LEVEL_DASHES = {"Data": "-", "Structural": "--",
-                "Functional": "-.", "Behavioral": ":"}
+#: One line style for every level in panels 3-4. Hue alone separates the four
+#: curves; they are far enough apart vertically that a dash pattern per level
+#: added texture without adding information.
+SWEEP_LINESTYLE = "-"
 
 #: The marker is the same for every level. It marks where a point was measured
 #: — the seven collection sizes, the nine draw sizes — which is a property of
@@ -476,24 +482,32 @@ def draw_corpora_bars(ax, levels: list[Level]) -> None:
 #: docstring for why. The title names what the panel varies and the axis label
 #: names the unit it varies it in, which is why both are carried and neither is
 #: derived from the other.
+#: ``(csv, x column, y column, title, x label, x cap)``. The cap drops the
+#: sweep's largest draw sizes from the panel; ``None`` keeps every x in the
+#: file. The nsweep ran one value past 2000 -- 5000 -- and it is cut here
+#: rather than in the CSV, so the sweep's own figure keeps it.
 SWEEPS = {
     "collection": (FIGURES_ROOT / "simplex_collection_size" / "group_size_scores.csv",
                    "n", "disparity_B", "Collection Size",
-                   "Models in the collection"),
+                   "Models in the collection", None),
     "nsweep": (FIGURES_ROOT / "simplex3_nsweep_olmo2_nsweep" / "nsweep_scores.csv",
                "n_samples", "disparity_requested", "Training Set Size",
-               "Training examples per adapter"),
+               "Training examples per adapter", 2_000),
 }
 
 
-def sweep_series(path: Path, xcol: str, ycol: str, sweep_key: str):
+def sweep_series(path: Path, xcol: str, ycol: str, sweep_key: str,
+                 xmax: int | None = None):
     """``(xs, median, q1, q3)`` over the replicates at each x, for one level."""
     by_x: dict[int, list[float]] = {}
     with open(path, newline="") as fh:
         for row in csv.DictReader(fh):
             if row["perspective"] != sweep_key:
                 continue
-            by_x.setdefault(int(row[xcol]), []).append(float(row[ycol]))
+            x = int(row[xcol])
+            if xmax is not None and x > xmax:
+                continue
+            by_x.setdefault(x, []).append(float(row[ycol]))
     if not by_x:
         raise SystemExit(f"{path.name} has no rows for perspective {sweep_key!r}")
     xs = np.array(sorted(by_x))
@@ -506,11 +520,11 @@ def sweep_series(path: Path, xcol: str, ycol: str, sweep_key: str):
 
 def draw_sweep(ax, which: str, levels: list[Level], legend: bool) -> None:
     """Panels 3 and 4 — all four levels on one axes, median plus IQR band."""
-    path, xcol, ycol, title, xlabel = SWEEPS[which]
+    path, xcol, ycol, title, xlabel, xmax = SWEEPS[which]
     for lv in levels:
-        xs, med, q1, q3 = sweep_series(path, xcol, ycol, lv.sweep_key)
+        xs, med, q1, q3 = sweep_series(path, xcol, ycol, lv.sweep_key, xmax)
         ax.fill_between(xs, q1, q3, color=lv.color, alpha=0.15, lw=0, zorder=2)
-        ax.plot(xs, med, color=lv.color, ls=LEVEL_DASHES[lv.label],
+        ax.plot(xs, med, color=lv.color, ls=SWEEP_LINESTYLE,
                 marker=SWEEP_MARKER, ms=4, lw=1.4, label=lv.label, zorder=3)
     ax.set_xscale("log")
     ax.set_title(title)
@@ -660,6 +674,10 @@ def build(row: str, decoding: str, yscale: str = "log",
     width = 19.0
     height = (top_h if want_top else 0) + (bottom_h if want_bottom else 0)
     fig = plt.figure(figsize=(width, height), layout="constrained")
+    #: The two rows read as separate statements -- one figure repeated at four
+    #: levels, then four ways that figure moves -- so they are given more air
+    #: between them than the default 0.02 leaves.
+    fig.get_layout_engine().set(hspace=0.09)
     outer = fig.add_gridspec(
         sum([want_top, want_bottom]), 1,
         height_ratios=[h for h, want in [(top_h, want_top), (bottom_h, want_bottom)]

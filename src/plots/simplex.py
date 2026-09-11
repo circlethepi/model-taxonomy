@@ -453,6 +453,26 @@ def _in_simplex_frame(coords: np.ndarray, model_ids: Sequence[str]) -> np.ndarra
         return np.asarray(coords, dtype=float)
 
 
+def _open_direction(pts: np.ndarray, i: int) -> np.ndarray:
+    """The unit direction out of ``pts[i]`` with the most room around it.
+
+    Scanned rather than derived: a probe is placed one nearest-neighbour step
+    out along each of 180 angles, and the angle whose probe sits furthest from
+    every *other* point wins. Used for a point whose radius from the centroid is
+    zero, which has no natural direction of its own.
+    """
+    others = np.delete(pts, i, axis=0)
+    if not len(others):
+        return np.array([0.0, 1.0])
+    step = float(np.min(np.linalg.norm(others - pts[i], axis=1)))
+    ang = np.linspace(0.0, 2 * np.pi, 180, endpoint=False)
+    dirs = np.column_stack([np.cos(ang), np.sin(ang)])
+    probes = pts[i] + dirs * step
+    room = np.min(np.linalg.norm(probes[:, None, :] - others[None, :, :], axis=2),
+                  axis=1)
+    return dirs[int(np.argmax(room))]
+
+
 def _spread_labels(ax, anns, dirs, pts, marker_size, fixed=(),
                    step: float = 2.0, max_extra: float = 60.0) -> None:
     """Push annotated labels out along their own radii until nothing overlaps.
@@ -605,13 +625,16 @@ def ternary_legend(
         if label_models:
             # Push each label away from the centroid along its own radius. A
             # fixed (3, 3) offset stacks the labels of the four points that share
-            # a row of the grid; a radial one fans them out, and the centre point
-            # (whose radius is zero) is nudged straight up.
+            # a row of the grid; a radial one fans them out. The centre point has
+            # no radius to push along, so it gets the emptiest direction instead
+            # -- pushing it along a fixed one walks it straight through whichever
+            # neighbour happens to lie that way, and it ends up reading as that
+            # neighbour's label.
             mid_xy = _bary_to_xy(np.array([1 / 3, 1 / 3, 1 / 3]))[0]
-            for (x, y), mid in zip(pts, model_ids):
+            for i, ((x, y), mid) in enumerate(zip(pts, model_ids)):
                 d = np.array([x, y]) - mid_xy
                 n = np.linalg.norm(d)
-                unit = (d / n) if n > 1e-9 else np.array([0.0, 0.85])
+                unit = (d / n) if n > 1e-9 else _open_direction(pts, i)
                 mix_dirs.append(unit)
                 mix_anns.append(ax.annotate(
                     label_fmt(mid), xy=(x, y), xytext=tuple(unit * label_offset),

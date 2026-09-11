@@ -247,7 +247,7 @@ FONT_SIZE = 13
 #: they crowd the configuration they are there to explain. One value for all of
 #: them -- the same text saying the same thing in five panels -- and it is the
 #: size the densest of those panels can carry.
-MIXTURE_LABEL_SIZE = 7
+MIXTURE_LABEL_SIZE = 8
 
 #: The names of the two axes every top-row panel is drawn in.
 MDS_AXES = ("MDS 1", "MDS 2")
@@ -595,7 +595,7 @@ YLABEL = "Procrustes Disparity"
 #: It is spent as a blank spacer row in the outer grid, not as the constrained
 #: layout's ``hspace``: each row here is a *nested* gridspec, and the engine's
 #: ``hspace`` is inert across a nesting boundary -- setting it moves nothing.
-ROW_GAP = 0.6
+ROW_GAP = 0.4
 
 #: Shared y range for the whole bottom row, per scale. Fixed rather than fitted
 #: so any two builds of this figure — the ``--behavioral`` and ``--yscale``

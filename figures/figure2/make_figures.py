@@ -257,26 +257,29 @@ MDS_AXES = ("MDS 1", "MDS 2")
 #: ``75/25/0`` and the bottom row of five is a single smear. The key is a dense
 #: legend rather than a panel, and this is the size at which it is readable as
 #: one. The three vertex *names* are unaffected and stay at FONT_SIZE.
-KEY_LABEL_SIZE = 6.0
+KEY_LABEL_SIZE = 8
 
-#: The key is drawn a fifth smaller than the panels beside it, in both the
-#: triangle and the text. It is a legend, not a fifth measurement, and at equal
-#: size it reads as the first of five findings; the extra margin is what buys
-#: the shrink, since the axes cell itself is fixed by the row's grid.
-KEY_SCALE = 0.8
+#: The *triangle* is drawn smaller than the panels beside it -- it is a legend,
+#: not a fifth measurement -- by widening the margin around it inside an axes
+#: cell the row's grid fixes. Nothing else in the key shrinks with it: the
+#: labels, the vertex names and the markers are text and marks, sized against
+#: the rest of the figure rather than against the triangle they sit on.
 KEY_PAD = 0.5
-KEY_VERTEX_SIZE = FONT_SIZE * KEY_SCALE
+KEY_VERTEX_SIZE = FONT_SIZE
+
+#: The labels are pushed further out along their radii than the default 9.5 pt,
+#: because the triangle they sit on is smaller while they are not: the sixteen
+#: points are closer together in inches, so the labels need more room to fan
+#: into. The vertex names clear this on their own -- see ``ternary_legend``.
+KEY_LABEL_OFFSET = 19.0
 KEY_TITLE = "Dataset Mixture"
 
 #: One marker area for every mixture point in the top row, key included. The
 #: key and the four MDS panels draw the same sixteen models, and a reader who
 #: looks up a point in the key and then finds it in a panel should be looking at
 #: the same mark; the two sources default to 26 and 130, which reads as two
-#: different kinds of thing. The key draws it at KEY_SCALE, like everything else
-#: in the key -- that is an area, so the scale is squared and the two markers
-#: stay the same mark at the two sizes the row is drawn at.
+#: different kinds of thing.
 MIXTURE_MARKER_SIZE = 70
-KEY_MARKER_SIZE = MIXTURE_MARKER_SIZE * KEY_SCALE ** 2
 
 #: The colour of every axis line in the figure -- the MDS crosshairs, the panel
 #: spines, and the key's triangle, which is that key's only frame. One value, so
@@ -459,8 +462,9 @@ def draw_top_row(fig, gs, levels: list[Level], cells, ids) -> None:
     ternary_legend(kax, ids, label_models=True,
                    vertex_names=group_display(3), show_topics=False,
                    label_size=KEY_LABEL_SIZE, vertex_size=KEY_VERTEX_SIZE,
-                   marker_size=KEY_MARKER_SIZE, label_fmt=bracket_label,
+                   marker_size=MIXTURE_MARKER_SIZE, label_fmt=bracket_label,
                    fill_points=True, pad=KEY_PAD, outline_color=AXIS_COLOR,
+                   label_offset=KEY_LABEL_OFFSET,
                    fontweight="bold", fontfamily=bold_capable_family())
     kax.set_title(KEY_TITLE, fontsize=FONT_SIZE, pad=10,
                   fontweight="bold", fontfamily=bold_capable_family())
@@ -737,7 +741,7 @@ def build(row: str, decoding: str, yscale: str = "log",
 
     r = 0
     if want_top:
-        draw_top_row(fig, outer[r].subgridspec(1, 5, width_ratios=[1.28 * KEY_SCALE] + [1.0] * 4),
+        draw_top_row(fig, outer[r].subgridspec(1, 5, width_ratios=[1.28] + [1.0] * 4),
                      top_levels, cells, ids)
         r += 1
     if want_bottom:

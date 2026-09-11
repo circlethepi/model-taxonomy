@@ -470,6 +470,7 @@ def ternary_legend(
     fill_points: bool = False,
     pad: float | None = None,
     outline_color: str = "0.35",
+    label_offset: float = 9.5,
 ) -> plt.Axes:
     """Draw the filled simplex that the point colours are read from.
 
@@ -490,6 +491,9 @@ def ternary_legend(
     overrides the margin left around the triangle, which is what shrinks the
     drawn key inside a fixed axes; *outline_color* is the triangle's edge, which
     a figure drawing its own axes usually wants to match them.
+    *label_offset* is how far, in points, each mixture label is pushed out along
+    its own radius -- the lever for a key whose triangle is drawn small, where
+    the sixteen labels crowd at the default.
 
     **Three groups only.** ``_bary_to_xy`` maps onto a triangle and this function
     labels three corners; a tetrahedron has no honest 2-D barycentric picture, so
@@ -555,7 +559,8 @@ def ternary_legend(
             for (x, y), mid in zip(pts, model_ids):
                 d = np.array([x, y]) - mid_xy
                 n = np.linalg.norm(d)
-                dx, dy = (d / n * 9.5) if n > 1e-9 else (0.0, 8.0)
+                dx, dy = ((d / n * label_offset) if n > 1e-9
+                          else (0.0, label_offset * 0.85))
                 ax.annotate(
                     label_fmt(mid), xy=(x, y), xytext=(dx, dy),
                     textcoords="offset points", ha="center", va="center",

@@ -134,7 +134,7 @@ def output_dir() -> str:
     return f"{REPO}/results/{slug()}"
 
 
-def samples_seen(n: int | None = None) -> int:
+def samples_seen(n: int | None = None, budget: int | None = None) -> int:
     """The ``_b5008`` token every adapter is named for.
 
     Derived from the suite's effective batch rather than written down: the budget
@@ -147,12 +147,15 @@ def samples_seen(n: int | None = None) -> int:
     an nsweep carries its own token (``_b64``, ``_b512``, ``_b5008``,
     ``_b50000``).  Omitting it means "this spec's single draw", which is what
     every non-nsweep call site means.
+
+    *budget* names the budget directly, for an epochsweep, where the budget is an
+    axis rather than a function of the draw.  ``None`` defers to ``n`` as above.
     """
-    return SPEC.samples_seen(SUITE.effective_batch, n)
+    return SPEC.samples_seen(SUITE.effective_batch, n, budget)
 
 
-def train_targets() -> list[tuple[str, int, int, int]]:
-    """Every adapter this tree trains, as ``(proportion, n_samples, seed, rank)``.
+def train_targets() -> list[tuple[str, int, int, int, int]]:
+    """Every adapter this tree trains, as ``(proportion, n_samples, seed, rank, budget)``.
 
     Ordered rank-major, then by `nsamples_train`, then by seed, then by proportion, because
     that is the order the shards are cut in: a training shard must be one wall,
@@ -166,15 +169,21 @@ def train_targets() -> list[tuple[str, int, int, int]]:
     For a spec that never set a training grid, under a suite that sweeps no rank,
     this is the 16 proportions at the one draw it has always trained, which is the
     list the generator used to build inline.
+
+    Budget is outermost for the reason rank is: ``total_train_samples`` is one
+    scalar in a training config, so a shard cannot mix two budgets, and training
+    time is very nearly proportional to it -- a 50-epoch adapter costs 50x a
+    1-epoch one -- so a shard must not straddle two either.
     """
     props = [name for name, _ in proportions()]
-    return [(name, n, seed, rank)
+    return [(name, n, seed, rank, budget)
+            for budget in train_budgets()
             for rank in lora_ranks()
             for n, seed in SPEC.train_grid()
             for name in props]
 
 
-def extract_targets() -> list[tuple[str, int, int, int]]:
+def extract_targets() -> list[tuple[str, int, int, int, int]]:
     """The adapters extraction runs over -- ``train_targets`` minus the `nsamples_train` values
     ``extract_sizes`` excludes.
 
@@ -184,7 +193,8 @@ def extract_targets() -> list[tuple[str, int, int, int]]:
     that trains its whole grid the two are the same list.
     """
     props = [name for name, _ in proportions()]
-    return [(name, n, seed, rank)
+    return [(name, n, seed, rank, budget)
+            for budget in train_budgets()
             for rank in lora_ranks()
             for n, seed in SPEC.extract_grid()
             for name in props]
@@ -228,6 +238,41 @@ def rank_sweep() -> bool:
     disk keep the sentences they carry.
     """
     return len(lora_ranks()) > 1
+
+
+def train_budgets() -> tuple[int, ...]:
+    """The sample budgets this tree trains the whole simplex at.
+
+    The spec's single budget for every suite that has run -- ``Suite.train_budgets``
+    is empty -- so the emitted trees are unchanged.  An epochsweep sets it and this
+    is its axis.
+
+    Read through ``SPEC.budget()`` rather than ``SPEC.total_train_samples`` so the
+    default still respects budget mode, where the budget is a function of the draw
+    (``budget_per_sample``).  The two are not combinable and must not be: a suite
+    that sets ``train_budgets`` over a spec in budget mode would be declaring the
+    budget twice, so that pairing is rejected in ``main()``.
+    """
+    return SUITE.train_budgets or (SPEC.budget(),)
+
+
+def budget_sweep() -> bool:
+    """Whether the budget is an axis of this tree rather than a fixed setting.
+
+    Read wherever emitted *prose* would otherwise assert something true only of a
+    single-budget tree, the same discipline ``rank_sweep`` follows.
+    """
+    return len(train_budgets()) > 1
+
+
+def epochs_for(budget: int, n: int | None = None) -> float:
+    """*budget* as a number of epochs over the training draw.
+
+    The epochsweep is specified in epochs and stored in samples, and this is the
+    conversion, kept in one place so no emitted comment recomputes it.  Fractional
+    whenever the budget does not land on a whole pass over the draw.
+    """
+    return budget / (SPEC.train_n if n is None else n)
 
 
 def lora_alpha(rank: int) -> int:
@@ -436,7 +481,7 @@ def query_blocks(which: str) -> str:
 
 
 def adapter_name(name: str, n: int | None = None, seed: int | None = None,
-                 rank: int | None = None) -> str:
+                 rank: int | None = None, budget: int | None = None) -> str:
     """The adapter's directory leaf.
 
     The ``_f{format_id}`` suffix appears only for a non-raw prompt format, so
@@ -450,12 +495,18 @@ def adapter_name(name: str, n: int | None = None, seed: int | None = None,
     already carried the draw, an nsweep needs no new naming scheme: its 640 adapters are distinct by construction, and its 16
     ``_n1000_s00_..._b5008`` adapters collide, deliberately, with the ones the
     yahoo tree already trained.
+
+    *budget* names the fine-tuning budget, and an epochsweep needs no new naming
+    scheme either: the ``_b{samples_seen}`` token has always recorded it, so the
+    six rungs are distinct by construction and the 5-epoch rung lands back on the
+    very ``_b5008`` directories the yahoo tree trained -- which is what makes it
+    free, and what makes it a regression test that none of this moved.
     """
     n = SPEC.train_n if n is None else n
     seed = SPEC.train_seed if seed is None else seed
     rank = SUITE.lora_rank if rank is None else rank
     stem = (f"{name}_n{n}_s{seed:02d}"
-            f"_r{rank}_i{LORA_INIT_SEED:02d}_b{samples_seen(n)}")
+            f"_r{rank}_i{LORA_INIT_SEED:02d}_b{samples_seen(n, budget)}")
     return f"{stem}_f{format_id()}" if format_id() else stem
 
 
@@ -484,9 +535,9 @@ def prompt_format_block() -> dict | None:
 
 
 def adapter_path(name: str, n: int | None = None, seed: int | None = None,
-                 rank: int | None = None) -> str:
+                 rank: int | None = None, budget: int | None = None) -> str:
     return (f"{CACHE_DIR}/03_adapters/{SUITE.model_slug}/"
-            f"{adapter_name(name, n, seed, rank)}")
+            f"{adapter_name(name, n, seed, rank, budget)}")
 
 
 def prompt_format_yaml() -> str:
@@ -695,16 +746,17 @@ extraction:
     return body
 
 
-def write_train(shard: int, targets: list[tuple[str, int, int, int]]) -> str:
+def write_train(shard: int, targets: list[tuple[str, int, int, int, int]]) -> str:
     """One training shard.
 
-    *targets* are ``(proportion, n_samples, seed, rank)`` tuples that all share one
+    *targets* are ``(proportion, n_samples, seed, rank, budget)`` tuples that all share one
     ``n_samples`` -- the shard planner guarantees it, because a shard is one wall
     and the `nsamples_train` values differ by ~750x in training time -- and one
     ``rank``, which the planner also guarantees but which is a *correctness*
     constraint rather than a scheduling one: ``fine_tuning.lora_rank`` is a single
     scalar, so a shard holding two ranks would silently train one of them at the
-    other's rank and write it to the other's path.
+    other's rank and write it to the other's path.  ``total_train_samples`` is a
+    single scalar for the same reason, so a shard holds one budget too.
 
     A shard may still span several seeds of that one `nsamples_train`, which is what makes
     the 80-adapter shards at the cheap `nsamples_train` values possible: ``n_samples_sweep`` and
@@ -721,16 +773,27 @@ def write_train(shard: int, targets: list[tuple[str, int, int, int]]) -> str:
         f"training shard {shard} mixes ranks {sorted({t[3] for t in targets})}; "
         f"lora_rank is one scalar per config"
     )
+    budget = targets[0][4]
+    assert all(t[4] == budget for t in targets), (
+        f"training shard {shard} mixes budgets {sorted({t[4] for t in targets})}; "
+        f"total_train_samples is one scalar per config"
+    )
     seeds_for: dict[str, list[int]] = {}
-    for name, _, seed, _ in targets:
+    for name, _, seed, _, _ in targets:
         seeds_for.setdefault(name, []).append(seed)
     names = list(seeds_for)
-    budget = SPEC.budget(n)
     n_adapters = len(targets)
     # The single-draw trees must regenerate byte-for-byte, so their header is the
     # sentence they already carry.  An nsweep shard says which `nsamples_train` it is instead,
     # because "only n=1000" would be false of the tree and useless on the shard.
-    if rank_sweep():
+    if budget_sweep():
+        size_note = (
+            f"# {epochs_for(budget, n):g} epoch(s) of {{"
+            f"{','.join(f'{epochs_for(b, n):g}' for b in train_budgets())}}}, the whole "
+            f"{len(proportions())}-point simplex at that one budget.\n"
+            f"# n={n}, seed={SPEC.train_seed}, rank {rank}, as the fixed-budget tree. "
+            f"total_train_samples\n")
+    elif rank_sweep():
         size_note = (
             f"# LoRA rank {rank} of {{{','.join(str(r) for r in lora_ranks())}}}, the whole "
             f"{len(proportions())}-point simplex at that one rank.\n"
@@ -751,9 +814,16 @@ def write_train(shard: int, targets: list[tuple[str, int, int, int]]) -> str:
         f"# {budget} quantizes UP to a step boundary at effective batch "
         f"{SUITE.effective_batch}:\n"
         f"# ceil({budget}/{SUITE.effective_batch}) = "
-        f"{SPEC.steps(SUITE.effective_batch, n)} steps, so {samples_seen(n)} samples seen and the\n"
-        f"# adapter is named _b{samples_seen(n)}. "
-        + ("Rank and the alpha that scales it are the ONLY\n"
+        f"{SPEC.steps(SUITE.effective_batch, n, budget)} steps, so "
+        f"{samples_seen(n, budget)} samples seen and the\n"
+        f"# adapter is named _b{samples_seen(n, budget)}. "
+        + ("The budget is the ONLY thing that differs\n"
+           f"# from the {len(proportions())}-adapter fixed-budget tree: same draw, same seed, "
+           f"same rank,\n# same targets, same query set, same learning rate. Note that the "
+           f"schedule\n# anneals the LR to zero over the budget, so each rung is a converged "
+           f"run\n# rather than a snapshot of a longer one.\n"
+           if budget_sweep() else
+           "Rank and the alpha that scales it are the ONLY\n"
            f"# things that differ from the r{SUITE.lora_rank} tree: same draws, same seeds, same "
            f"budget,\n# same targets, same query set. alpha is {lora_alpha(rank)} = 2 x {rank}, "
            f"holding the gain\n# alpha/rank at the 2 every existing adapter trained under.\n"
@@ -850,10 +920,10 @@ def write_extract(
     level: str,
     query: str,
     shard: int | None,
-    names: list[tuple[str, int, int, int]],
+    names: list[tuple[str, int, int, int, int]],
     temperature: float | None = None,
 ) -> str:
-    # *names* are ``(proportion, n_samples, seed, rank)`` tuples -- every adapter
+    # *names* are ``(proportion, n_samples, seed, rank, budget)`` tuples -- every adapter
     # this job extracts from.  For a single-draw, single-rank tree the tuple is the
     # one draw it has always trained and the rendered path is unchanged; for an
     # nsweep the same list carries all four `nsamples_train` values and for a rank
@@ -1461,6 +1531,76 @@ SUITES = {
         # See the olmo2 entry: l40s is not safe for TRAINING this model, only for
         # extraction. Submit training with `sbatch --partition=h200,h100`.
     ).for_model("allenai/OLMo-2-0425-1B-Instruct"),
+
+    #: The **epochsweep** suite: the training-length axis, over the same 16-point
+    #: yahoo simplex, the same n=1000 seed-0 draw and the same 100-query 33/33/33
+    #: set as ``olmo2``.  Six budgets -- 1, 2, 5, 10, 20 and 50 epochs of the
+    #: 1000-row draw -- so 96 adapters.
+    #:
+    #: It is the rank sweep's twin and is built the same way for the same reasons.
+    #: The budget is a Suite axis rather than a spec one because how long a run
+    #: trains describes the run, not the corpus; ``yahoo`` is the spec unchanged,
+    #: so the 5-epoch rung resolves to the very ``_b5008`` adapter directories
+    #: ``simplex3_olmo2`` already trained.  That rung is therefore not new work but
+    #: the fixed-budget tree itself, and the other five budgets are the only
+    #: training bought here -- 80 adapters, ~11 GPU-hours.
+    #:
+    #: **Each rung is a separately annealed run, not a checkpoint of a longer
+    #: one.**  ``SFTConfig`` in ``scripts/finetune_lora.py`` names no
+    #: ``lr_scheduler_type``, so it takes the HuggingFace default of a linear decay
+    #: from the learning rate to zero across ``max_steps``, and ``max_steps`` comes
+    #: from the budget.  A snapshot taken 313 steps into a 3125-step run sits
+    #: mid-decay at ~1.8e-4 and is still moving; the 5-epoch rung here has annealed
+    #: to zero and has converged.  They are different models, and only the second
+    #: is comparable with the rest of this project -- every adapter on disk,
+    #: including the ``_b5008`` sixteen this sweep reuses, is a completed run.
+    #: Checkpointing one 50-epoch run would save ~4 of the ~11 GPU-hours and cost
+    #: that comparability, which is why it is not done.
+    #:
+    #: Levels are the nsweep's and the rsweep's, for their reason: the
+    #: log-probability level, generation-mode activations and the temperature
+    #: sweep are dropped because no standing representation reads any of them and
+    #: all three are priced per adapter.  The dataset level is model-free, does not
+    #: depend on the budget at all, and is already on disk.
+    "olmo2_epochsweep": Suite(
+        tag="epochsweep_olmo2",
+        train_budgets=(1000, 2000, 5000, 10000, 20000, 50000),
+        query_sets=("question_only",),
+        job_tokens={"question_only": "qonly"},
+        emit_embed_jobs=False,
+        emit_build_job=False,
+        # Off here as on the rsweep, and for its reason: the `matrix` re-embed
+        # authors a model-free surrogate the olmo2 tree has already written, and
+        # two trees emitting it would race for no second artefact.
+        emit_embed_matrix_job=False,
+        job_prefix="s3eo2",
+        # As the rsweep: training IS driven from submit_all.sh here, across ten
+        # shards, so pinning training off l40s has to be a field rather than the
+        # comment the older olmo2 trees carry -- a comment would be read after the
+        # thirteen dead shards, not before. Extraction keeps the full list; it is
+        # forward-only, and an offloaded forward pass is correct, just slower.
+        train_partitions="h200,h100",
+        emit_logprob_jobs=False,
+        emit_gen_activation_job=False,
+        temperature_sweep=(),
+        # `train_shards` is DERIVED in main() from the budget tuple, because the
+        # shards are cut per budget and the per-budget sizes span 20x. A literal
+        # would be a second place to forget when a rung is added.
+        #
+        # 96 adapters at ~2.45 min each (the nsweep's measurement for this 1B at
+        # this draw) is ~3.9 h of sampled decoding: 6 shards of 16 is ~40 min,
+        # the cadence every behavioral wall here was tuned against. Inference does
+        # not depend on the budget, so one number serves all six rungs.
+        behavioral_shards=6,
+        # Greedy stays unsharded: ~17.7 s/model over 96 adapters is ~28 min,
+        # inside the 1:30 wall.
+        greedy_shards=1,
+        # The largest shard is the 50-epoch rung at 4 adapters x 22.8 min = ~1:31,
+        # which is the measured N=10000 nsweep shard at this same _b50000 budget.
+        # 3:00:00 is what the llama, nsweep and rsweep suites already carry, and
+        # headroom costs only queue priority.
+        train_time="3:00:00",
+    ).for_model("allenai/OLMo-2-0425-1B-Instruct"),
 }
 
 
@@ -1555,14 +1695,44 @@ NSWEEP_BEHAVIORAL_ADAPTERS_PER_SHARD = 16
 #: and 16 shards rather than the 90 that matching the behavioral cut would emit.
 NSWEEP_GREEDY_ADAPTERS_PER_SHARD = 90
 
+#: Adapters per training shard **by sample budget**, for an epochsweep.  Same
+#: constraint as ``TRAIN_ADAPTERS_PER_SHARD_BY_N`` above and, deliberately, the
+#: same numbers: training time is set by the optimizer step count, the step count
+#: is ``ceil(budget / 16)``, and the draw size enters only through the ~``N/1100``
+#: seconds it takes to build the draw.  So the table there -- which is indexed by
+#: `nsamples_train` only because its budget happened to be ``5N`` -- is really a
+#: table over budgets, and this re-indexes it as one rather than re-deriving it.
+#:
+#: The six epochsweep budgets at ``train_n=1000`` read off it as:
+#:
+#:     1 epoch    _b1008     ~0.5 min/adapter   80/shard -> 16 adapters, 1 shard
+#:     2 epochs   _b2000     ~1.0 min/adapter   40/shard -> 16 adapters, 1 shard
+#:     5 epochs   _b5008     ~2.5 min/adapter   16/shard -> 16 adapters, 1 shard
+#:     10 epochs  _b10000    ~4.8 min/adapter   16/shard -> ~1:17
+#:     20 epochs  _b20000    ~9.6 min/adapter    8/shard -> ~1:17
+#:     50 epochs  _b50000    22.8 min/adapter    4/shard -> 1:31  (measured)
+#:
+#: The 1- and 2-epoch rungs are far under their shard size and emit one shard of
+#: 16 each, which is the point: a shard size is a ceiling, not a target.
+#:
+#: The 50-epoch entry is the one *measured* number in the table (the N=10000
+#: nsweep smoke shard, 4 adapters in 1:31:44) and it is the same budget --
+#: ``_b50000`` is ``_b50000`` however the draw got there -- so the expensive end
+#: of this sweep is calibrated rather than extrapolated.  A budget absent from the
+#: table falls back to the conservative 4.
+TRAIN_ADAPTERS_PER_SHARD_BY_BUDGET = {
+    64: 80, 112: 80, 256: 80, 512: 80, 1008: 80, 2000: 40,
+    2512: 40, 5008: 16, 10000: 16, 20000: 8, 25008: 8, 50000: 4,
+}
+
 
 def _has_train_grid() -> bool:
     """Whether this spec sweeps the training draw at all."""
     return bool(SPEC.train_sizes or SPEC.train_seeds)
 
 
-def train_shard_plan(train_shards: int | None = None) -> list[list[tuple[str, int, int, int]]]:
-    """The training shards, as lists of ``(proportion, n_samples, seed, rank)``.
+def train_shard_plan(train_shards: int | None = None) -> list[list[tuple[str, int, int, int, int]]]:
+    """The training shards, as lists of ``(proportion, n_samples, seed, rank, budget)``.
 
     With neither a training grid nor a rank sweep the shards are strided over the
     proportions, which is what the existing trees carry and must keep carrying.
@@ -1575,16 +1745,23 @@ def train_shard_plan(train_shards: int | None = None) -> list[list[tuple[str, in
     how the suite's own ``train_shards`` field gets computed.
     """
     targets = train_targets()
-    if not _has_train_grid() and not rank_sweep():
+    if not _has_train_grid() and not rank_sweep() and not budget_sweep():
         k = SUITE.train_shards if train_shards is None else train_shards
         return [targets[i::k] for i in range(k)]
-    plan: list[list[tuple[str, int, int, int]]] = []
-    for rank in lora_ranks():
-        for n in SPEC.train_sizes or (SPEC.train_n,):
-            block = [t for t in targets if t[1] == n and t[3] == rank]
-            size = (TRAIN_ADAPTERS_PER_SHARD_RSWEEP if not _has_train_grid()
-                    else TRAIN_ADAPTERS_PER_SHARD_BY_N.get(n, TRAIN_ADAPTERS_PER_SHARD))
-            plan += [block[i:i + size] for i in range(0, len(block), size)]
+    plan: list[list[tuple[str, int, int, int, int]]] = []
+    for budget in train_budgets():
+        for rank in lora_ranks():
+            for n in SPEC.train_sizes or (SPEC.train_n,):
+                block = [t for t in targets
+                         if t[1] == n and t[3] == rank and t[4] == budget]
+                if budget_sweep():
+                    size = TRAIN_ADAPTERS_PER_SHARD_BY_BUDGET.get(
+                        samples_seen(n, budget), TRAIN_ADAPTERS_PER_SHARD)
+                elif not _has_train_grid():
+                    size = TRAIN_ADAPTERS_PER_SHARD_RSWEEP
+                else:
+                    size = TRAIN_ADAPTERS_PER_SHARD_BY_N.get(n, TRAIN_ADAPTERS_PER_SHARD)
+                plan += [block[i:i + size] for i in range(0, len(block), size)]
     return plan
 
 
@@ -1708,8 +1885,23 @@ def main() -> None:
     # iterates `range(SUITE.train_shards)` while the files come from
     # `train_shard_plan()`, and the two disagreeing would submit a job name that
     # does not exist -- the failure dd70b48 already shipped once for greedy.
-    if rank_sweep():
+    #
+    # An epochsweep's shards are cut per budget, and the per-budget shard sizes
+    # differ by 20x, so its count is no more derivable from a divisor than the
+    # rank sweep's is.
+    if rank_sweep() or budget_sweep():
         SUITE = replace(SUITE, train_shards=len(train_shard_plan()))
+    # The budget cannot be declared twice. `budget_per_sample` makes it a function
+    # of the draw and `train_budgets` makes it an axis; a spec/suite pair setting
+    # both would silently let the suite win, and every adapter in the tree would
+    # be named for a budget the spec says it does not have.
+    if SUITE.train_budgets and SPEC.budget_per_sample is not None:
+        raise SystemExit(
+            f"--suite {args.suite} sets train_budgets={SUITE.train_budgets} while "
+            f"--dataset {args.dataset} is in budget mode "
+            f"(budget_per_sample={SPEC.budget_per_sample}). The budget cannot be "
+            f"both an axis of the suite and a function of the draw; drop one."
+        )
 
     root = Path(args.root)
     tree = slug()
@@ -1957,9 +2149,14 @@ def main() -> None:
     # The adapter count is the simplex crossed with the training grid, which is
     # the simplex itself for every tree without one.  Printed rather than assumed
     # because it is the number the GPU budget is a function of.
-    n_adapters = len(props) * len(SPEC.train_grid()) * len(lora_ranks())
+    n_adapters = (len(props) * len(SPEC.train_grid()) * len(lora_ranks())
+                  * len(train_budgets()))
     grid_note = ""
-    if _has_train_grid():
+    if budget_sweep():
+        grid_note = (f" ({len(props)} x {len(train_budgets())} budgets"
+                     f" {{{','.join(f'{epochs_for(b):g}' for b in train_budgets())}}}"
+                     f" epochs, {len(train_shard_plan())} train shards)")
+    elif _has_train_grid():
         grid_note = (f" ({len(props)} x {len(SPEC.train_grid())} training draws,"
                      f" {len(train_shard_plan())} train shards)")
     elif rank_sweep():

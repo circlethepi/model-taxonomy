@@ -79,6 +79,29 @@ class Suite:
     #: ``target_modules`` and ``torch_dtype`` are here.
     lora_ranks: tuple[int, ...] = ()
 
+    #: The sample budgets an **epochsweep** trains, if this suite is one.  Empty
+    #: means "just the budget the spec names", which is every suite that has run,
+    #: so the existing trees emit exactly the files they already carry.
+    #:
+    #: Non-empty makes the budget an axis of the adapter list alongside the
+    #: proportion, the training draw size, the draw seed and the rank: the tree
+    #: trains the whole simplex at each budget and extracts over the union.  A
+    #: budget is a *sample* count, not an epoch count -- the epochs are the ratio
+    #: to the training draw, so ``(1000, 2000, 5000, ...)`` at ``train_n=1000`` is
+    #: 1, 2, 5, ... epochs, and the adapter is named for the budget quantized up
+    #: to a step boundary (``_b1008``, ``_b2000``, ``_b5008``).  Samples rather
+    #: than epochs because samples is the unit ``total_train_samples`` is written
+    #: in and the unit the ``_b`` token records, so no conversion sits between the
+    #: field and the name.
+    #:
+    #: It is a Suite field rather than a ``DataSimplexSpec`` one for the reason
+    #: ``lora_ranks`` is: how long a run trains describes how the run is
+    #: configured, not what corpus it is run over.  The spec's
+    #: ``total_train_samples`` stays the single-budget default this overrides, so
+    #: a budget equal to it resolves to the adapters already on disk -- which is
+    #: what makes an epochsweep's middle rung free.
+    train_budgets: tuple[int, ...] = ()
+
     #: ``{}`` renders no ``prompt_format:`` block at all, which is what makes the
     #: raw path byte-identical to the pre-prompt-format generator output.
     prompt_format: dict = field(default_factory=dict)

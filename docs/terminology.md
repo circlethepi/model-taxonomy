@@ -151,6 +151,36 @@ keyed on that name, so the `r16` point of an rsweep resolves to the adapters and
 activations `simplex3_olmo2` already wrote. See
 `docs/notes/rank_sweep.md`.
 
+**epochsweep** — a sweep over how *long* a model is fine-tuned, holding the
+corpus, the mixture grid, the training draw, the seed, the rank and every other
+optimizer setting fixed. Named on 2026-09-14, spelled out rather than abbreviated
+to `esweep` because `e` is not free the way `n` and `r` were. It reaches code as
+`Suite.train_budgets`, a Suite field rather than a `DataSimplexSpec` one for the
+reason `lora_ranks` is: how long a run trains says how the run is configured, not
+what corpus it is run over.
+
+The axis is declared in **samples**, not epochs. A budget is a total
+samples-seen count — the `total_train_samples` a training config carries — and
+the epoch count is the ratio to the training draw, so `(1000, 2000, 5000, 10000,
+20000, 50000)` at a 1000-row draw is 1, 2, 5, 10, 20, 50 epochs. Samples is the
+unit `total_train_samples` is written in and the unit the `_b` token records, so
+nothing has to convert between the field and the adapter name. The name carries
+the budget quantized up to a step boundary at effective batch 16, which is why 1
+epoch is `_b1008` rather than `_b1000`.
+
+Two things the word does not mean. It is not a sweep over **checkpoints** of one
+long run: `SFTConfig` in `scripts/finetune_lora.py` names no `lr_scheduler_type`
+and so takes the HuggingFace default of a linear decay to zero across
+`max_steps`, which means a snapshot 313 steps into a 3125-step run sits mid-decay
+and is still moving while a completed 313-step run has annealed and converged.
+Every rung of an epochsweep is a separately annealed run, which is what makes it
+comparable with every other adapter in this project. And it is not a re-run of
+the fixed-budget tree at its own middle rung: the budget is inside every adapter
+directory name (`..._r16_i00_b5008_f…`) and every cache is keyed on that name, so
+the 5-epoch rung of an epochsweep over yahoo resolves to the sixteen adapters and
+activations `simplex3_olmo2` already wrote — 80 of its 96 adapters are new work,
+and the other 16 double as a regression test that none of the naming moved.
+
 **Prompt format** — an optional `_f{fmt}` suffix on a draw directory, recording
 which chat template was applied. Deliberately kept out of `recipe_hash`, which
 would otherwise change the identity of every cached draw at once.

@@ -410,7 +410,8 @@ class DataSimplexSpec:
             return self.total_train_samples
         return self.budget_per_sample * (self.train_n if n is None else n)
 
-    def samples_seen(self, effective_batch: int, n: int | None = None) -> int:
+    def samples_seen(self, effective_batch: int, n: int | None = None,
+                     budget: int | None = None) -> int:
         """The budget rounded UP to a step boundary -- the ``_b5008`` token.
 
         The budget quantizes up because the trainer runs whole steps, so the
@@ -423,11 +424,21 @@ class DataSimplexSpec:
         defaults to ``None`` so that every existing call site keeps naming the
         adapter it always named -- which is what makes the 16 ``_b5008`` yahoo
         adapters resolve from cache when the nsweep tree asks for them again.
-        """
-        return -(-self.budget(n) // effective_batch) * effective_batch
 
-    def steps(self, effective_batch: int, n: int | None = None) -> int:
-        return -(-self.budget(n) // effective_batch)
+        *budget* overrides the derivation entirely, for an **epochsweep** -- a
+        sweep over the budget itself, where the budget is an axis of the adapter
+        list rather than a function of the draw.  ``None`` means "whatever
+        ``budget(n)`` says", which is what every other call site means.
+        """
+        return -(-self._budget_or(n, budget) // effective_batch) * effective_batch
+
+    def steps(self, effective_batch: int, n: int | None = None,
+              budget: int | None = None) -> int:
+        return -(-self._budget_or(n, budget) // effective_batch)
+
+    def _budget_or(self, n: int | None, budget: int | None) -> int:
+        """*budget* when given, else the one ``budget(n)`` derives."""
+        return self.budget(n) if budget is None else budget
 
 
 #: Yahoo, the original.  Every field is the module constant it replaced in

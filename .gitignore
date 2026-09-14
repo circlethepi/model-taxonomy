@@ -56,6 +56,14 @@ jobs/simplex3_nsweep_*/
 experiments/simplex3_rsweep_*/
 jobs/simplex3_rsweep_*/
 
+# The epochsweep tree, whole, for the same reason as the two above: every file in
+# it is written by `scripts/gen_simplex3.py --suite olmo2_epochsweep` -- 10 train
+# shards, 6 behavioral shards, and the non-shard drivers beside them -- so there
+# is nothing hand-written left to keep. The generator, the Suite and the spec
+# stay tracked, so one command rebuilds it.
+experiments/simplex3_epochsweep_*/
+jobs/simplex3_epochsweep_*/
+
 # Run logs from the nsweep scoring sweep. The CSV it writes is the artifact;
 # these are just the per-slice progress lines.
 figures/simplex3_nsweep_olmo2_nsweep/logs/

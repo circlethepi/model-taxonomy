@@ -1835,7 +1835,7 @@ def run_suite(*, base_model, draw, outdir, cache_root=None, levels=None,
               no_cache=False, select=None, source=None, n_expected=16,
               crosslevel_only=False, datasets=None, embedder=None,
               dataset_embedder=None, train_draw=None, mixtures=None,
-              closer=True):
+              lora_rank=None, closer=True):
     """Build the figure suite for one run.
 
     This is the old ``main()`` body with the argument parsing lifted out, so the
@@ -1876,6 +1876,15 @@ def run_suite(*, base_model, draw, outdir, cache_root=None, levels=None,
     ``train_draw`` both return all 1020 and only the mixture itself tells them
     apart. Pass ``spec.mixture_pcts`` from the ``DataSimplexSpec`` the figure is
     about. ``None`` keeps every mixture.
+
+    *lora_rank* restricts the scan to adapters trained at one LoRA rank. It is
+    the same kind of guard *train_draw* is, for the fourth axis a rank sweep
+    adds: ``lora_ranks=(1, 2, 4, 8, 16, 32, 64, 128)`` trains the whole simplex
+    at each rank, so one corpus, one base model, one training draw and one
+    mixture grid still return eight adapters per mixture and nothing coarser
+    tells them apart. Pass the rank the figure is about -- 16 for every suite
+    that ran before the sweep, which is ``Suite.lora_rank``'s default. ``None``
+    keeps every rank.
 
     *crosslevel_only* keeps the cross-level closer and drops every other output:
     the per-level grids, the per-metric detail panels, the functional layer sweep
@@ -1971,6 +1980,8 @@ def run_suite(*, base_model, draw, outdir, cache_root=None, levels=None,
     if train_draw is not None:
         n_samples, seed = train_draw
         idx = idx.filter(n_samples=n_samples, seed=seed)
+    if lora_rank is not None:
+        idx = idx.filter(lora_rank=lora_rank)
     if mixtures is not None:
         from src.plots.simplex import raw_mixture_pcts
         wanted = {tuple(m) for m in mixtures}
@@ -1985,6 +1996,8 @@ def run_suite(*, base_model, draw, outdir, cache_root=None, levels=None,
         found = datasets_present(idx)
         draws = sorted({(e.n_samples, e.seed) for e in idx.entries
                         if e.n_samples is not None})
+        ranks = sorted({e.lora_rank for e in idx.entries
+                        if e.lora_rank is not None})
         if len(found) > 1:
             why = ("The cache holds more than one dataset under this base model, "
                    "which is by design -- pass datasets=[...] to say which one "
@@ -1997,6 +2010,14 @@ def run_suite(*, base_model, draw, outdir, cache_root=None, levels=None,
                    f"{draws[:4]}{'...' if len(draws) > 4 else ''}, which is by "
                    f"design -- pass train_draw=(n_samples, seed) to say which "
                    f"one this figure is about.")
+        elif len(ranks) > 1:
+            # The rank-sweep case: one corpus, one base model, one training
+            # draw, the same mixture grid trained at every rank. Named before
+            # the mixture branch below because mixtures=[...] is what that
+            # branch asks for and it cannot separate two ranks of one mixture.
+            why = (f"The cache holds {len(ranks)} LoRA ranks of this corpus "
+                   f"{ranks}, which is by design -- pass lora_rank=r to say "
+                   f"which one this figure is about.")
         elif len(idx.model_ids) > n_expected:
             # One corpus, one base model, one draw, still too many: two mixture
             # grids share all three.  This is the simplex-vs-pool collision, and

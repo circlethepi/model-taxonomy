@@ -197,10 +197,14 @@ LEVEL_COLORS = {
 #: which no reader loses to colour vision, and one hue for the panel says the
 #: four bars in a group differ in degree rather than in kind.
 MODEL_COLORS = {
-    "allenai/OLMo-2-0425-1B-Instruct":      "#C6DBEF",
-    "Qwen/Qwen3.5-4B":                      "#6BAED6",
-    "meta-llama/Llama-3.1-8B-Instruct":     "#2171B5",
-    "mistralai/Mistral-Nemo-Instruct-2407": "#08306B",
+    # "allenai/OLMo-2-0425-1B-Instruct":      "#C6DBEF", # initial colors
+    # "Qwen/Qwen3.5-4B":                      "#6BAED6",
+    # "meta-llama/Llama-3.1-8B-Instruct":     "#2171B5",
+    # "mistralai/Mistral-Nemo-Instruct-2407": "#08306B",
+    "allenai/OLMo-2-0425-1B-Instruct":      "#A6C6E1",
+    "Qwen/Qwen3.5-4B":                      "#649CCB",
+    "meta-llama/Llama-3.1-8B-Instruct":     "#2171B5", # base color + tint
+    "mistralai/Mistral-Nemo-Instruct-2407": "#123E64",
 }
 
 #: Corpus -> colour, in order of increasing distance from a topic mixture:
@@ -208,7 +212,12 @@ MODEL_COLORS = {
 #: Teal, green and turquoise: one neighbourhood of the wheel, like the model
 #: ramp beside it, but three hues at comparable weight rather than a ramp --
 #: nothing orders three corpora, so nothing here should look ordered.
-CORPUS_COLORS = {"yahoo": "#17807A", "dolly": "#4C9A2A", "oasst1": "#5FD3D0"}
+CORPUS_COLORS = {
+    "yahoo" :   "#1E5513",
+    "dolly" :   "#379A22",
+    "oasst1":   "#AFD7A7"
+}
+# {"yahoo": "#17807A", "dolly": "#4C9A2A", "oasst1": "#5FD3D0"}
 
 #: One line style for every level in panels 3-4. Hue alone separates the four
 #: curves; they are far enough apart vertically that a dash pattern per level
@@ -380,6 +389,15 @@ TOP_DRAW = {"recipe_hash": "6149cf8055bac2c1", "n_samples": 100, "seed": 1,
 #: stages read.
 TOP_TRAIN_DRAW = (1000, 0)
 
+#: The LoRA rank the simplex3 adapters were trained at. Not optional, and not a
+#: filter this driver needed when it was written: the rank sweep has since
+#: trained the same 16 mixtures of this corpus at eight ranks under this base
+#: model and this training draw, so a scan filtered only by corpus, draw and
+#: mixture returns 128 models and ``n_expected`` trips. 16 is the rank every
+#: suite that predates the sweep ran at -- ``Suite.lora_rank``'s default -- so
+#: pinning it here is what keeps this panel the same measurement it was.
+TOP_LORA_RANK = 16
+
 #: Decoder layers of :data:`TOP_BASE_MODEL`, from the checkpoint's own config.
 #: The functional reference surrogate names ``N_LAYERS + 1`` rows, so the exact
 #: label the suite must be asked for is derived from this rather than written
@@ -431,6 +449,7 @@ def top_row_cells(levels: list[Level], cache_root=None, no_cache=False):
         datasets=TOP_DATASETS,
         train_draw=TOP_TRAIN_DRAW,
         mixtures=SPECS["yahoo"].mixture_pcts(),
+        lora_rank=TOP_LORA_RANK,
         source="figures/figure2/make_figures.py",
     )
     cells = {}

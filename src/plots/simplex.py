@@ -322,6 +322,13 @@ def _bary_to_xy(w: np.ndarray) -> np.ndarray:
 VERTEX_LABELS = ("100/0/0", "0/100/0", "0/0/100")
 CENTRE_LABEL = "33/33/33"
 
+#: The midpoint of each edge -- the three mixtures that are even between two
+#: groups and carry none of the third. Named beside the vertices and the centre
+#: because they complete the simplex's own frame: together the seven are every
+#: point of the 25%-grid whose position a reader can name without counting,
+#: which is what a key thinned for a small figure keeps.
+EDGE_MIDPOINT_LABELS = ("0/50/50", "50/0/50", "50/50/0")
+
 
 def frame_labels(k: int) -> tuple[str, str, str]:
     """``(centre, up, right)`` as ``mixture_label`` spells them at ``k`` groups.
@@ -473,6 +480,82 @@ def _open_direction(pts: np.ndarray, i: int) -> np.ndarray:
     return dirs[int(np.argmax(room))]
 
 
+#: Where a pinned mixture label sits relative to the point it names, how it is
+#: aligned there, and what fraction of *label_offset* it travels. A label put to
+#: the side is aligned away from its point so it hangs off that side rather than
+#: straddling it, which means the offset only has to clear the marker rather
+#: than the label's own half-width as well -- hence the shorter side travel. It
+#: is also centred on its own baseline rather than on its bounding box, which
+#: includes descender space the digits do not use and reads as sitting low.
+#: "up" and "down" keep the centred alignment and full travel they have always
+#: had. The four diagonals are the side pins tilted by :data:`_PIN_TILT`: they
+#: are for a label that has to hang off one side to stay out of a neighbour's
+#: way but still reads as sitting low against the point it names. They are
+#: aligned and travel like the side they lean on, since it is the horizontal
+#: reach that has to clear the marker.
+
+#: How far a diagonal pin leans off its side, as a rise over the unit run. Small
+#: enough that the label is still read as being beside its point rather than
+#: above it.
+_PIN_TILT = 0.45
+
+
+def _tilted(dx: float, dy: float) -> np.ndarray:
+    """The unit vector along ``(dx, dy)``.
+
+    The pinned offsets are scaled by *label_offset*, so a diagonal has to be
+    normalised or it would travel further than the side it leans on for no
+    reason other than being diagonal.
+    """
+    v = np.array([dx, dy], dtype=float)
+    return v / np.linalg.norm(v)
+
+
+_PINNED_DIRECTIONS: dict[str, tuple[np.ndarray, dict[str, str], float]] = {
+    "up": (np.array([0.0, 1.0]), {"ha": "center", "va": "center"}, 1.0),
+    "down": (np.array([0.0, -1.0]), {"ha": "center", "va": "center"}, 1.0),
+    "left": (np.array([-1.0, 0.0]),
+             {"ha": "right", "va": "center_baseline"}, 0.55),
+    "right": (np.array([1.0, 0.0]),
+              {"ha": "left", "va": "center_baseline"}, 0.55),
+    "upper left": (_tilted(-1.0, _PIN_TILT),
+                   {"ha": "right", "va": "center_baseline"}, 0.55),
+    "upper right": (_tilted(1.0, _PIN_TILT),
+                    {"ha": "left", "va": "center_baseline"}, 0.55),
+    "lower left": (_tilted(-1.0, -_PIN_TILT),
+                   {"ha": "right", "va": "center_baseline"}, 0.55),
+    "lower right": (_tilted(1.0, -_PIN_TILT),
+                    {"ha": "left", "va": "center_baseline"}, 0.55),
+}
+
+
+def _make_top_room(ax, anns, slack: float = 2.0, passes: int = 6) -> None:
+    """Grow the axes' top limit until *anns* are inside it.
+
+    The apex's vertex name is placed in points above a triangle measured in
+    inches, so how far it reaches above the frame depends on how wide the
+    figure is: the same 26 pt that clears the apex at full width overruns a
+    third-size key. Rather than carry a margin per width, the name is measured
+    and the limit grows to fit it, which leaves the axes' title free to sit at
+    the same pad as every other title in its row instead of being raised over
+    the name. The aspect is equal, so growing the limit shrinks the drawn
+    triangle rather than stretching it, and each pass re-measures because that
+    shrink moves the apex the name is hanging off.
+    """
+    fig = ax.figure
+    for _ in range(passes):
+        fig.canvas.draw()
+        renderer = fig.canvas.get_renderer()
+        box = ax.get_window_extent()
+        if box.height <= 0:
+            return
+        over = max(a.get_window_extent(renderer).y1 for a in anns) - box.y1
+        if over + slack <= 0.5:
+            return
+        lo, hi = ax.get_ylim()
+        ax.set_ylim(lo, hi + (over + slack) * (hi - lo) / box.height)
+
+
 def _spread_labels(ax, anns, dirs, pts, marker_size, fixed=(),
                    step: float = 2.0, max_extra: float = 60.0) -> None:
     """Push annotated labels out along their own radii until nothing overlaps.
@@ -537,6 +620,15 @@ def ternary_legend(
     outline_color: str = "0.35",
     label_offset: float = 9.5,
     avoid_collisions: bool = False,
+    label_points: Sequence[str] | None = None,
+    marker: str = "o",
+    frame_marker: str | None = None,
+    frame_points: Sequence[str] = VERTEX_LABELS + (CENTRE_LABEL,),
+    frame_marker_scale: float = 1.0,
+    vertex_scale: float = 1.0,
+    label_max_extra: float = 60.0,
+    fixed_points: Sequence[str] | Mapping[str, str] = (),
+    top_room: bool = False,
 ) -> plt.Axes:
     """Draw the filled simplex that the point colours are read from.
 
@@ -563,6 +655,53 @@ def ternary_legend(
     offset a floor rather than a fixed value: a label that still overlaps
     another label, a corner name or a marker is pushed further out until it does
     not (see :func:`_spread_labels`).
+
+    *label_points* names which sampled mixtures are labelled, in
+    :func:`mixture_label` form; ``None`` labels every one of them, which is what
+    every caller did before the argument existed. A key drawn small enough that
+    sixteen labels crowd it passes the subset it can carry --
+    :data:`VERTEX_LABELS`, :data:`CENTRE_LABEL` and
+    :data:`EDGE_MIDPOINT_LABELS` are the seven landmarks a reader can name
+    without counting.
+
+    *marker* is the shape every sampled mixture is drawn with.
+    *frame_marker* overrides it for the mixtures named in *frame_points* --
+    the three vertices and the centre by default, the points
+    :func:`frame_labels` names -- so what fixes the frame can be told from the
+    interior at a glance; ``None`` draws every
+    point with *marker*, the behaviour before the argument existed. A triangle
+    reads smaller than a circle of the same area, so *frame_marker_scale*
+    multiplies ``marker_size`` for those points alone.
+
+    *vertex_scale* multiplies how far the three corner names sit outside their
+    corners, and *label_max_extra* is how far :func:`_spread_labels` may push a
+    mixture label before it gives up. Both are distances in points while the
+    triangle is measured in inches, so a key drawn small has to scale them down
+    with its text: at ``1.0`` a third-size key keeps the full-size key's 26 pt
+    above the apex, which puts the corner name in the panel title, and the full
+    60 pt of travel, which puts a label outside the frame to clear a neighbour
+    it is only just touching.
+
+    *fixed_points* names mixtures whose label stays where it is put, at
+    *label_offset* from the point, and blocks the others rather than being
+    pushed itself. A sequence puts each one straight up; a mapping gives each a
+    side instead -- ``{"33/33/33": "right"}`` -- from the four in
+    :data:`_PINNED_DIRECTIONS`, and a label put to one side is aligned away
+    from its point rather than centred on it. The centre is the case this
+    exists for: it is the one sampled mixture with no radius to fan along, so
+    it borrows a direction from :func:`_open_direction`, and on a small
+    triangle the emptiest direction is the same one the nearest edge
+    midpoint's label is already travelling down. Both then run to the cap and
+    stack. Which side is free is a property of the grid rather than of the
+    figure: the mixtures sit in rows of constant first weight, so straight up
+    and straight down from the centre is another sampled point, while the band
+    to either side of it between two rows holds none.
+
+    *top_room* grows the top limit until the apex's vertex name is inside the
+    axes (:func:`_make_top_room`), so the title can sit at its own pad rather
+    than being raised over a name that has overrun the frame. Off by default:
+    at full size the name clears the apex within the margin *pad* already
+    leaves, and growing the limit would shrink the triangle for nothing.
 
     **Three groups only.** ``_bary_to_xy`` maps onto a triangle and this function
     labels three corners; a tetrahedron has no honest 2-D barycentric picture, so
@@ -612,16 +751,33 @@ def ternary_legend(
 
     mix_anns: list = []
     mix_dirs: list = []
+    pinned_anns: list = []
     pts = None
     if model_ids:
         pts = _bary_to_xy(np.array([mixture_weights(m) for m in model_ids]))
-        if fill_points:
-            ax.scatter(pts[:, 0], pts[:, 1], s=marker_size,
-                       c=model_colors(model_ids, anchors),
-                       edgecolors="0.2", linewidths=0.9, zorder=3)
-        else:
-            ax.scatter(pts[:, 0], pts[:, 1], s=marker_size, facecolors="none",
-                       edgecolors="white", linewidths=0.9, zorder=3)
+        colors = model_colors(model_ids, anchors)
+        # One scatter per shape: matplotlib takes a single marker per call, so
+        # the frame points are drawn as their own pass over the same coordinates
+        # rather than point by point.
+        frame_pts = set(frame_points) if frame_marker else set()
+        groups = [(marker, marker_size,
+                   [i for i, m in enumerate(model_ids)
+                    if mixture_label(m) not in frame_pts])]
+        if frame_pts:
+            groups.append((frame_marker, marker_size * frame_marker_scale,
+                           [i for i, m in enumerate(model_ids)
+                            if mixture_label(m) in frame_pts]))
+        for shape, size, sel in groups:
+            if not sel:
+                continue
+            if fill_points:
+                ax.scatter(pts[sel, 0], pts[sel, 1], s=size, marker=shape,
+                           c=[colors[i] for i in sel],
+                           edgecolors="0.2", linewidths=0.9, zorder=3)
+            else:
+                ax.scatter(pts[sel, 0], pts[sel, 1], s=size, marker=shape,
+                           facecolors="none", edgecolors="white",
+                           linewidths=0.9, zorder=3)
         if label_models:
             # Push each label away from the centroid along its own radius. A
             # fixed (3, 3) offset stacks the labels of the four points that share
@@ -631,16 +787,35 @@ def ternary_legend(
             # neighbour happens to lie that way, and it ends up reading as that
             # neighbour's label.
             mid_xy = _bary_to_xy(np.array([1 / 3, 1 / 3, 1 / 3]))[0]
+            keep = None if label_points is None else set(label_points)
+            pinned = (dict(fixed_points) if isinstance(fixed_points, Mapping)
+                      else dict.fromkeys(fixed_points, "up"))
             for i, ((x, y), mid) in enumerate(zip(pts, model_ids)):
-                d = np.array([x, y]) - mid_xy
-                n = np.linalg.norm(d)
-                unit = (d / n) if n > 1e-9 else _open_direction(pts, i)
-                mix_dirs.append(unit)
-                mix_anns.append(ax.annotate(
-                    label_fmt(mid), xy=(x, y), xytext=tuple(unit * label_offset),
-                    textcoords="offset points", ha="center", va="center",
-                    fontsize=label_size, color="0.15", zorder=4, **text_kw,
-                ))
+                if keep is not None and mixture_label(mid) not in keep:
+                    continue
+                if mixture_label(mid) in pinned:
+                    unit, align, travel = _PINNED_DIRECTIONS[
+                        pinned[mixture_label(mid)]]
+                else:
+                    align, travel = {"ha": "center", "va": "center"}, 1.0
+                    d = np.array([x, y]) - mid_xy
+                    n = np.linalg.norm(d)
+                    unit = (d / n) if n > 1e-9 else _open_direction(pts, i)
+                ann = ax.annotate(
+                    label_fmt(mid), xy=(x, y),
+                    xytext=tuple(unit * label_offset * travel),
+                    textcoords="offset points",
+                    fontsize=label_size, color="0.15", zorder=4,
+                    **align, **text_kw,
+                )
+                # A pinned label goes on the blocking list instead of the
+                # movable one: it still pushes its neighbours away, it just does
+                # not move itself.
+                if mixture_label(mid) in pinned:
+                    pinned_anns.append(ann)
+                else:
+                    mix_dirs.append(unit)
+                    mix_anns.append(ann)
 
     # Default to the `g1`/`g2`/`g3` shorthand: the dense surrogate x metric grids have
     # no room for "Group 1", and only the cross-taxonomy figure is aimed at a
@@ -650,6 +825,7 @@ def ternary_legend(
     # labelled the vertex name has to clear that label rather than land on top
     # of it. The radial offset above is 9.5pt, so the name goes beyond it.
     up, down = (26, -25) if (model_ids and label_models) else (13, -11)
+    up, down = up * vertex_scale, down * vertex_scale
     corner_anns: list = []
     for (x, y), key, va, ha in [
         ((0.5, _SQRT3_2), "g1", "bottom", "center"),
@@ -675,10 +851,13 @@ def ternary_legend(
         ax.set_ylim(-pad, _SQRT3_2 + pad * 0.9)
         ax.set_aspect("equal")
         _spread_labels(ax, mix_anns, mix_dirs, pts, marker_size,
-                       fixed=corner_anns)
+                       fixed=corner_anns + pinned_anns,
+                       max_extra=label_max_extra)
     ax.set_xlim(-pad, 1.0 + pad)
     ax.set_ylim(-pad, _SQRT3_2 + pad * 0.9)
     ax.set_aspect("equal")
+    if top_room:
+        _make_top_room(ax, corner_anns)
     ax.axis("off")
     return ax
 
@@ -881,6 +1060,12 @@ def crosslevel_panel(
     bold: bool = True,
     label_fmt: Callable[[str], str] = mixture_label,
     axis_color: str = "0.88",
+    marker: str = "o",
+    frame_marker: str | None = None,
+    frame_points: Sequence[str] = VERTEX_LABELS + (CENTRE_LABEL,),
+    frame_marker_scale: float = 1.0,
+    point_label_pad: float = 11.0,
+    title_pad: float = 10.0,
 ) -> plt.Axes:
     """One cross-level MDS panel, drawn into *ax*.
 
@@ -920,9 +1105,26 @@ def crosslevel_panel(
     *label_fmt* renders a model id as the text of its point label. It does not
     choose *which* points are labelled -- *label_points* still does that, and
     still names them in :func:`mixture_label` form -- so a figure can restyle
-    the four labels without restating which four they are.
+    the four labels without restating which four they are. Pass ``()`` for a
+    panel with no labels at all: in a row that already carries the mixture key
+    beside it, naming the same four points in every panel can cost more room
+    than it returns.
 
     *axis_color* is the colour of the two crosshair lines through the origin.
+
+    *marker* is the shape every model is drawn with, and *frame_marker*
+    overrides it for the mixtures named in *frame_points* -- the three
+    vertices and the centre by default, the four points that fix this panel's
+    frame. ``None`` draws every point with *marker*, which is what every caller
+    did before the argument existed. *frame_marker_scale* multiplies
+    *marker_size* for those points alone, because a triangle reads smaller than
+    a circle of the same area.
+
+    *point_label_pad* is how far above its point a label sits, in points. It
+    travels with the label size: at a smaller size the default 11 leaves a gap
+    the text no longer needs. *title_pad* is the same distance for the title,
+    and exists so a figure can keep this panel's title level with the titles of
+    whatever else shares its row.
     """
     from src.analysis.bridge import fit_geometry
     from src.analysis.quality import kruskal_stress
@@ -938,13 +1140,27 @@ def crosslevel_panel(
 
     ax.axhline(0.0, color=axis_color, lw=1.0, zorder=0)
     ax.axvline(0.0, color=axis_color, lw=1.0, zorder=0)
-    ax.scatter(xy[:, 0], xy[:, 1], c=model_colors(geo.model_ids, anchors),
-               s=marker_size, zorder=3, edgecolors="0.2", linewidths=1.0)
+    colors = model_colors(geo.model_ids, anchors)
+    # One scatter per shape: matplotlib takes a single marker per call, so the
+    # the frame points are drawn as their own pass over the same coordinates.
+    frame_pts = set(frame_points) if frame_marker else set()
+    groups = [(marker, marker_size,
+               [i for i, m in enumerate(geo.model_ids)
+                if mixture_label(m) not in frame_pts])]
+    if frame_pts:
+        groups.append((frame_marker, marker_size * frame_marker_scale,
+                       [i for i, m in enumerate(geo.model_ids)
+                        if mixture_label(m) in frame_pts]))
+    for shape, size, sel in groups:
+        if sel:
+            ax.scatter(xy[sel, 0], xy[sel, 1], c=[colors[i] for i in sel],
+                       s=size, marker=shape, zorder=3, edgecolors="0.2",
+                       linewidths=1.0)
 
     for (x, y), mid in zip(xy, geo.model_ids):
         label = mixture_label(mid)
         if label in keep:
-            ax.annotate(label_fmt(mid), xy=(x, y), xytext=(0, 11),
+            ax.annotate(label_fmt(mid), xy=(x, y), xytext=(0, point_label_pad),
                         textcoords="offset points", ha="center",
                         fontsize=label_size, color="0.1", zorder=4, **weight)
 
@@ -963,7 +1179,8 @@ def crosslevel_panel(
         title = (f"{name}\ndCor {dcor:.3f}  ·  Procrustes {procrustes:.3f}"
                  f"\nstress {stress:.3f}")
         size = 12
-    ax.set_title(title, fontsize=title_size or font_size or size, pad=10,
+    ax.set_title(title, fontsize=title_size or font_size or size,
+                 pad=title_pad,
                  **weight)
 
     # Symmetric about the origin, which the frame has already made the

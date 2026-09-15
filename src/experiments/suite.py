@@ -79,6 +79,24 @@ class Suite:
     #: ``target_modules`` and ``torch_dtype`` are here.
     lora_ranks: tuple[int, ...] = ()
 
+    #: The LoRA initialisation seeds an **initsweep** trains, if this suite is
+    #: one.  Empty means "just the generator's ``LORA_INIT_SEED``", which is 0 and
+    #: is every suite that has run, so the existing trees emit exactly the files
+    #: they already carry.
+    #:
+    #: Non-empty makes the initialisation seed an axis of the adapter list beside
+    #: rank: the tree trains the whole simplex once per seed and extracts over
+    #: the union.  The seed is the ``_i00`` token every adapter directory already
+    #: carries (``..._r16_i00_b5008``), so seed 0 resolves to adapters that are
+    #: already on disk and only the other seeds are new work.
+    #:
+    #: A Suite field rather than a ``DataSimplexSpec`` one for the same reason
+    #: ``lora_ranks`` is: initialisation says how a run is configured, not what
+    #: corpus it is run over.  It varies neither the rows trained on nor their
+    #: order -- that is the *dataset draw* seed, the ``s00`` in ``_n1000_s00``,
+    #: which lives on the spec.
+    lora_init_seeds: tuple[int, ...] = ()
+
     #: ``{}`` renders no ``prompt_format:`` block at all, which is what makes the
     #: raw path byte-identical to the pre-prompt-format generator output.
     prompt_format: dict = field(default_factory=dict)

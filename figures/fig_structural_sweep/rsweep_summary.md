@@ -9,6 +9,11 @@ projections, pooling and metric), as opposed to the level itself. The eight
 canonical surrogates are this project's standing per-level defaults, defined in
 `figures/simplex_collection_size/sweep_group_size.py` and imported, not copied.
 
+**primary representations** — the four canonical perspectives to plot by
+default: `dataset_embedding`, `structural_all_o`, `functional_all`,
+`behavioral`. One per taxonomy level that reads a model, plus the dataset
+reference. See `docs/terminology.md`.
+
 Eight collections of 16 adapters — the 25% yahoo 3-group simplex on
 OLMo-2-0425-1B-Instruct at ranks 1, 2, 4, 8, 16, 32, 64, 128, all trained on the
 same 1000-row draw (seed 0, 5008 samples seen) and read on the same 100-query
@@ -20,8 +25,47 @@ Reproduce:
 
 ```
 python figures/fig_structural_sweep/sweep_rsweep.py          # -> rsweep_scores.csv
-python figures/fig_structural_sweep/make_figures.py --score both
+python figures/fig_structural_sweep/make_figures.py          # primary · disparity
+python figures/fig_structural_sweep/make_figures.py --score both --levels both
 ```
+
+## Which four to plot
+
+**The primary representations are the default set for future figures:
+`dataset_embedding`, `structural_all_o` (all layers · o_proj), `functional_all`
+(all hidden states) and `behavioral` (R=16 per query)** — one per taxonomy level
+that reads a model, plus the dataset reference that no adapter touches. They are
+fixed once, as `sweep_group_size.PRIMARY_REPRESENTATIONS`, and imported by every
+driver rather than relisted, so the figures cannot drift apart.
+
+The other four canonical perspectives are **controls on the read, not levels**:
+`structural_all_qkvo` and `structural_last_o` move the structural scope,
+`functional_last` the functional scope, `behavioral_greedy` decoding alone. They
+answer *does the scope matter on this axis*, which is a separate question from
+*do the levels agree with the simplex*.
+
+Narrowing happens at plot time and never at measure time: `sweep_rsweep.py`
+still scores all eight, because the controls are what make the primary rows
+readable — `structural_last_o` at r=2 beating r=128 is precisely how we know the
+single-init-seed caveat below has teeth — and because dropping one at measure
+time would cost a re-run to get it back.
+
+`make_figures.py` takes the level set and the estimator as independent flags,
+and every combination writes its own filename, so a disparity figure and a dCor\*
+figure of the same levels can sit side by side:
+
+| flags | grid file |
+|---|---|
+| *(defaults)* | `fig_rsweep_lora_rank_primary_disparity.png` |
+| `--score dcor` | `fig_rsweep_lora_rank_primary_dcor.png` |
+| `--score both` | `fig_rsweep_lora_rank_primary.png` |
+| `--levels canonical` | `fig_rsweep_lora_rank_disparity.png` |
+| `--score both --levels canonical` | `fig_rsweep_lora_rank.png` |
+
+Each also writes the overlay of the same curves, with `_overlay` before the
+score suffix. `--levels both` writes the primary and canonical versions in one
+run. A primary perspective missing from the CSV is a hard error rather than a
+dropped panel, since the headline figure would otherwise lose a level silently.
 
 ## What the numbers say
 
@@ -78,7 +122,8 @@ the same thing, larger: 0.075–0.235 across r=1…64, then **0.583 at r=128**.
 | file | what |
 |---|---|
 | `sweep_rsweep.py` | scores the eight collections; writes `rsweep_scores.csv` |
-| `make_figures.py` | plots it; writes the two PNGs |
+| `make_figures.py` | plots it; `--score` picks the estimator, `--levels` the level set, one filename per combination |
 | `rsweep_scores.csv` | 64 rows: perspective × rank, with `dcor`, `disparity`, `lora_alpha` |
-| `fig_rsweep_lora_rank.png` | panel grid, one column per level, column order shared with the nsweep and collection-size figures |
-| `fig_rsweep_lora_rank_overlay.png` | the same curves on one axes per estimator |
+| `fig_rsweep_lora_rank_primary*.png` | the four primary representations — the figure to reach for |
+| `fig_rsweep_lora_rank.png` | all eight canonical perspectives, column order shared with the nsweep and collection-size figures |
+| `fig_rsweep_lora_rank*_overlay*.png` | the same curves on one axes per estimator |

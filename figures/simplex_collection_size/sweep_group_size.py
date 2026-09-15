@@ -174,6 +174,27 @@ MDS_SEED = suite.MDS_SEED
 
 # ── the canonical perspectives ────────────────────────────────────────────────
 
+#: **The primary representations**: the four canonical perspectives to plot by
+#: default in future figures, one per taxonomy level that has a model in it plus
+#: the dataset reference.  The other four canonical perspectives are *scope
+#: controls* -- ``structural_all_qkvo`` and ``structural_last_o`` vary the
+#: structural scope, ``functional_last`` the functional one, and
+#: ``behavioral_greedy`` varies decoding alone -- and they answer "does the scope
+#: matter here", which is a different question from "do the levels agree".  Read
+#: this tuple as the headline figure and the full eight as the appendix.
+#:
+#: Designated 2026-09-15.  ``canonical_perspectives()`` stays the full set: this
+#: is a plotting default, not a narrowing of what gets scored, and a sweep should
+#: still compute all eight so the controls remain available without a re-run.
+#: Recorded in ``docs/terminology.md``.
+PRIMARY_REPRESENTATIONS = (
+    "dataset_embedding",
+    "structural_all_o",
+    "functional_all",
+    "behavioral",
+)
+
+
 def canonical_perspectives() -> dict[str, dict]:
     """``perspective -> {taxonomy, metric, label, and the selector keywords}``.
 
@@ -208,6 +229,11 @@ def canonical_perspectives() -> dict[str, dict]:
       are indexed ``0..N_LAYERS`` with ``h0`` the embedding, so the final state
       is ``N_STATES - 1``; LoRA layers are indexed ``0..N_LAYERS-1``, so the
       final adapter layer is ``N_LAYERS - 1``.
+
+    Four of these seven -- see :data:`PRIMARY_REPRESENTATIONS` -- are the
+    **primary representations**, the default set to plot; the rest are scope and
+    decoding controls.  All seven are still scored, because the controls are what
+    make the primary rows interpretable.
 
     The dataset level is read under ``euclidean`` alone -- plain row-wise L2
     between the mean vectors, ``FrobeniusDistanceMetric(normalize=False)``.  Its

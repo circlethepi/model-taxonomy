@@ -90,6 +90,7 @@ the objects at that stage**, as in `03A_adapter_alignments`.
 | `05A_logprobs` | Per-token log-probabilities and entropies |
 | `06_pairwise` | Individual pairwise distances, one entry per model pair |
 | `07_collections` | Distance matrices and geometry results |
+| `07A_permutation_tests` | Label-null permutation tests over those collections |
 
 **Draw** — one sampled subset of a dataset, spelled `n{n}_s{seed:02d}` with the
 seed zero-padded. `src/cache/_draw.py` owns the spelling. Writing is narrow and
@@ -328,3 +329,37 @@ visible in the figure. The gaps are structural: CKA, MMD and energy all need
 more than one row, so none can run on a `model mean` representation, and
 Bures-Wasserstein stacks per-block factors before its SVD, so a selection mixing
 2560-input and 4096-input projections has no BW value.
+
+---
+
+## Reference levels
+
+Two ways of asking *what would this score have been if the taxonomy had learned
+nothing?*. They answer different questions and the difference is the point, so
+the names are kept apart even though both produce a shaded 5–95 interval drawn
+behind the real scores. Defined in `docs/notes/chance_baselines.md` and
+implemented in `src/analysis/baselines.py`.
+
+**Structure null** — replace the taxonomy with a structureless configuration
+drawn from a generator (`gaussian` or `dirichlet`), keep the real ground truth,
+and score. Its 5–95 interval is the **uninformed band**, and the level itself
+the **uninformed baseline**. Because the configuration is scored *directly*, it
+never passes through MDS, so against an MDS-mediated score such as the
+Procrustes disparity the uninformed band is mildly **optimistic**.
+
+**Label null** — keep *both* real geometries and permute which model is which,
+destroying only the correspondence between them. Built from
+`src.analysis.configurations.protest` and `src.analysis.matrices.dcor_test`, and
+stored in `07A_permutation_tests`. It carries the real geometries through the
+real scoring path, so unlike the uninformed band it has no MDS gap.
+
+**Permutation band** — the label null's 5–95 interval, as drawn on a figure.
+The same object the note calls the label null: the figures say *permutation*
+because PROTEST and `dcor_test` are permutation tests, and the note says *label*
+because what is permuted is the labelling. **They are one concept under two
+names, not two nulls.** `figures/figure2_v2` draws both bands together; where
+they agree, the MDS gap above is small.
+
+**Generator** — how a structure null's configuration is drawn. Only two:
+`gaussian` and `dirichlet`. Dirichlet(1) *is* uniform on the simplex, so a
+separate "uniform" generator would be a duplicate.

@@ -782,6 +782,206 @@ def t_uninformed_lambda_matches_standardize():
     return "identical at k=3 and k=4, and sum(l^2) = 1"
 
 
+# ── the permutation band and its cache tier ───────────────────────────────────
+#
+# A *label null* keeps both real geometries and permutes which model is which;
+# the *permutation band* is its 5-95 interval, and `docs/terminology.md` records
+# that the two names are one concept.  Synthetic like the block above: these
+# build their own data and write into a temporary cache root, so nothing here
+# depends on `results/shared_cache` or on a cluster run.
+
+
+@check("permutation cache: the key carries everything that changes the numbers")
+def t_permutation_key_completeness():
+    """Anything that moves the null must move the key, and nothing else may.
+
+    A key that omits a parameter does not make the cache smaller; it makes two
+    different measurements share a name, and the second one silently reads the
+    first.  ``random_state`` and ``n_permutations`` are the two that are easy to
+    forget -- the same omission ``CollectionCache.geometry_key`` had to correct
+    one level down -- so they are pinned here alongside the rest.
+    """
+    from src.cache import PermutationCache
+
+    cache = PermutationCache("/nonexistent")     # keys are pure; no I/O
+    base = dict(members=["m3", "m1", "m2"], source_handle="structural/a/cosine_b",
+                truth_kind="simplex", test="protest",
+                params={"n_permutations": 9999, "random_state": 0,
+                        "n_components": 2})
+    key = cache.test_key(**base)
+
+    def moved(**over):
+        merged = dict(base)
+        merged.update(over)
+        return cache.test_key(**merged) != key
+
+    assert not moved(members=["m1", "m2", "m3"]), (
+        "the key depends on member *order*; a subgroup assembled in a different "
+        "order would miss its own stored null")
+    for field, value in (
+            ("params", {**base["params"], "random_state": 1}),
+            ("params", {**base["params"], "n_permutations": 999}),
+            ("params", {**base["params"], "n_components": 3}),
+            ("members", ["m1", "m2", "m3", "m4"]),
+            ("test", "dcor"),
+            ("truth_kind", "realized"),
+            ("source_handle", "structural/a/cosine_OTHER")):
+        assert moved(**{field: value}), f"{field}={value!r} does not change the key"
+    return "order-free in members; sensitive to all 7 of the rest"
+
+
+@check("permutation cache: a stored null reloads bit-identically")
+def t_permutation_cache_roundtrip():
+    """float64 in, the same float64 out.
+
+    Stored at float64 for the reason ``CollectionCache.save_distance_matrix``
+    gives: a cached value must be indistinguishable from a freshly computed one,
+    or the only test that the reuse is correct stops testing anything.
+    """
+    import tempfile
+
+    from src.cache import PermutationCache
+
+    with tempfile.TemporaryDirectory() as root:
+        cache = PermutationCache(root)
+        null = np.random.default_rng(3).standard_normal(2_500)
+        params = {"n_permutations": 2_500, "random_state": 0, "n_components": 2}
+        gk, tk = cache.save_result(
+            test="protest", members=["a", "b", "c"], source_handle="h",
+            truth_kind="simplex", params=params, statistic=0.0651,
+            p_value=0.0004, null=null, n_models=3, n_permutations=2_500)
+        got = cache.load_result("protest", gk, tk)
+        assert got["null"].dtype == np.float64, got["null"].dtype
+        assert np.array_equal(got["null"], null), "null is not bit-identical"
+        assert got["statistic"] == 0.0651 and got["p_value"] == 0.0004
+        band = got["band"]
+        assert band["lo"] <= band["mid"] <= band["hi"], band
+        assert cache.list_results() == [("protest", gk, tk)]
+        # The catalogue is never load-bearing: a read must survive losing it.
+        (Path(root) / "07A_permutation_tests" / "index.json").unlink()
+        assert cache.load_result("protest", gk, tk, with_null=False) is not None
+        assert cache.list_results() == [("protest", gk, tk)]
+    return "float64 round-trip exact; reads survive a deleted index.json"
+
+
+@check("bands: span mode covers only its own x range")
+def t_band_span_extent():
+    """``span`` is what a grouped bar chart needs and ``horizontal`` is not.
+
+    A bar panel whose groups do not share a baseline -- figure 2's corpus panel,
+    where yahoo is 16 models on a 3-vertex simplex and dolly and oasst1 are 35 on
+    a 4-vertex one -- would otherwise get the first group's level drawn across
+    all of them.
+    """
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    from src.plots.figures import (PERMUTATION_LABEL, draw_permutation_band,
+                                   draw_uninformed_band)
+
+    band = (0.77, 0.92, 0.98)
+    fig, ax = plt.subplots()
+    try:
+        ax.set_xlim(-0.5, 3.5)
+        draw_uninformed_band(ax, mode="span", generator="dirichlet",
+                             band=band, x=(0.6, 1.4), label=True)
+        ext = ax.collections[-1].get_paths()[0].get_extents()
+        assert abs(ext.x0 - 0.6) < 1e-9 and abs(ext.x1 - 1.4) < 1e-9, ext
+        assert abs(ext.y0 - 0.77) < 1e-9 and abs(ext.y1 - 0.98) < 1e-9, ext
+        # One legend entry for the pair, never two: the dashed centre line must
+        # not carry its own label.
+        assert len(ax.get_legend_handles_labels()[1]) == 1
+    finally:
+        plt.close(fig)
+
+    fig, ax = plt.subplots()
+    try:
+        draw_permutation_band(ax, mode="span", band=band, x=(0.0, 1.0),
+                              label=True)
+        assert ax.get_legend_handles_labels()[1] == [PERMUTATION_LABEL]
+    finally:
+        plt.close(fig)
+
+    for mode, kw in (("span", {}), ("radial", {})):
+        fig, ax = plt.subplots()
+        try:
+            draw_uninformed_band(ax, mode=mode, generator="g", band=band, **kw)
+        except ValueError as exc:
+            assert "needs x" in str(exc), exc
+        else:
+            raise AssertionError(f"mode={mode!r} without x should raise")
+        finally:
+            plt.close(fig)
+    return "span covers exactly (x0, x1); one legend entry per band"
+
+
+@check("bands: a complete mixture grid has an isotropic truth")
+def t_grid_specs_isotropic():
+    """Every suite grid is symmetric, so its Lambda is ``1/sqrt(d)`` exactly.
+
+    This is what lets ``figures/figure2_v2`` compute those panels' uninformed
+    bands directly instead of interpolating the pooled table -- no estimated
+    Lambda, and no log-n interpolation between grid rungs.  Pinned because it is
+    a property of the mixture grids rather than of the code: a spec that stops
+    being a complete grid must fail here loudly rather than quietly acquire a
+    band computed for a truth it does not have.
+
+    ``yahoo_pool`` is the control.  It is a random scatter over the simplex
+    rather than a grid, so it must *not* be isotropic -- otherwise this check
+    would pass on an implementation that returned ``1/sqrt(d)`` unconditionally.
+    """
+    from src.experiments.data_simplex_spec import SPECS
+
+    rows = []
+    for name in ("yahoo", "yahoo_nsweep", "dolly", "oasst1"):
+        W = np.array(SPECS[name].mixture_pcts(), dtype=float) / 100.0
+        k = W.shape[1]
+        lam = truth_singular_values(W @ simplex_vertices(k))
+        want = 1.0 / np.sqrt(k - 1)
+        assert np.allclose(lam, want, atol=1e-12), (name, lam, want)
+        rows.append(f"{name} n={len(W)} K={k} l={lam[0]:.4f}")
+
+    W = np.array(SPECS["yahoo_pool"].mixture_pcts(), dtype=float) / 100.0
+    lam = truth_singular_values(W @ simplex_vertices(W.shape[1]))
+    assert not np.allclose(lam, 1.0 / np.sqrt(W.shape[1] - 1), atol=1e-3), (
+        "yahoo_pool is a scatter, not a grid, and must not come out isotropic — "
+        "this check would otherwise pass on a constant")
+    return "; ".join(rows) + f"; yahoo_pool anisotropic {lam}"
+
+
+@check("bands: the exact grid band agrees with the tabulated one")
+def t_exact_band_matches_table():
+    """Two routes to one quantity, and they must not be two conventions.
+
+    ``figures/figure2_v2`` computes panels 1, 2 and 4 from the suite's own grid
+    and reads panel 3 from ``results/baselines/constants.json``.  If those
+    disagreed, one figure would carry two different definitions of the same
+    band.  Compared against a freshly sampled table-style band rather than the
+    generated file, so this stays synthetic.
+    """
+    from src.experiments.data_simplex_spec import SPECS
+
+    W = np.array(SPECS["yahoo"].mixture_pcts(), dtype=float) / 100.0
+    n, k = len(W), W.shape[1]
+    lam_grid = truth_singular_values(W @ simplex_vertices(k))
+    exact = band_quantiles(disparity_null_analytic(n, lam_grid, n_mc=40_000,
+                                                   seed=0))
+    # The table's route: a Lambda pooled over Dirichlet(1) truths rather than
+    # the grid's own.
+    lam_pooled = np.mean([truth_singular_values(_baseline_truth(n, k, seed=s))
+                          for s in range(50)], axis=0)
+    lam_pooled = lam_pooled / np.linalg.norm(lam_pooled)
+    pooled = band_quantiles(disparity_null_analytic(n, lam_pooled, n_mc=40_000,
+                                                    seed=0))
+    for label, a, b in zip(("q05", "q50", "q95"), exact, pooled):
+        assert abs(a - b) < 0.05, (
+            f"{label}: exact {a:.4f} vs pooled {b:.4f} — the two routes to the "
+            "uninformed band disagree by more than sampling noise")
+    return (f"exact [{exact[0]:.4f} {exact[1]:.4f} {exact[2]:.4f}] vs pooled "
+            f"[{pooled[0]:.4f} {pooled[1]:.4f} {pooled[2]:.4f}]")
+
+
 @check("procrustes: matches scipy.spatial.procrustes")
 def t_procrustes_vs_scipy():
     from scipy.spatial import procrustes as sp_procrustes
@@ -6401,6 +6601,11 @@ SYNTHETIC = [
     t_uninformed_disparity_analytic, t_uninformed_approx_threshold,
     t_uninformed_separates_truth, t_uninformed_dcor_centre,
     t_uninformed_lambda_matches_standardize,
+    t_permutation_key_completeness,
+    t_permutation_cache_roundtrip,
+    t_band_span_extent,
+    t_grid_specs_isotropic,
+    t_exact_band_matches_table,
     t_dispersion, t_quality, t_correlation_table, t_match_models, t_fit_geometry,
     t_similarity_conversion, t_simplex_roundtrip, t_cosine_equivalence,
     t_bures_wasserstein_equivalence, t_bures_wasserstein_invariance,

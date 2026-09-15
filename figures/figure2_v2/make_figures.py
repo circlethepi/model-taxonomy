@@ -153,6 +153,10 @@ import matplotlib  # noqa: E402
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
 import numpy as np  # noqa: E402
+from matplotlib.legend import Legend  # noqa: E402
+from matplotlib.legend_handler import HandlerTuple  # noqa: E402
+from matplotlib.lines import Line2D  # noqa: E402
+from matplotlib.patches import Patch  # noqa: E402
 
 from src.plots import make_series, plot_grouped_bars, save_figure, set_style  # noqa: E402
 from src.plots.config import bold_capable_family  # noqa: E402
@@ -165,7 +169,9 @@ from src.analysis.baselines import (band_quantiles,  # noqa: E402
                                     truth_singular_values, uninformed_band)
 from src.analysis.ground_truth import simplex_vertices  # noqa: E402
 from src.experiments.data_simplex_spec import SPECS  # noqa: E402
-from src.plots.figures import (draw_permutation_band,  # noqa: E402
+from src.plots.figures import (PERMUTATION_COLOUR, PERMUTATION_LABEL,  # noqa: E402
+                               UNINFORMED_COLOUR, UNINFORMED_LABEL,
+                               draw_permutation_band,
                                draw_uninformed_band, load_baseline_table)
 
 FIGURES_ROOT = REPO_ROOT / "figures"
@@ -703,19 +709,54 @@ class Bands:
         self._drew_permutation = False
 
     # -- one legend entry each ------------------------------------------------
+    #
+    # The bands are never labelled *into a panel legend*. A bar panel's only
+    # free space is the strip above its tallest bar, which is exactly where the
+    # bands are, so a legend large enough to name them lands on top of them --
+    # and widening the y axis far enough to seat a six-entry legend above a
+    # band at 0.98 would compress the decade the bars actually live in. The
+    # panel legends therefore keep naming only their own series, and the bands
+    # are named once for the whole row by ``legend_handles`` below.
     def _u(self, ax, **kw):
         if self.generator is None:
             return
-        draw_uninformed_band(ax, generator=self.generator,
-                             label=not self._drew_uninformed, **kw)
+        draw_uninformed_band(ax, generator=self.generator, label=False, **kw)
         self._drew_uninformed = True
 
     def _p(self, ax, band, **kw):
         if band is None:
             return
-        draw_permutation_band(ax, band=band,
-                              label=not self._drew_permutation, **kw)
+        draw_permutation_band(ax, band=band, label=False, **kw)
         self._drew_permutation = True
+
+    def legend_handles(self) -> tuple[list, list[str]]:
+        """Proxy handles for whichever bands were actually drawn.
+
+        Proxies rather than the real artists because a band is drawn many times
+        -- once per level group, or once per bar -- and every copy is the same
+        level. Each handle pairs the shaded interval with the dashed median the
+        band draws, so the legend key looks like the thing it names.
+        """
+        handles: list = []
+        labels: list[str] = []
+        pairs = [
+            (self._drew_uninformed, UNINFORMED_COLOUR,
+             UNINFORMED_LABEL.format(generator=self.generator)),
+            (self._drew_permutation, PERMUTATION_COLOUR, PERMUTATION_LABEL),
+        ]
+        for drew, colour, text in pairs:
+            if not drew:
+                continue
+            handles.append((
+                # Darker than the band itself (0.13). The band is faint by
+                # design -- it is a backdrop -- but a key is a tenth the size
+                # of the thing it names, and at 0.13 over a legend-sized patch
+                # it reads as an empty box.
+                Patch(facecolor=colour, alpha=0.38, linewidth=0),
+                Line2D([], [], color=colour, ls="--", lw=1.0),
+            ))
+            labels.append(text)
+        return handles, labels
 
     # -- the bar panels -------------------------------------------------------
     def uninformed_whole(self, ax, spec_name: str) -> None:
@@ -802,15 +843,22 @@ class Bands:
 
 
 def _bar_legend_loc(bands: Bands | None) -> str:
-    """Where a bar panel's legend goes, given whether bands are drawn.
+    """Where a bar panel's series legend goes. Always ``upper left``.
 
-    Without bands the top of the panel is empty and ``upper left`` is the right
-    answer. With them it is the *worst* answer: both reference levels sit near
-    0.9 on a disparity axis whose bars top out around 0.3, so an upper-left
-    legend lands exactly on the thing it was added to show. The mid-panel gap
-    between the tallest bar and the bands is empty in every configuration this
-    figure draws, so the legend moves there instead.
+    Kept as a function because the answer was contested. Both reference levels
+    sit near 0.9 on an axis whose bars top out near 0.3, so an upper-left
+    legend risks landing on the very thing the bands were added to show. Two
+    other placements were tried and are worse: a bar panel on a log axis has no
+    free space *below* a bar -- bars are drawn from the axis floor, so every
+    lower placement is on top of data -- and the mid-panel gap between the
+    tallest bar and the bands is too short to seat two rows.
+
+    What resolves it instead is headroom plus eviction: ``YLIMS_BANDED`` lifts
+    the log top to 8, and the band keys move out of the panel entirely (see
+    :func:`draw_band_legend`). That leaves the series legend four entries in
+    two rows, which clears the bands, so the placement never has to change.
     """
+    del bands  # kept in the signature for callers; the answer no longer varies
     return "upper left"
 
 
@@ -971,17 +1019,54 @@ YLIMS = {"log": (4e-3, 1.2), "linear": (0.0, 1.0)}
 
 #: The same ranges with headroom above the reference levels.
 #:
-#: Both bands sit near 0.9 on this score, and the plain ranges stop just above
-#: it — so with bands drawn there is nowhere for a legend to go that is not
-#: either on the bands or on the bars. Widening the top is what buys the room,
-#: and it costs nothing a reader needs: the axis is a disparity, the region
-#: above 1 is unreachable, and the extra decade is empty by construction.
-YLIMS_BANDED = {"log": (4e-3, 4.0), "linear": (0.0, 1.25)}
+#: Both bands sit near 0.9 on this score and the plain range stops just above
+#: it, so with bands drawn a bar panel's series legend has nowhere to go that
+#: is not on the bands or on the bars. Widening the top buys that room, and it
+#: costs a reader nothing: the axis is a disparity, everything above 1 is
+#: unreachable, and the added space is empty by construction. 8 rather than a
+#: smaller number because it is what measurably clears a two-row legend — at 4
+#: the legend's lower edge still cut the permutation median.
+YLIMS_BANDED = {"log": (4e-3, 8.0), "linear": (0.0, 1.25)}
 
 
 def ylim_for(yscale: str, bands: "Bands | None") -> tuple[float, float]:
     """The shared y range, widened when reference levels are drawn."""
     return (YLIMS_BANDED if bands is not None else YLIMS)[yscale]
+
+
+#: How far below a bar panel's x axis the band legend sits, in axes-height
+#: units. Enough to clear the tick labels -- the four taxonomy names -- and no
+#: more, so the strip reads as belonging to the row above it.
+BAND_LEGEND_DROP = -0.13
+
+
+def draw_band_legend(ax, bands: "Bands") -> None:
+    """Name the reference bands once, in a strip beneath the two bar panels.
+
+    Not inside a panel, and not once per panel. A band is a *level* rather than
+    a series: it is the same level on all four panels, so naming it four times
+    would say there are four of them, and naming it inside a bar panel would
+    put the key on top of the band, which is the only free space a bar panel
+    has. Anchoring it to panel 1 and letting two columns run rightwards puts it
+    under panels 1 and 2, in the margin the row already owns.
+
+    Attached with ``add_artist`` rather than ``ax.legend`` so that panel 1 keeps
+    the series legend it already has -- ``ax.legend`` would replace it.
+    """
+    handles, labels = bands.legend_handles()
+    if not handles:
+        return
+    legend = Legend(
+        ax, handles, labels,
+        loc="upper left", bbox_to_anchor=(0.0, BAND_LEGEND_DROP),
+        bbox_transform=ax.transAxes, ncol=len(handles),
+        frameon=False, borderaxespad=0.0,
+        # Both proxies are a shaded patch with the band's dashed median over
+        # it; ndivide=None overlays the pair in one key rather than shrinking
+        # them into two half-width keys side by side.
+        handler_map={tuple: HandlerTuple(ndivide=None)},
+    )
+    ax.add_artist(legend)
 
 
 def draw_bottom_row(fig, gs, bar_levels: list[Level],
@@ -1011,6 +1096,8 @@ def draw_bottom_row(fig, gs, bar_levels: list[Level],
         ax.tick_params(axis="x", rotation=0)
         for lbl in ax.get_xticklabels():
             lbl.set_ha("center")
+    if bands is not None:
+        draw_band_legend(axes[0], bands)
     return axes
 
 
@@ -1060,8 +1147,13 @@ def _embolden(fig) -> None:
         for lbl in ax.get_xticklabels() + ax.get_yticklabels():
             lbl.set_fontweight("bold")
             lbl.set_fontfamily(family)
-        legend = ax.get_legend()
-        if legend is not None:
+        # ``get_legend`` returns only the axes' *primary* legend. The band
+        # legend is attached as a plain artist so it does not displace the
+        # series legend beside it, so it has to be collected separately or it
+        # would be the one unbolded thing on the figure.
+        legends = [lg for lg in [ax.get_legend()] if lg is not None]
+        legends += [a for a in ax.artists if isinstance(a, Legend)]
+        for legend in legends:
             for txt in legend.get_texts():
                 txt.set_fontweight("bold")
                 txt.set_fontfamily(family)

@@ -151,6 +151,28 @@ keyed on that name, so the `r16` point of an rsweep resolves to the adapters and
 activations `simplex3_olmo2` already wrote. See
 `docs/notes/rank_sweep.md`.
 
+**initsweep** — a sweep over the LoRA **initialisation seed**, the argument to
+`torch.manual_seed()` immediately before PEFT initialises the LoRA `A` and `B`
+matrices, holding the corpus, the mixture grid, the training draw, the dataset
+seeds, the rank and every other optimizer setting fixed. Named for its parallel
+with [nsweep](#nsweep) and [rsweep](#rsweep) above: `n` there is the training
+draw size, `r` there is the rank, `i` here is the initialisation seed, and all
+three are the letter the adapter directory name already carries
+(`..._n1000_s00_r16_i00_b5008`). It reaches code as `Suite.lora_init_seeds`, a
+Suite field rather than a `DataSimplexSpec` one for rsweep's reason: how a run is
+configured, not what corpus it is run over.
+
+Spelled out rather than shortened because **seed** is already taken. Everywhere
+else in this repo it means the *dataset-draw* seed — the `s00` in `n1000_s00`,
+the thing `results/yahoo_topics_mean_cosine_10seeds` swept. An initsweep varies
+neither the rows trained on nor their order, which is why the dataset level is an
+exact null control across it: all its seeds read the same draws.
+
+It is not a re-run of the fixed-seed tree at its own `i00` point, for rsweep's
+reason — the seed is in the adapter name and every cache is keyed on that name —
+so a ten-seed initsweep over the 16-point yahoo simplex is 144 new adapters and
+not 160. See `docs/notes/init_seed_sweep.md`.
+
 **Prompt format** — an optional `_f{fmt}` suffix on a draw directory, recording
 which chat template was applied. Deliberately kept out of `recipe_hash`, which
 would otherwise change the identity of every cached draw at once.

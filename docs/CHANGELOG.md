@@ -4,6 +4,40 @@
 
 ## Unreleased
 
+### The LoRA initialisation seed is a sweepable axis (`olmo2_initsweep`)
+
+`lora_init_seed` has been `0` in every config ever written and every one of the 9073
+adapter directories on disk is named `_i00`, so the initialisation is the one axis of
+the standing experiments with no error bar at all. Every score the project reports is
+computed over one collection trained from one random `A` draw, and nothing in those
+numbers separates the taxonomy level from that draw.
+
+`Suite.lora_init_seeds` now crosses the simplex with the initialisation seed the way
+`Suite.lora_ranks` crosses it with the rank: empty means "just `LORA_INIT_SEED`", which
+is every suite that has run, so the thirteen existing trees regenerate byte-for-byte.
+Non-empty makes the adapter list init-seed-major, one training shard per seed.
+`train_targets`/`extract_targets` tuples gain a fifth element and `adapter_name` takes
+the seed as a parameter instead of closing over the module constant.
+
+The new assertion in `write_train` is the point of the change rather than a detail:
+`fine_tuning.lora_init_seed` is one scalar per config and the adapter's directory name
+is rendered from the loop variable, not from what PEFT actually seeded, so a shard
+holding two seeds would train one of them under the other's seed and write it to the
+other's path with nothing raised. The rank assertion beside it exists for the same
+reason.
+
+`--suite olmo2_initsweep` emits the 16-point yahoo simplex at ten seeds on
+OLMo-2-0425-1B-Instruct, 10 training shards, 10 behavioral shards, unsharded greedy and
+functional. The `i00` point is not a re-run: the seed is in the adapter name, every
+cache is keyed on that name, and `finetune_lora.py` skips a directory that already holds
+an `adapter_config.json` — so the sweep's middle point *is* `simplex3_olmo2`, and the
+new work is 144 adapters rather than 160.
+
+Not the dataset-draw seed. That is the `s00` in `_n1000_s00`, it lives on the spec, and
+it is unchanged across the sweep — which makes the dataset-embedding level an exact null
+control, since all ten seeds read the same sixteen draws. Design, analyses and traps are
+in `docs/notes/init_seed_sweep.md`; the word is defined in `docs/terminology.md`.
+
 ### One `crosslevel_scores.csv` per suite
 
 `cross_level` appended its *suffix* to every output it wrote, so the

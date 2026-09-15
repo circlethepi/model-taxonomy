@@ -15,11 +15,40 @@ trained at eight LoRA ranks (``2**{0..7}``) on OLMo-2-0425-1B-Instruct, all on
 one 1000-row draw and read on one 100-query test draw.
 
 This file is purely plotting; every value is read from ``rsweep_scores.csv``,
-which ``sweep_rsweep.py`` writes.  Two files are written per run: the per-level
-panel grid, whose column order matches the group-size and nsweep figures so the
-three can be read against each other, and a single-axes overlay of the same
-curves, which is the quicker read when the question is which level responds to
-rank at all.
+which ``sweep_rsweep.py`` writes.  Each run writes a panel grid, whose column
+order matches the group-size and nsweep figures so the three can be read against
+each other, and a single-axes overlay of the same curves, which is the quicker
+read when the question is which level responds to rank at all.
+
+Two axes choose which files come out, and every combination lands on its own
+name, so a disparity figure and a dCor* figure of the same levels can sit side by
+side instead of overwriting each other:
+
+``--score {disparity,dcor,both}``
+    Which estimator to draw.  A single score gives a one-row grid and the score's
+    name in the filename; ``both`` draws two rows and keeps the unsuffixed name.
+
+``--levels {primary,canonical,both}``
+    Which perspectives to draw.  ``primary`` is the four **primary
+    representations** and is the default; ``canonical`` is all eight; ``both``
+    writes each.  Files of the primary set carry ``_primary``.
+
+The primary representations
+---------------------------
+**These four are the set to plot by default in future figures**:
+``dataset_embedding``, ``structural_all_o`` (all layers, o_proj),
+``functional_all`` (all hidden states) and ``behavioral`` (R=16 per query) -- one
+per taxonomy level, plus the dataset reference.  They are defined once, as
+``sweep_group_size.PRIMARY_REPRESENTATIONS``, and imported here rather than
+relisted, so this figure and its siblings cannot drift apart.
+
+The other four canonical perspectives are **controls on the read, not levels**:
+``structural_all_qkvo`` and ``structural_last_o`` move the structural scope,
+``functional_last`` the functional scope, and ``behavioral_greedy`` moves decoding
+alone.  They answer "does the scope matter on this axis", which is a separate
+question from "do the levels agree with the simplex", and they crowd the headline
+when both are asked at once.  All eight are still *scored* -- narrowing happens
+at plot time, never at measure time, so no control ever needs a re-run.
 
 Reading the figure
 ------------------
@@ -55,9 +84,17 @@ Usage
 -----
 ::
 
+    # the default: the four primary representations, disparity alone
     python figures/fig_structural_sweep/make_figures.py
-    python figures/fig_structural_sweep/make_figures.py --score both
+
+    # dCor* alone, same four levels
     python figures/fig_structural_sweep/make_figures.py --score dcor
+
+    # all eight canonical perspectives, both estimators
+    python figures/fig_structural_sweep/make_figures.py --score both --levels canonical
+
+    # everything, eight files
+    python figures/fig_structural_sweep/make_figures.py --score both --levels both
 """
 
 from __future__ import annotations
@@ -78,6 +115,11 @@ from matplotlib.ticker import FixedLocator, NullFormatter, ScalarFormatter  # no
 from src.plots.config import set_style  # noqa: E402
 from src.plots.figures import save_figure  # noqa: E402
 
+# The primary set is defined at the same place as the canonical eight and
+# imported, never relisted, so this figure cannot drift from its siblings.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "simplex_collection_size"))
+from sweep_group_size import PRIMARY_REPRESENTATIONS  # noqa: E402
+
 HERE = Path(__file__).resolve().parent
 
 #: Column order and display names, one column per **perspective**, matching
@@ -94,6 +136,13 @@ LEVELS = [
     ("behavioral", "Behavioral\nR=16 per query"),
     ("behavioral_greedy", "Behavioral (greedy)\nR=1 deterministic"),
 ]
+
+#: The four **primary representations**: the default set to plot, one per
+#: taxonomy level plus the dataset reference.  The remaining four canonical
+#: perspectives are scope and decoding controls; see the module docstring.  Kept
+#: in this file order rather than the tuple's so the primary figure's columns are
+#: a subset of the canonical figure's in the same left-to-right order.
+PRIMARY = tuple(PRIMARY_REPRESENTATIONS)
 
 #: Perspective -> colour, following ``figures/figure2/make_figures.py``: one hue
 #: per taxonomy family -- green data, blue structural, gold functional, red
@@ -158,7 +207,18 @@ def rank_axis(ax, ranks):
     ax.tick_params(axis="x", labelsize=6.5)
 
 
-def draw_grid(rows, cols, stems, outdir):
+def out_name(part, stems, primary):
+    """One filename per (level set, score set), so no variant overwrites another.
+
+    ``both`` estimators keep the unsuffixed name, which is the one the committed
+    figures and the summary note already use.
+    """
+    stem = "fig_rsweep_lora_rank" + ("_primary" if primary else "")
+    score = "" if len(stems) > 1 else f"_{stems[0]}"
+    return f"{stem}{part}{score}.png"
+
+
+def draw_grid(rows, cols, stems, outdir, primary=False):
     """One panel per perspective, one row per score."""
     set_style("two_col_full")
     fig, axes = plt.subplots(len(stems), len(cols),
@@ -199,18 +259,19 @@ def draw_grid(rows, cols, stems, outdir):
                 ax.spines["left"].set_color("0.35")
 
     fig.suptitle(
-        "Taxonomy agreement with the mixture simplex vs. LoRA rank\n"
-        "OLMo-2-1B-Instruct · yahoo 3-group 25% simplex · 16 models per rank · "
+        "Taxonomy agreement with the mixture simplex vs. LoRA rank"
+        + (" — the four primary representations" if primary else "")
+        + "\nOLMo-2-1B-Instruct · yahoo 3-group 25% simplex · 16 models per rank · "
         f"alpha = 2r · dotted line = r={REFERENCE_RANK}, the rank every other "
         "experiment uses",
         fontsize=8.5)
     fig.tight_layout(rect=(0, 0, 1, 0.99))
-    out = Path(outdir) / "fig_rsweep_lora_rank.png"
+    out = Path(outdir) / out_name("", stems, primary)
     save_figure(fig, out)
     print(f"wrote {out}")
 
 
-def draw_overlay(rows, cols, stems, outdir):
+def draw_overlay(rows, cols, stems, outdir, primary=False):
     """Every level on one axes per score -- which levels respond to rank at all."""
     set_style("two_col_full")
     fig, axes = plt.subplots(1, len(stems), figsize=(4.2 * len(stems), 3.4),
@@ -240,10 +301,12 @@ def draw_overlay(rows, cols, stems, outdir):
     if handles:
         fig.legend(handles, labs, loc="lower center", ncol=3, frameon=False,
                    fontsize=6.5, bbox_to_anchor=(0.5, -0.02))
-    fig.suptitle("Every canonical level against LoRA rank, one axes per estimator",
-                 fontsize=8.5)
+    fig.suptitle(
+        ("The four primary representations" if primary else "Every canonical level")
+        + " against LoRA rank, one axes per estimator",
+        fontsize=8.5)
     fig.tight_layout(rect=(0, 0.13, 1, 0.97))
-    out = Path(outdir) / "fig_rsweep_lora_rank_overlay.png"
+    out = Path(outdir) / out_name("_overlay", stems, primary)
     save_figure(fig, out)
     print(f"wrote {out}")
 
@@ -255,7 +318,14 @@ def main() -> None:
     ap.add_argument("--outdir", default=str(HERE))
     ap.add_argument("--score", choices=["disparity", "dcor", "both"],
                     default="disparity",
-                    help="which estimator to draw; disparity is the default")
+                    help="which estimator to draw; disparity is the default. "
+                         "A single score gives a one-row grid and puts its name "
+                         "in the filename")
+    ap.add_argument("--levels", choices=["primary", "canonical", "both"],
+                    default="primary",
+                    help="which perspectives to draw: the four primary "
+                         "representations (the default), all eight canonical "
+                         "perspectives, or one figure of each")
     args = ap.parse_args()
 
     path = Path(args.scores)
@@ -272,8 +342,26 @@ def main() -> None:
     cols += [(k, k) for k in sorted(present - {k for k, _ in LEVELS})]
 
     stems = ["disparity", "dcor"] if args.score == "both" else [args.score]
-    draw_grid(rows, cols, stems, args.outdir)
-    draw_overlay(rows, cols, stems, args.outdir)
+
+    primary_cols = [(k, lab) for k, lab in cols if k in PRIMARY]
+    missing = [k for k in PRIMARY if k not in present]
+    if args.levels in ("primary", "both") and missing:
+        # A primary row absent from the CSV is a scoring gap, not a plotting
+        # choice: the headline figure would silently lose a level.
+        raise SystemExit(
+            f"{path} is missing primary representations {missing}; "
+            "re-run sweep_rsweep.py for them or pass --levels canonical."
+        )
+
+    wanted = []
+    if args.levels in ("primary", "both"):
+        wanted.append((primary_cols, True))
+    if args.levels in ("canonical", "both"):
+        wanted.append((cols, False))
+
+    for these, is_primary in wanted:
+        draw_grid(rows, these, stems, args.outdir, primary=is_primary)
+        draw_overlay(rows, these, stems, args.outdir, primary=is_primary)
 
 
 if __name__ == "__main__":

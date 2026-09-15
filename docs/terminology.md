@@ -231,6 +231,31 @@ L2-normalises each mean before subtracting) is a second legitimate reading of
 "euclidean norm" and the simplex3 drivers carry both; whether a given suite
 wants it is a per-suite decision, not part of this list.
 
+**Primary representations** — the four canonical perspectives to plot by
+default: `dataset_embedding`, `structural_all_o`, `functional_all` and
+`behavioral`. One per taxonomy level that reads a model, plus the dataset
+reference that no adapter touches. Designated 2026-09-15; fixed in
+`figures/simplex_collection_size/sweep_group_size.py::PRIMARY_REPRESENTATIONS`
+and imported by the figure drivers rather than relisted in each.
+
+The other four canonical perspectives are **controls on the read, not levels**:
+`structural_all_qkvo` and `structural_last_o` move the structural scope,
+`functional_last` moves the functional scope, and `behavioral_greedy` moves
+decoding alone. They answer *does the scope matter on this axis*, which is a
+different question from *do the levels agree with the simplex*, and asking both
+in one panel grid crowds the headline.
+
+This is a **plotting** default and nothing more. Every sweep still scores all
+eight, because the controls are what make the primary rows interpretable —
+`structural_last_o` is how you know `structural_all_o` is not an artefact of
+reading the whole stack — and because narrowing at measure time would mean a
+re-run to get a control back. Narrow at plot time, never at measure time.
+
+Note the wording: *representation*, not *perspective*. The two are the same
+objects here; "primary representations" is the phrase used when the emphasis is
+on which few to show, and "canonical perspective" when the emphasis is on what a
+level's default reading is.
+
 Two things this term is **not**. It is unrelated to `_canonical(dm)` in
 `src/analysis/comparison.py`, which means a distance matrix's *sorted row order*
 — a different layer of the problem entirely, which is why this is always written

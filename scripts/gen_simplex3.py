@@ -71,6 +71,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from src.experiments.data_simplex_spec import SPECS, DataSimplexSpec  # noqa: E402
+from src.experiments.query_mixture_spec import QMIX_SPECS, QMixArm  # noqa: E402
 from src.experiments.suite import Suite  # noqa: E402
 
 # ── The experiment's fixed parameters ──────────────────────────────────────────
@@ -106,6 +107,21 @@ SPEC = SPECS["yahoo"]
 #: name no base model, because nothing in them loads one; see ``base_models_yaml``.
 DATA_TREE = False
 
+#: The bound :class:`QMixSpec` while a **qmix** tree is being emitted, else None.
+#:
+#: qmix ("query mixture") is the axis of query-set *composition*: what fraction
+#: of the 100-row probe is the corpus the adapters were trained on, the rest
+#: being a diluting corpus they never saw.  It varies the probe, never the
+#: adapter -- a qmix tree trains nothing and reuses an existing adapter fleet.
+#: See ``src/experiments/query_mixture_spec.py``.
+#:
+#: Read by exactly two functions that behave differently under it -- ``slug``,
+#: so the tree does not land on top of the suite's own, and
+#: ``prompt_format_block``, which must emit the union field list.  Everything
+#: else a qmix config needs is passed explicitly, so that binding this global
+#: cannot change a file any other mode emits.
+QMIX = None
+
 
 def base_models_yaml() -> str:
     """The ``base_models:`` block.
@@ -130,6 +146,12 @@ def slug() -> str:
     """
     if DATA_TREE:
         return f"simplex3{SPEC.suffix}_data"
+    if QMIX is not None:
+        # Between the dataset token and the suite's, so the tree reads as "the
+        # qmix variant of simplex3_olmo2" -- and, more to the point, so it does
+        # not land on top of simplex3_olmo2 itself, whose adapters it reuses and
+        # whose results directory it must not write experiment.yaml into.
+        return f"simplex3{SPEC.suffix}{QMIX.suffix}{SUITE.suffix}"
     return f"simplex3{SPEC.suffix}{SUITE.suffix}"
 
 
@@ -474,6 +496,115 @@ def query_blocks(which: str) -> str:
                          text_fields=list(SPEC.query_fields))
 
 
+def qmix_entry_yaml(dataset_id: str, weight: int, *, text_fields: tuple[str, ...],
+                    answer_field: str, class_field: str, class_filter: list,
+                    indent: str = "      ") -> str:
+    """One entry of a **qmix** query recipe: one corpus, at one relative weight.
+
+    The single-corpus ``entry_yaml`` cannot serve here -- it reads ``dataset_id``,
+    ``class_field`` and ``answer_field`` off the bound spec, and the whole point
+    of a query mixture is that the two entries disagree about all three.
+    ``ClassDatasetEntry`` has always carried them per entry; nothing in the data
+    layer had to change for this.
+
+    ``text_fields`` is what makes the mixture projectable: ``row_text`` picks the
+    entry "by which of its named columns the row actually has", and the two
+    corpora of either arm have disjoint column sets, so the dispatch is
+    unambiguous.  Under a chat suite the *prompt* is rendered from
+    ``prompt_format.user_fields`` instead, but this block still selects the rows.
+
+    ``class_sampling: pooled`` and a filter naming every value of the axis is how
+    an UNSTRATIFIED draw is spelled: the rows are drawn from the union, with no
+    per-class quota.  That is deliberate -- a qmix point varies how much of the
+    probe is yahoo, and a second quota inside the yahoo share would confound the
+    dilution with a change in the yahoo mixture.
+
+    ``class_filter`` is emitted as a Python repr, so strings arrive quoted.  That
+    is a change from ``entry_yaml``'s bare list and it is the safer spelling:
+    ``no`` (Norwegian), ``on``, ``off``, ``y`` and ``n`` are YAML 1.1 booleans,
+    and a language-filtered arm is exactly where one would turn up.
+    """
+    return (
+        f"{indent}- dataset_id: {dataset_id}\n"
+        f"{indent}  split: train\n"
+        f"{indent}  weight: {weight}.0\n"
+        f"{indent}  text_field: {answer_field}          # fallback projection; text_fields wins\n"
+        f"{indent}  text_fields: [{', '.join(text_fields)}]\n"
+        f'{indent}  text_separator: "\\n"\n'
+        f"{indent}  class_field: {class_field}\n"
+        f"{indent}  class_filter: {class_filter!r}\n"
+        f"{indent}  class_sampling: pooled           # unstratified: draw from the union\n"
+    )
+
+
+def qmix_query_block(arm: QMixArm | None, pct: int, seed: int) -> str:
+    """The ``datasets:`` block for one qmix point at one draw seed.
+
+    Two entries at integer weights *pct* : *100 - pct*, except at the endpoints,
+    where the zero-weight side is dropped rather than carried at ``weight: 0.0``
+    -- matching ``weights_for``'s convention, keeping the endpoint recipes
+    distinct by entry set, and avoiding a filter that selects rows to draw none
+    of.
+
+    Weights are not reduced to lowest terms here, unlike ``weights_for``.  They
+    are relative either way -- 5:95 and 1:19 normalize identically -- and the
+    unreduced pair is the percentage the file name claims, which is the number a
+    reader is checking.
+    """
+    name = QMIX.recipe_name(arm, pct)
+    if arm is None:
+        mix = "100% yahoo, undiluted -- the reference the whole curve is read against"
+    else:
+        mix = (f"{pct}% yahoo / {100 - pct}% {arm.key} "
+               f"({arm.contrast}), seed {seed}")
+    head = (f"  - name: {name}\n"
+            f"    recipe_type: class_aware\n"
+            f"    n_samples: {QMIX.query_n}\n"
+            f"    seed: {seed}\n"
+            f"    # {mix}\n"
+            f"    entries:\n")
+    body = ""
+    if pct > 0:
+        body += qmix_entry_yaml(
+            QMIX.base_spec.dataset_id, pct,
+            text_fields=QMIX.base_query_fields(),
+            answer_field=QMIX.base_spec.answer_field,
+            class_field=QMIX.base_spec.class_field,
+            class_filter=QMIX.base_classes(),
+        )
+    if arm is not None and pct < 100:
+        body += qmix_entry_yaml(
+            arm.dataset_id, 100 - pct,
+            text_fields=arm.query_fields,
+            answer_field=arm.answer_field,
+            class_field=arm.class_field,
+            class_filter=arm.class_filter,
+        )
+    return head + body
+
+
+def qmix_adapter_paths() -> list[str]:
+    """The sixteen literal adapter paths a qmix tree extracts from.
+
+    Resolved with ``QMIX`` temporarily unbound, which is the whole trick.  An
+    adapter's directory leaf carries ``_f{format_id}``, ``format_id`` is a digest
+    of the prompt format, and a qmix tree deliberately renders under a *different*
+    (union) prompt format -- so re-deriving these paths in place would name
+    sixteen directories that do not exist.  The fleet was trained under the stock
+    format and keeps the name it was trained under; only the probe changes.
+
+    Saving and restoring the global mirrors ``proportions_for``, which does the
+    same for ``SPEC`` and for the same reason: one emission needs a value the
+    bound one does not carry.
+    """
+    global QMIX
+    was, QMIX = QMIX, None
+    try:
+        return [adapter_path(*t) for t in extract_targets()]
+    finally:
+        QMIX = was
+
+
 def adapter_name(name: str, n: int | None = None, seed: int | None = None,
                  rank: int | None = None, init_seed: int | None = None) -> str:
     """The adapter's directory leaf.
@@ -517,6 +648,17 @@ def prompt_format_block() -> dict | None:
     """
     if not SUITE.prompt_format:
         return None
+    if QMIX is not None:
+        # A qmix probe holds rows of two corpora with disjoint column names, and
+        # _join_fields SKIPS a column the row does not have rather than raising
+        # -- so the stock single-corpus list would render every diluent row as an
+        # empty user turn, silently. The union renders each row as its own
+        # fields; see QMixSpec.user_fields.
+        return {
+            **SUITE.prompt_format,
+            "user_fields": QMIX.user_fields(),
+            "answer_fields": QMIX.answer_fields(),
+        }
     return {
         **SUITE.prompt_format,
         "user_fields": list(SPEC.query_fields),
@@ -914,12 +1056,67 @@ def _qdesc(which: str) -> str:
     return desc
 
 
+def qmix_note(qpoint: tuple[QMixArm | None, int, int], level: str,
+              n_models: int) -> str:
+    """The header paragraph of a qmix config: what this job varies, and what it does not.
+
+    Emitted in place of the level-specific notes the other modes carry, because
+    those describe a tree whose adapters vary and whose probe does not, and this
+    is that tree read the other way round.  Getting that backwards in a comment
+    is how a config comes to mean something a reader did not check.
+    """
+    arm, pct, qseed = qpoint
+    what = ("the SAME 100-row probe, undiluted" if arm is None else
+            f"a 100-row probe that is {pct}% yahoo and {100 - pct}% "
+            f"{arm.key} ({arm.contrast})")
+    note = (
+        f"# One point of the QMIX axis: query-set composition. The {n_models} adapters are\n"
+        f"# held completely fixed -- the existing yahoo simplex on this base model, same\n"
+        f"# rank, same init seed, same training draw, same budget. Nothing is trained\n"
+        f"# here. What varies is {what},\n"
+        f"# at draw seed {qseed} of {len(QMIX.seeds)}.\n"
+        f"#\n"
+        f"# extraction.models below is a list of LITERAL paths and must stay one. The\n"
+        f"# adapters were named under the stock prompt format; this config renders under\n"
+        f"# the union one (see prompt_format), which is a different format_id, so a\n"
+        f"# re-derived path would name a directory that does not exist.\n"
+        f"#\n"
+        f"# {QMIX.caveats['unstratified'].replace(chr(10), chr(10) + '# ')}\n"
+        f"#\n"
+        f"# {QMIX.caveats['format'].replace(chr(10), chr(10) + '# ')}\n"
+    )
+    if arm is not None and pct > 0:
+        rows = round(QMIX.query_n * pct / 100)
+        note += (
+            f"#\n"
+            f"# At {pct}% of {QMIX.query_n} rows this probe holds {rows} yahoo "
+            f"{'row' if rows == 1 else 'rows'}. Whole-percent targets\n"
+            f"# against 100 rows, so largest-remainder allocation is exact and the realized\n"
+            f"# composition equals the requested one"
+            + (".\n" if rows > 1 else
+               " -- but WHICH single row it is dominates\n"
+               "# the variance at this point, which is what the ten draw seeds are for.\n")
+        )
+    if arm is not None:
+        note += (
+            f"#\n"
+            f"# The {arm.key} pool is {arm.pool_rows} rows and this draw takes at most "
+            f"{QMIX.query_n}, so\n"
+            f"# ClassMixedDataset has no reason to scale the mixture down. If a log shows\n"
+            f"# 'MixedDataset: recipe capacity', that assumption broke and the realized\n"
+            f"# composition is not the one this file names.\n"
+        )
+    return note + "\n"
+
+
 def write_extract(
     level: str,
     query: str,
     shard: int | None,
     names: list[tuple[str, int, int, int, int]],
     temperature: float | None = None,
+    models_override: list[str] | None = None,
+    qpoint: tuple[QMixArm | None, int, int] | None = None,
 ) -> str:
     # *names* are ``(proportion, n_samples, seed, rank, init_seed)`` tuples -- every adapter
     # this job extracts from.  For a single-draw, single-rank tree the tuple is the
@@ -928,15 +1125,29 @@ def write_extract(
     # sweep all eight ranks and for an initsweep all ten initialisation seeds,
     # because inference does not depend on how the adapter
     # was trained and so is sharded by none of them.
-    qname = query_full_context_name() if query == "full_context" else query_question_only_name()
-    if SUITE.prompt_format:
+    #
+    # *models_override* and *qpoint* are the two qmix hooks, and both default to
+    # None so every existing call site emits exactly what it always did.  A qmix
+    # job pins its adapter list to literal paths (the fleet is named under the
+    # stock prompt format, not the union one this tree renders with) and replaces
+    # the query set with one point of the query-mixture axis.
+    if qpoint is not None:
+        arm, pct, qseed = qpoint
+        qname = QMIX.recipe_name(arm, pct)
+        qdesc = (
+            ("100% yahoo, undiluted, unstratified"
+             if arm is None else
+             f"{pct}% yahoo / {100 - pct}% {arm.key}, unstratified")
+            + f", draw seed {qseed}"
+        )
+    else:
+        qname = (query_full_context_name() if query == "full_context"
+                 else query_question_only_name())
         # Under a chat template with completion-only loss the training prompt IS
         # the question, so the roles are the reverse of the raw suite's.  Saying
         # so here rather than carrying the raw suite's phrasing forward, which
         # would be actively wrong.
-        qdesc = _qdesc("chat")
-    else:
-        qdesc = _qdesc(query)
+        qdesc = _qdesc("chat") if SUITE.prompt_format else _qdesc(query)
     token = SUITE.job_token(query)
     n_shards = {"sweep": SUITE.sweep_shards,
                 "greedy": SUITE.greedy_shards}.get(level, SUITE.behavioral_shards)
@@ -944,14 +1155,19 @@ def write_extract(
         f"simplex3_{level}_{token}"
         + ("" if temperature is None else f"_{temp_token(temperature)}")
         + ("" if shard is None else f"_shard{shard}")
+        + ("" if qpoint is None else f"_{qname}_s{qpoint[2]:02d}")
     )
     body = HEADER + (
-        f"# {level.capitalize()} extraction over the {query} query set ({qdesc}).\n"
+        f"# {level.capitalize()} extraction over the "
+        + ("qmix" if qpoint is not None else query)
+        + f" query set ({qdesc}).\n"
         f"# {len(names)} adapter(s)"
         + ("" if shard is None else f", shard {shard} of {n_shards}")
         + ".\n#\n"
     )
-    if level == "functional" and rank_sweep():
+    if qpoint is not None:
+        body += qmix_note(qpoint, level, len(names))
+    elif level == "functional" and rank_sweep():
         body += (
             f"# One job for all {len(names)}: HFInferenceTaxonomy loads the base model once\n"
             f"# and swaps adapters onto it, so every rank amortizes a single load, and\n"
@@ -1089,14 +1305,19 @@ def write_extract(
             f"# times buys eight short slots that actually backfill.\n\n"
         )
     body += preamble(label)
-    body += "datasets:\n" + query_blocks(query)
+    body += "datasets:\n" + (query_blocks(query) if qpoint is None
+                             else qmix_query_block(*qpoint))
     body += f"\nbase_models:\n  - {SUITE.base_model}\n\n"
     body += prompt_format_yaml()
     body += "fine_tuning:\n  enabled: false\n\n"
     body += "extraction:\n  models:\n"
-    body += "".join(f"    - {adapter_path(*t)}\n" for t in names)
+    body += "".join(
+        f"    - {m}\n" for m in
+        (models_override if models_override is not None
+         else [adapter_path(*t) for t in names])
+    )
     body += f"""  queries_dataset: {qname}
-  n_queries: {SPEC.query_n}
+  n_queries: {QMIX.query_n if qpoint is not None else SPEC.query_n}
   device: cuda
   torch_dtype: {SUITE.torch_dtype}
 """
@@ -1804,6 +2025,10 @@ def main() -> None:
                         help="Which configuration to emit (default: llama).")
     parser.add_argument("--dataset", default="yahoo", choices=sorted(SPECS),
                         help="Which corpus the simplex is built over (default: yahoo).")
+    parser.add_argument("--qmix", action="store_true",
+                        help="Emit the qmix tree instead: the query-set composition "
+                             "axis over an EXISTING adapter fleet. Trains nothing; "
+                             "both diluent arms and the shared undiluted point.")
     parser.add_argument("--data-tree", action="store_true",
                         help="Emit only the dataset build tree -- the build job and the "
                              "embedding sweeps -- detached from any model suite.")
@@ -1838,6 +2063,19 @@ def main() -> None:
 
     if args.data_tree:
         write_data_tree(Path(args.root))
+        return
+
+    # Before the suite is adjusted for a corpus, because a qmix tree does not
+    # vary the corpus: it holds one fleet fixed and varies the probe, so none of
+    # the shard-count and prefix machinery below applies to it.
+    if args.qmix:
+        if args.dataset != "yahoo":
+            raise SystemExit(
+                "--qmix is defined over the yahoo fleet only. The diluents are "
+                "the arms of the qmix spec, not --dataset; see "
+                "src/experiments/query_mixture_spec.py."
+            )
+        write_qmix_tree(Path(args.root), args.suite)
         return
 
     SUITE = _suite_for_dataset(SUITES[args.suite], args.dataset, args.suite,
@@ -2300,6 +2538,175 @@ def _data_tree_prefix() -> str:
             f"to _DATA_TREE_PREFIXES, checking it collides with none of "
             f"{sorted(_DATA_TREE_PREFIXES.values())} or the suite prefixes."
         ) from None
+
+
+#: The three levels a qmix tree collects, as
+#: ``(write_extract level, file prefix, job token, Suite wall attribute)``.
+#:
+#: Ordered cheapest-last on purpose: the sampled behavioral level is ~85% of the
+#: bill, so it is what a partial submission should start with.
+#:
+#: ``functional_gen`` and the log-prob level are deliberately absent.  Neither
+#: was asked for, both are priced per adapter, and both could be added later over
+#: these same query sets without regenerating a single generation -- they read
+#: the probe, they do not define it.
+QMIX_LEVELS = (
+    ("behavioral", "05_behavioral", "behav", "behav_time"),
+    ("greedy", "08_greedy", "greedy", "greedy_time"),
+    ("functional", "04_functional", "func", "func_time"),
+)
+
+
+def qmix_job_token(arm: QMixArm | None, pct: int, seed: int) -> str:
+    """The point's token inside a job name: ``d005_s00``, ``o050_s03``, ``pure_s00``.
+
+    Short because it sits inside a job name that already carries a prefix and a
+    level, and sacct truncates.  One letter for the arm -- ``d`` for dolly, ``o``
+    for oasst1-zh -- then the yahoo percentage, then the draw seed.
+    """
+    if arm is None:
+        return f"pure_s{seed:02d}"
+    return f"{arm.name_token[0]}{pct:03d}_s{seed:02d}"
+
+
+def write_qmix_tree(root: Path, suite_name: str) -> None:
+    """Emit the **qmix** tree: one fixed adapter fleet, many query compositions.
+
+    A standalone emitter in the shape of ``write_data_tree``, rather than a set
+    of branches through ``main``.  ``main`` is a training pipeline -- prefetch,
+    build, train shards, then extraction gated on them -- and a qmix tree has
+    none of that: no training, no build barrier, no dependency chain at all, just
+    independent extraction jobs over adapters that already exist.  Threading that
+    through ``main`` would add a dozen ``if`` statements to the emitter that
+    thirteen trees on disk must keep regenerating byte-for-byte.
+
+    What it does *not* fork is the file-writing itself: ``write_extract``,
+    ``sbatch``, ``embedder_block``, ``prompt_format_yaml`` and ``preamble`` are
+    the shared functions, so a wall or a batch size that changes for one mode
+    changes for this one too.
+    """
+    global SUITE, QMIX
+
+    QMIX = QMIX_SPECS["yahoo"]
+    from dataclasses import replace
+    SUITE = replace(SUITES[suite_name], job_prefix=QMIX.job_prefix)
+
+    tree = slug()
+    exp = root / "experiments" / tree
+    jobs = root / "jobs" / tree
+    logs = f"{output_dir()}/logs"
+    exp.mkdir(parents=True, exist_ok=True)
+    jobs.mkdir(parents=True, exist_ok=True)
+
+    # Resolved once, with QMIX temporarily unbound, and then passed to every
+    # config: the fleet is the one thing this whole tree holds constant, so it is
+    # computed in one place rather than sixteen times per job.
+    models = qmix_adapter_paths()
+
+    written: list[str] = []
+
+    def emit(path: Path, text: str) -> None:
+        path.write_text(text)
+        written.append(str(path))
+
+    names = extract_targets()
+    for arm, pct in QMIX.points():
+        for seed in QMIX.seeds:
+            point = (arm, pct, seed)
+            stem = f"{QMIX.recipe_name(arm, pct)}_s{seed:02d}"
+            tok = qmix_job_token(arm, pct, seed)
+            for level, num, jtok, wall in QMIX_LEVELS:
+                cfg = f"{level}_{stem}.yaml"
+                taxonomy = "functional" if level == "functional" else "behavioral"
+                emit(exp / cfg, write_extract(
+                    level, "question_only", None, names,
+                    models_override=models, qpoint=point,
+                ))
+                emit(jobs / f"{num}_{stem}.sh", sbatch(
+                    f"{SUITE.job_prefix}_{jtok}_{tok}", SUITE.gpu_partitions, True,
+                    SUITE.extract_mem_gb, getattr(SUITE, wall),
+                    # --steps build extract, not extract alone: make_queries reads
+                    # the query recipe from
+                    # {output_dir}/datasets/{queries_dataset}.recipe.json, and
+                    # nothing else in this tree writes that file.
+                    f"python scripts/run_experiment.py experiments/{tree}/{cfg}"
+                    f" --steps build extract --taxonomy {taxonomy}",
+                    logs,
+                ))
+
+    emit(jobs / "submit_all.sh", qmix_submit_all(tree))
+    (jobs / "submit_all.sh").chmod(0o755)
+
+    n_points = len(QMIX.points())
+    print(f"Wrote {len(written)} files:")
+    print(f"  {len(list(exp.glob('*.yaml')))} configs in {exp}")
+    print(f"  {len(list(jobs.glob('*.sh')))} scripts in {jobs}")
+    print(f"\n{n_points} query compositions x {len(QMIX.seeds)} draw seeds = "
+          f"{QMIX.n_configs()} query sets, x {len(QMIX_LEVELS)} levels = "
+          f"{QMIX.n_configs() * len(QMIX_LEVELS)} jobs over {len(models)} fixed adapters.")
+    print(f"Submit with: bash {jobs}/submit_all.sh")
+
+
+def qmix_submit_all(tree: str) -> str:
+    """The qmix submit script: three flat stages, no dependencies anywhere.
+
+    Every other tree in this generator submits an ``afterok`` chain, because
+    extraction there waits on training.  Nothing here trains, so every job is
+    independent and the only ordering that matters is which stage is worth
+    spending the queue on first.
+    """
+    stages = "\n".join(
+        f'for f in {num}_*.sh; do\n'
+        f'  J=$(sb "$f"); echo "{jtok:<6} ${{f%.sh}}   $J"\n'
+        f'done\n'
+        for _, num, jtok, _ in QMIX_LEVELS
+    )
+    n_sets = QMIX.n_configs()
+    n_jobs = n_sets * len(QMIX_LEVELS)
+    # Per-job GPU-hours from the measured per-adapter costs on this 1B (147 s
+    # sampled at R=16, 18.6 s greedy, 1.9 s functional over 16 adapters), plus a
+    # per-job base-model load. Printed because a submit script for 450 jobs that
+    # does not say what it costs is one nobody can check before running it.
+    behav_h = round(n_sets * 0.75)
+    other_h = round(n_sets * (0.12 + 0.05))
+    return f"""#!/bin/bash
+# GENERATED BY scripts/gen_simplex3.py --qmix --suite ... -- do not edit by hand.
+#
+# The QMIX tree: {n_sets} query sets x {len(QMIX_LEVELS)} levels = {n_jobs} jobs, over ONE fixed
+# adapter fleet. Nothing here trains, so there are no dependencies at all --
+# every job below is independent and the stages are ordered by what is worth
+# spending the queue on first, not by what must finish before what.
+#
+# THIS SUBMITS {n_jobs} JOBS. Read the cost note before running it whole:
+#   - {n_sets} sampled behavioral jobs at ~45 min each is ~{behav_h} GPU-h, ~85% of the bill
+#   - the greedy and functional stages together are ~{other_h} GPU-h
+# Under a 16-GPU cap the whole thing is ~8-9 h of wall clock.
+#
+# Levers, both without touching a config: run one stage at a time by copying the
+# loop you want, or run one arm first --
+#   for f in 05_behavioral_qmix_yahoo*_dolly*.sh; do sbatch "$f"; done
+#
+# sbatch on this cluster refuses without --comment=accept_cost, and the gate
+# quotes the REQUESTED wall rather than elapsed time. It is added by hand at
+# submit time and is deliberately not baked in here.
+#
+# CHECK THE QUEUE FIRST -- the partition ordering and the walls were chosen
+# against a snapshot of free capacity, and a snapshot written into a config is
+# stale by the time it runs:
+#
+#     sinfo -o "%P %a %D %t %G"
+#     squeue --states=PD -o "%P %R" | sort | uniq -c
+
+set -euo pipefail
+cd "$(dirname "$0")"
+mkdir -p {output_dir()}/logs
+
+sb() {{ sbatch --parsable "$@"; }}
+
+{stages}
+echo
+echo "Submitted. Watch with: squeue -u $USER -o '%.10i %.14j %.9P %.2t %.10M %R'"
+"""
 
 
 def submit_all() -> str:

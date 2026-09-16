@@ -134,16 +134,33 @@ def query_draws(exp_dir: Path, results_dir: Path, qmix) -> list[dict]:
     return draws
 
 
+#: The behavioral embedder this tree generated under: multilingual, because the
+#: oasst1-zh arm's probes are Chinese and so are the generations they elicit.
+#: ``simplex_suite.EMBEDDER`` is yahoo's English-only v1.5 and would find nothing
+#: here -- the hash is a path component, so a mismatch reads as an empty cache
+#: rather than as an error. The value is the one the dolly and oasst1 trees
+#: already use; see ``simplex_suite.EMBEDDER``'s own comment.
+QMIX_EMBEDDER = "0b579825f703fb21"   # nomic-embed-text-v2-moe, search_document
+
+
 def with_draw(spec: dict, draw: dict) -> dict:
-    """*spec* with its level selector pointed at *draw*.
+    """*spec* with its level selector pointed at *draw*, on this tree's embedder.
 
     Every other field of the selector -- pooling, view, normalisation, the
-    embedder, the sampling hash -- is left exactly as the canonical perspective
-    defines it.  The draw is the one thing this experiment varies, and the whole
-    point of importing the perspectives is that nothing else does.
+    sampling hash -- is left exactly as the canonical perspective defines it.
+    The draw is the one thing this experiment varies, and the whole point of
+    importing the perspectives is that nothing else does.
+
+    The embedder is the one exception, and it is not a free choice: it is a
+    property of what was *written*, not of how it is read. These generations were
+    embedded with v2-moe, so asking for v1.5 would address a cache entry that
+    does not exist.
     """
     key = SELECTOR_KEY[spec["taxonomy"]]
-    return {**spec, key: {**spec[key], "draw": draw}}
+    sel = {**spec[key], "draw": draw}
+    if "embedder_hash" in sel:
+        sel["embedder_hash"] = QMIX_EMBEDDER
+    return {**spec, key: sel}
 
 
 def point_matrix(index, ids, cache_root, name, spec, *, use_cache=True):

@@ -121,7 +121,7 @@ extraction:
       top_k: null
       generation_seed: 0
       embedder:
-        model_name: nomic-ai/nomic-embed-text-v1.5
+        model_name: nomic-ai/nomic-embed-text-v2-moe
         normalize_embeddings: true
         trust_remote_code: true
         # The literal prefix nomic wants is "search_document: ". Note the existing

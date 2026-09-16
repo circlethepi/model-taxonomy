@@ -727,8 +727,20 @@ def embedder_block() -> str:
     so v2-moe is already covered by the prefix machinery and uses the same
     ``search_document: `` spelling.  Both models emit 768 dimensions.
     """
+    # A qmix probe can hold Chinese: the oasst1-zh arm's queries are zh, so the
+    # generations they elicit are too.  yahoo's v1.5 is English-only, and an
+    # embedder that cannot represent half the text would make the oasst arm's
+    # curve its own artefact -- indistinguishable from the dilution effect the
+    # experiment exists to measure.  v2-moe is multilingual and handles English
+    # equally well, which is why DOLLY and OASST1 already carry it.
+    #
+    # Tree-wide, both arms and the shared undiluted point, so the curves are on
+    # one scale.  It costs nothing in comparability: the unstratified yahoo draw
+    # already puts qmix outside figure 2's numbers. Both models emit 768 dims.
+    model_name = ("nomic-ai/nomic-embed-text-v2-moe" if QMIX is not None
+                  else SPEC.embedder_model)
     return """      embedder:
-        model_name: """ + SPEC.embedder_model + """
+        model_name: """ + model_name + """
         normalize_embeddings: true
         trust_remote_code: true
         # The literal prefix nomic wants is "search_document: ". Note the existing

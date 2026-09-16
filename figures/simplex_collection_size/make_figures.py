@@ -55,8 +55,13 @@ import matplotlib  # noqa: E402
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
 
+from src.analysis.baselines import uninformed_band  # noqa: E402
 from src.plots.config import set_style  # noqa: E402
-from src.plots.figures import save_figure  # noqa: E402
+from src.plots.figures import (  # noqa: E402
+    draw_uninformed_band,
+    load_baseline_table,
+    save_figure,
+)
 
 HERE = Path(__file__).resolve().parent
 
@@ -178,7 +183,38 @@ def summarise(rows, level, column):
             np.array([disjoint[n] for n in ns]))
 
 
-def draw(rows, variants, outdir: Path, suffix: str = "") -> Path:
+#: The pool's ground truth is a 3-vertex simplex — every adapter is a mixture of
+#: group 1, group 2 and group 3 of the yahoo task, which is what the ``g1/g2/g3``
+#: in an adapter name records — so the truth configuration is 2-D.  There is no
+#: column in the CSV that says this, which is why it is a named constant here
+#: rather than inferred: an inferred ``K`` that guessed wrong would silently pick
+#: the wrong baseline table entry.
+TRUTH_K = 3
+TRUTH_D = TRUTH_K - 1
+
+#: The variant the band describes.  Variant A keeps ``n_refs`` reference models
+#: in the matrix and U-centres over ``n + n_refs``, so its null is a different
+#: derivation; until that is done, A panels say so rather than borrowing B's.
+BASELINE_VARIANT = "B"
+
+
+def baseline_curves(table, generator, ns):
+    """``{score: (lo, mid, hi)}`` over *ns*, from the precomputed table."""
+    out = {}
+    for score, _, _ in SCORES:
+        try:
+            triples = [uninformed_band(n, table=table, score=score,
+                                       generator=generator,
+                                       k=TRUTH_K, d=TRUTH_D) for n in ns]
+        except (KeyError, ValueError) as e:
+            raise SystemExit(f"cannot draw the {score} baseline: {e}") from None
+        lo, mid, hi = (np.array(x) for x in zip(*triples))
+        out[score] = (lo, mid, hi)
+    return out
+
+
+def draw(rows, variants, outdir: Path, suffix: str = "",
+         baseline: str | None = None) -> Path:
     set_style("two_col_full")
     cols = columns_for(rows)
     fig, axes = plt.subplots(len(SCORES), len(cols),
@@ -193,9 +229,26 @@ def draw(rows, variants, outdir: Path, suffix: str = "") -> Path:
     labels = {"A": "variant A (references in the matrix)",
               "B": "variant B (sampled models only)"}
 
+    # The uninformed band, if asked for.  Evaluated on a dense log grid rather
+    # than on the sweep's seven rungs so the curve reads as a level rather than
+    # as a series with markers.
+    bands, band_x = None, None
+    if baseline is not None:
+        all_n = sorted({r["n"] for r in rows})
+        band_x = np.geomspace(min(all_n), max(all_n), 120)
+        bands = baseline_curves(load_baseline_table(), baseline, band_x)
+
+    first_band_drawn = False
     for col, (level, title) in enumerate(cols):
         for row, (score, ylabel, _high_good) in enumerate(SCORES):
             ax = axes[row][col]
+            if bands is not None and BASELINE_VARIANT in variants:
+                draw_uninformed_band(
+                    ax, mode="curve", generator=baseline,
+                    band=bands[score], x=band_x,
+                    label=not first_band_drawn,
+                )
+                first_band_drawn = True
             drew = False
             for variant in variants:
                 got = summarise(rows, level, f"{score}_{variant}")
@@ -223,6 +276,13 @@ def draw(rows, variants, outdir: Path, suffix: str = "") -> Path:
             if not drew:
                 ax.text(0.5, 0.5, "no rows", ha="center", va="center",
                         transform=ax.transAxes, color="0.5")
+            elif baseline is not None and BASELINE_VARIANT not in variants:
+                # Asked for a band on a figure showing only variant A.  Say so
+                # in the panel: a silently missing band reads as "the baseline
+                # is off the axis", which is the opposite of the truth.
+                ax.text(0.03, 0.03, "no baseline drawn\n(variant A)",
+                        transform=ax.transAxes, fontsize=6, color="0.45",
+                        ha="left", va="bottom", linespacing=1.4)
             ax.set_xscale("log")
             if score in YLIM:
                 ax.set_ylim(*YLIM[score])
@@ -240,15 +300,26 @@ def draw(rows, variants, outdir: Path, suffix: str = "") -> Path:
                    frameon=False, fontsize=8, bbox_to_anchor=(0.5, -0.015))
     fig.suptitle("Score against collection size, at each level's standing perspectives",
                  fontsize=11, y=0.995)
-    fig.text(0.5, 0.945,
-             "Band = interquartile range across replicates, not a confidence "
-             "interval: replicates are drawn without replacement from one pool, "
-             "so they share models and the spread is deflated.\n"
-             f"Hollow markers and a dashed band mark sizes with fewer than "
-             f"{DEFLATED_BELOW} disjoint groups per shuffle, where that "
-             "deflation dominates.",
+    caption = (
+        "Band = interquartile range across replicates, not a confidence "
+        "interval: replicates are drawn without replacement from one pool, "
+        "so they share models and the spread is deflated.\n"
+        f"Hollow markers and a dashed band mark sizes with fewer than "
+        f"{DEFLATED_BELOW} disjoint groups per shuffle, where that "
+        "deflation dominates."
+    )
+    if bands is not None and BASELINE_VARIANT in variants:
+        caption += (
+            f"\nGrey = the uninformed baseline for variant "
+            f"{BASELINE_VARIANT}: what a taxonomy that learned nothing would "
+            f"score at that $n$, over a {baseline} structure null (5–95, "
+            "dashed centre).\nIt is scored directly as a configuration and "
+            "never passes through MDS, so on the disparity row it is mildly "
+            "optimistic — the real score is handicapped in a way it is not."
+        )
+    fig.text(0.5, 0.945, caption,
              ha="center", va="top", fontsize=7, color="0.35", linespacing=1.5)
-    fig.tight_layout(rect=(0, 0.03, 1, 0.905))
+    fig.tight_layout(rect=(0, 0.03, 1, 0.905 if bands is None else 0.87))
 
     # The decoding pair, marked only if both its panels are actually present:
     # a divider promising a comparison that one half of is missing would be
@@ -315,6 +386,14 @@ def main() -> None:
                          "(default: both)")
     ap.add_argument("--suffix", default="",
                     help="appended to the figure filename")
+    ap.add_argument("--baseline", nargs="?", const="gaussian", default=None,
+                    choices=["gaussian", "dirichlet"],
+                    help="draw the uninformed baseline — the level a taxonomy "
+                         "that learned nothing would score — as a band, using "
+                         "this structure-null generator (default off; bare "
+                         "--baseline means gaussian). Needs "
+                         "results/baselines/constants.json; make it with "
+                         "scripts/make_baselines.py")
     args = ap.parse_args()
 
     outdir = Path(args.outdir)
@@ -326,7 +405,14 @@ def main() -> None:
     rows = read_rows(csv_path)
     variants = args.variants or ["A", "B"]
 
-    fig_path = draw(rows, variants, outdir, args.suffix)
+    # The band goes on a new filename so the committed original is never
+    # overwritten.  Reuses --suffix rather than adding a parallel token
+    # mechanism; an explicit --suffix still wins.
+    suffix = args.suffix
+    if args.baseline is not None and not suffix:
+        suffix = f"_uninformed-{args.baseline}"
+
+    fig_path = draw(rows, variants, outdir, suffix, baseline=args.baseline)
     md_path = write_summary(rows, variants, outdir)
     print(f"wrote {fig_path}")
     print(f"wrote {md_path}")

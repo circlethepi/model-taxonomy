@@ -4,6 +4,101 @@
 
 ## Unreleased
 
+### The initsweep's summaries scored against truth, and the level ordering they invert
+
+`sweep_initsweep.py` gains a fourth CSV, `initsweep_truth.csv`, and
+`make_initsweep_figures.py` two figures, `fig_initsweep_truth_disparity_*` and
+`fig_initsweep_truth_dcor_*`: one estimator per file, every level on one axes, the pooled
+read beside the per-seed overlay. Analysis A already scored the ten seeds one at a time;
+this scores the objects those ten summarise, so the band — the full range over the ten,
+the initialisation error bar — has a centre to sit around.
+
+Four sources, and they are four different objects rather than four estimates of one. Two
+are 16-point summaries of the 160-model pool that step around its degenerate truth: the
+mean **embedding** (the joint fit's per-mixture centroids) and the mean **distance
+matrix** (the 160×160 averaged to one row per mixture). Each estimator gets the one it can
+read on its own terms — Procrustes wants a configuration, dCor\* wants distances and would
+otherwise be forced onto a 2-D footing analysis A's ten values are not on. The fourth does
+not step around the degeneracy: it scores all 160 against a **160-point truth** that
+places every pair of seed-siblings at exactly 0, because they do share a recipe. That is
+dCor\* only — a Procrustes fit against ten coincident points per mixture is dominated by a
+constraint nothing can satisfy, so its disparity is written and not drawn.
+
+Two findings. **The structural joint fit is wrecked and averaging inside it does not repair
+it**: disparity 0.0093 from the overlay's mean against 0.4495 from the pool's, a factor of
+48 between two objects both describing "the simplex averaged over ten seeds", while
+averaging the distances first recovers most of it (0.0735). Functional is indifferent — all
+four sources agree to within 0.001. **The 160-point truth inverts the level ordering**:
+structural and functional are indistinguishable per seed (0.9695 against 0.9754) and
+0.4809 against 0.9824 here, which puts structural below even the sampled behavioral read.
+That is analysis B's `ratio*` ordering reproduced by an estimator rather than by a pair of
+means — the truth asserts initialisation does not exist, and structural disagrees most.
+
+No number in analyses A, B or C moves; the geometry CSV is byte-identical and the other two
+differ only in their timing column.
+
+### Scoring and figures for the initsweep, and a separation statistic that was measuring the pool
+
+`figures/fig_structural_sweep/sweep_initsweep.py` writes the three analyses of
+`docs/notes/init_seed_sweep.md` to three CSVs and
+`make_initsweep_figures.py` draws them, on the rsweep's convention: the sweep script does
+all the reading, the figure script reads only coordinates and numbers and does no analysis
+of its own — every Procrustes alignment and both means over seeds are computed upstream.
+Four surrogates, no dataset row: `structural_all_o`, `functional_all`, `behavioral` and
+`behavioral_greedy`. The two behavioral reads differ by decoding alone and are never drawn
+on one axes, so each of the five figures is written twice, `_sampled` and `_greedy`, as
+PDF. `jobs/initsweep_score.sh` runs it; the 160-model pools are too heavy for a login node.
+
+The headline: **the structural level is dominated by the initialisation and the functional
+level is nearly immune to it.** Two adapters of the same mixture from different seeds sit
+43% further apart structurally than two adapters of different mixtures sharing a seed;
+functionally the same comparison runs a factor of 13 the other way. The shape survives
+regardless — every seed's configuration agrees with the mixture simplex to dCor\*
+0.966–0.976, and the ten configurations superimpose on each other. Numbers in
+`figures/fig_structural_sweep/initsweep_summary.md`.
+
+The separation statistic is three cells rather than a within/between ratio, and that is a
+correction, not a refinement. A *between* pair — two adapters of different mixtures — may
+or may not share an initialisation, and those two cases sit far apart, so a pooled
+`between_mean` is not a statistic of the surrogate: the share of same-seed pairs is
+`1/n_seeds`, so the mean drifts with how many seeds are in the pool while every distance
+in it stays put. On `structural_all_o` it climbed 0.6021 → 0.6603 → 0.7079 → 0.7406 across
+pools of 2, 3, 5 and 10 seeds while `within_mean` held at 0.617; a two-cell fit to the
+first two predicts the last two to within 0.0012. `ratio` is kept in the CSV for
+continuity and should not be quoted; `ratio_same_seed` is the comparison pool size does
+not move.
+
+The three geometry figures are drawn in figure 2's idiom — crosshairs through the
+origin, one grey for spines and crosshairs, no ticks, axes named and labelled on y only
+in the leftmost panel, limits symmetric about the origin, one text size and weight, and
+every marker a filled circle with a dark outline. They are the same object as figure 2's
+top row, an MDS fit of the same sixteen mixtures, so they are drawn the same way rather
+than in a second dialect. The figure titles and the mixture key are gone: these are
+panels for a larger frame that supplies both, as figure 2's top row takes its key from a
+separate panel. The overlay's mean is now a large outlined circle rather than a hollow
+diamond, so it is the same mark the pool panel uses for a mean and the coincident seeds
+read through it as a darker core.
+
+The overlay gains its own mean and every panel gains a fixed orientation. `seed_mean`
+is each mixture's centroid over its ten *aligned* per-seed positions — the centre of
+exactly the cloud the overlay draws, and a third mean over seeds that agrees with
+neither of the others by construction: `mean_after` is a centroid inside a joint fit of
+all 160 adapters and `mean_before` is an embedding of averaged distances, while this one
+averages ten separate fits after reconciling their frames. `--seed-alpha` fades the
+individual seeds against it. Every geometry kind is now written in a house orientation —
+pure-g1 vertex due north, pure-g2 vertex in positive x — because MDS leaves rotation and
+reflection free and two panels of the same simplex could otherwise be mirror images.
+Kinds sharing a frame are turned together by one map, so the superpositions are
+undisturbed, and scale is untouched.
+
+The geometry CSV carries **both** sides of every Procrustes superposition
+(`seed_reference`, `mean_after_aligned`) rather than the aligned half alone.
+`procrustes_compare` centres and scales both configurations to unit Frobenius norm, so an
+aligned configuration is never on the scale of the raw one it was aligned to — and the raw
+scale differs by three orders of magnitude between the structural and functional rows.
+Drawn against the raw mean, the functional overlay and means panels showed that ratio and
+nothing about the seeds.
+
 ### The LoRA initialisation seed is a sweepable axis (`olmo2_initsweep`)
 
 `lora_init_seed` has been `0` in every config ever written and every one of the 9073

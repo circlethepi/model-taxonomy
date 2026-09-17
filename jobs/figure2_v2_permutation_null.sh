@@ -44,7 +44,11 @@
 
 set -euo pipefail
 
-REPO=/weka/scratch/jhu/cpriebe1/MO/model-taxonomy/.claude/worktrees/uninformed-baselines
+# The main checkout, not the worktree this was written in: that branch merged
+# (a3116c8) and the worktree has sat at 4046310 since, which predates the
+# lora_init_seed filter the init sweep made necessary. Run from there and the
+# yahoo bars trip n_expected with 160 models before a single permutation.
+REPO=/weka/scratch/jhu/cpriebe1/MO/model-taxonomy
 mkdir -p /weka/scratch/jhu/cpriebe1/MO/model-taxonomy/results/figure2_v2/logs
 
 source /weka/home/jhu/mohata1/miniforge3/etc/profile.d/conda.sh

@@ -726,9 +726,23 @@ def plot_grouped_bars(
 #: hued band competes with the series it exists to contextualise.
 UNINFORMED_COLOUR = "0.45"
 
-#: The one legend label.  A band drawn without saying which generator produced
-#: it is unreadable, so the generator is always in the label.
-UNINFORMED_LABEL = "uninformed baseline ({generator}, 5–95)"
+#: The one legend label.
+#:
+#: "random config" names what the null actually *is* — a configuration drawn at
+#: random and scored — where "uninformed baseline" named only what it is for.
+#: ``docs/terminology.md`` records it as the display name of the **structure
+#: null**; the code keeps ``UNINFORMED_*`` so that the identifiers still match
+#: the note and the tier they come from.
+#:
+#: Neither the generator nor the interval appears in the key.  Both are figure
+#: *provenance* — which sampler drew the configurations, and that the band is
+#: a 5–95 interval rather than a full range — and provenance belongs in the
+#: caption, where a reader who wants it is looking anyway.  The key is read at
+#: a glance against a bar, and at that glance the only thing it has to say is
+#: which backdrop this is.  The format field is kept so that every call site
+#: still passes its generator and a figure that wants it back needs one edit
+#: here.
+UNINFORMED_LABEL = "random config"
 
 #: One colour for every permutation band.  Warm, and outside both series ramps
 #: this project uses — the model bars are blues and the corpus bars greens — so
@@ -743,7 +757,13 @@ PERMUTATION_COLOUR = "#9A6A4F"
 #: says "label"; ``docs/terminology.md`` records that they are one concept, and
 #: neither spelling is a second null.  No generator appears here, because there
 #: is nothing to generate: the null is built from the real data.
-PERMUTATION_LABEL = "permutation null (5–95)"
+#:
+#: "permutation", not "permutation null": the key sits beside "random config",
+#: which does not say "null" either, and the word earned its place only while
+#: the two keys had to be told apart as nulls rather than as procedures.  The
+#: 5–95 interval is left to the caption for the reason given at
+#: :data:`UNINFORMED_LABEL`.
+PERMUTATION_LABEL = "permutation"
 
 
 def load_baseline_table(path=None) -> dict:

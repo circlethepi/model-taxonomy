@@ -412,6 +412,18 @@ the **uninformed baseline**. Because the configuration is scored *directly*, it
 never passes through MDS, so against an MDS-mediated score such as the
 Procrustes disparity the uninformed band is mildly **optimistic**.
 
+**Random config** — what the figures *call* the structure null, as of
+2026-09-17. It replaces "uninformed baseline" on every band legend
+(`UNINFORMED_LABEL` in `src/plots/figures.py`) and names what the null is — a
+configuration drawn at random and scored — rather than what it is for. **Not a
+third null**: structure null, uninformed baseline and random config are one
+concept, with "structure null" the note's name, "random config" the figures',
+and `UNINFORMED_*` the code's. The identifiers and the `--baseline` flag are
+deliberately unchanged, so a grep for `uninformed` still finds all of it. The
+key is those two words and nothing else: the generator that drew the
+configurations and the fact that the band is a 5–95 interval are figure
+provenance, and belong in the caption rather than in a key read at a glance.
+
 **Label null** — keep *both* real geometries and permute which model is which,
 destroying only the correspondence between them. Built from
 `src.analysis.configurations.protest` and `src.analysis.matrices.dcor_test`, and
@@ -423,7 +435,10 @@ The same object the note calls the label null: the figures say *permutation*
 because PROTEST and `dcor_test` are permutation tests, and the note says *label*
 because what is permuted is the labelling. **They are one concept under two
 names, not two nulls.** `figures/figure2_v2` draws both bands together; where
-they agree, the MDS gap above is small.
+they agree, the MDS gap above is small. The legend key reads **permutation**
+alone as of 2026-09-17 — it used to read "permutation null (5–95)", and dropped
+the noun to sit beside "random config", which does not carry it either, and the
+interval for the reason given there.
 
 **Generator** — how a structure null's configuration is drawn. Only two:
 `gaussian` and `dirichlet`. Dirichlet(1) *is* uniform on the simplex, so a

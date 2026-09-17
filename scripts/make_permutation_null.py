@@ -90,16 +90,18 @@ OUT = REPO / "results/figure2_v2/permutation_null.json"
 #: base models on yahoo; together that is six distinct runs, not twelve.
 PANEL2_BASE_MODEL = "allenai/OLMo-2-0425-1B-Instruct"
 
-#: The training draw and LoRA rank every simplex3 suite predating the sweeps was
-#: built at.  The per-suite drivers do not declare these — they did not have to
-#: when they were written — but the nsweep has since put 90 further draws of
-#: yahoo under this base model and the rank sweep trained the same mixtures at
-#: eight ranks, so a scan filtered only by corpus and mixture now returns far
-#: more models than the suite has and ``n_expected`` trips.  ``figures/figure2``
-#: pins both for the one run it builds; this pins them for all six, and a driver
-#: that declares its own still wins.
+#: The training draw, LoRA rank and LoRA init seed every simplex3 suite
+#: predating the sweeps was built at.  The per-suite drivers do not declare
+#: these — they did not have to when they were written — but the nsweep has
+#: since put 90 further draws of yahoo under this base model, the rank sweep
+#: trained the same mixtures at eight ranks and the init sweep trained them from
+#: ten draws of ``A``, so a scan filtered only by corpus and mixture now returns
+#: far more models than the suite has and ``n_expected`` trips.
+#: ``figures/figure2`` pins all three for the one run it builds; this pins them
+#: for all six, and a driver that declares its own still wins.
 DEFAULT_TRAIN_DRAW = (1000, 0)
 DEFAULT_LORA_RANK = 16
+DEFAULT_LORA_INIT_SEED = 0
 
 #: The suite's embedder hashes **as imported**, captured before anything runs.
 #:
@@ -304,7 +306,9 @@ def bars_cells(run, cache_root, no_cache, levels=None):
             ("train_draw", "TRAIN_DRAW",
              DEFAULT_TRAIN_DRAW if disambiguate else None),
             ("lora_rank", "LORA_RANK",
-             DEFAULT_LORA_RANK if disambiguate else None)):
+             DEFAULT_LORA_RANK if disambiguate else None),
+            ("lora_init_seed", "LORA_INIT_SEED",
+             DEFAULT_LORA_INIT_SEED if disambiguate else None)):
         value = getattr(drv, attr, default)
         if value is not None:
             kwargs[name] = value

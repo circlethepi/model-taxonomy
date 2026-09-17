@@ -1835,7 +1835,7 @@ def run_suite(*, base_model, draw, outdir, cache_root=None, levels=None,
               no_cache=False, select=None, source=None, n_expected=16,
               crosslevel_only=False, datasets=None, embedder=None,
               dataset_embedder=None, train_draw=None, mixtures=None,
-              lora_rank=None, closer=True):
+              lora_rank=None, lora_init_seed=None, closer=True):
     """Build the figure suite for one run.
 
     This is the old ``main()`` body with the argument parsing lifted out, so the
@@ -1885,6 +1885,16 @@ def run_suite(*, base_model, draw, outdir, cache_root=None, levels=None,
     tells them apart. Pass the rank the figure is about -- 16 for every suite
     that ran before the sweep, which is ``Suite.lora_rank``'s default. ``None``
     keeps every rank.
+
+    *lora_init_seed* restricts the scan to adapters initialised from one LoRA
+    init seed, and is the same guard again for the fifth axis the init sweep
+    adds: ``lora_init_seeds=(0, ..., 9)`` trains the whole simplex from each
+    draw of ``A``, so one corpus, one base model, one training draw, one rank
+    and one mixture grid still return ten adapters per mixture. Pass the seed
+    the figure is about -- 0 for every suite that ran before the sweep, which is
+    the generator's ``LORA_INIT_SEED`` -- and note that the sweep's ``i00``
+    point *is* the pre-sweep collection rather than a re-run of it, so pinning
+    the seed keeps a figure the measurement it was. ``None`` keeps every seed.
 
     *crosslevel_only* keeps the cross-level closer and drops every other output:
     the per-level grids, the per-metric detail panels, the functional layer sweep
@@ -1982,6 +1992,8 @@ def run_suite(*, base_model, draw, outdir, cache_root=None, levels=None,
         idx = idx.filter(n_samples=n_samples, seed=seed)
     if lora_rank is not None:
         idx = idx.filter(lora_rank=lora_rank)
+    if lora_init_seed is not None:
+        idx = idx.filter(lora_init_seed=lora_init_seed)
     if mixtures is not None:
         from src.plots.simplex import raw_mixture_pcts
         wanted = {tuple(m) for m in mixtures}
@@ -1998,6 +2010,8 @@ def run_suite(*, base_model, draw, outdir, cache_root=None, levels=None,
                         if e.n_samples is not None})
         ranks = sorted({e.lora_rank for e in idx.entries
                         if e.lora_rank is not None})
+        seeds = sorted({e.lora_init_seed for e in idx.entries
+                        if e.lora_init_seed is not None})
         if len(found) > 1:
             why = ("The cache holds more than one dataset under this base model, "
                    "which is by design -- pass datasets=[...] to say which one "
@@ -2018,6 +2032,14 @@ def run_suite(*, base_model, draw, outdir, cache_root=None, levels=None,
             why = (f"The cache holds {len(ranks)} LoRA ranks of this corpus "
                    f"{ranks}, which is by design -- pass lora_rank=r to say "
                    f"which one this figure is about.")
+        elif len(seeds) > 1:
+            # The init-sweep case: everything above agrees and the mixture grid
+            # is the figure's own, but the simplex was trained from several
+            # draws of A. Named before the mixture branch for the rank branch's
+            # reason -- mixtures=[...] cannot separate two seeds of one mixture.
+            why = (f"The cache holds {len(seeds)} LoRA init seeds of this "
+                   f"corpus {seeds}, which is by design -- pass "
+                   f"lora_init_seed=i to say which one this figure is about.")
         elif len(idx.model_ids) > n_expected:
             # One corpus, one base model, one draw, still too many: two mixture
             # grids share all three.  This is the simplex-vs-pool collision, and

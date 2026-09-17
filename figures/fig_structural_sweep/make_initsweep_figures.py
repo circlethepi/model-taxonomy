@@ -135,6 +135,12 @@ HERE = Path(__file__).resolve().parent
 #: points, and the geometry panels are read by zooming into a seed cloud.
 SUFFIX = ".pdf"
 
+#: Opacity of one initialisation's point in the overlay. The per-mixture mean is
+#: always drawn fully opaque, so this is what sets the contrast between the two;
+#: ``--seed-alpha`` overrides it. Chosen so that ten coincident structural points
+#: still read as one mark rather than as a dark blot.
+SEED_ALPHA = 0.55
+
 #: The two levels every variant shares, in the column order the rank,
 #: group-size and nsweep figures use, so the four can be read against each other.
 SHARED_LEVELS = [
@@ -527,8 +533,21 @@ def draw_means(geometry, variant, outdir):
     print(f"wrote {out}")
 
 
-def draw_overlay(geometry, variant, outdir):
-    """The ten per-seed embeddings on one axes, aligned to their consensus."""
+def draw_overlay(geometry, variant, outdir, seed_alpha=SEED_ALPHA):
+    """The ten per-seed embeddings on one axes, against their per-mixture mean.
+
+    Each seed's sixteen adapters are embedded against *each other* and nobody
+    else -- ten 16x16 matrices, ten MDS fits -- and the ten configurations are
+    Procrustes-superimposed before they are drawn, because MDS fixes coordinates
+    only up to rotation, reflection and scale.  The mean marker is the centroid
+    of each mixture's ten aligned points, so it is the centre of exactly the
+    cloud drawn around it.
+
+    *seed_alpha* fades the individual seeds against that mean.  It is a knob
+    because the right value depends on the level: at 0.85 the structural panel
+    reads as a single crisp point per mixture and the sampled behavioral panel is
+    a solid mass, and no one setting serves both.
+    """
     levels = levels_for(variant)
     set_style("two_col_full")
     fig, axes = plt.subplots(1, len(levels), figsize=(2.6 * len(levels), 3.2),
@@ -538,41 +557,39 @@ def draw_overlay(geometry, variant, outdir):
     for ci, (key, label) in enumerate(levels):
         ax = axes[0][ci]
         pts, mix = coords_of(geometry, key, "seed_aligned")
-        # ``seed_reference``, not ``mean_before``: the alignment scaled both
-        # configurations to unit norm, and the raw mean is on the surrogate's
-        # own scale, which differs from it by three orders of magnitude on the
+        # ``seed_mean``, not ``mean_before``: the alignment scaled every
+        # configuration to unit norm, and the raw mean is on the surrogate's own
+        # scale, which differs from it by three orders of magnitude on the
         # functional row. See ``sweep_initsweep.py`` for the full note.
-        ref, refmix = coords_of(geometry, key, "seed_reference")
+        ref, refmix = coords_of(geometry, key, "seed_mean")
         geometry_panel(ax, label)
         if not pts:
             ax.text(0.5, 0.5, "not measured", ha="center", va="center",
                     transform=ax.transAxes, fontsize=7, color="0.5")
             continue
         drew = True
-        # The reference each seed was superimposed on, so a point's distance
-        # from its marker is disagreement rather than orientation.
         anchor = {refmix[m]: xy for m, xy in ref.items()}
         for model, (x, y) in pts.items():
             color = mixture_color(mix[model])
             base = anchor.get(mix[model])
             if base is not None:
                 ax.plot([x, base[0]], [y, base[1]], "-", color=color, lw=0.35,
-                        alpha=0.45, zorder=1)
-            ax.plot(x, y, "o", ms=2.6, color=color, alpha=0.85, zorder=3)
+                        alpha=seed_alpha * 0.55, zorder=1)
+            ax.plot(x, y, "o", ms=2.6, color=color, alpha=seed_alpha, zorder=3)
         # Hollow, and drawn under the points: on the structural and functional
-        # rows every seed lands inside the marker, and a filled consensus would
-        # hide the ten points it is meant to be compared against -- an empty
-        # panel and a perfectly reproducible one would look identical.
+        # rows every seed lands inside the marker, and a filled mean would hide
+        # the ten points it is meant to be compared against -- an empty panel and
+        # a perfectly reproducible one would look identical.
         for m, (x, y) in anchor.items():
             ax.plot(x, y, "D", ms=7.0, mfc="none", mec=mixture_color(m),
-                    mew=1.1, zorder=2)
+                    mew=1.3, alpha=1.0, zorder=4)
 
     if drew:
         mixture_legend(fig, sorted_mixtures(geometry, levels[0][0]))
     fig.suptitle(
-        "Ten per-seed embeddings overlaid, each Procrustes-aligned to their "
-        "consensus\nsmall point = one initialisation's placement of one mixture "
-        "· diamond = the consensus it was aligned to",
+        "Ten per-seed embeddings overlaid, each Procrustes-aligned to the others"
+        "\nsmall point = one initialisation's placement of one mixture "
+        "· diamond = that mixture's mean over the ten aligned points",
         fontsize=8.5)
     fig.tight_layout(rect=(0, 0.11, 1, 0.93))
     out = out_path(outdir, "overlay", variant)
@@ -594,7 +611,13 @@ def main() -> None:
     ap.add_argument("--figure", action="append", dest="figures",
                     choices=FIGURES,
                     help="repeatable; default is every figure")
+    ap.add_argument("--seed-alpha", type=float, default=SEED_ALPHA,
+                    help="opacity of one initialisation's point in the overlay; "
+                         "the per-mixture mean is always opaque "
+                         f"(default {SEED_ALPHA})")
     args = ap.parse_args()
+    if not 0.0 < args.seed_alpha <= 1.0:
+        raise SystemExit("--seed-alpha must be in (0, 1]")
 
     variants = list(VARIANTS) if args.variant == "both" else [args.variant]
     wanted = args.figures or list(FIGURES)
@@ -623,7 +646,8 @@ def main() -> None:
         if "means" in wanted:
             draw_means(geometry, variant, args.outdir)
         if "overlay" in wanted:
-            draw_overlay(geometry, variant, args.outdir)
+            draw_overlay(geometry, variant, args.outdir,
+                         seed_alpha=args.seed_alpha)
 
 
 if __name__ == "__main__":

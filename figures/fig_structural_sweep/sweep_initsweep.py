@@ -101,10 +101,20 @@ summary carries ``mixture = ALL``.
 Analysis C -- geometry over the full collection  (``initsweep_geometry.csv``)
 ----------------------------------------------------------------------------
 Coordinates for the pictures A and B summarise -- whether the seed cloud is small
-against the simplex, or large enough to swallow the 25% grid spacing.  Five kinds
-of row, all 2-D MDS.  Everything a figure needs is in this file, including every
-alignment, so ``make_initsweep_figures.py`` reads coordinates and draws them and
-does no analysis of its own:
+against the simplex, or large enough to swallow the 25% grid spacing.  Seven
+kinds of row, all 2-D MDS.  Everything a figure needs is in this file, including
+every alignment, so ``make_initsweep_figures.py`` reads coordinates and draws
+them and does no analysis of its own.
+
+Every kind is written in the **house orientation**: the pure-g1 vertex due north
+of the configuration's centre and the pure-g2 vertex in positive x.  MDS leaves
+rotation and reflection free, so without this two panels of the same simplex can
+be mirror images and a reader comparing levels side by side has to re-derive
+which way is which in each one.  Kinds that share a frame are turned together, by
+one map computed from the sixteen mixture points in that frame, so the
+superpositions above are not disturbed: ``pool160`` with ``mean_after``,
+``mean_after_aligned`` with ``mean_before_aligned``, and ``seed_aligned`` with
+``seed_mean`` and ``seed_reference``.  Scale is left alone.
 
 ``pool160``
     One MDS fit over all 160 models, per surrogate.  Every model is a point; the
@@ -153,6 +163,15 @@ does no analysis of its own:
 
     This alignment binds only the *picture*.  The scores in analysis A are
     orientation-invariant already and are unaffected by it.
+
+``seed_mean``
+    **The mean of the overlay**: each mixture's ten *aligned* positions averaged,
+    sixteen points.  This is the centre of the seed cloud as the overlay draws
+    it, and so the thing the overlay should be measured against.  It is a third
+    mean over seeds and agrees with neither of the other two by construction --
+    ``mean_after`` is a centroid inside a joint fit of all 160 adapters, and
+    ``mean_before`` is an embedding of averaged distances.  This one averages ten
+    separate fits after reconciling their frames.
 
 ``seed_reference``
     That consensus, in the frame the seeds were aligned into: sixteen points,
@@ -208,7 +227,9 @@ from src.analysis.ground_truth import (  # noqa: E402
 from src.core.distance import DistanceMatrix  # noqa: E402
 from src.experiments.data_simplex_spec import SPECS  # noqa: E402
 from src.plots import simplex_suite as suite  # noqa: E402
-from src.plots.simplex import raw_mixture_pcts, sort_by_mixture  # noqa: E402
+from src.plots.simplex import (  # noqa: E402
+    mixture_weights, raw_mixture_pcts, sort_by_mixture,
+)
 
 # Imported, never copied: these are the project's standing per-level defaults,
 # not a property of any one experiment, and two divergent copies would be a
@@ -476,6 +497,95 @@ def centroid_geometry(geo):
     )
 
 
+def _vertex_label(labels, group):
+    """The label of the adapter trained on *group* alone, e.g. 100/0/0.
+
+    Found by weight rather than by spelling, so the ``NNNgK`` field widths and
+    the ``_nNNNN_sNN`` tail are not this function's problem.
+    """
+    for label in labels:
+        weights = mixture_weights(label)
+        if group < len(weights) and weights[group] > 0.99:
+            return label
+    raise ValueError(f"no pure group-{group + 1} vertex among {len(labels)} "
+                     "labels, so the canonical orientation is undefined")
+
+
+def canonical_frame(geo):
+    """The centring and the 2x2 map that put a configuration in the house frame.
+
+    MDS fixes coordinates only up to rotation, reflection and scale, so two
+    panels of the same simplex can be mirror images of each other and nothing is
+    wrong.  That is fine for a single picture and bad for a row of them: a reader
+    comparing three levels side by side has to re-derive which way is which in
+    every panel.  This pins the remaining freedom by the *content* rather than by
+    the fit -- the pure-g1 vertex is rotated onto the positive y axis, and the
+    pure-g2 vertex is reflected into positive x if it is not there already.
+    Every panel then shows the simplex the same way up.
+
+    Returns ``(centroid, M)``; apply with :func:`orient`.  Scale is deliberately
+    untouched, so this composes with a Procrustes superposition without undoing
+    its fitted scale.
+    """
+    coords = np.asarray(geo.coordinates, dtype=np.float64)[:, :2]
+    labels = list(geo.model_ids)
+    centroid = coords.mean(axis=0)
+    at = {lab: coords[i] - centroid for i, lab in enumerate(labels)}
+
+    x, y = at[_vertex_label(labels, 0)]
+    # Rotate by the angle that carries this vertex from where it is to due north.
+    alpha = np.pi / 2 - np.arctan2(y, x)
+    c, s = np.cos(alpha), np.sin(alpha)
+    M = np.array([[c, -s], [s, c]])
+    if (M @ at[_vertex_label(labels, 1)])[0] < 0:
+        # Mirror in the y axis. The g1 vertex is on that axis by construction and
+        # so is fixed; only the handedness of the panel changes.
+        M = np.array([[-1.0, 0.0], [0.0, 1.0]]) @ M
+    return centroid, M
+
+
+def orient(geo, frame):
+    """Apply a :func:`canonical_frame` to one geometry, keeping its labels."""
+    from src.core.geometry import GeometryResult
+
+    centroid, M = frame
+    coords = np.asarray(geo.coordinates, dtype=np.float64)[:, :2]
+    moved = (coords - centroid) @ M.T
+    return GeometryResult(
+        coordinates=moved.astype(np.float32), model_ids=list(geo.model_ids),
+        method=geo.method, taxonomy=geo.taxonomy, n_components=2,
+        stress=geo.stress, metadata={**(geo.metadata or {}),
+                                     "oriented": "g1 vertex north, g2 vertex east"},
+    )
+
+
+def mean_of(geos):
+    """Per-mixture centroid over a list of geometries that share a frame.
+
+    The mean of the overlay: each mixture's ten *aligned* positions averaged.
+    Distinct from both means over seeds in analysis C -- it is neither a centroid
+    of a joint fit (``mean_after``, which embeds all 160 at once) nor an
+    embedding of averaged distances (``mean_before``).  It is the centre of the
+    seed cloud as the overlay actually draws it, which is what the overlay should
+    be measured against.
+    """
+    from src.core.geometry import GeometryResult
+
+    by_key = defaultdict(list)
+    ref = geos[0]
+    for geo in geos:
+        coords = np.asarray(geo.coordinates, dtype=np.float64)[:, :2]
+        for i, label in enumerate(geo.model_ids):
+            by_key[mixture_of(label)].append(coords[i])
+    keys = sorted(by_key)
+    means = np.vstack([np.mean(by_key[k], axis=0) for k in keys])
+    return GeometryResult(
+        coordinates=means.astype(np.float32), model_ids=keys, method=ref.method,
+        taxonomy=ref.taxonomy, n_components=2, stress=0.0,
+        metadata={"derived": "mean over cross-seed-aligned embeddings"},
+    )
+
+
 def geometry_rows(geo, name, kind, init_seed, ids=None):
     """Coordinate rows for one embedding.
 
@@ -633,31 +743,49 @@ def main() -> None:
 
         mean_geo = fit_geometry(mean_dm, method="mds", n_components=2,
                                 random_state=suite.MDS_SEED)
-        geo_rows += geometry_rows(mean_geo, name, "mean_before", MEAN_BEFORE)
+        geo_rows += geometry_rows(orient(mean_geo, canonical_frame(mean_geo)),
+                                  name, "mean_before", MEAN_BEFORE)
 
-        # ── the overlay: ten embeddings in the mean's frame ───────────────
-        # MDS fixes coordinates only up to rotation, reflection and scale, so
-        # every seed is superimposed on the consensus before it is plotted.
-        # Matched by mixture rather than by id, since no two seeds share one.
+        # ── the overlay: ten embeddings in one frame ──────────────────────
+        # Each seed's sixteen adapters are embedded against *each other* and
+        # nobody else -- ten 16x16 matrices, ten MDS fits -- so the ten
+        # configurations start in ten unrelated frames. MDS fixes coordinates
+        # only up to rotation, reflection and scale, so they are superimposed
+        # before they are plotted. Matched by mixture, since no two seeds share
+        # an adapter id.
+        aligned_seed = {}
+        reference = None
         for seed in seeds:
             fit = procrustes_compare(mean_geo, per_seed_geo[seed],
                                      key=mixture_of)
-            by_key = {mixture_key(m): m for m in per_seed_geo[seed].model_ids}
-            geo_rows += geometry_rows(
-                fit.aligned_b, name, "seed_aligned", seed,
-                ids=[by_key[k] for k in fit.aligned_b.model_ids])
-            if seed == seeds[0]:
+            aligned_seed[seed] = fit.aligned_b
+            if reference is None:
                 # The reference the seeds were aligned *to*, in the frame they
                 # were aligned into. procrustes_compare centres and scales both
                 # configurations to unit Frobenius norm, so the raw
                 # ``mean_before`` is not on this scale -- and is off by a factor
                 # of the surrogate's distances, which run from ~1 for structural
-                # to ~1e-3 for functional. Plotting the seeds against the raw
-                # mean would show that factor and nothing else. Written once:
-                # every seed is aligned to the same reference, so this does not
-                # depend on which one produced it.
-                geo_rows += geometry_rows(fit.aligned_a, name,
-                                          "seed_reference", MEAN_BEFORE)
+                # to ~1e-3 for functional. Kept once: every seed is aligned to
+                # the same reference, so this does not depend on which one
+                # produced it.
+                reference = fit.aligned_a
+
+        # The mean of the overlay, computed here and not at plot time: the
+        # centroid of each mixture's ten aligned positions. The whole overlay
+        # frame -- seeds, reference and mean together -- is then turned the same
+        # way up as every other panel.
+        seed_mean = mean_of([aligned_seed[s] for s in seeds])
+        frame = canonical_frame(seed_mean)
+        geo_rows += geometry_rows(orient(seed_mean, frame), name,
+                                  "seed_mean", MEAN_BEFORE)
+        geo_rows += geometry_rows(orient(reference, frame), name,
+                                  "seed_reference", MEAN_BEFORE)
+        for seed in seeds:
+            by_key = {mixture_key(m): m for m in per_seed_geo[seed].model_ids}
+            moved = orient(aligned_seed[seed], frame)
+            geo_rows += geometry_rows(
+                moved, name, "seed_aligned", seed,
+                ids=[by_key[k] for k in moved.model_ids])
 
         # ── analyses B and C: the 160-model pool ──────────────────────────
         if args.skip_pool:
@@ -677,7 +805,6 @@ def main() -> None:
         dt = time.time() - t0
         rows = separation_rows(pool_dm, pspec, name, dt)
         sep_rows += rows
-        geo_rows += geometry_rows(pool_geo, name, "pool160", MEAN_BEFORE)
 
         # Both means in one frame, so the figure can draw them together without
         # doing any analysis of its own. Note that this is the *superposition's*
@@ -687,11 +814,19 @@ def main() -> None:
         # -- is not on this scale. Both sides of the superposition are therefore
         # written, and a figure comparing the two means uses the aligned pair.
         after_geo = centroid_geometry(pool_geo)
-        geo_rows += geometry_rows(after_geo, name, "mean_after", MEAN_BEFORE)
+        # The pool and its per-mixture centroids are one frame and are turned as
+        # one, off the centroids: the 160 adapters carry ten labels per mixture
+        # and no single vertex to orient by.
+        pool_frame = canonical_frame(after_geo)
+        geo_rows += geometry_rows(orient(pool_geo, pool_frame), name,
+                                  "pool160", MEAN_BEFORE)
+        geo_rows += geometry_rows(orient(after_geo, pool_frame), name,
+                                  "mean_after", MEAN_BEFORE)
         in_frame = procrustes_compare(after_geo, mean_geo, key=mixture_of)
-        geo_rows += geometry_rows(in_frame.aligned_a, name,
+        means_frame = canonical_frame(in_frame.aligned_a)
+        geo_rows += geometry_rows(orient(in_frame.aligned_a, means_frame), name,
                                   "mean_after_aligned", MEAN_BEFORE)
-        geo_rows += geometry_rows(in_frame.aligned_b, name,
+        geo_rows += geometry_rows(orient(in_frame.aligned_b, means_frame), name,
                                   "mean_before_aligned", MEAN_BEFORE)
         print(f"  {name:<20} means disparity between the two means = "
               f"{in_frame.disparity:.4f}", flush=True)

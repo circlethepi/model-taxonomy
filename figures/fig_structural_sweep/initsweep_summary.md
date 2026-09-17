@@ -33,6 +33,8 @@ a login node):
 ```
 sbatch jobs/initsweep_score.sh                               # -> the three CSVs
 python figures/fig_structural_sweep/make_initsweep_figures.py   # -> ten PDFs
+python figures/fig_structural_sweep/make_initsweep_figures.py \
+    --figure overlay --seed-alpha 0.18        # fade the seeds under the means
 ```
 
 Cold, the run is dominated by assembling the 160-model pools (the structural one
@@ -133,23 +135,47 @@ Figure: `fig_initsweep_separation_{sampled,greedy}.pdf`.
 
 ## Analysis C — geometry over the full collection
 
-`fig_initsweep_pool_*.pdf` — all 160 in one MDS fit, coloured by mixture, with
-each mixture's after-embedding mean ringed. This is analysis B as a picture: the
-structural panel smears each mixture into a horizontal band wider than the
-spacing between mixtures, while the functional panel collapses each mixture's ten
-seeds to a single visible point.
+**One joint fit or ten separate ones.** This is the distinction the three figures
+turn on, and the two answers can differ without either being wrong.
 
-`fig_initsweep_means_*.pdf` — the two means superimposed and joined per mixture.
-They differ because MDS is not linear. Functional's two means coincide; structural's
-do not.
+`fig_initsweep_pool_*.pdf` — **one** 160×160 dissimilarity matrix over all 160
+adapters and **one** MDS fit; the ten seeds of a mixture are placed by that joint
+fit. The ringed point is not a selected adapter: it is that mixture's
+**after-embedding mean**, the arithmetic centroid of its ten `pool160`
+coordinates. This is analysis B as a picture — the structural panel smears each
+mixture into a band wider than the spacing between mixtures, while the functional
+panel collapses each mixture's ten seeds to a single visible point.
 
-`fig_initsweep_overlay_*.pdf` — the ten per-seed 16-point embeddings on one axes,
-each Procrustes-aligned to their consensus first, because MDS fixes coordinates
-only up to rotation, reflection and scale. **Structural and functional: every
-seed lands within a marker width of the consensus.** This is the second half of
-the headline, and it is not in tension with analysis B — B measures where
-adapters sit in a joint embedding of all ten seeds, C measures whether each
-seed's own 16-point configuration has the same shape. It does.
+`fig_initsweep_overlay_*.pdf` — **ten** 16×16 matrices and **ten** MDS fits, one
+per seed, each seed's sixteen adapters compared against each other and nobody
+else. The ten configurations start in ten unrelated frames and are
+Procrustes-superimposed before they are drawn. The diamond is that mixture's
+**mean over the ten aligned points** (`seed_mean`) — the centre of exactly the
+cloud drawn around it. `--seed-alpha` fades the individual seeds against it; the
+default is 0.55, and the right value depends on the level, since no one setting
+serves both a structural panel where ten points coincide and a sampled behavioral
+panel that is a solid mass.
+
+**Structural and functional: every seed lands within a marker width of the
+mean.** This is the second half of the headline and it is not in tension with
+analysis B. B asks where adapters sit in a joint embedding of all ten seeds; the
+overlay asks whether each seed's own 16-point configuration has the same *shape*.
+It does. Initialisation moves where the adapters are, not what shape they make.
+
+`fig_initsweep_means_*.pdf` — the two means over seeds superimposed and joined per
+mixture. They differ because MDS is not linear. Functional's two coincide;
+structural's do not. Note there are now **three** means over seeds in the CSV and
+they are three different objects: `mean_after` (centroid inside the joint fit),
+`mean_before` (embedding of averaged distances) and `seed_mean` (average of ten
+separate fits, after reconciling their frames).
+
+**House orientation.** Every geometry kind is written with the pure-g1 vertex due
+north of its centre and the pure-g2 vertex in positive x. MDS leaves rotation and
+reflection free, so without this two panels of the same simplex can be mirror
+images of each other and a reader comparing levels side by side has to re-derive
+which way is which in every panel. Kinds that share a frame are turned together,
+by one map computed from the sixteen mixture points in that frame, so the
+superpositions are not disturbed. Scale is left alone.
 
 ## Traps
 

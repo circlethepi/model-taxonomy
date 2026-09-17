@@ -35,6 +35,18 @@ first two predicts the last two to within 0.0012. `ratio` is kept in the CSV for
 continuity and should not be quoted; `ratio_same_seed` is the comparison pool size does
 not move.
 
+The overlay gains its own mean and every panel gains a fixed orientation. `seed_mean`
+is each mixture's centroid over its ten *aligned* per-seed positions — the centre of
+exactly the cloud the overlay draws, and a third mean over seeds that agrees with
+neither of the others by construction: `mean_after` is a centroid inside a joint fit of
+all 160 adapters and `mean_before` is an embedding of averaged distances, while this one
+averages ten separate fits after reconciling their frames. `--seed-alpha` fades the
+individual seeds against it. Every geometry kind is now written in a house orientation —
+pure-g1 vertex due north, pure-g2 vertex in positive x — because MDS leaves rotation and
+reflection free and two panels of the same simplex could otherwise be mirror images.
+Kinds sharing a frame are turned together by one map, so the superpositions are
+undisturbed, and scale is untouched.
+
 The geometry CSV carries **both** sides of every Procrustes superposition
 (`seed_reference`, `mean_after_aligned`) rather than the aligned half alone.
 `procrustes_compare` centres and scales both configurations to unit Frobenius norm, so an

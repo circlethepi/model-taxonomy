@@ -96,6 +96,37 @@ A qmix query set deliberately does **not** wear that shape — it is spelled
 out of adapter ids, and a query set wearing it would invite a parse that means
 the wrong thing. See `docs/notes/qmix_dataset_composition.md`.
 
+**qbig** (*big query set*) — the axis of **probe depth**: the same adapter fleet
+and the same query-set *composition*, measured with more queries and more
+replicates per query. Named on 2026-09-17. It reaches code as `YAHOO_QBIG` in
+`src/experiments/data_simplex_spec.py` and the `olmo2_qbig` suite, emitted with
+`scripts/gen_simplex3.py --suite olmo2_qbig --dataset yahoo_qbig`.
+
+Like [qmix](#the-simplex-experiments), qbig varies the probe and never the
+adapter — it trains nothing and reuses the existing sixteen
+`_n1000_s00_r16_i00_b5008` adapters — but it is the *orthogonal* probe axis:
+qmix asks **what the queries are made of**, qbig asks **how many of them there
+are and how hard each one is sampled**. The standing yahoo tree sits at
+`query_n=100, replicates=16`; the qbig tree at `query_n=1000, replicates=64`.
+
+| axis | varies | qbig holds it at |
+|---|---|---|
+| the mixture simplex | what an adapter was *trained* on | the existing 16 points |
+| [nsamples_train](#nsamples_train) | the size of the *training* draw | 1000 |
+| qmix | the *composition* of the query draw | 100% base corpus, undiluted |
+| **qbig** | the *size* of the query draw, and R | — |
+
+Two traps. First, the query **draw seed** moves with the size and must: seed 0 is
+what the adapters were trained on, so probing with it would score every model on
+its own training rows, and seed 1 is the standing 100-query set. qbig draws at
+seed 2, which shares no row with either.
+
+Second, **R does not apply to greedy**. `replicates: 64` describes the sampled
+run only; `BehavioralTaxonomy` raises on `replicates > 1` with `do_sample: false`
+rather than storing 64 copies of one deterministic continuation
+(`src/taxonomy/behavioral.py:110-114`), so the greedy control in a qbig tree is
+emitted at R=1 and lands in its own cache entry.
+
 ---
 
 ## The shared cache

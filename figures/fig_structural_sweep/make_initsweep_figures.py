@@ -125,7 +125,7 @@ import matplotlib  # noqa: E402
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
 
-from src.plots.config import set_style  # noqa: E402
+from src.plots.config import bold_capable_family, set_style  # noqa: E402
 from src.plots.figures import save_figure  # noqa: E402
 from src.plots.simplex import barycentric_color, mixture_weights  # noqa: E402
 
@@ -140,6 +140,37 @@ SUFFIX = ".pdf"
 #: ``--seed-alpha`` overrides it. Chosen so that ten coincident structural points
 #: still read as one mark rather than as a dark blot.
 SEED_ALPHA = 0.55
+
+# ── figure 2's styling for the three MDS panels ───────────────────────────────
+# The geometry panels here are the same object as figure 2's top row -- an MDS
+# fit of the same sixteen mixtures -- so they are drawn the same way, and the
+# constants are the values that figure fixed rather than new ones. See
+# ``figures/figure2_v2/make_figures.py``.
+
+#: One text size for everything in a geometry figure. A size difference between
+#: panels of one frame reads as emphasis rather than as provenance.
+FONT_SIZE = 13
+
+#: The colour of every axis line: the crosshairs through the origin and the panel
+#: spines. One value, so a row of panels sits in one box rather than in three.
+AXIS_COLOR = "0.55"
+
+#: The outline on every marker. What makes coincident points countable, and what
+#: distinguishes the mean from the seeds now that both are circles.
+MARKER_EDGE = "0.2"
+
+#: Marker areas, as ``scatter`` takes them. The mean is figure 2's mixture marker
+#: size; the seeds are small enough that ten of them fit inside one mean.
+MEAN_MARKER_SIZE = 150
+SEED_MARKER_SIZE = 26
+
+#: MDS coordinates have no units and no origin a reader can use, so the axes are
+#: named and never numbered.
+MDS_AXES = ("MDS 1", "MDS 2")
+
+#: How much room to leave around the outermost point, as a multiple of its
+#: distance from the origin. Figure 2's value.
+LIMIT_PAD = 1.28
 
 #: The two levels every variant shares, in the column order the rank,
 #: group-size and nsweep figures use, so the four can be read against each other.
@@ -212,12 +243,60 @@ def out_path(outdir, stem, variant):
     return Path(outdir) / f"fig_initsweep_{stem}_{variant}{SUFFIX}"
 
 
-def geometry_panel(ax, title):
-    """MDS axes carry no units, so nothing is labelled and the aspect is equal."""
-    ax.set_aspect("equal", adjustable="datalim")
+def geometry_style() -> None:
+    """Figure 2's house style, then one text size over the top of it.
+
+    ``set_style`` scales tick labels and legends to three quarters of the base
+    size and leaves titles at it, which is right for a panel that is a figure in
+    its own right and wrong for a row of panels meant to be read as one frame.
+    The weight needs the family changed with it: ``set_style`` prefers Libre
+    Franklin, a *variable* font matplotlib registers at exactly one weight, so
+    ``fontweight="bold"`` against it silently renders Thin.
+    :func:`bold_capable_family` picks the first family in the stack that really
+    ships more than one weight.
+    """
+    set_style("two_col_full")
+    matplotlib.rcParams.update({
+        "font.size": FONT_SIZE, "axes.titlesize": FONT_SIZE,
+        "axes.labelsize": FONT_SIZE, "xtick.labelsize": FONT_SIZE,
+        "ytick.labelsize": FONT_SIZE, "figure.titlesize": FONT_SIZE,
+        "font.sans-serif": [bold_capable_family(), "DejaVu Sans"],
+        "font.weight": "bold", "axes.labelweight": "bold",
+        "axes.titleweight": "bold",
+        "axes.edgecolor": AXIS_COLOR, "axes.linewidth": 1.0,
+    })
+
+
+def geometry_panel(ax, title, first=False):
+    """One MDS panel, in figure 2's idiom.
+
+    Crosshairs through the origin, which the canonical orientation has already
+    made the centre of the configuration; no ticks, because an MDS coordinate has
+    no units and no origin a reader can use, and numbering these axes invites a
+    comparison that is not there to make; the axes named anyway, because which
+    plane this is remains worth saying. Only the leftmost panel is labelled on y:
+    the panels share a meaning, not a scale -- they differ by orders of magnitude
+    in absolute MDS size -- so repeating the name says nothing the first does not.
+    """
+    ax.axhline(0.0, color=AXIS_COLOR, lw=1.0, zorder=0)
+    ax.axvline(0.0, color=AXIS_COLOR, lw=1.0, zorder=0)
+    ax.set_aspect("equal", adjustable="box")
     ax.set_xticks([])
     ax.set_yticks([])
-    ax.set_title(title, fontsize=7.5)
+    ax.set_title(title, fontsize=FONT_SIZE, pad=10)
+    ax.set_xlabel(MDS_AXES[0])
+    if first:
+        ax.set_ylabel(MDS_AXES[1])
+
+
+def square_limits(ax, xys) -> None:
+    """Symmetric about the origin, so 1:1 scaling does not push it off-centre."""
+    xys = [p for p in xys if p is not None]
+    if not xys:
+        return
+    r = float(np.abs(np.asarray(xys, dtype=float)).max()) * LIMIT_PAD
+    ax.set_xlim(-r, r)
+    ax.set_ylim(-r, r)
 
 
 def mixture_legend(fig, mixtures):
@@ -428,40 +507,36 @@ def sorted_mixtures(geometry, perspective):
 def draw_pool(geometry, variant, outdir):
     """All 160 models in one MDS fit, with a spoke to each mixture's mean."""
     levels = levels_for(variant)
-    set_style("two_col_full")
-    fig, axes = plt.subplots(1, len(levels), figsize=(2.6 * len(levels), 3.2),
+    geometry_style()
+    fig, axes = plt.subplots(1, len(levels), figsize=(3.1 * len(levels), 3.7),
                              squeeze=False)
 
-    drew = False
     for ci, (key, label) in enumerate(levels):
         ax = axes[0][ci]
         pts, mix = coords_of(geometry, key, "pool160")
         means, _ = coords_of(geometry, key, "mean_after")
-        geometry_panel(ax, label)
+        geometry_panel(ax, label, first=ci == 0)
         if not pts:
             ax.text(0.5, 0.5, "not measured", ha="center", va="center",
-                    transform=ax.transAxes, fontsize=7, color="0.5")
+                    transform=ax.transAxes, fontsize=FONT_SIZE, color="0.5")
             continue
-        drew = True
         for model, (x, y) in pts.items():
             color = mixture_color(mix[model])
             mean = means.get(mix[model])
             if mean is not None:
                 ax.plot([x, mean[0]], [y, mean[1]], "-", color=color, lw=0.4,
                         alpha=0.5, zorder=1)
-            ax.plot(x, y, "o", ms=2.6, color=color, alpha=0.85, zorder=2)
-        for m, (x, y) in means.items():
-            ax.plot(x, y, "o", ms=6, color=mixture_color(m), mec="0.15",
-                    mew=0.7, zorder=3)
+        seeds = list(pts.values())
+        ax.scatter([p[0] for p in seeds], [p[1] for p in seeds],
+                   c=[mixture_color(mix[m]) for m in pts], s=SEED_MARKER_SIZE,
+                   marker="o", edgecolors=MARKER_EDGE, linewidths=0.4,
+                   alpha=0.85, zorder=2)
+        ax.scatter([p[0] for p in means.values()], [p[1] for p in means.values()],
+                   c=[mixture_color(m) for m in means], s=MEAN_MARKER_SIZE,
+                   marker="o", edgecolors=MARKER_EDGE, linewidths=1.0, zorder=3)
+        square_limits(ax, seeds + list(means.values()))
 
-    if drew:
-        mixture_legend(fig, sorted_mixtures(geometry, levels[0][0]))
-    fig.suptitle(
-        "The seed cloud against the simplex: 160 models in one MDS fit\n"
-        "small point = one initialisation · ringed point = that mixture's "
-        "after-embedding mean · spoke = the distance between them",
-        fontsize=8.5)
-    fig.tight_layout(rect=(0, 0.11, 1, 0.93))
+    fig.tight_layout()
     out = out_path(outdir, "pool", variant)
     save_figure(fig, out)
     plt.close(fig)
@@ -471,11 +546,10 @@ def draw_pool(geometry, variant, outdir):
 def draw_means(geometry, variant, outdir):
     """The two means on one axes, joined per mixture."""
     levels = levels_for(variant)
-    set_style("two_col_full")
-    fig, axes = plt.subplots(1, len(levels), figsize=(2.6 * len(levels), 3.2),
+    geometry_style()
+    fig, axes = plt.subplots(1, len(levels), figsize=(3.1 * len(levels), 3.7),
                              squeeze=False)
 
-    drew = False
     for ci, (key, label) in enumerate(levels):
         ax = axes[0][ci]
         # Both sides of the superposition, not the raw ``mean_after``: the fit
@@ -484,49 +558,34 @@ def draw_means(geometry, variant, outdir):
         # before-mean. That is the pool figure's frame, not this one's.
         after, _ = coords_of(geometry, key, "mean_after_aligned")
         before, bmix = coords_of(geometry, key, "mean_before_aligned")
-        geometry_panel(ax, label)
+        geometry_panel(ax, label, first=ci == 0)
         if not after or not before:
             ax.text(0.5, 0.5, "not measured", ha="center", va="center",
-                    transform=ax.transAxes, fontsize=7, color="0.5")
+                    transform=ax.transAxes, fontsize=FONT_SIZE, color="0.5")
             continue
-        drew = True
         by_mixture = defaultdict(dict)
         for m, xy in after.items():
             by_mixture[m]["after"] = xy
         for model, xy in before.items():
             by_mixture[bmix[model]]["before"] = xy
-        for m, pair in by_mixture.items():
-            if "after" not in pair or "before" not in pair:
-                continue
-            color = mixture_color(m)
+        pairs = [(m, p) for m, p in by_mixture.items()
+                 if "after" in p and "before" in p]
+        for m, pair in pairs:
             (ax_, ay), (bx, by) = pair["after"], pair["before"]
-            ax.plot([ax_, bx], [ay, by], "-", color=color, lw=0.8, alpha=0.8,
-                    zorder=1)
-            ax.plot(ax_, ay, "o", ms=5, color=color, mec="0.15", mew=0.7,
-                    zorder=3)
-            ax.plot(bx, by, "^", ms=5, color=color, mec="0.15", mew=0.7,
-                    zorder=3)
+            ax.plot([ax_, bx], [ay, by], "-", color=mixture_color(m), lw=0.8,
+                    alpha=0.8, zorder=1)
+        # The two means keep their two shapes: this panel's whole subject is
+        # that they disagree, and a reader who cannot tell which is which is
+        # left with an unexplained pair of dots.
+        for kind, marker in (("after", "o"), ("before", "^")):
+            ax.scatter([p[kind][0] for _, p in pairs],
+                       [p[kind][1] for _, p in pairs],
+                       c=[mixture_color(m) for m, _ in pairs],
+                       s=MEAN_MARKER_SIZE, marker=marker,
+                       edgecolors=MARKER_EDGE, linewidths=1.0, zorder=3)
+        square_limits(ax, [p[k] for _, p in pairs for k in ("after", "before")])
 
-    if drew:
-        mixture_legend(fig, sorted_mixtures(geometry, levels[0][0]))
-    handles = [
-        plt.Line2D([], [], marker="o", ls="", ms=5, color="0.3", mec="0.15",
-                   label="after-embedding mean (centroid of the ten points)"),
-        plt.Line2D([], [], marker="^", ls="", ms=5, color="0.3", mec="0.15",
-                   label="before-embedding mean (the ten matrices averaged, "
-                         "then embedded)"),
-    ]
-    # Figure-level, not on the first panel: the panels are filled edge to edge
-    # by construction (equal aspect, no ticks, points scaled to fill), so there
-    # is no corner inside one that a legend does not cover.
-    fig.legend(handles=handles, loc="upper center", frameon=False, fontsize=6,
-               ncol=2, bbox_to_anchor=(0.5, 0.90))
-    fig.suptitle(
-        "The two means over initialisations, superimposed and joined per mixture"
-        "\nthey differ because MDS is not linear; the rotation between the two "
-        "fits is already removed",
-        fontsize=8.5)
-    fig.tight_layout(rect=(0, 0.11, 1, 0.88))
+    fig.tight_layout()
     out = out_path(outdir, "means", variant)
     save_figure(fig, out)
     plt.close(fig)
@@ -549,11 +608,10 @@ def draw_overlay(geometry, variant, outdir, seed_alpha=SEED_ALPHA):
     a solid mass, and no one setting serves both.
     """
     levels = levels_for(variant)
-    set_style("two_col_full")
-    fig, axes = plt.subplots(1, len(levels), figsize=(2.6 * len(levels), 3.2),
+    geometry_style()
+    fig, axes = plt.subplots(1, len(levels), figsize=(3.1 * len(levels), 3.7),
                              squeeze=False)
 
-    drew = False
     for ci, (key, label) in enumerate(levels):
         ax = axes[0][ci]
         pts, mix = coords_of(geometry, key, "seed_aligned")
@@ -562,36 +620,35 @@ def draw_overlay(geometry, variant, outdir, seed_alpha=SEED_ALPHA):
         # scale, which differs from it by three orders of magnitude on the
         # functional row. See ``sweep_initsweep.py`` for the full note.
         ref, refmix = coords_of(geometry, key, "seed_mean")
-        geometry_panel(ax, label)
+        geometry_panel(ax, label, first=ci == 0)
         if not pts:
             ax.text(0.5, 0.5, "not measured", ha="center", va="center",
-                    transform=ax.transAxes, fontsize=7, color="0.5")
+                    transform=ax.transAxes, fontsize=FONT_SIZE, color="0.5")
             continue
-        drew = True
         anchor = {refmix[m]: xy for m, xy in ref.items()}
         for model, (x, y) in pts.items():
-            color = mixture_color(mix[model])
             base = anchor.get(mix[model])
             if base is not None:
-                ax.plot([x, base[0]], [y, base[1]], "-", color=color, lw=0.35,
+                ax.plot([x, base[0]], [y, base[1]], "-",
+                        color=mixture_color(mix[model]), lw=0.35,
                         alpha=seed_alpha * 0.55, zorder=1)
-            ax.plot(x, y, "o", ms=2.6, color=color, alpha=seed_alpha, zorder=3)
-        # Hollow, and drawn under the points: on the structural and functional
-        # rows every seed lands inside the marker, and a filled mean would hide
-        # the ten points it is meant to be compared against -- an empty panel and
-        # a perfectly reproducible one would look identical.
-        for m, (x, y) in anchor.items():
-            ax.plot(x, y, "D", ms=7.0, mfc="none", mec=mixture_color(m),
-                    mew=1.3, alpha=1.0, zorder=4)
+        seeds = list(pts.values())
+        ax.scatter([p[0] for p in seeds], [p[1] for p in seeds],
+                   c=[mixture_color(mix[m]) for m in pts], s=SEED_MARKER_SIZE,
+                   marker="o", edgecolors=MARKER_EDGE, linewidths=0.4,
+                   alpha=seed_alpha, zorder=3)
+        # A filled circle with an outline, the same shape as the seeds and the
+        # same mark the pool panel uses for a mean. What separates it from them
+        # is size, the outline and full opacity -- so on the structural and
+        # functional rows, where every seed lands inside the mean, the cloud
+        # still reads through it as a darker core rather than disappearing.
+        ax.scatter([p[0] for p in anchor.values()],
+                   [p[1] for p in anchor.values()],
+                   c=[mixture_color(m) for m in anchor], s=MEAN_MARKER_SIZE,
+                   marker="o", edgecolors=MARKER_EDGE, linewidths=1.0, zorder=2)
+        square_limits(ax, seeds + list(anchor.values()))
 
-    if drew:
-        mixture_legend(fig, sorted_mixtures(geometry, levels[0][0]))
-    fig.suptitle(
-        "Ten per-seed embeddings overlaid, each Procrustes-aligned to the others"
-        "\nsmall point = one initialisation's placement of one mixture "
-        "· diamond = that mixture's mean over the ten aligned points",
-        fontsize=8.5)
-    fig.tight_layout(rect=(0, 0.11, 1, 0.93))
+    fig.tight_layout()
     out = out_path(outdir, "overlay", variant)
     save_figure(fig, out)
     plt.close(fig)

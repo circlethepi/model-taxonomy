@@ -149,7 +149,8 @@ panel collapses each mixture's ten seeds to a single visible point.
 `fig_initsweep_overlay_*.pdf` — **ten** 16×16 matrices and **ten** MDS fits, one
 per seed, each seed's sixteen adapters compared against each other and nobody
 else. The ten configurations start in ten unrelated frames and are
-Procrustes-superimposed before they are drawn. The diamond is that mixture's
+Procrustes-superimposed before they are drawn. The large outlined circle is that
+mixture's
 **mean over the ten aligned points** (`seed_mean`) — the centre of exactly the
 cloud drawn around it. `--seed-alpha` fades the individual seeds against it; the
 default is 0.55, and the right value depends on the level, since no one setting
@@ -168,6 +169,17 @@ structural's do not. Note there are now **three** means over seeds in the CSV an
 they are three different objects: `mean_after` (centroid inside the joint fit),
 `mean_before` (embedding of averaged distances) and `seed_mean` (average of ten
 separate fits, after reconciling their frames).
+
+**Panel styling.** The three geometry figures are drawn in figure 2's idiom,
+because they are the same object as its top row — an MDS fit of the same sixteen
+mixtures. Crosshairs through the origin, spines and crosshairs at one grey, no
+ticks (an MDS coordinate has no units and no origin a reader can use, so
+numbering the axes invites a comparison that is not there), axes named but only
+labelled on y in the leftmost panel, limits symmetric about the origin, and every
+marker a filled circle with a dark outline. **They carry no figure title and no
+mixture key**: they are built to drop into a larger frame that supplies both, the
+way figure 2's top row takes its key from a separate panel. The per-panel level
+titles stay, since nothing else says which level a panel is.
 
 **House orientation.** Every geometry kind is written with the pure-g1 vertex due
 north of its centre and the pure-g2 vertex in positive x. MDS leaves rotation and

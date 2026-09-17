@@ -35,6 +35,17 @@ first two predicts the last two to within 0.0012. `ratio` is kept in the CSV for
 continuity and should not be quoted; `ratio_same_seed` is the comparison pool size does
 not move.
 
+The three geometry figures are drawn in figure 2's idiom — crosshairs through the
+origin, one grey for spines and crosshairs, no ticks, axes named and labelled on y only
+in the leftmost panel, limits symmetric about the origin, one text size and weight, and
+every marker a filled circle with a dark outline. They are the same object as figure 2's
+top row, an MDS fit of the same sixteen mixtures, so they are drawn the same way rather
+than in a second dialect. The figure titles and the mixture key are gone: these are
+panels for a larger frame that supplies both, as figure 2's top row takes its key from a
+separate panel. The overlay's mean is now a large outlined circle rather than a hollow
+diamond, so it is the same mark the pool panel uses for a mean and the coincident seeds
+read through it as a darker core.
+
 The overlay gains its own mean and every panel gains a fixed orientation. `seed_mean`
 is each mixture's centroid over its ten *aligned* per-seed positions — the centre of
 exactly the cloud the overlay draws, and a third mean over seeds that agrees with

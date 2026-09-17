@@ -30,6 +30,9 @@ python scripts/gen_simplex3.py --suite qwen    # experiments/simplex3_qwen/, job
 python scripts/gen_simplex3.py --list          # enumerate the proportions and exit
 ```
 
+Every run that has been generated this way, with its slug, its job prefix and its
+exact command, is indexed in the [Experiment Run Index](experiment_run_index.md).
+
 **The default suite must regenerate byte-for-byte.** That is the regression test that
 lifting the Llama values out of the script changed nothing:
 
@@ -38,6 +41,11 @@ python scripts/gen_simplex3.py && git diff --exit-code experiments/simplex3 jobs
 ```
 
 ## Registered suites
+
+The five base-model suites are below. Four further suites cross an extra axis with
+the simplex — `olmo2_pool`, `olmo2_nsweep`, `olmo2_rsweep`, `olmo2_initsweep` — and
+are described, with every run they have produced and the command that regenerates
+it, in the [Experiment Run Index](experiment_run_index.md).
 
 | Suite | Base model | Query sets | Notable |
 |---|---|---|---|

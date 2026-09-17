@@ -196,6 +196,26 @@ class DataSimplexSpec:
     query_n: int = 100
     query_seed: int = 1
 
+    #: Continuations drawn per query at the behavioral level -- the ``R`` in
+    #: ``(n_queries * R, d)``.  16 for every spec that has run, and that is the
+    #: regression test as much as the default: it was a module constant in the
+    #: generator until a spec needed to vary it, so the five existing trees must
+    #: keep rendering ``replicates: 16``.
+    #:
+    #: A spec field rather than a ``Suite`` one because R says *how hard the
+    #: probe samples a model's output distribution*, which is a property of the
+    #: measurement the corpus is being put to and not of the hardware -- the same
+    #: side of the split ``query_n`` and ``query_seed`` are already on.  It is
+    #: also the field a tree's cost is very nearly linear in: R and ``query_n``
+    #: multiply, and their product times ``max_new_tokens`` is the decode budget
+    #: per adapter.
+    #:
+    #: Greedy is NOT subject to this.  ``BehavioralTaxonomy`` raises on
+    #: ``replicates > 1`` with ``do_sample: false`` rather than storing R copies
+    #: of one deterministic continuation (``src/taxonomy/behavioral.py:110-114``),
+    #: so the greedy job is emitted at R=1 whatever this says.
+    replicates: int = 16
+
     embedder_model: str = "nomic-ai/nomic-embed-text-v1.5"
 
     #: ``None`` inherits the suite's sweep; ``()`` drops it.  Dropping the
@@ -651,7 +671,51 @@ YAHOO_NSWEEP = replace(
 )
 
 
+#: **qbig**: the same 16-point 25% yahoo simplex and the same sixteen adapters
+#: as ``YAHOO``, probed an order of magnitude harder.  Nothing about the *models*
+#: moves -- ``train_n``, ``train_seed``, the grid, the rank and the init seed are
+#: all inherited, so every adapter resolves to a
+#: ``yahoo_..._n1000_s00_r16_i00_b5008_fea27ccee`` directory that is already on
+#: disk and the training shards this tree emits are cache hits that skip.
+#:
+#: Three fields move, and all three are the *probe*:
+#:
+#: ``query_n=1000`` is ten times the standing 100-query draw.  At 100 queries a
+#: behavioral distance between two adapters is estimated from 100 prompts, and a
+#: functional row is a 100-point cloud in 34,816 dimensions -- far fewer points
+#: than dimensions.  A 1000-row draw is the same measurement with ten times the
+#: queries behind each number.
+#:
+#: ``query_seed=2`` is a draw independent of both seeds already in play: seed 0
+#: is what the adapters were *trained* on, so reusing it would probe every model
+#: with its own training rows, and seed 1 is the standing 100-query probe set.  2
+#: is simply the first seed that is neither.
+#:
+#: ``replicates=64`` is four times the standing R=16.  R is what separates a
+#: model's output *distribution* from one sample of it, and the behavioral level
+#: is the one that has repeatedly read as noise-dominated: at R=16 over 100
+#: queries a behavioral row is 1600 draws, here it is 64,000.
+#:
+#: ``temperature_sweep`` and ``sweep_seeds`` are dropped.  The sweep prices ten
+#: more extraction passes and this spec is already ~40x the decode of the run it
+#: scales up; the point here is depth at T=1.0 and at greedy, not breadth over T.
+#: ``suffix`` is what keeps the *trees* apart, exactly as for ``YAHOO_POOL`` and
+#: ``YAHOO_NSWEEP``.
+YAHOO_QBIG = replace(
+    YAHOO,
+    suffix="_qbig",
+    query_n=1000,
+    query_seed=2,
+    replicates=64,
+    temperature_sweep=(),
+    sweep_seeds=(),
+    subtitle=("Mixtures from 3 topic groupings of the Yahoo Answers Dataset, "
+              "probed with 1000 queries at 64 replicates"),
+)
+
+
 #: The corpora this generator knows how to emit.  ``yahoo`` is the one that
 #: already ran and must regenerate unchanged.
 SPECS = {"yahoo": YAHOO, "dolly": DOLLY, "oasst1": OASST1,
-         "yahoo_pool": YAHOO_POOL, "yahoo_nsweep": YAHOO_NSWEEP}
+         "yahoo_pool": YAHOO_POOL, "yahoo_nsweep": YAHOO_NSWEEP,
+         "yahoo_qbig": YAHOO_QBIG}

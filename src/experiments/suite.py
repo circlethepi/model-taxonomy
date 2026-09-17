@@ -157,6 +157,36 @@ class Suite:
     train_shards: int = 4
     behavioral_shards: int = 8
 
+    #: Adapters per sampled-behavioral shard, for the corpora whose shard counts
+    #: ``_suite_for_dataset`` *derives* from the adapter count rather than taking
+    #: from ``behavioral_shards`` above.  2 is the value every existing wall was
+    #: tuned against and is what the generator's
+    #: ``BEHAVIORAL_ADAPTERS_PER_SHARD`` carried, so every tree on disk is
+    #: unmoved.
+    #:
+    #: It is a field because the adapter count is not the only thing that sets a
+    #: shard's length: ``query_n * replicates`` is the decode budget per adapter,
+    #: and a suite that raises either by 40x has the same 16 adapters costing
+    #: forty times the wall.  Cutting to one adapter per shard there is what keeps
+    #: a shard the length the partitions were chosen for, and keeps a shard that
+    #: dies costing one adapter's decode instead of two.
+    behavioral_adapters_per_shard: int = 2
+
+    #: Adapters per sampled-behavioral shard, for the corpora whose shard counts
+    #: ``_suite_for_dataset`` *derives* from the adapter count rather than taking
+    #: from ``behavioral_shards`` above.  2 is the value every existing wall was
+    #: tuned against and is what the generator's
+    #: ``BEHAVIORAL_ADAPTERS_PER_SHARD`` carried, so every tree on disk is
+    #: unmoved.
+    #:
+    #: It is a field because the adapter count is not the only thing that sets a
+    #: shard's length: ``query_n * replicates`` is the decode budget per adapter,
+    #: and a suite that raises either by 40x has the same 16 adapters costing
+    #: forty times the wall.  Cutting to one adapter per shard there is what keeps
+    #: a shard the length the partitions were chosen for, and keeps a shard that
+    #: dies costing one adapter's decode instead of two.
+    behavioral_adapters_per_shard: int = 2
+
     #: Shards for the greedy run.  One -- i.e. unsharded -- for every suite that
     #: has 16 adapters to decode, which is what "~7 generate() calls per adapter
     #: against ~50 for the sampled runs" buys.  It stops being true once a tree

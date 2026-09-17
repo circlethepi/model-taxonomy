@@ -4,6 +4,45 @@
 
 ## Unreleased
 
+### Scoring and figures for the initsweep, and a separation statistic that was measuring the pool
+
+`figures/fig_structural_sweep/sweep_initsweep.py` writes the three analyses of
+`docs/notes/init_seed_sweep.md` to three CSVs and
+`make_initsweep_figures.py` draws them, on the rsweep's convention: the sweep script does
+all the reading, the figure script reads only coordinates and numbers and does no analysis
+of its own — every Procrustes alignment and both means over seeds are computed upstream.
+Four surrogates, no dataset row: `structural_all_o`, `functional_all`, `behavioral` and
+`behavioral_greedy`. The two behavioral reads differ by decoding alone and are never drawn
+on one axes, so each of the five figures is written twice, `_sampled` and `_greedy`, as
+PDF. `jobs/initsweep_score.sh` runs it; the 160-model pools are too heavy for a login node.
+
+The headline: **the structural level is dominated by the initialisation and the functional
+level is nearly immune to it.** Two adapters of the same mixture from different seeds sit
+43% further apart structurally than two adapters of different mixtures sharing a seed;
+functionally the same comparison runs a factor of 13 the other way. The shape survives
+regardless — every seed's configuration agrees with the mixture simplex to dCor\*
+0.966–0.976, and the ten configurations superimpose on each other. Numbers in
+`figures/fig_structural_sweep/initsweep_summary.md`.
+
+The separation statistic is three cells rather than a within/between ratio, and that is a
+correction, not a refinement. A *between* pair — two adapters of different mixtures — may
+or may not share an initialisation, and those two cases sit far apart, so a pooled
+`between_mean` is not a statistic of the surrogate: the share of same-seed pairs is
+`1/n_seeds`, so the mean drifts with how many seeds are in the pool while every distance
+in it stays put. On `structural_all_o` it climbed 0.6021 → 0.6603 → 0.7079 → 0.7406 across
+pools of 2, 3, 5 and 10 seeds while `within_mean` held at 0.617; a two-cell fit to the
+first two predicts the last two to within 0.0012. `ratio` is kept in the CSV for
+continuity and should not be quoted; `ratio_same_seed` is the comparison pool size does
+not move.
+
+The geometry CSV carries **both** sides of every Procrustes superposition
+(`seed_reference`, `mean_after_aligned`) rather than the aligned half alone.
+`procrustes_compare` centres and scales both configurations to unit Frobenius norm, so an
+aligned configuration is never on the scale of the raw one it was aligned to — and the raw
+scale differs by three orders of magnitude between the structural and functional rows.
+Drawn against the raw mean, the functional overlay and means panels showed that ratio and
+nothing about the seeds.
+
 ### The LoRA initialisation seed is a sweepable axis (`olmo2_initsweep`)
 
 `lora_init_seed` has been `0` in every config ever written and every one of the 9073

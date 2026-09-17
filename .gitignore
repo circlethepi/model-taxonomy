@@ -5,6 +5,7 @@ notebooks/*
 .venv
 .vscode
 results
+jobs
 experiments/*.slurm.sh
 experiments/archive/*
 fonts/

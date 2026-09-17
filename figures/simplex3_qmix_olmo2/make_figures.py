@@ -111,6 +111,10 @@ ARMS = [
     ("oasst1zh", "diluted with oasst1-zh (zh, conversation)", "#C1553B", "--"),
 ]
 
+#: ``seed`` of a row that summarises the seeds rather than being one of them --
+#: ``sweep_qmix.POOLED``.  See :func:`series` for why it is excluded.
+POOLED = -1
+
 #: Where the linear part of the x axis gives way to the log part.  Below this the
 #: axis is linear, so 0% -- a real point, and the fully-diluted floor -- has
 #: somewhere to sit.
@@ -132,12 +136,19 @@ def series(rows, perspective, column, arm):
     The undiluted point carries ``arm == "none"`` in the CSV and is folded into
     every arm here, so each curve runs the full width to its own reference rather
     than stopping at 50%.
+
+    Rows with ``seed == POOLED`` are skipped.  They are the pooled read --
+    distances averaged over the seeds, then scored once -- which is a summary
+    *of* this sample and not a member of it, so letting it in would weight the
+    summary into the median and the band it summarises.
     """
     by_pct = defaultdict(list)
     for r in rows:
         if r["perspective"] != perspective:
             continue
         if r["arm"] not in (arm, "none"):
+            continue
+        if int(r["seed"]) == POOLED:
             continue
         v = r.get(column)
         if v in (None, ""):

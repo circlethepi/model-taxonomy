@@ -4,6 +4,53 @@
 
 ## Unreleased
 
+### The qmix tree scored, and what dilution costs each level
+
+`sweep_qmix.py` runs against the extracted tree and writes two files:
+`qmix_scores.csv` as before, and a new `qmix_geometry.csv` of 2-D MDS coordinates.
+`make_qmix_figures.py` is a new driver for the figure the experiment was built to
+produce — **Procrustes disparity against yahoo percentage, functional and behavioral
+as lines** — in figure 2's idiom, with the geometry those disparities summarise
+beside it.
+
+**The result, on the one draw seed extracted so far.** Functional barely notices the
+probe being diluted: disparity 0.0077 undiluted against 0.0095 (dolly) and 0.0098
+(oasst1-zh) with no yahoo row left at all — a fifth of a percent of the scale, and the
+recovered simplex is visibly the same lattice in all eight geometry panels. Behavioral
+pays for it and pays more for the language change than the task change: 0.057 undiluted
+against 0.087 on dolly and 0.109 on oasst1-zh. Greedy is worse throughout (0.125 to
+0.31) and its geometry panels are visibly scrambled, which is the 16-model half of the
+behavioral noise floor — greedy is the clean read on a dense pool and the poor one on
+this 16-adapter simplex.
+
+**Four fields of training pin, not one.** The scan in `sweep_qmix.py` now filters
+`n_samples`, `seed`, `lora_rank` *and* `lora_init_seed`. The rsweep's eight ranks and
+the initsweep's ten initialisations have since landed in the same content-addressed
+cache under the same base model, the same corpus and the same 16-point grid, so the
+mixture filter alone returned **1700** adapters where it once returned 16, and the
+completeness guard fired on every point.
+
+**Seeds are discovered, not assumed.** The tree emits ten draw seeds per composition as
+ten independent jobs and only `s00` has run. `draw_available` asks the stage cache
+whether a draw exists before scoring it, so the sweep scores what has landed, says what
+it skipped, and picks the rest up on a re-run with no edit; `--seed` names seeds
+explicitly and makes an absent one fatal instead. Bands and seed clouds appear only
+where there is more than one seed — a one-seed point draws its marker and no invented
+spread.
+
+**Three objects per geometry panel, because two of them are not the same point.** The
+**pooled** fit averages the per-seed distance matrices and embeds once; the **mean
+location** averages each adapter's position over the *aligned* per-seed fits. MDS is not
+linear, so they disagree, and both are carried. The per-seed fits are
+Procrustes-superimposed on the pooled one in the sweep rather than at plot time, and
+every panel in a grid shares one frame and one set of limits — the superposition already
+put them on one scale, and per-panel autoscaling would silently undo it and turn a row
+of eight shapes into a row of eight magnifications.
+
+One fix to the existing `make_figures.py`: its `series()` now skips the `seed == POOLED`
+sentinel, which would otherwise weight the pooled summary into the median and IQR of the
+sample it summarises.
+
 ### The initsweep's summaries scored against truth, and the level ordering they invert
 
 `sweep_initsweep.py` gains a fourth CSV, `initsweep_truth.csv`, and

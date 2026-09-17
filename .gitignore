@@ -69,6 +69,14 @@ jobs/simplex3_rsweep_*/
 experiments/simplex3_initsweep_*/
 jobs/simplex3_initsweep_*/
 
+# The qbig tree, whole, for the same reason as the three above: every file in it
+# is written by `scripts/gen_simplex3.py --suite olmo2_qbig --dataset yahoo_qbig`
+# -- 4 train shards, 16 behavioral shards, and the four non-shard drivers beside
+# them -- so there is nothing hand-written left to keep. The generator, the Suite
+# and the spec stay tracked, so one command rebuilds it.
+experiments/simplex3_qbig_*/
+jobs/simplex3_qbig_*/
+
 # Run logs from the nsweep scoring sweep. The CSV it writes is the artifact;
 # these are just the per-slice progress lines.
 figures/simplex3_nsweep_olmo2_nsweep/logs/

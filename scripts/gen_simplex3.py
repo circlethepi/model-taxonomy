@@ -307,8 +307,27 @@ def lora_alpha(rank: int) -> int:
     return 2 * rank
 
 
-REPLICATES = 16
+#: Replicates moved to ``DataSimplexSpec.replicates`` when a spec needed to vary
+#: them; every existing spec carries 16, so the five trees on disk regenerate
+#: unchanged.  Read ``SPEC.replicates``, not a constant.
 MAX_NEW_TOKENS = 128
+
+#: ``generate()`` calls one adapter costs at a given batch width -- the quantity
+#: decode time is actually driven by, since every call runs ``MAX_NEW_TOKENS``
+#: sequential steps regardless of how wide it is.  Derived rather than written
+#: down because the two figures the emitted prose quotes ("~7 calls per adapter
+#: against ~50 for the sampled runs") are only true at ``query_n=100``, and a
+#: spec that probes with 1000 queries would otherwise ship a comment off by 10x.
+def generate_calls(n_queries: int, batch_size: int) -> int:
+    return -(-n_queries // batch_size)
+
+
+#: The batch width every SAMPLED run is pinned to.  See the ``batch_size: 2``
+#: block emitted for the behavioral and sweep levels: one RNG stream serves a
+#: whole ``generate()`` call, so batch shape determines the text, and the value
+#: is excluded from the cache key.  Named here so the prose that counts calls and
+#: the YAML that sets it cannot drift.
+SAMPLED_BATCH_SIZE = 2
 
 #: Sampled runs hold batch_size at 2 because one RNG stream serves a whole
 #: generate() call, so batch shape determines the text (first-order) and the value
@@ -1261,19 +1280,19 @@ def write_extract(
             f"# One point of the TEMPERATURE SWEEP: T={temperature}, R={SUITE.sweep_replicates}.\n"
             f"#\n"
             f"# The sweep resolves the log-prob surface along the decoding axis instead\n"
-            f"# of at the single T=1.0 the R={REPLICATES} runs measured. Each point is its own\n"
+            f"# of at the single T=1.0 the R={SPEC.replicates} runs measured. Each point is its own\n"
             f"# cache entry -- temperature is inside the sampling hash and therefore\n"
             f"# inside the filename -- so ten temperatures are ten entries, not one\n"
             f"# silently reused.\n"
             f"#\n"
-            f"# R={SUITE.sweep_replicates}, not {REPLICATES}, and uniformly so across all ten points. The cached\n"
-            f"# R={REPLICATES} entry at T=1.0 is a DIFFERENT entry (replicates are in the\n"
+            f"# R={SUITE.sweep_replicates}, not {SPEC.replicates}, and uniformly so across all ten points. The cached\n"
+            f"# R={SPEC.replicates} entry at T=1.0 is a DIFFERENT entry (replicates are in the\n"
             f"# filename), so this does not collide with it; re-running T=1.0 here is\n"
             f"# what keeps one point of a variance-vs-temperature curve from having half\n"
             f"# the sampling noise of the other nine.\n"
             f"#\n"
             f"# {SUITE.sweep_shards} shards of {len(names)} adapters: halving R halves the decode, so this\n"
-            f"# lands at the same wall the {SUITE.behavioral_shards}-shard R={REPLICATES} runs were sized against.\n\n"
+            f"# lands at the same wall the {SUITE.behavioral_shards}-shard R={SPEC.replicates} runs were sized against.\n\n"
         )
     elif level == "greedy":
         body += (
@@ -1291,31 +1310,40 @@ def write_extract(
             f"# behavioral.py:150-151) so a temperature that was never applied cannot\n"
             f"# change the digest; writing them here would only imply they matter.\n"
             f"# This also means greedy lands in its own cache entry and cannot collide\n"
-            f"# with the R={REPLICATES} runs over the same adapters and draw.\n"
+            f"# with the R={SPEC.replicates} runs over the same adapters and draw.\n"
             f"#\n"
-            + (f"# One job, unsharded: {SPEC.query_n} queries at batch {GREEDY_BATCH_SIZE} is ~7 generate()\n"
-               f"# calls per adapter against ~50 for the sampled runs -- ~17.7 s/model\n"
+            + (f"# One job, unsharded: {SPEC.query_n} queries at batch {GREEDY_BATCH_SIZE} is "
+               f"~{generate_calls(SPEC.query_n, GREEDY_BATCH_SIZE)} generate()\n"
+               f"# calls per adapter against "
+               f"~{generate_calls(SPEC.query_n, SAMPLED_BATCH_SIZE)} for the sampled runs -- ~17.7 s/model\n"
                f"# measured on the 1004-adapter pool, so ~{round(len(names) * 17.7 / 60)} min for all "
                f"{len(names)} here, inside\n"
                f"# the {SUITE.greedy_time} wall.\n\n"
                if shard is None and (rank_sweep() or init_sweep()) else
-               f"# One job, unsharded: {SPEC.query_n} queries at batch {GREEDY_BATCH_SIZE} is ~7 generate()\n"
-               f"# calls per adapter against ~50 for the sampled runs, so all 16 adapters\n"
-               f"# finish in well under an hour.\n\n"
+               f"# One job, unsharded: {SPEC.query_n} queries at batch {GREEDY_BATCH_SIZE} is "
+               f"~{generate_calls(SPEC.query_n, GREEDY_BATCH_SIZE)} generate()\n"
+               f"# calls per adapter against "
+               f"~{generate_calls(SPEC.query_n, SAMPLED_BATCH_SIZE)} for the sampled runs, so all "
+               f"16 adapters\n"
+               # "16" is a LITERAL and is knowingly wrong for the corpora that
+               # have 35 adapters and for the 1004-adapter pool, for the same
+               # reason the "~25,600" above is: it was hardcoded when only the
+               # 16-adapter yahoo tree existed, and deriving it would rewrite
+               # config files belonging to runs that have already happened. It is
+               # right for every 16-adapter tree, which is the yahoo simplex and
+               # everything built on it -- including qbig.
+               f"# finish in {greedy_wall_prose()}.\n\n"
                if shard is None else
-               f"# {SPEC.query_n} queries at batch {GREEDY_BATCH_SIZE} is ~7 generate() calls per adapter\n"
-               f"# against ~50 for the sampled runs -- but that cheapness does not survive\n"
+               f"# {SPEC.query_n} queries at batch {GREEDY_BATCH_SIZE} is "
+               f"~{generate_calls(SPEC.query_n, GREEDY_BATCH_SIZE)} generate() calls per adapter\n"
+               f"# against ~{generate_calls(SPEC.query_n, SAMPLED_BATCH_SIZE)} for the sampled runs "
+               f"-- but that cheapness does not survive\n"
                f"# a training grid: ~17.7 s/model (measured on the 1004-adapter pool, job\n"
                f"# 325767) over {len(SPEC.extract_grid()) * len(proportions())} adapters is ~7 hours against a 1:30 wall, which is\n"
                f"# how that pool job died. {SUITE.greedy_shards} shards of {len(names)} is ~{round(len(names) * 17.7 / 60)} min each.\n\n")
         )
     else:
-        body += (
-            f"# Sharded because this is the expensive half: {len(proportions())} adapters x {SPEC.query_n} queries\n"
-            f"# x {REPLICATES} replicates x {MAX_NEW_TOKENS} tokens is ~25,600 generations, ~4 GPU-hours.\n"
-            f"# Shards write to disjoint adapter directories. Paying the 8B load eight\n"
-            f"# times buys eight short slots that actually backfill.\n\n"
-        )
+        body += behavioral_shard_rationale()
     body += preamble(label)
     body += "datasets:\n" + (query_blocks(query) if qpoint is None
                              else qmix_query_block(*qpoint))
@@ -1359,8 +1387,10 @@ def write_extract(
             f"  # runs. Greedy seeds no RNG at all, so batch size only flips argmax on\n"
             f"  # fp16 near-ties -- measured at 6/8 sequences byte-identical between\n"
             f"  # batch 1 and batch 8. Decode cost is driven by the number of generate()\n"
-            f"  # calls, not their width, so this is the difference between ~7 calls per\n"
-            f"  # adapter and ~50. Lower it if an 8B at {GREEDY_BATCH_SIZE} x (prompt + {MAX_NEW_TOKENS}) OOMs.\n"
+            f"  # calls, not their width, so this is the difference between "
+            f"~{generate_calls(SPEC.query_n, GREEDY_BATCH_SIZE)} calls per\n"
+            f"  # adapter and ~{generate_calls(SPEC.query_n, SAMPLED_BATCH_SIZE)}. "
+            f"Lower it if an 8B at {GREEDY_BATCH_SIZE} x (prompt + {MAX_NEW_TOKENS}) OOMs.\n"
             f"  batch_size: {GREEDY_BATCH_SIZE}\n"
         )
         if level == "greedy_logprob":
@@ -1460,7 +1490,7 @@ def write_extract(
     behavioral:
       enabled: true
       max_new_tokens: {MAX_NEW_TOKENS}
-      replicates: {REPLICATES}
+      replicates: {SPEC.replicates}
       do_sample: true
       temperature: 1.0
       top_p: 1.0
@@ -1712,6 +1742,53 @@ SUITES = {
         # extraction. Submit training with `sbatch --partition=h200,h100`.
     ).for_model("allenai/OLMo-2-0425-1B-Instruct"),
 
+    #: The **qbig** suite: the standing olmo2 simplex probed an order of magnitude
+    #: harder -- 1000 queries at seed 2 instead of 100 at seed 1, and R=64 instead
+    #: of R=16 (all three on ``YAHOO_QBIG``, not here, because they describe the
+    #: probe rather than the hardware).  It trains nothing new: the sixteen
+    #: adapters it extracts over are the ``_n1000_s00_r16_i00_b5008`` directories
+    #: the ``olmo2`` tree already wrote, so the training shards this suite emits
+    #: are cache hits that print "Already trained -- skipping".
+    #:
+    #: Four fields differ from ``olmo2`` and every one of them follows from the
+    #: probe being 40x the decode:
+    #:
+    #: The log-probability level and the generated-activation job are dropped.
+    #: Neither was asked for here, and ``functional_gen`` in particular measured
+    #: 210 s/model at 100 queries, which is ~9 GPU-hours at 1000 -- more than the
+    #: behavioral level this tree exists for.  The temperature sweep is dropped by
+    #: the spec, for the same reason ``YAHOO_POOL`` drops it.
+    #:
+    #: ``behavioral_adapters_per_shard=1``: at ~2,560 tok/s (measured, job 264147)
+    #: one adapter is 1000 x 64 x 128 / 2560 = ~53 min, so two would not fit a
+    #: wall any partition here backfills well.
+    #:
+    #: ``behav_time`` and ``greedy_time`` at 2:00:00 against ~1:00 and ~0:51 of
+    #: expected work.  Both are sized against the *floor* throughput rather than
+    #: the expected one: 2,560 tok/s was measured at 32 rows per generate() call
+    #: and these runs are 128 rows wide, which a 1B is nowhere near saturated by,
+    #: so the real numbers should come in under these and the wall is charged only
+    #: in queue priority. ``func_time`` and ``train_time`` stay at the defaults --
+    #: input-mode extraction measured 1.1 s/model at 100 queries, so ~3 min for
+    #: the fleet at 1000, and the training shards do no work at all.
+    "olmo2_qbig": Suite(
+        tag="olmo2_qbig",
+        query_sets=("question_only",),
+        job_tokens={"question_only": "qonly"},
+        emit_embed_jobs=False,
+        emit_build_job=False,
+        job_prefix="s3bo2",
+        emit_logprob_jobs=False,
+        emit_gen_activation_job=False,
+        behavioral_adapters_per_shard=1,
+        behav_time="2:00:00",
+        greedy_time="2:00:00",
+        # See the olmo2 entry: l40s is not safe for TRAINING this model, only for
+        # extraction. The shards here retrain nothing, but the list is held the
+        # same so a `--force` retrain from this tree does not die where the
+        # olmo2 tree's would not.
+    ).for_model("allenai/OLMo-2-0425-1B-Instruct"),
+
     #: The **rsweep** suite: the LoRA-rank axis, over the same 16-point yahoo
     #: simplex and the same 100-query 33/33/33 draw as ``olmo2``.  Eight ranks,
     #: 1 to 128 by powers of two, so 128 adapters.
@@ -1855,6 +1932,7 @@ _SUITE_PREFIXES = {
     ("oasst1", "olmo2"): "s3oo2",
     ("yahoo_pool", "olmo2_pool"): "s3po2",
     ("yahoo_nsweep", "olmo2_nsweep"): "s3no2",
+    ("yahoo_qbig", "olmo2_qbig"): "s3bo2",
 }
 
 #: Adapters per shard, held at the value every existing wall was tuned against.
@@ -1946,6 +2024,73 @@ def _has_train_grid() -> bool:
     return bool(SPEC.train_sizes or SPEC.train_seeds)
 
 
+def greedy_wall_prose() -> str:
+    """How long the unsharded greedy job is claimed to take, as prose.
+
+    "well under an hour" is a measured statement about ONE shape -- 16 adapters
+    over a 100-query draw, which ran in 5:05 -- and it stops being true when a
+    spec probes with ten times the queries: the same ~19 s/model becomes ~190,
+    i.e. most of an hour rather than a twelfth of it.  Branching here rather than
+    inflating the sentence keeps the five trees on disk regenerating byte-for-byte
+    while refusing to ship a claim the new tree would falsify on its first run.
+    """
+    if SPEC.query_n == 100:
+        return "well under an hour"
+    # ~19 s/model at 100 queries (job 264150, 16 adapters in 5:05), and decode is
+    # linear in the query count at fixed batch width.
+    minutes = round(len(proportions()) * 19.1 * SPEC.query_n / 100 / 60)
+    return f"~{minutes} min"
+
+
+def behavioral_shard_rationale() -> str:
+    """The comment explaining why the sampled behavioral level is sharded.
+
+    Two shapes, and the split is not cosmetic.  The original sentence quotes a
+    *measured* cost -- 25,600 generations at ~4 GPU-hours -- which is an 8B over
+    a 100-query draw at R=16, and every number in it is wrong for a spec that
+    changes ``query_n`` or ``replicates``.  The second branch recomputes the
+    generation count from the spec and prices it off the 1B's own measurement
+    rather than the 8B's, because the two differ by more than an order of
+    magnitude per token and quoting the wrong one is how a wall gets sized wrong.
+    """
+    gens = len(proportions()) * SPEC.query_n * SPEC.replicates
+    if SPEC.query_n == 100 and SPEC.replicates == 16:
+        # "~25,600" is a LITERAL, not `gens`, and knowingly wrong for the
+        # 35-adapter corpora: dolly and oasst1 are 56,000 generations and their
+        # emitted configs say 25,600, because the count was hardcoded when only
+        # the 16-adapter yahoo tree existed. Deriving it here would be correct
+        # and would rewrite ~150 config files belonging to runs that have already
+        # happened, for a comment no code reads. Left as it is; fix it in a commit
+        # whose whole subject is that, so the diff is legible as a prose fix
+        # rather than hiding inside a feature.
+        return (
+            f"# Sharded because this is the expensive half: {len(proportions())} adapters x {SPEC.query_n} queries\n"
+            f"# x {SPEC.replicates} replicates x {MAX_NEW_TOKENS} tokens is ~25,600 generations, ~4 GPU-hours.\n"
+            f"# Shards write to disjoint adapter directories. Paying the 8B load eight\n"
+            f"# times buys eight short slots that actually backfill.\n\n"
+        )
+    per_shard = -(-len(proportions()) // SUITE.behavioral_shards)
+    # 80 s/model for 1600 sequences of 128 tokens on an h200 (job 264147, the
+    # R=16 100-query shard) = ~2,560 tok/s, taken as a FLOOR: that ran 32 rows
+    # per generate() call and this runs batch 2 x R={R}, which is wider and no
+    # slower per row. Pricing at the floor is what keeps the wall honest if the
+    # width buys nothing.
+    secs_per_model = SPEC.query_n * SPEC.replicates * MAX_NEW_TOKENS / 2560
+    return (
+        f"# Sharded because this is the expensive half: {len(proportions())} adapters x {SPEC.query_n} queries\n"
+        f"# x {SPEC.replicates} replicates x {MAX_NEW_TOKENS} tokens is ~{gens:,} generations.\n"
+        f"# At the ~2,560 tok/s this 1B measured on an h200 over the R=16 100-query\n"
+        f"# draw (job 264147) that is ~{secs_per_model / 60:.0f} min/adapter, so ~{gens * MAX_NEW_TOKENS / 2560 / 3600:.0f} GPU-hours\n"
+        f"# for the fleet. That rate is a FLOOR: it was measured at {SAMPLED_BATCH_SIZE} x R=16 = 32\n"
+        f"# rows per generate() call and this runs {SAMPLED_BATCH_SIZE} x R={SPEC.replicates} = "
+        f"{SAMPLED_BATCH_SIZE * SPEC.replicates} rows,\n"
+        f"# which a 1B is nowhere near saturated by, so expect better and size the\n"
+        f"# wall for worse.\n"
+        f"# {SUITE.behavioral_shards} shards of {per_shard} write to disjoint adapter directories, so a\n"
+        f"# shard that dies costs one adapter's decode rather than the fleet's.\n\n"
+    )
+
+
 def train_shard_plan(train_shards: int | None = None) -> list[list[tuple[str, int, int, int, int]]]:
     """The training shards, as lists of ``(proportion, n_samples, seed, rank, init_seed)``.
 
@@ -2014,7 +2159,11 @@ def _suite_for_dataset(suite: Suite, dataset: str, suite_name: str,
         greedy_shards = -(-n_extract // NSWEEP_GREEDY_ADAPTERS_PER_SHARD)
     else:
         train_shards = -(-n_adapters // TRAIN_ADAPTERS_PER_SHARD)
-        behavioral_shards = -(-n_adapters // BEHAVIORAL_ADAPTERS_PER_SHARD)
+        # The divisor is the suite's, defaulting to BEHAVIORAL_ADAPTERS_PER_SHARD,
+        # because a shard's length is the adapter count times the decode budget
+        # per adapter -- and `query_n * replicates` moves the second by 40x while
+        # leaving the first at 16.
+        behavioral_shards = -(-n_adapters // suite.behavioral_adapters_per_shard)
         greedy_shards = suite.greedy_shards
     return replace(
         suite,
@@ -2877,7 +3026,7 @@ def _submit_greedy() -> str:
         return (
             "# Greedy: the deterministic control, one job per query set. Its own cache entries\n"
             "# (GREEDY_SAMPLING nulls the sampling fields), so it cannot collide with the\n"
-            f"# R={REPLICATES} runs over the same adapters and draw.\n"
+            f"# R={SPEC.replicates} runs over the same adapters and draw.\n"
             f"for q in {toks}; do\n"
             "  J=$(sb --dependency=afterok:$TRAIN 08_greedy_$q.sh)\n"
             '  echo "greedy  $q     $J"\n'
@@ -2887,7 +3036,7 @@ def _submit_greedy() -> str:
     return (
         f"# Greedy: the deterministic control, {SUITE.greedy_shards} shards per query set. Its own\n"
         "# cache entries (GREEDY_SAMPLING nulls the sampling fields), so it cannot collide\n"
-        f"# with the R={REPLICATES} runs over the same adapters and draw.\n"
+        f"# with the R={SPEC.replicates} runs over the same adapters and draw.\n"
         f"for q in {toks}; do\n"
         f"  for i in {idx}; do\n"
         "    J=$(sb --dependency=afterok:$TRAIN 08_greedy_${q}_shard$i.sh)\n"

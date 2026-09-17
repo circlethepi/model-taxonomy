@@ -71,6 +71,31 @@ mixture is appended as an extra point only when `K` does not divide `G` — whic
 is why yahoo has 16 proportions and not 15, and why dolly and oasst1 have exactly
 35.
 
+**qmix** (*query mixture*) — the axis of **query-set composition**: what fraction
+of the query set an adapter is probed with is the corpus it was trained on, the
+rest being a diluting corpus it never saw. One value of qmix is one
+`(base-corpus percentage, diluent)` pair. Named on 2026-09-16. It reaches code as
+`QMixSpec` in `src/experiments/query_mixture_spec.py`, the third dataclass beside
+`Suite` and `DataSimplexSpec`, and as `scripts/gen_simplex3.py --qmix`.
+
+qmix varies the *probe*, never the adapter — a qmix tree trains nothing and
+reuses an existing adapter fleet — which is what distinguishes it from the three
+mixtures and sizes already in this list, all of which vary a subject:
+
+| axis | varies | fixed under qmix at |
+|---|---|---|
+| the mixture simplex | what an adapter was *trained* on | the existing 16 points |
+| [nsamples_train](#nsamples_train) | the size of the *training* draw | 1000 |
+| `n_samples_sweep` | the size of the *embedding* draw | unused |
+| **qmix** | the *composition of the query draw* | — |
+
+The trap the word exists to avoid: "the mixture" in a simplex context has always
+meant the training mixture, and adapter names spell one as `100g1_000g2_000g3`.
+A qmix query set deliberately does **not** wear that shape — it is spelled
+`qmix_yahoo001_dolly099_qtc` — because `src/plots/simplex.py` parses `NNNg1_NNNg2`
+out of adapter ids, and a query set wearing it would invite a parse that means
+the wrong thing. See `docs/notes/qmix_dataset_composition.md`.
+
 ---
 
 ## The shared cache

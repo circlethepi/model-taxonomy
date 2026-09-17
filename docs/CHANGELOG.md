@@ -4,6 +4,39 @@
 
 ## Unreleased
 
+### The initsweep's summaries scored against truth, and the level ordering they invert
+
+`sweep_initsweep.py` gains a fourth CSV, `initsweep_truth.csv`, and
+`make_initsweep_figures.py` two figures, `fig_initsweep_truth_disparity_*` and
+`fig_initsweep_truth_dcor_*`: one estimator per file, every level on one axes, the pooled
+read beside the per-seed overlay. Analysis A already scored the ten seeds one at a time;
+this scores the objects those ten summarise, so the band — the full range over the ten,
+the initialisation error bar — has a centre to sit around.
+
+Four sources, and they are four different objects rather than four estimates of one. Two
+are 16-point summaries of the 160-model pool that step around its degenerate truth: the
+mean **embedding** (the joint fit's per-mixture centroids) and the mean **distance
+matrix** (the 160×160 averaged to one row per mixture). Each estimator gets the one it can
+read on its own terms — Procrustes wants a configuration, dCor\* wants distances and would
+otherwise be forced onto a 2-D footing analysis A's ten values are not on. The fourth does
+not step around the degeneracy: it scores all 160 against a **160-point truth** that
+places every pair of seed-siblings at exactly 0, because they do share a recipe. That is
+dCor\* only — a Procrustes fit against ten coincident points per mixture is dominated by a
+constraint nothing can satisfy, so its disparity is written and not drawn.
+
+Two findings. **The structural joint fit is wrecked and averaging inside it does not repair
+it**: disparity 0.0093 from the overlay's mean against 0.4495 from the pool's, a factor of
+48 between two objects both describing "the simplex averaged over ten seeds", while
+averaging the distances first recovers most of it (0.0735). Functional is indifferent — all
+four sources agree to within 0.001. **The 160-point truth inverts the level ordering**:
+structural and functional are indistinguishable per seed (0.9695 against 0.9754) and
+0.4809 against 0.9824 here, which puts structural below even the sampled behavioral read.
+That is analysis B's `ratio*` ordering reproduced by an estimator rather than by a pair of
+means — the truth asserts initialisation does not exist, and structural disagrees most.
+
+No number in analyses A, B or C moves; the geometry CSV is byte-identical and the other two
+differ only in their timing column.
+
 ### Scoring and figures for the initsweep, and a separation statistic that was measuring the pool
 
 `figures/fig_structural_sweep/sweep_initsweep.py` writes the three analyses of

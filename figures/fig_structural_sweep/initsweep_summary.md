@@ -31,8 +31,8 @@ Reproduce (all compute goes through Slurm; the 160-model pools are too heavy for
 a login node):
 
 ```
-sbatch jobs/initsweep_score.sh                               # -> the three CSVs
-python figures/fig_structural_sweep/make_initsweep_figures.py   # -> ten PDFs
+sbatch jobs/initsweep_score.sh                               # -> the four CSVs
+python figures/fig_structural_sweep/make_initsweep_figures.py   # -> fourteen PDFs
 python figures/fig_structural_sweep/make_initsweep_figures.py \
     --figure overlay --seed-alpha 0.18        # fade the seeds under the means
 ```
@@ -188,6 +188,67 @@ images of each other and a reader comparing levels side by side has to re-derive
 which way is which in every panel. Kinds that share a frame are turned together,
 by one map computed from the sixteen mixture points in that frame, so the
 superpositions are not disturbed. Scale is left alone.
+
+## Analysis D — the summaries scored against truth
+
+Analysis A scores the ten seeds one at a time. This scores the objects those ten
+*summarise*, so the figures can draw a centre with the ten around it as a range
+band. Four sources, and they are four different objects — see
+`sweep_initsweep.py`. The band in both figures is the full range of analysis A's
+ten values, drawn around `overlay_mean`, because those ten are the fits that mean
+is a mean of.
+
+| surrogate | source | dCor\* | disparity |
+|---|---|---|---|
+| structural · all layers · o_proj | overlay mean | 0.9919 | 0.0093 |
+| | pool · mean embedding | 0.6942 | **0.4495** |
+| | pool · mean distance matrix | 0.9752 | 0.0735 |
+| | pool160 vs 160-point truth | **0.4809** | 0.7243 |
+| functional · all hidden states | overlay mean | 0.9919 | 0.0073 |
+| | pool · mean embedding | 0.9917 | 0.0077 |
+| | pool · mean distance matrix | 0.9756 | 0.0078 |
+| | pool160 vs 160-point truth | 0.9824 | 0.0083 |
+| behavioral · R=16 per query | overlay mean | 0.7713 | 0.2502 |
+| | pool · mean embedding | 0.7106 | 0.3391 |
+| | pool · mean distance matrix | 0.9288 | 0.0912 |
+| | pool160 vs 160-point truth | 0.4423 | 0.6780 |
+| behavioral · greedy | overlay mean | 0.8558 | 0.1600 |
+| | pool · mean embedding | 0.8797 | 0.1454 |
+| | pool · mean distance matrix | 0.9102 | 0.2216 |
+| | pool160 vs 160-point truth | 0.8571 | 0.1670 |
+
+**The structural joint fit is wrecked, and averaging inside it does not repair
+it.** Structural disparity is 0.0093 from the overlay's mean and 0.4495 from the
+pool's — a factor of 48 between two objects that both claim to be "the mixture
+simplex averaged over ten seeds". This is analysis B seen from the other side: in
+the 160-model fit each mixture is smeared into a band wider than the 25% grid
+spacing, and a centroid taken *inside* a fit that damaged does not recover the
+grid. Averaging the **distances** first does, largely — 0.0735 — because the seed
+spread is cancelled before the embedding rather than embedded and then averaged.
+**Which mean over seeds is quoted therefore matters for structural and is
+irrelevant for functional**, where all four sources agree to within 0.001
+disparity.
+
+**The 160-point truth inverts the level ordering.** Scored per seed, structural
+(dCor\* 0.9695) and functional (0.9754) are indistinguishable. Scored on the pool
+against a truth that places every pair of seed-siblings at exactly 0 — which is
+what the truth actually says, since the ten share a recipe — structural falls to
+0.4809 while functional holds at 0.9824, and structural is the **worst** of the
+four, below even the sampled behavioral read's 0.4423. That number is analysis
+B's `ratio*` ordering reproduced by an estimator instead of by a pair of means:
+the truth asserts that initialisation does not exist, and structural is the level
+that disagrees most.
+
+The `pool160` **disparity** column is written but should not be read. A Procrustes
+fit against a configuration with ten coincident points per mixture is dominated
+by a constraint nothing can satisfy, which is why the disparity figure carries one
+pooled point and the dCor\* figure three.
+
+Figures: `fig_initsweep_truth_disparity_{sampled,greedy}.pdf` and
+`fig_initsweep_truth_dcor_{sampled,greedy}.pdf`. Disparity is drawn on a log axis
+— it spans 0.006 to 0.73, which a linear axis would flatten onto zero — and
+dCor\* linearly, since it is bounded above by 1, spans well under one order of
+magnitude and may legitimately be negative.
 
 ## Traps
 

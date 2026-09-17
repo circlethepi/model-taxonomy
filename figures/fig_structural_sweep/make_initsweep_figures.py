@@ -76,6 +76,19 @@ The figures
     disagreement between initialisations**, and this is the only figure here that
     shows it per model rather than as a summary.
 
+``fig_initsweep_truth_disparity_<variant>.pdf``  (analysis D)
+``fig_initsweep_truth_dcor_<variant>.pdf``  (analysis D)
+    One estimator per file, every level on one axes, the **pooled** read beside
+    the **overlay** read.  The band is the full range of analysis A's ten
+    per-seed scores -- the initialisation error bar -- and the point inside it is
+    the overlay's own centre, the mean of the ten aligned fits scored against the
+    same simplex.  The pooled markers summarise the *joint* 160-model fit
+    instead.  dCor* carries a third point that disparity cannot: the undiluted
+    160-model pool against a 160-point truth which, because all ten
+    seed-siblings share a recipe, places every sibling pair at exactly 0.  Read
+    it as analysis B's question put to an estimator -- how near does the
+    surrogate come to the truth's claim that initialisation does not exist.
+
 Reading the figures
 -------------------
 * **The two estimators run in opposite directions.**  A Procrustes disparity of 0
@@ -211,7 +224,36 @@ MEAN_BEFORE = -1
 #: The ``mixture`` value of the per-level summary row in the separation CSV.
 ALL_MIXTURES = "ALL"
 
-FIGURES = ("replicates", "separation", "pool", "means", "overlay")
+#: Which ``source`` rows of the truth CSV each estimator draws, in x order, with
+#: the marker that names it.  **The first entry of each list is the one the range
+#: band is drawn around**, and it is the overlay in both, because the ten scores
+#: the band is made of are the ten fits that mean is a mean of.
+#:
+#: The two lists differ on the pooled side by necessity rather than by choice: a
+#: mean embedding is a configuration, which Procrustes reads directly and dCor*
+#: could only read after being pushed onto a 2-D footing that analysis A's ten
+#: values are not on; a mean distance matrix is the reverse.  So each estimator
+#: takes the pooled object it can read on its own terms.  ``pool160`` is dCor*
+#: only for the same reason -- see :func:`draw_truth`.
+TRUTH_SERIES = {
+    "disparity": [
+        ("overlay_mean", "o",
+         "overlay · mean of the ten aligned per-seed fits"),
+        ("pool_mean_embedding", "s",
+         "pool · mean embedding of the 160-model joint fit"),
+    ],
+    "dcor": [
+        ("overlay_mean", "o",
+         "overlay · mean of the ten aligned per-seed fits"),
+        ("pool_mean_distance", "s",
+         "pool · mean distance matrix, one row per mixture"),
+        ("pool160", "^",
+         "pool · all 160, against a 160-point truth (seed-siblings at 0)"),
+    ],
+}
+
+FIGURES = ("replicates", "separation", "pool", "means", "overlay",
+           "truth_disparity", "truth_dcor")
 
 
 def read_rows(path: Path) -> list[dict]:
@@ -655,12 +697,111 @@ def draw_overlay(geometry, variant, outdir, seed_alpha=SEED_ALPHA):
     print(f"wrote {out}")
 
 
+# ── analysis D ────────────────────────────────────────────────────────────────
+
+def draw_truth(scores, truth, variant, outdir, stem):
+    """One estimator, every level, the pooled read against the overlay read.
+
+    Analysis A gives ten values per level; this draws what those ten are
+    *around*.  The band is their full range -- the initialisation error bar --
+    and the point inside it is the overlay's own centre, ``seed_mean`` scored
+    against the same simplex.  Beside it sit the pooled reads, which summarise
+    the *joint* 160-model fit rather than the ten separate ones.
+
+    **The two estimators do not get the same axis treatment**, and the reason is
+    in the numbers rather than in taste.  Disparity runs from 0.006 on the
+    structural row to 0.73 on the sampled behavioral one -- two orders of
+    magnitude, which a linear axis would flatten into a single row of points
+    sitting on zero -- so it is drawn on a log axis, as the separation figure's
+    distances are.  dCor* is bounded above by 1, spans well under one order of
+    magnitude, and may legitimately be negative, so it is linear.
+
+    **dCor* carries three pooled points and disparity one.**  A mean embedding
+    is a configuration, which is what Procrustes wants and what dCor* would have
+    to be forced onto a 2-D footing to read; a mean distance matrix is the
+    reverse.  So each estimator is given the pooled object it can read on its
+    own terms, plus -- for dCor* only -- the undiluted pool against a 160-point
+    truth that places every pair of seed-siblings at exactly 0.  That last point
+    is not a worse measurement of the same thing: it is the only one here that
+    asks whether the surrogate reproduces the truth's claim that initialisation
+    does not exist, which is analysis B's question handed to an estimator.
+    """
+    levels = levels_for(variant)
+    series = TRUTH_SERIES[stem]
+    set_style("two_col_full")
+    fig, ax = plt.subplots(figsize=(6.4, 3.6))
+
+    column, ylabel = SCORES[stem]
+    offsets = (np.linspace(-0.17, 0.17, len(series)) if len(series) > 1
+               else np.zeros(1))
+    drawn = set()
+    for ci, (key, label) in enumerate(levels):
+        color = LEVEL_COLORS.get(key, "0.3")
+        for si, (source, marker, _) in enumerate(series):
+            row = next((r for r in truth if r["perspective"] == key
+                        and r["source"] == source), None)
+            if row is None or row[column] == "":
+                continue
+            x = ci + offsets[si]
+            value = float(row[column])
+            if si == 0:
+                # The ten per-seed scores of analysis A: the same ten fits this
+                # point is the mean of, so the band belongs around this marker
+                # and around no other one on the panel.
+                vals = [float(r[column]) for r in scores
+                        if r["perspective"] == key
+                        and int(r["init_seed"]) != MEAN_BEFORE]
+                if vals:
+                    ax.vlines(x, min(vals), max(vals), color=color, lw=1.4,
+                              alpha=0.45, zorder=1)
+                    ax.plot([x, x], [min(vals), max(vals)], ls="", marker="_",
+                            ms=7, color=color, alpha=0.7, zorder=1)
+            ax.plot(x, value, ls="", marker=marker, ms=7.5, color=color,
+                    mec="white", mew=0.8, zorder=3)
+            drawn.add(source)
+
+    ax.set_xticks(range(len(levels)))
+    ax.set_xticklabels([label.replace("\n", "\n") for _, label in levels],
+                       fontsize=7)
+    ax.set_xlim(-0.5, len(levels) - 0.5)
+    ax.set_ylabel(ylabel, fontsize=7.5)
+    if stem == "disparity":
+        ax.set_yscale("log")
+    ax.grid(axis="y", ls=":", lw=0.5, color="0.8", zorder=0)
+    ax.set_axisbelow(True)
+    # After the scale, so a log axis pads in log space. Without it the lowest
+    # marker sits on the spine and reads as clipped rather than as measured --
+    # which on the dCor* figure is the structural 160-point point, the one number
+    # the figure exists to show.
+    ax.margins(y=0.10)
+
+    handles = [plt.Line2D([], [], ls="", marker=m, ms=6.5, color="0.3",
+                          mec="white", mew=0.8, label=text)
+               for src, m, text in series if src in drawn]
+    handles.append(plt.Line2D([], [], ls="-", lw=1.4, color="0.3", alpha=0.45,
+                              label="range over the ten initialisations"))
+    fig.legend(handles, [h.get_label() for h in handles], loc="lower center",
+               ncol=1, frameon=False, fontsize=6.5, bbox_to_anchor=(0.5, -0.02))
+    fig.suptitle(
+        f"{ylabel.splitlines()[0]} against the mixture simplex: "
+        "the pooled fit and the per-seed overlay\n"
+        "OLMo-2-1B-Instruct · yahoo 3-group 25% simplex · ten LoRA "
+        f"initialisations · r=16 · {VARIANTS[variant][1].splitlines()[0].lower()} read",
+        fontsize=8.5)
+    fig.tight_layout(rect=(0, 0.13, 1, 0.95))
+    out = out_path(outdir, f"truth_{stem}", variant)
+    save_figure(fig, out)
+    plt.close(fig)
+    print(f"wrote {out}")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--scores", default=str(HERE / "initsweep_scores.csv"))
     ap.add_argument("--separation", default=str(HERE / "initsweep_separation.csv"))
     ap.add_argument("--geometry", default=str(HERE / "initsweep_geometry.csv"))
+    ap.add_argument("--truth", default=str(HERE / "initsweep_truth.csv"))
     ap.add_argument("--outdir", default=str(HERE))
     ap.add_argument("--variant", choices=[*VARIANTS, "both"], default="both",
                     help="which behavioral read to draw. The two are never on "
@@ -683,6 +824,8 @@ def main() -> None:
     geometry = read_rows(Path(args.geometry)) if {"pool", "means", "overlay"} \
         & set(wanted) else []
     separation = read_rows(Path(args.separation)) if "separation" in wanted else []
+    truth = read_rows(Path(args.truth)) if {"truth_disparity", "truth_dcor"} \
+        & set(wanted) else []
 
     for variant in variants:
         present = {r["perspective"] for r in scores}
@@ -705,6 +848,9 @@ def main() -> None:
         if "overlay" in wanted:
             draw_overlay(geometry, variant, args.outdir,
                          seed_alpha=args.seed_alpha)
+        for stem in ("disparity", "dcor"):
+            if f"truth_{stem}" in wanted:
+                draw_truth(scores, truth, variant, args.outdir, stem)
 
 
 if __name__ == "__main__":

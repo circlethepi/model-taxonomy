@@ -354,7 +354,12 @@ FRAME_MARKER_SCALE = 1.3
 
 #: The IQR band is context for its curve, not a second series. Faint enough that
 #: two overlapping bands do not read as a third colour.
-BAND_ALPHA = 0.12
+BAND_ALPHA = 0.15
+
+#: The two reference bands' opacity, overriding the 0.13 the drawing helpers
+#: default to. Set here rather than in :mod:`src.plots.figures` so it is this
+#: figure that reads a little heavier, and every other figure keeps the default.
+REFERENCE_BAND_ALPHA = 0.15
 
 #: Where the sweep row's one legend sits. It names the four levels for both
 #: panels, and it goes on the collection panel's right: the curves there fall
@@ -1275,12 +1280,14 @@ class Bands:
     def _u(self, ax, **kw):
         if self.generator is None:
             return
+        kw.setdefault("alpha", REFERENCE_BAND_ALPHA)
         draw_uninformed_band(ax, generator=self.generator, label=False, **kw)
         self._drew_uninformed = True
 
     def _p(self, ax, band, **kw):
         if band is None:
             return
+        kw.setdefault("alpha", REFERENCE_BAND_ALPHA)
         draw_permutation_band(ax, band=band, label=False, **kw)
         self._drew_permutation = True
 
@@ -1303,10 +1310,11 @@ class Bands:
             if not drew:
                 continue
             handles.append((
-                # Darker than the band itself (0.13). The band is faint by
+                # Darker than the band itself
+                # (:data:`REFERENCE_BAND_ALPHA`). The band is faint by
                 # design -- it is a backdrop -- but a key is a tenth the size
-                # of the thing it names, and at 0.13 over a legend-sized patch
-                # it reads as an empty box.
+                # of the thing it names, and at that alpha over a legend-sized
+                # patch it reads as an empty box.
                 Patch(facecolor=colour, alpha=0.38, linewidth=0),
                 Line2D([], [], color=colour, ls="--", lw=1.0),
             ))

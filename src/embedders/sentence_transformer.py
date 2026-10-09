@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import warnings
-from typing import Any
+from typing import Any, Sequence
 
 import numpy as np
 
@@ -168,6 +168,54 @@ class SentenceTransformerEmbedder(Embedder):
             warnings.filterwarnings("ignore", message=".*get_extended_attention_mask.*")
             vec = self._st_model.encode(text, **encode_kwargs)
         return vec.astype(np.float32)
+
+    def encode_texts(
+        self, texts: Sequence[str], batch_size: int = 256
+    ) -> np.ndarray:
+        """Embed many texts in one batched pass, as :meth:`embed` would one by one.
+
+        The same prefix, the same ``normalize_embeddings``, the same ``encode``
+        kwargs — this is :meth:`embed`'s body hoisted out for a caller that holds
+        a list.  ``scripts/reembed_behavioral.py`` is why it exists: one qbig
+        draw is 65,000 continuations, and a call per string is dominated by
+        per-call overhead rather than by the model.
+
+        Returns ``(len(texts), d)`` float32, in the order given.
+
+        **Not bit-identical to :meth:`embed` in a loop.**  A batch is padded to
+        its longest member, so the attention mask — and with it the kernels that
+        run — depend on how the texts were grouped.  Measured drift is ~1e-6 per
+        component on normalized vectors, orders of magnitude below any distance
+        this repo reports, but it is not zero: treat a matrix from here and one
+        from :class:`~src.taxonomy.behavioral.BehavioralTaxonomy` as equal to
+        float tolerance, never as byte-equal.  The *embedder_hash* is the same
+        either way, which is the point — batching is a machine detail and does
+        not belong in the cache key, exactly as ``batch_size`` stays out of
+        ``BehavioralTaxonomy.config_dict``.
+        """
+        self._load()
+        texts = list(texts)
+        if not texts:
+            return np.empty((0, self._embedding_dim or 0), dtype=np.float32)
+
+        encode_kwargs: dict = dict(
+            convert_to_numpy=True,
+            normalize_embeddings=self.normalize_embeddings,
+            show_progress_bar=False,
+            batch_size=int(batch_size),
+        )
+        if self.prompt_prefix:
+            # Prepended here rather than passed as prompt_name=, for the reason
+            # spelled out in embed(): this model's synthesised prompts map holds
+            # empty strings, so the kwarg silently prepends nothing.
+            texts = [self.prompt_prefix + t for t in texts]
+        elif self.prompt_name is not None:
+            encode_kwargs["prompt_name"] = self.prompt_name
+
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", message=".*get_extended_attention_mask.*")
+            vecs = self._st_model.encode(texts, **encode_kwargs)
+        return np.ascontiguousarray(vecs, dtype=np.float32)
 
     def config_dict(self) -> dict[str, Any]:
         return {

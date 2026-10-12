@@ -21,6 +21,9 @@ The figures (embedder ``v2moe`` unless ``--embedder`` says otherwise)
     per R), behavioral (greedy), functional (all hidden states), functional
     (final hidden state).  x is the number of queries.
 
+``fig_qbig_*_<embedder>_linear.pdf``
+    The same two figures with disparity on a linear 0-1 axis.
+
 ``fig_qbig_replicates_<embedder>.pdf``
     The sampled behavioral read alone, one column per R, so the R lines that
     share one panel in the main figure can be read without overplotting.
@@ -99,14 +102,24 @@ PANELS = [
     ("functional", "final_state", "Functional · final state", "Functional"),
 ]
 
-#: ``(column, y label, scale, limits)`` per row.  Disparity on log, as the qmix
-#: figures draw it, because the functional values sit an order of magnitude
-#: under the behavioral ones; dCor* on linear, where it can go negative.
-METRICS = [
-    ("disparity", "Procrustes disparity\n(0 = identical shape)", "log",
-     (2e-3, 1.4)),
-    ("dcor", "dCor*\n(1 = perfect)", "linear", (None, 1.03)),
-]
+#: Disparity's y range per scale -- ``make_qmix_figures.YLIMS``, so the two
+#: probe axes share a frame.  Log separates the functional values (~1e-2) from
+#: the behavioral ones (~1e-1); linear runs the full 0-1 and is the honest read
+#: of "how far from perfect".  Both are drawn; neither corrects the other.
+DISPARITY_YLIMS = {"log": (2e-3, 1.4), "linear": (-0.03, 1.03)}
+
+#: File-name suffix per disparity scale.  Log is the unsuffixed default.
+YSCALE_SUFFIX = {"log": "", "linear": "_linear"}
+
+
+def metrics(yscale):
+    """``(column, y label, scale, limits)`` per row.  dCor* is always linear,
+    where it can go negative; only disparity follows *yscale*."""
+    return [
+        ("disparity", "Procrustes disparity\n(0 = identical shape)", yscale,
+         DISPARITY_YLIMS[yscale]),
+        ("dcor", "dCor*\n(1 = perfect)", "linear", (None, 1.03)),
+    ]
 
 EMBEDDER_LABEL = {"v2moe": "nomic-embed-text-v2-moe",
                   "v15": "nomic-embed-text-v1.5"}
@@ -177,17 +190,18 @@ def caption(embedder, what):
     )
 
 
-def fig_depth(rows, embedder, outdir, ext) -> Path:
+def fig_depth(rows, embedder, outdir, ext, yscale="log") -> Path:
     """The main figure: rows = metric, columns = level/perspective."""
     height = 5.6
     font = apply_style(PAGE_WIDTH)
-    fig, axes = plt.subplots(len(METRICS), len(PANELS),
+    rows_m = metrics(yscale)
+    fig, axes = plt.subplots(len(rows_m), len(PANELS),
                              figsize=(PAGE_WIDTH, height), sharex=True,
                              sharey="row", squeeze=False)
     rs = sorted({int(r["replicates"]) for r in
                  select(rows, embedder, "behavioral", "sampled")})
     colours = r_colours(rs)
-    for mi, (col, ylabel, scale, lims) in enumerate(METRICS):
+    for mi, (col, ylabel, scale, lims) in enumerate(rows_m):
         for pi, (level, persp, title, ckey) in enumerate(PANELS):
             ax = axes[mi][pi]
             if persp == "sampled":
@@ -200,7 +214,7 @@ def fig_depth(rows, embedder, outdir, ext) -> Path:
             style_axes(ax, scale, lims)
             if mi == 0:
                 ax.set_title(title.replace(" · ", "\n"))
-            if mi == len(METRICS) - 1:
+            if mi == len(rows_m) - 1:
                 ax.set_xlabel("queries")
             if pi == 0:
                 ax.set_ylabel(ylabel)
@@ -212,20 +226,21 @@ def fig_depth(rows, embedder, outdir, ext) -> Path:
     place_caption(fig, caption(embedder, "Recovery of the mixture simplex"),
                   font, height, bottom=0.085)
     embolden(fig)
-    return save_figure(fig, Path(outdir) / f"fig_qbig_depth_{embedder}.{ext}")
+    return save_figure(fig, Path(outdir) / f"fig_qbig_depth_{embedder}{YSCALE_SUFFIX[yscale]}.{ext}")
 
 
-def fig_replicates(rows, embedder, outdir, ext) -> Path:
+def fig_replicates(rows, embedder, outdir, ext, yscale="log") -> Path:
     """Sampled behavioral alone, one column per R."""
     sampled = select(rows, embedder, "behavioral", "sampled")
     rs = sorted({int(r["replicates"]) for r in sampled})
     colours = r_colours(rs)
     height = 4.6
     font = apply_style(PAGE_WIDTH)
-    fig, axes = plt.subplots(len(METRICS), len(rs),
+    rows_m = metrics(yscale)
+    fig, axes = plt.subplots(len(rows_m), len(rs),
                              figsize=(PAGE_WIDTH, height), sharex=True,
                              sharey="row", squeeze=False)
-    for mi, (col, ylabel, scale, lims) in enumerate(METRICS):
+    for mi, (col, ylabel, scale, lims) in enumerate(rows_m):
         for ri, r in enumerate(rs):
             ax = axes[mi][ri]
             draw(ax, [t for t in sampled if int(t["replicates"]) == r], col,
@@ -235,7 +250,7 @@ def fig_replicates(rows, embedder, outdir, ext) -> Path:
             ax.set_xticklabels(["1", "100"])
             if mi == 0:
                 ax.set_title(f"R={r}")
-            if mi == len(METRICS) - 1:
+            if mi == len(rows_m) - 1:
                 ax.set_xlabel("queries")
             if ri == 0:
                 ax.set_ylabel(ylabel)
@@ -243,7 +258,8 @@ def fig_replicates(rows, embedder, outdir, ext) -> Path:
                   font, height)
     embolden(fig)
     return save_figure(fig,
-                       Path(outdir) / f"fig_qbig_replicates_{embedder}.{ext}")
+                       Path(outdir) / f"fig_qbig_replicates_{embedder}"
+                       f"{YSCALE_SUFFIX[yscale]}.{ext}")
 
 
 def main() -> None:
@@ -254,6 +270,10 @@ def main() -> None:
     ap.add_argument("--outdir", default=str(HERE))
     ap.add_argument("--embedder", default="v2moe",
                     choices=list(EMBEDDER_LABEL))
+    ap.add_argument("--yscale", default="both",
+                    choices=["both"] + list(DISPARITY_YLIMS),
+                    help="disparity y scale; 'both' writes the log figures "
+                         "and the _linear ones")
     ap.add_argument("--ext", default="pdf", choices=["pdf", "png", "svg"])
     args = ap.parse_args()
 
@@ -261,9 +281,12 @@ def main() -> None:
     if not any(r["embedder"] == args.embedder for r in rows):
         raise SystemExit(f"{args.scores} has no rows for embedder "
                          f"{args.embedder!r}")
-    for path in (fig_depth(rows, args.embedder, args.outdir, args.ext),
-                 fig_replicates(rows, args.embedder, args.outdir, args.ext)):
-        print(f"wrote {path}")
+    scales = (list(DISPARITY_YLIMS) if args.yscale == "both"
+              else [args.yscale])
+    for yscale in scales:
+        for fig in (fig_depth, fig_replicates):
+            path = fig(rows, args.embedder, args.outdir, args.ext, yscale)
+            print(f"wrote {path}")
 
 
 if __name__ == "__main__":

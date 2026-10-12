@@ -50,6 +50,9 @@ The figures
     The same four curves on one axes -- level by colour, arm by dash -- for
     reading the two arms against each other instead.
 
+``fig_qmix_disparity*_<variant>_linear.pdf``
+    The two curve figures again, with disparity on a linear 0-1 axis.
+
 ``fig_qmix_mds_<arm>_<variant>.pdf``
     The geometry the disparities summarise: rows are levels, columns are yahoo
     percentages.  Each panel carries three things at once, per :func:`draw_mds`:
@@ -218,6 +221,10 @@ SINGLE_ROW_AT = 1
 #: perfect", so both are kept and neither is a correction of the other.
 YLIMS = {"log": (2e-3, 1.4), "linear": (-0.03, 1.03)}
 
+#: File-name suffix per scale, so the linear build sits beside the log one
+#: instead of overwriting it.  Log is the unsuffixed default.
+YSCALE_SUFFIX = {"log": "", "linear": "_linear"}
+
 #: How much room to leave around the outermost point of a geometry grid, as a
 #: fraction of the span it has to cover. Without it the pure-mixture markers sit
 #: on the panel's own frame and are clipped by it -- and those are exactly the
@@ -372,7 +379,8 @@ def fig_disparity_arms(rows, variant, yscale, outdir, ext="pdf") -> Path:
                   bottom=0.07)
     embolden(fig)
     return save_figure(fig, Path(outdir) /
-                       f"fig_qmix_disparity_arms_{variant}.{ext}")
+                       f"fig_qmix_disparity_arms_{variant}"
+                       f"{YSCALE_SUFFIX[yscale]}.{ext}")
 
 
 def fig_disparity_one_axes(rows, variant, yscale, outdir,
@@ -397,7 +405,8 @@ def fig_disparity_one_axes(rows, variant, yscale, outdir,
     place_caption(fig, caption(variant, counts), font, ONE_AXES_HEIGHT)
     embolden(fig)
     return save_figure(fig, Path(outdir) /
-                       f"fig_qmix_disparity_{variant}.{ext}")
+                       f"fig_qmix_disparity_{variant}"
+                       f"{YSCALE_SUFFIX[yscale]}.{ext}")
 
 
 # ── the geometry grid ────────────────────────────────────────────────────────
@@ -609,8 +618,10 @@ def main() -> None:
                     help="draw one decoding variant instead of both")
     ap.add_argument("--figure", choices=["all", "main", "one-axes", "mds"],
                     default="all")
-    ap.add_argument("--yscale", choices=["log", "linear"], default="log",
-                    help="y range of the disparity curves; see YLIMS")
+    ap.add_argument("--yscale", choices=["both"] + list(YLIMS),
+                    default="both",
+                    help="y range of the disparity curves; see YLIMS. 'both' "
+                         "writes the log figures and the _linear ones")
     # pdf is what goes in the paper; png is for looking at one on a terminal
     # that cannot open a pdf, and for a quick diff between two builds.
     ap.add_argument("--ext", default="pdf", choices=["pdf", "png", "svg"])
@@ -627,12 +638,14 @@ def main() -> None:
             print(f"skipping {variant}: none of {sorted(wanted)} is in "
                   f"{args.scores} (found {sorted(present)})")
             continue
-        if args.figure in ("all", "main"):
-            written.append(fig_disparity_arms(rows, variant, args.yscale,
-                                              args.outdir, args.ext))
-        if args.figure in ("all", "one-axes"):
-            written.append(fig_disparity_one_axes(
-                rows, variant, args.yscale, args.outdir, args.ext))
+        scales = list(YLIMS) if args.yscale == "both" else [args.yscale]
+        for yscale in scales:
+            if args.figure in ("all", "main"):
+                written.append(fig_disparity_arms(rows, variant, yscale,
+                                                  args.outdir, args.ext))
+            if args.figure in ("all", "one-axes"):
+                written.append(fig_disparity_one_axes(
+                    rows, variant, yscale, args.outdir, args.ext))
 
     if args.figure in ("all", "mds"):
         geo_rows = read_rows(Path(args.geometry))

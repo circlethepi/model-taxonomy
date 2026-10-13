@@ -1142,6 +1142,24 @@ def truth_geometry(ids):
     return simplex_geometry(truth_weights(ids), list(ids), vertices(ids))
 
 
+def truth_scores(dm, ids):
+    """``(dCor*, Procrustes disparity)`` of *dm* against the requested truth.
+
+    The pair every sweep over a fixed fleet reports per point: dCor* reads the
+    distances, disparity the MDS configuration, fitted at the truth's own width
+    under :data:`MDS_SEED`. The two run in opposite directions -- 1 is perfect
+    for dCor*, 0 for disparity. For a fleet whose realized mixture differs from
+    its requested one, score against :func:`realized_truth_dm` /
+    :func:`realized_truth_geometry` instead.
+    """
+    tgeo = truth_geometry(ids)
+    return (
+        dcor_vs_truth(dm, truth_dm(ids)),
+        disparity_vs_truth(dm, tgeo, random_state=MDS_SEED,
+                           n_components=tgeo.coordinates.shape[1]),
+    )
+
+
 def realized_truth_dm(ids, n_samples):
     """``truth_dm`` against the mixture the draw realized. See
     :func:`realized_truth_weights`."""

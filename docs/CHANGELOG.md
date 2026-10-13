@@ -4,6 +4,42 @@
 
 ## Unreleased
 
+### qbigtemp: qbig's sampled run at four temperatures, on one GPU architecture
+
+`scripts/gen_simplex3.py --suite olmo2_qbig_temp --dataset yahoo_qbig` emits a new
+tree, `simplex3_qbig_olmo2_qbigtemp`. It is qbig's R=64 sampled behavioral run over
+the 1000-query seed-2 draw, repeated at T = 0.25, 0.5, 0.75 and 1.0: 64 shards, one
+adapter each, all pinned to `l40s`.
+
+**Why one architecture.** qbig's T=1.0 shards landed on A100, L40S and Hopper. At
+one seed and one batch shape, adapters decoding the same (query, replicate) slot share
+a random stream, and that coupling does not survive a change of architecture: in qbig,
+pairs on the same GPU type wrote the same opening in 38% of slots against 4.7% across
+types, and its sampled scores fell to dCor* 0.40 where the standing run has 0.94.
+`l40s` because it bills at well under half an A100's rate. qbig's two l40s shards ran
+in ~33 min at 2.6 GB host RSS against the 2 h / 64 GB the shards ask for.
+
+**qbig's T=1.0 entry is archived, not overwritten.** The GPU is not in the cache key,
+so qbigtemp's T=1.0 point is the same entry (`generation128_64r_58d3f985`). Its
+generations, both embeddings, the two surrogates built on them and their run records
+(112 paths, 6.5 GB) were moved to `results/archive/qbig_t10_mixed_gpu/` with a
+`MANIFEST.json`. Greedy and functional entries for the draw are untouched, and
+qbigtemp emits no jobs for them.
+
+**Generator changes, all defaulting to what every existing tree emits** (all 26
+emittable trees regenerate byte-for-byte):
+
+- `Suite.behavioral_temperatures`: repeat the main sampled run once per
+  temperature. This is distinct from `temperature_sweep`, which stores log-probs at
+  a reduced R.
+- `Suite.behavioral_partitions`: the partition list for sampled behavioral jobs
+  alone.
+- `Suite.emit_functional_jobs` / `emit_greedy_jobs`: off for a tree that re-decodes
+  a draw another tree already extracted.
+- `temp_token(t, places=)` plus `temp_places()`: the old one-decimal token would
+  have named T=0.25 `t02` and T=0.75 `t08`. It now raises on a temperature it cannot
+  represent. qbigtemp's tokens are `t025 t050 t075 t100`.
+
 ### The qmix tree scored, and what dilution costs each level
 
 `sweep_qmix.py` runs against the extracted tree and writes two files:

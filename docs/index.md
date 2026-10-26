@@ -53,6 +53,7 @@ Collection of models
 | [Structural Taxonomy](guides/structural_taxonomy.md) | LoRA adapter cache, config.json schema, layer selection |
 | [Model Profiles and Prompt Formats](guides/model_profiles.md) | Per-checkpoint defaults, chat-template pinning, and the prompt/completion cut |
 | [Experiment Suites](guides/experiment_suites.md) | `Suite`, the simplex3 config generator, and smoke-testing a new base model |
+| [Experiment Run Index](guides/experiment_run_index.md) | Every generated run, what it varies, and the command that regenerates it |
 | [Cross-Level Comparison](guides/cross_level_comparison.md) | Surrogate transforms, ground-truth scoring, distributional metrics |
 | [Visualization](guides/visualization.md) | Barycentric simplex colours, panel grids, regenerating the figure suite |
 | [Compute Backends](guides/compute_backends.md) | Local execution and SLURM cluster setup |

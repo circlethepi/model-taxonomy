@@ -127,6 +127,23 @@ rather than storing 64 copies of one deterministic continuation
 (`src/taxonomy/behavioral.py:110-114`), so the greedy control in a qbig tree is
 emitted at R=1 and lands in its own cache entry.
 
+**qbigtemp** (*qbig over temperature*) — qbig's sampled behavioral run repeated at
+T = 0.25, 0.5, 0.75 and 1.0: the same sixteen adapters, the same 1000-query seed-2
+draw, the same R=64, with no log-probs. Named on 2026-10-13. It reaches code as the
+`olmo2_qbig_temp` suite (directory tag `olmo2_qbigtemp`, job prefix `s3bt2`),
+emitted with `scripts/gen_simplex3.py --suite olmo2_qbig_temp --dataset yahoo_qbig`
+into `experiments/simplex3_qbig_olmo2_qbigtemp/`. It is not the log-prob
+temperature sweep (`Suite.temperature_sweep`), which runs at a reduced R and stores
+logits; this one is `Suite.behavioral_temperatures`.
+
+Every shard is pinned to one GPU architecture (l40s). At one seed and one batch
+shape, adapters decoding the same (query, replicate) slot draw from the same random
+stream, and that **sampling coupling** breaks across GPU architectures. qbig's own
+T=1.0 run decoded across A100, L40S and Hopper and lost it. Because the GPU is not
+in the cache key, qbigtemp's T=1.0 point is the *same* cache entry qbig wrote, so
+qbig's entry was moved to `results/archive/qbig_t10_mixed_gpu/` before re-decoding
+(see that directory's `MANIFEST.json`).
+
 ---
 
 ## The shared cache

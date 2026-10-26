@@ -147,6 +147,38 @@ class Suite:
     #: queue is congested; nothing downstream depends on the shard count.
     sweep_shards: int = 4
 
+    #: Temperatures for the MAIN sampled behavioral run, as a tuple.  Empty emits
+    #: the single T=1.0 run every suite has always emitted, under the filenames
+    #: it has always carried, so the existing trees do not move by a byte.
+    #:
+    #: Not the sweep above, and the difference is the point.  The sweep exists for
+    #: the log-probability level: it stores both logit stacks per token at a
+    #: reduced R, which at 1000 queries x R=64 would be terabytes nobody asked
+    #: for.  This repeats the run the tree already describes -- the spec's
+    #: ``replicates``, its query draw, no log-probs -- once per temperature, each
+    #: its own cache entry because temperature is inside the sampling hash.
+    behavioral_temperatures: tuple[float, ...] = ()
+
+    #: Partitions for the sampled behavioral jobs alone.  ``None`` means "the
+    #: same list as extraction", which is every suite that has run.
+    #:
+    #: It exists because sampled behavioral is the one level whose *numbers*
+    #: depend on the hardware.  At one seed and one batch shape, adapters decoding
+    #: the same (query, replicate) slot share a random stream, and that coupling
+    #: survives across Hopper variants but not across architectures: the qbig
+    #: tree's shards landed on A100, L40S and Hopper and its sampled scores fell
+    #: from 0.94 dCor* to 0.40.  A single-architecture list keeps a whole run on
+    #: one stream.
+    behavioral_partitions: str | None = None
+
+    #: Whether to emit the input-mode functional and greedy behavioral jobs.  On
+    #: for every suite that has run.  Off for a tree that re-decodes the sampled
+    #: level over a draw another tree already extracted: those jobs would only
+    #: rediscover cache entries that are already on disk, and a ``submit_all.sh``
+    #: that submits them holds GPUs to do it.
+    emit_functional_jobs: bool = True
+    emit_greedy_jobs: bool = True
+
     #: Shard *counts* for training and the R=16 behavioral run, read the same way
     #: as ``sweep_shards`` above.  They live here rather than in the generator
     #: because sharding is a property of how much work a run has -- which is the
@@ -265,6 +297,11 @@ class Suite:
     def train_gpu_partitions(self) -> str:
         """The partition list the training jobs are emitted with."""
         return self.train_partitions or self.gpu_partitions
+
+    @property
+    def behavioral_gpu_partitions(self) -> str:
+        """The partition list the sampled behavioral jobs are emitted with."""
+        return self.behavioral_partitions or self.gpu_partitions
 
     @property
     def model_slug(self) -> str:

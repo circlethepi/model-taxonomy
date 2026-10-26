@@ -22,18 +22,28 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+from scipy.spatial.distance import pdist, squareform
+
 from src.analysis import (
+    APPROX_MIN_N,
     align_to_reference,
     anchor_weight_vs_truth,
     as_distance_matrix,
+    band_quantiles,
     barycentric,
     compare_simplices,
     correlation_table,
+    dcor_null_direct,
+    disparity_null_analytic,
+    disparity_null_approx,
+    disparity_null_direct,
     fit_geometry,
     kruskal_stress,
     dcor_test,
     distance_correlation,
     mantel_test,
+    simplex_vertices,
+    truth_singular_values,
     matrix_correlation,
     per_point_residuals,
     point_dispersion,
@@ -606,6 +616,370 @@ def t_procrustes():
     pt = protest(_geometry(coords), _geometry(transformed), n_permutations=999)
     assert pt.p_value < 0.01, pt.p_value
     return f"disparity={res.disparity:.2e}, protest p={pt.p_value:.4f}"
+
+
+# ── uninformed baselines ──────────────────────────────────────────────────────
+#
+# An *uninformed baseline* is the level a taxonomy that learned nothing would
+# score; the *uninformed band* is its 5-95 interval.  These checks are all
+# synthetic on purpose: they build their own ground truth and never read
+# `results/baselines/constants.json`, which is generated and gitignored, so they
+# pass in a fresh clone and in a worktree.
+
+
+def _baseline_truth(n, k, seed=0):
+    """A Dirichlet(1) ground truth at *n* on a *k*-vertex simplex."""
+    rng = np.random.default_rng(seed)
+    return rng.dirichlet(np.ones(k), size=n) @ simplex_vertices(k)
+
+
+@check("uninformed: analytic disparity null matches the full scoring path")
+def t_uninformed_disparity_analytic():
+    """The closed form against a Monte Carlo of draw -> standardise -> superimpose.
+
+    This is the load-bearing check of the whole module: everything else trusts
+    that ``1 - ||L Z||_*^2 / (||Z||_F^2 + W_n)`` really is the disparity's null.
+    Both band edges and the centre, at three n spanning the range, at d=2 and
+    d=3.
+    """
+    worst = 0.0
+    for k, ns in ((3, (5, 50, 500)), (4, (5, 50, 500))):
+        for n in ns:
+            truth = _baseline_truth(n, k, seed=n + k)
+            lam = truth_singular_values(truth)
+            got = np.array(band_quantiles(
+                disparity_null_analytic(n, lam, n_mc=40_000, seed=1)))
+            ref = np.array(band_quantiles(
+                disparity_null_direct(n, truth, n_mc=4_000, seed=2)))
+            worst = max(worst, float(np.abs(got - ref).max()))
+    # 4k direct draws put the Monte Carlo error on a 5th percentile at ~0.01.
+    assert worst < 0.02, f"analytic and direct disagree by {worst:.4f}"
+    return f"max |analytic - direct| = {worst:.4f} over 6 (k, n) cells"
+
+
+@check("uninformed: the large-n approximation holds above its threshold, and "
+       "fails below")
+def t_uninformed_approx_threshold():
+    """``APPROX_MIN_N`` is a tested claim, not a comment.
+
+    The approximation replaces the random denominator with its mean while the
+    numerator's ``Z`` is *inside* that denominator, so it fails at small n --
+    and it has to be shown failing, or the threshold means nothing.
+    """
+    lam = truth_singular_values(_baseline_truth(200, 3, seed=5))
+
+    def err(n):
+        a = np.array(band_quantiles(disparity_null_analytic(n, lam, seed=1)))
+        b = np.array(band_quantiles(disparity_null_approx(n, lam, seed=1)))
+        return float(np.abs(a - b).max())
+
+    above = max(err(n) for n in (APPROX_MIN_N, 50, 100, 500))
+    assert above < 0.01, f"approximation is off by {above:.4f} at n >= {APPROX_MIN_N}"
+    below = err(5)
+    assert below > 0.05, (
+        f"approximation is only off by {below:.4f} at n=5; if it no longer "
+        f"fails there, APPROX_MIN_N={APPROX_MIN_N} is too conservative"
+    )
+    return f"err <= {above:.4f} at n >= {APPROX_MIN_N}, {below:.3f} at n=5"
+
+
+@check("uninformed: a perfect recovery falls outside the band")
+def t_uninformed_separates_truth():
+    """A baseline that cannot separate the truth from noise is broken.
+
+    Scores the truth against itself -- disparity 0, dCor* 1 -- and requires both
+    to sit outside the uninformed band at every n.  This is the check that would
+    catch a band drawn on the wrong scale or with its edges swapped.
+    """
+    for k in (3, 4):
+        for n in (5, 20, 500):
+            truth = _baseline_truth(n, k, seed=n)
+            lam = truth_singular_values(truth)
+            lo, _, hi = band_quantiles(
+                disparity_null_analytic(n, lam, n_mc=20_000, seed=3))
+            assert 0.0 < lo, (
+                f"k={k} n={n}: perfect disparity 0 is inside the band "
+                f"[{lo:.4f}, {hi:.4f}]"
+            )
+            dm = squareform(pdist(truth))
+            dlo, _, dhi = band_quantiles(
+                dcor_null_direct(n, dm, k=k, n_mc=600, seed=4))
+            assert 1.0 > dhi, (
+                f"k={k} n={n}: perfect dCor* 1 is inside the band "
+                f"[{dlo:.4f}, {dhi:.4f}]"
+            )
+    return "disparity 0 and dCor* 1 both clear the band at every (k, n)"
+
+
+@check("uninformed: the dCor structure null has mean zero and a shrinking skew")
+def t_uninformed_dcor_centre():
+    """dCor*'s null is centred at zero *in the mean*, and is right-skewed.
+
+    The analytic claim is about the mean and only the mean: the bias-corrected
+    numerator is an unbiased estimator of dCov^2, which is 0 when the two
+    matrices are independent.  The **median** is a different story and is pinned
+    separately here, because it is the number a band's centre line actually
+    draws.
+
+    dCor* is a ratio with a random denominator, so its null is right-skewed and
+    the median sits *below* the mean.  Measured at k=3, 8000 draws:
+
+    .. code-block:: text
+
+        n        mean      median
+        10     +0.0025    -0.027
+        50     +0.0002    -0.0055
+        200    -0.0001    -0.0014
+
+    The skew is real, not noise -- it is ~10x the median's standard error at
+    every n -- and it decays like 1/n, so it matters only where the band is
+    already ~0.27 wide.  Both facts are pinned: the mean must be ~0 everywhere,
+    and the median's offset must shrink by at least 4x from n=10 to n=200.  A
+    median that stopped shrinking, or a mean that did not sit at 0, would both
+    mean the U-centring was wrong.
+    """
+    means, medians = {}, {}
+    for generator in ("gaussian", "dirichlet"):
+        for n in (10, 50, 200):
+            dm = squareform(pdist(_baseline_truth(n, 3, seed=n)))
+            sample = dcor_null_direct(n, dm, k=3, generator=generator,
+                                      n_mc=4_000, seed=6)
+            means[generator, n] = float(np.mean(sample))
+            medians[generator, n] = float(np.median(sample))
+
+    worst_mean = max(abs(v) for v in means.values())
+    assert worst_mean < 0.01, f"dCor* null mean is {worst_mean:.4f}, not 0"
+
+    for generator in ("gaussian", "dirichlet"):
+        small = abs(medians[generator, 10])
+        large = abs(medians[generator, 200])
+        assert small > 4 * large, (
+            f"{generator}: median offset {small:.4f} at n=10 vs {large:.4f} at "
+            "n=200 — the skew is not shrinking with n"
+        )
+    return (f"max |mean| = {worst_mean:.4f}; median offset "
+            f"{abs(medians['gaussian', 10]):.3f} -> "
+            f"{abs(medians['gaussian', 200]):.4f} from n=10 to 200")
+
+
+@check("uninformed: lambda matches the standardisation Procrustes applies")
+def t_uninformed_lambda_matches_standardize():
+    """``truth_singular_values`` must be the *same* standardisation as the score.
+
+    The analytic law is stated in terms of the singular values of the truth
+    *after* ``_standardize`` -- centred and unit Frobenius norm.  If these two
+    ever diverge the band would be computed for a differently-scaled truth than
+    the one the disparity is measured against, silently.
+    """
+    from src.analysis.configurations import _standardize
+
+    for k in (3, 4):
+        truth = _baseline_truth(37, k, seed=8)
+        mine = truth_singular_values(truth)
+        theirs = np.linalg.svd(_standardize(truth, True)[0], compute_uv=False)
+        assert np.allclose(mine, theirs, atol=1e-12), (mine, theirs)
+        assert abs(float((mine ** 2).sum()) - 1.0) < 1e-12
+    return "identical at k=3 and k=4, and sum(l^2) = 1"
+
+
+# ── the permutation band and its cache tier ───────────────────────────────────
+#
+# A *label null* keeps both real geometries and permutes which model is which;
+# the *permutation band* is its 5-95 interval, and `docs/terminology.md` records
+# that the two names are one concept.  Synthetic like the block above: these
+# build their own data and write into a temporary cache root, so nothing here
+# depends on `results/shared_cache` or on a cluster run.
+
+
+@check("permutation cache: the key carries everything that changes the numbers")
+def t_permutation_key_completeness():
+    """Anything that moves the null must move the key, and nothing else may.
+
+    A key that omits a parameter does not make the cache smaller; it makes two
+    different measurements share a name, and the second one silently reads the
+    first.  ``random_state`` and ``n_permutations`` are the two that are easy to
+    forget -- the same omission ``CollectionCache.geometry_key`` had to correct
+    one level down -- so they are pinned here alongside the rest.
+    """
+    from src.cache import PermutationCache
+
+    cache = PermutationCache("/nonexistent")     # keys are pure; no I/O
+    base = dict(members=["m3", "m1", "m2"], source_handle="structural/a/cosine_b",
+                truth_kind="simplex", test="protest",
+                params={"n_permutations": 9999, "random_state": 0,
+                        "n_components": 2})
+    key = cache.test_key(**base)
+
+    def moved(**over):
+        merged = dict(base)
+        merged.update(over)
+        return cache.test_key(**merged) != key
+
+    assert not moved(members=["m1", "m2", "m3"]), (
+        "the key depends on member *order*; a subgroup assembled in a different "
+        "order would miss its own stored null")
+    for field, value in (
+            ("params", {**base["params"], "random_state": 1}),
+            ("params", {**base["params"], "n_permutations": 999}),
+            ("params", {**base["params"], "n_components": 3}),
+            ("members", ["m1", "m2", "m3", "m4"]),
+            ("test", "dcor"),
+            ("truth_kind", "realized"),
+            ("source_handle", "structural/a/cosine_OTHER")):
+        assert moved(**{field: value}), f"{field}={value!r} does not change the key"
+    return "order-free in members; sensitive to all 7 of the rest"
+
+
+@check("permutation cache: a stored null reloads bit-identically")
+def t_permutation_cache_roundtrip():
+    """float64 in, the same float64 out.
+
+    Stored at float64 for the reason ``CollectionCache.save_distance_matrix``
+    gives: a cached value must be indistinguishable from a freshly computed one,
+    or the only test that the reuse is correct stops testing anything.
+    """
+    import tempfile
+
+    from src.cache import PermutationCache
+
+    with tempfile.TemporaryDirectory() as root:
+        cache = PermutationCache(root)
+        null = np.random.default_rng(3).standard_normal(2_500)
+        params = {"n_permutations": 2_500, "random_state": 0, "n_components": 2}
+        gk, tk = cache.save_result(
+            test="protest", members=["a", "b", "c"], source_handle="h",
+            truth_kind="simplex", params=params, statistic=0.0651,
+            p_value=0.0004, null=null, n_models=3, n_permutations=2_500)
+        got = cache.load_result("protest", gk, tk)
+        assert got["null"].dtype == np.float64, got["null"].dtype
+        assert np.array_equal(got["null"], null), "null is not bit-identical"
+        assert got["statistic"] == 0.0651 and got["p_value"] == 0.0004
+        band = got["band"]
+        assert band["lo"] <= band["mid"] <= band["hi"], band
+        assert cache.list_results() == [("protest", gk, tk)]
+        # The catalogue is never load-bearing: a read must survive losing it.
+        (Path(root) / "07A_permutation_tests" / "index.json").unlink()
+        assert cache.load_result("protest", gk, tk, with_null=False) is not None
+        assert cache.list_results() == [("protest", gk, tk)]
+    return "float64 round-trip exact; reads survive a deleted index.json"
+
+
+@check("bands: span mode covers only its own x range")
+def t_band_span_extent():
+    """``span`` is what a grouped bar chart needs and ``horizontal`` is not.
+
+    A bar panel whose groups do not share a baseline -- figure 2's corpus panel,
+    where yahoo is 16 models on a 3-vertex simplex and dolly and oasst1 are 35 on
+    a 4-vertex one -- would otherwise get the first group's level drawn across
+    all of them.
+    """
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    from src.plots.figures import (PERMUTATION_LABEL, draw_permutation_band,
+                                   draw_uninformed_band)
+
+    band = (0.77, 0.92, 0.98)
+    fig, ax = plt.subplots()
+    try:
+        ax.set_xlim(-0.5, 3.5)
+        draw_uninformed_band(ax, mode="span", generator="dirichlet",
+                             band=band, x=(0.6, 1.4), label=True)
+        ext = ax.collections[-1].get_paths()[0].get_extents()
+        assert abs(ext.x0 - 0.6) < 1e-9 and abs(ext.x1 - 1.4) < 1e-9, ext
+        assert abs(ext.y0 - 0.77) < 1e-9 and abs(ext.y1 - 0.98) < 1e-9, ext
+        # One legend entry for the pair, never two: the dashed centre line must
+        # not carry its own label.
+        assert len(ax.get_legend_handles_labels()[1]) == 1
+    finally:
+        plt.close(fig)
+
+    fig, ax = plt.subplots()
+    try:
+        draw_permutation_band(ax, mode="span", band=band, x=(0.0, 1.0),
+                              label=True)
+        assert ax.get_legend_handles_labels()[1] == [PERMUTATION_LABEL]
+    finally:
+        plt.close(fig)
+
+    for mode, kw in (("span", {}), ("radial", {})):
+        fig, ax = plt.subplots()
+        try:
+            draw_uninformed_band(ax, mode=mode, generator="g", band=band, **kw)
+        except ValueError as exc:
+            assert "needs x" in str(exc), exc
+        else:
+            raise AssertionError(f"mode={mode!r} without x should raise")
+        finally:
+            plt.close(fig)
+    return "span covers exactly (x0, x1); one legend entry per band"
+
+
+@check("bands: a complete mixture grid has an isotropic truth")
+def t_grid_specs_isotropic():
+    """Every suite grid is symmetric, so its Lambda is ``1/sqrt(d)`` exactly.
+
+    This is what lets ``figures/figure2_v2`` compute those panels' uninformed
+    bands directly instead of interpolating the pooled table -- no estimated
+    Lambda, and no log-n interpolation between grid rungs.  Pinned because it is
+    a property of the mixture grids rather than of the code: a spec that stops
+    being a complete grid must fail here loudly rather than quietly acquire a
+    band computed for a truth it does not have.
+
+    ``yahoo_pool`` is the control.  It is a random scatter over the simplex
+    rather than a grid, so it must *not* be isotropic -- otherwise this check
+    would pass on an implementation that returned ``1/sqrt(d)`` unconditionally.
+    """
+    from src.experiments.data_simplex_spec import SPECS
+
+    rows = []
+    for name in ("yahoo", "yahoo_nsweep", "dolly", "oasst1"):
+        W = np.array(SPECS[name].mixture_pcts(), dtype=float) / 100.0
+        k = W.shape[1]
+        lam = truth_singular_values(W @ simplex_vertices(k))
+        want = 1.0 / np.sqrt(k - 1)
+        assert np.allclose(lam, want, atol=1e-12), (name, lam, want)
+        rows.append(f"{name} n={len(W)} K={k} l={lam[0]:.4f}")
+
+    W = np.array(SPECS["yahoo_pool"].mixture_pcts(), dtype=float) / 100.0
+    lam = truth_singular_values(W @ simplex_vertices(W.shape[1]))
+    assert not np.allclose(lam, 1.0 / np.sqrt(W.shape[1] - 1), atol=1e-3), (
+        "yahoo_pool is a scatter, not a grid, and must not come out isotropic — "
+        "this check would otherwise pass on a constant")
+    return "; ".join(rows) + f"; yahoo_pool anisotropic {lam}"
+
+
+@check("bands: the exact grid band agrees with the tabulated one")
+def t_exact_band_matches_table():
+    """Two routes to one quantity, and they must not be two conventions.
+
+    ``figures/figure2_v2`` computes panels 1, 2 and 4 from the suite's own grid
+    and reads panel 3 from ``results/baselines/constants.json``.  If those
+    disagreed, one figure would carry two different definitions of the same
+    band.  Compared against a freshly sampled table-style band rather than the
+    generated file, so this stays synthetic.
+    """
+    from src.experiments.data_simplex_spec import SPECS
+
+    W = np.array(SPECS["yahoo"].mixture_pcts(), dtype=float) / 100.0
+    n, k = len(W), W.shape[1]
+    lam_grid = truth_singular_values(W @ simplex_vertices(k))
+    exact = band_quantiles(disparity_null_analytic(n, lam_grid, n_mc=40_000,
+                                                   seed=0))
+    # The table's route: a Lambda pooled over Dirichlet(1) truths rather than
+    # the grid's own.
+    lam_pooled = np.mean([truth_singular_values(_baseline_truth(n, k, seed=s))
+                          for s in range(50)], axis=0)
+    lam_pooled = lam_pooled / np.linalg.norm(lam_pooled)
+    pooled = band_quantiles(disparity_null_analytic(n, lam_pooled, n_mc=40_000,
+                                                    seed=0))
+    for label, a, b in zip(("q05", "q50", "q95"), exact, pooled):
+        assert abs(a - b) < 0.05, (
+            f"{label}: exact {a:.4f} vs pooled {b:.4f} — the two routes to the "
+            "uninformed band disagree by more than sampling noise")
+    return (f"exact [{exact[0]:.4f} {exact[1]:.4f} {exact[2]:.4f}] vs pooled "
+            f"[{pooled[0]:.4f} {pooled[1]:.4f} {pooled[2]:.4f}]")
 
 
 @check("procrustes: matches scipy.spatial.procrustes")
@@ -6224,6 +6598,14 @@ SYNTHETIC = [
     t_mantel, t_dcor_bias, t_dcor_test, t_dcor_unsigned, t_dcor_u_centering_symmetry,
     t_dcor_restricted, t_data_simplex_spec_sampling,
     t_procrustes, t_procrustes_vs_scipy, t_per_point_residuals,
+    t_uninformed_disparity_analytic, t_uninformed_approx_threshold,
+    t_uninformed_separates_truth, t_uninformed_dcor_centre,
+    t_uninformed_lambda_matches_standardize,
+    t_permutation_key_completeness,
+    t_permutation_cache_roundtrip,
+    t_band_span_extent,
+    t_grid_specs_isotropic,
+    t_exact_band_matches_table,
     t_dispersion, t_quality, t_correlation_table, t_match_models, t_fit_geometry,
     t_similarity_conversion, t_simplex_roundtrip, t_cosine_equivalence,
     t_bures_wasserstein_equivalence, t_bures_wasserstein_invariance,

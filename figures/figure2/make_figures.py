@@ -852,6 +852,16 @@ TOP_TRAIN_DRAW = (1000, 0)
 #: pinning it here is what keeps this panel the same measurement it was.
 TOP_LORA_RANK = 16
 
+#: The LoRA init seed the simplex3 adapters were initialised from. Not optional,
+#: and not a filter this driver needed when it was written: the init sweep has
+#: since trained the same 16 mixtures of this corpus at ten draws of ``A`` under
+#: this base model, training draw and rank, so a scan filtered by all four
+#: returns 160 models and ``n_expected`` trips. 0 is the generator's
+#: ``LORA_INIT_SEED``, the seed every suite that predates the sweep ran at, and
+#: the sweep's ``i00`` point is that collection rather than a re-run of it -- so
+#: pinning it here is what keeps this panel the same measurement it was.
+TOP_LORA_INIT_SEED = 0
+
 #: Decoder layers of :data:`TOP_BASE_MODEL`, from the checkpoint's own config.
 #: The functional reference surrogate names ``N_LAYERS + 1`` rows, so the exact
 #: label the suite must be asked for is derived from this rather than written
@@ -904,6 +914,7 @@ def top_row_cells(levels: list[Level], cache_root=None, no_cache=False):
         train_draw=TOP_TRAIN_DRAW,
         mixtures=SPECS["yahoo"].mixture_pcts(),
         lora_rank=TOP_LORA_RANK,
+        lora_init_seed=TOP_LORA_INIT_SEED,
         source="figures/figure2/make_figures.py",
     )
     cells = {}

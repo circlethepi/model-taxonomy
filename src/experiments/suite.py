@@ -79,6 +79,24 @@ class Suite:
     #: ``target_modules`` and ``torch_dtype`` are here.
     lora_ranks: tuple[int, ...] = ()
 
+    #: The LoRA initialisation seeds an **initsweep** trains, if this suite is
+    #: one.  Empty means "just the generator's ``LORA_INIT_SEED``", which is 0 and
+    #: is every suite that has run, so the existing trees emit exactly the files
+    #: they already carry.
+    #:
+    #: Non-empty makes the initialisation seed an axis of the adapter list beside
+    #: rank: the tree trains the whole simplex once per seed and extracts over
+    #: the union.  The seed is the ``_i00`` token every adapter directory already
+    #: carries (``..._r16_i00_b5008``), so seed 0 resolves to adapters that are
+    #: already on disk and only the other seeds are new work.
+    #:
+    #: A Suite field rather than a ``DataSimplexSpec`` one for the same reason
+    #: ``lora_ranks`` is: initialisation says how a run is configured, not what
+    #: corpus it is run over.  It varies neither the rows trained on nor their
+    #: order -- that is the *dataset draw* seed, the ``s00`` in ``_n1000_s00``,
+    #: which lives on the spec.
+    lora_init_seeds: tuple[int, ...] = ()
+
     #: The sample budgets an **epochsweep** trains, if this suite is one.  Empty
     #: means "just the budget the spec names", which is every suite that has run,
     #: so the existing trees emit exactly the files they already carry.
@@ -161,6 +179,36 @@ class Suite:
     #: raising the counts to 9 and 18 rather than by doubling every wall.
     train_shards: int = 4
     behavioral_shards: int = 8
+
+    #: Adapters per sampled-behavioral shard, for the corpora whose shard counts
+    #: ``_suite_for_dataset`` *derives* from the adapter count rather than taking
+    #: from ``behavioral_shards`` above.  2 is the value every existing wall was
+    #: tuned against and is what the generator's
+    #: ``BEHAVIORAL_ADAPTERS_PER_SHARD`` carried, so every tree on disk is
+    #: unmoved.
+    #:
+    #: It is a field because the adapter count is not the only thing that sets a
+    #: shard's length: ``query_n * replicates`` is the decode budget per adapter,
+    #: and a suite that raises either by 40x has the same 16 adapters costing
+    #: forty times the wall.  Cutting to one adapter per shard there is what keeps
+    #: a shard the length the partitions were chosen for, and keeps a shard that
+    #: dies costing one adapter's decode instead of two.
+    behavioral_adapters_per_shard: int = 2
+
+    #: Adapters per sampled-behavioral shard, for the corpora whose shard counts
+    #: ``_suite_for_dataset`` *derives* from the adapter count rather than taking
+    #: from ``behavioral_shards`` above.  2 is the value every existing wall was
+    #: tuned against and is what the generator's
+    #: ``BEHAVIORAL_ADAPTERS_PER_SHARD`` carried, so every tree on disk is
+    #: unmoved.
+    #:
+    #: It is a field because the adapter count is not the only thing that sets a
+    #: shard's length: ``query_n * replicates`` is the decode budget per adapter,
+    #: and a suite that raises either by 40x has the same 16 adapters costing
+    #: forty times the wall.  Cutting to one adapter per shard there is what keeps
+    #: a shard the length the partitions were chosen for, and keeps a shard that
+    #: dies costing one adapter's decode instead of two.
+    behavioral_adapters_per_shard: int = 2
 
     #: Shards for the greedy run.  One -- i.e. unsharded -- for every suite that
     #: has 16 adapters to decode, which is what "~7 generate() calls per adapter

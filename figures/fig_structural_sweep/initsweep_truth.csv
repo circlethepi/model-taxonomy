@@ -1,0 +1,17 @@
+perspective,taxonomy,metric,source,n_points,dcor,disparity
+structural_all_o,structural,cosine,overlay_mean,16,0.9918888322994667,0.009315829538780575
+structural_all_o,structural,cosine,pool_mean_embedding,16,0.6941659348918199,0.4495259815316346
+structural_all_o,structural,cosine,pool_mean_distance,16,0.9751792777772638,0.07350734994298484
+structural_all_o,structural,cosine,pool160,160,0.48087693897256034,0.7243179507906978
+functional_all,functional,cosine,overlay_mean,16,0.991943083254015,0.007309886777142049
+functional_all,functional,cosine,pool_mean_embedding,16,0.9917250807471366,0.007730364374464077
+functional_all,functional,cosine,pool_mean_distance,16,0.975607914134194,0.007840643662220417
+functional_all,functional,cosine,pool160,160,0.982416088091668,0.008331856102137322
+behavioral,behavioral,cosine,overlay_mean,16,0.7712767425751689,0.2501622966541699
+behavioral,behavioral,cosine,pool_mean_embedding,16,0.7105561856172677,0.339097176403797
+behavioral,behavioral,cosine,pool_mean_distance,16,0.9287613265766766,0.0912464171730148
+behavioral,behavioral,cosine,pool160,160,0.4423181050148196,0.6779950306033846
+behavioral_greedy,behavioral,cosine,overlay_mean,16,0.855833525533988,0.16004240484781984
+behavioral_greedy,behavioral,cosine,pool_mean_embedding,16,0.8797136763287252,0.14536767470946976
+behavioral_greedy,behavioral,cosine,pool_mean_distance,16,0.910173380321629,0.22157446803359515
+behavioral_greedy,behavioral,cosine,pool160,160,0.8571145581949668,0.16697911558233863

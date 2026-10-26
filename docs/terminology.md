@@ -71,6 +71,62 @@ mixture is appended as an extra point only when `K` does not divide `G` — whic
 is why yahoo has 16 proportions and not 15, and why dolly and oasst1 have exactly
 35.
 
+**qmix** (*query mixture*) — the axis of **query-set composition**: what fraction
+of the query set an adapter is probed with is the corpus it was trained on, the
+rest being a diluting corpus it never saw. One value of qmix is one
+`(base-corpus percentage, diluent)` pair. Named on 2026-09-16. It reaches code as
+`QMixSpec` in `src/experiments/query_mixture_spec.py`, the third dataclass beside
+`Suite` and `DataSimplexSpec`, and as `scripts/gen_simplex3.py --qmix`.
+
+qmix varies the *probe*, never the adapter — a qmix tree trains nothing and
+reuses an existing adapter fleet — which is what distinguishes it from the three
+mixtures and sizes already in this list, all of which vary a subject:
+
+| axis | varies | fixed under qmix at |
+|---|---|---|
+| the mixture simplex | what an adapter was *trained* on | the existing 16 points |
+| [nsamples_train](#nsamples_train) | the size of the *training* draw | 1000 |
+| `n_samples_sweep` | the size of the *embedding* draw | unused |
+| **qmix** | the *composition of the query draw* | — |
+
+The trap the word exists to avoid: "the mixture" in a simplex context has always
+meant the training mixture, and adapter names spell one as `100g1_000g2_000g3`.
+A qmix query set deliberately does **not** wear that shape — it is spelled
+`qmix_yahoo001_dolly099_qtc` — because `src/plots/simplex.py` parses `NNNg1_NNNg2`
+out of adapter ids, and a query set wearing it would invite a parse that means
+the wrong thing. See `docs/notes/qmix_dataset_composition.md`.
+
+**qbig** (*big query set*) — the axis of **probe depth**: the same adapter fleet
+and the same query-set *composition*, measured with more queries and more
+replicates per query. Named on 2026-09-17. It reaches code as `YAHOO_QBIG` in
+`src/experiments/data_simplex_spec.py` and the `olmo2_qbig` suite, emitted with
+`scripts/gen_simplex3.py --suite olmo2_qbig --dataset yahoo_qbig`.
+
+Like [qmix](#the-simplex-experiments), qbig varies the probe and never the
+adapter — it trains nothing and reuses the existing sixteen
+`_n1000_s00_r16_i00_b5008` adapters — but it is the *orthogonal* probe axis:
+qmix asks **what the queries are made of**, qbig asks **how many of them there
+are and how hard each one is sampled**. The standing yahoo tree sits at
+`query_n=100, replicates=16`; the qbig tree at `query_n=1000, replicates=64`.
+
+| axis | varies | qbig holds it at |
+|---|---|---|
+| the mixture simplex | what an adapter was *trained* on | the existing 16 points |
+| [nsamples_train](#nsamples_train) | the size of the *training* draw | 1000 |
+| qmix | the *composition* of the query draw | 100% base corpus, undiluted |
+| **qbig** | the *size* of the query draw, and R | — |
+
+Two traps. First, the query **draw seed** moves with the size and must: seed 0 is
+what the adapters were trained on, so probing with it would score every model on
+its own training rows, and seed 1 is the standing 100-query set. qbig draws at
+seed 2, which shares no row with either.
+
+Second, **R does not apply to greedy**. `replicates: 64` describes the sampled
+run only; `BehavioralTaxonomy` raises on `replicates > 1` with `do_sample: false`
+rather than storing 64 copies of one deterministic continuation
+(`src/taxonomy/behavioral.py:110-114`), so the greedy control in a qbig tree is
+emitted at R=1 and lands in its own cache entry.
+
 ---
 
 ## The shared cache
@@ -90,6 +146,7 @@ the objects at that stage**, as in `03A_adapter_alignments`.
 | `05A_logprobs` | Per-token log-probabilities and entropies |
 | `06_pairwise` | Individual pairwise distances, one entry per model pair |
 | `07_collections` | Distance matrices and geometry results |
+| `07A_permutation_tests` | Label-null permutation tests over those collections |
 
 **Draw** — one sampled subset of a dataset, spelled `n{n}_s{seed:02d}` with the
 seed zero-padded. `src/cache/_draw.py` owns the spelling. Writing is narrow and
@@ -150,6 +207,28 @@ inside every adapter directory name (`..._r16_i00_b5008_f…`) and every cache i
 keyed on that name, so the `r16` point of an rsweep resolves to the adapters and
 activations `simplex3_olmo2` already wrote. See
 `docs/notes/rank_sweep.md`.
+
+**initsweep** — a sweep over the LoRA **initialisation seed**, the argument to
+`torch.manual_seed()` immediately before PEFT initialises the LoRA `A` and `B`
+matrices, holding the corpus, the mixture grid, the training draw, the dataset
+seeds, the rank and every other optimizer setting fixed. Named for its parallel
+with [nsweep](#nsweep) and [rsweep](#rsweep) above: `n` there is the training
+draw size, `r` there is the rank, `i` here is the initialisation seed, and all
+three are the letter the adapter directory name already carries
+(`..._n1000_s00_r16_i00_b5008`). It reaches code as `Suite.lora_init_seeds`, a
+Suite field rather than a `DataSimplexSpec` one for rsweep's reason: how a run is
+configured, not what corpus it is run over.
+
+Spelled out rather than shortened because **seed** is already taken. Everywhere
+else in this repo it means the *dataset-draw* seed — the `s00` in `n1000_s00`,
+the thing `results/yahoo_topics_mean_cosine_10seeds` swept. An initsweep varies
+neither the rows trained on nor their order, which is why the dataset level is an
+exact null control across it: all its seeds read the same draws.
+
+It is not a re-run of the fixed-seed tree at its own `i00` point, for rsweep's
+reason — the seed is in the adapter name and every cache is keyed on that name —
+so a ten-seed initsweep over the 16-point yahoo simplex is 144 new adapters and
+not 160. See `docs/notes/init_seed_sweep.md`.
 
 **epochsweep** — a sweep over how *long* a model is fine-tuned, holding the
 corpus, the mixture grid, the training draw, the seed, the rank and every other
@@ -260,6 +339,31 @@ after asking. The dataset level's normalised sibling metric (`frobenius`, which
 L2-normalises each mean before subtracting) is a second legitimate reading of
 "euclidean norm" and the simplex3 drivers carry both; whether a given suite
 wants it is a per-suite decision, not part of this list.
+
+**Primary representations** — the four canonical perspectives to plot by
+default: `dataset_embedding`, `structural_all_o`, `functional_all` and
+`behavioral`. One per taxonomy level that reads a model, plus the dataset
+reference that no adapter touches. Designated 2026-09-15; fixed in
+`figures/simplex_collection_size/sweep_group_size.py::PRIMARY_REPRESENTATIONS`
+and imported by the figure drivers rather than relisted in each.
+
+The other four canonical perspectives are **controls on the read, not levels**:
+`structural_all_qkvo` and `structural_last_o` move the structural scope,
+`functional_last` moves the functional scope, and `behavioral_greedy` moves
+decoding alone. They answer *does the scope matter on this axis*, which is a
+different question from *do the levels agree with the simplex*, and asking both
+in one panel grid crowds the headline.
+
+This is a **plotting** default and nothing more. Every sweep still scores all
+eight, because the controls are what make the primary rows interpretable —
+`structural_last_o` is how you know `structural_all_o` is not an artefact of
+reading the whole stack — and because narrowing at measure time would mean a
+re-run to get a control back. Narrow at plot time, never at measure time.
+
+Note the wording: *representation*, not *perspective*. The two are the same
+objects here; "primary representations" is the phrase used when the emphasis is
+on which few to show, and "canonical perspective" when the emphasis is on what a
+level's default reading is.
 
 Two things this term is **not**. It is unrelated to `_canonical(dm)` in
 `src/analysis/comparison.py`, which means a distance matrix's *sorted row order*
@@ -376,3 +480,52 @@ visible in the figure. The gaps are structural: CKA, MMD and energy all need
 more than one row, so none can run on a `model mean` representation, and
 Bures-Wasserstein stacks per-block factors before its SVD, so a selection mixing
 2560-input and 4096-input projections has no BW value.
+
+---
+
+## Reference levels
+
+Two ways of asking *what would this score have been if the taxonomy had learned
+nothing?*. They answer different questions and the difference is the point, so
+the names are kept apart even though both produce a shaded 5–95 interval drawn
+behind the real scores. Defined in `docs/notes/chance_baselines.md` and
+implemented in `src/analysis/baselines.py`.
+
+**Structure null** — replace the taxonomy with a structureless configuration
+drawn from a generator (`gaussian` or `dirichlet`), keep the real ground truth,
+and score. Its 5–95 interval is the **uninformed band**, and the level itself
+the **uninformed baseline**. Because the configuration is scored *directly*, it
+never passes through MDS, so against an MDS-mediated score such as the
+Procrustes disparity the uninformed band is mildly **optimistic**.
+
+**Random config** — what the figures *call* the structure null, as of
+2026-09-17. It replaces "uninformed baseline" on every band legend
+(`UNINFORMED_LABEL` in `src/plots/figures.py`) and names what the null is — a
+configuration drawn at random and scored — rather than what it is for. **Not a
+third null**: structure null, uninformed baseline and random config are one
+concept, with "structure null" the note's name, "random config" the figures',
+and `UNINFORMED_*` the code's. The identifiers and the `--baseline` flag are
+deliberately unchanged, so a grep for `uninformed` still finds all of it. The
+key is those two words and nothing else: the generator that drew the
+configurations and the fact that the band is a 5–95 interval are figure
+provenance, and belong in the caption rather than in a key read at a glance.
+
+**Label null** — keep *both* real geometries and permute which model is which,
+destroying only the correspondence between them. Built from
+`src.analysis.configurations.protest` and `src.analysis.matrices.dcor_test`, and
+stored in `07A_permutation_tests`. It carries the real geometries through the
+real scoring path, so unlike the uninformed band it has no MDS gap.
+
+**Permutation band** — the label null's 5–95 interval, as drawn on a figure.
+The same object the note calls the label null: the figures say *permutation*
+because PROTEST and `dcor_test` are permutation tests, and the note says *label*
+because what is permuted is the labelling. **They are one concept under two
+names, not two nulls.** `figures/figure2_v2` draws both bands together; where
+they agree, the MDS gap above is small. The legend key reads **permutation**
+alone as of 2026-09-17 — it used to read "permutation null (5–95)", and dropped
+the noun to sit beside "random config", which does not carry it either, and the
+interval for the reason given there.
+
+**Generator** — how a structure null's configuration is drawn. Only two:
+`gaussian` and `dirichlet`. Dirichlet(1) *is* uniform on the simplex, so a
+separate "uniform" generator would be a duplicate.

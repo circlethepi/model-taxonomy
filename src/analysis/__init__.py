@@ -14,6 +14,21 @@ reconciling the identifier schemes different taxonomy levels use for the same
 models.
 """
 
+from .baselines import (
+    APPROX_MIN_N,
+    GENERATORS,
+    band_quantiles,
+    dcor_band_from_c,
+    dcor_null_direct,
+    disparity_null_analytic,
+    disparity_null_approx,
+    disparity_null_direct,
+    draw_configuration,
+    fit_dcor_c,
+    table_key,
+    truth_singular_values,
+    uninformed_band,
+)
 from .bridge import (
     as_distance_matrix,
     fit_geometry,
@@ -73,6 +88,20 @@ from .simplex import (
 )
 
 __all__ = [
+    # baselines
+    "APPROX_MIN_N",
+    "GENERATORS",
+    "band_quantiles",
+    "dcor_band_from_c",
+    "dcor_null_direct",
+    "disparity_null_analytic",
+    "disparity_null_approx",
+    "disparity_null_direct",
+    "draw_configuration",
+    "fit_dcor_c",
+    "table_key",
+    "truth_singular_values",
+    "uninformed_band",
     # bridge
     "as_distance_matrix",
     "lora_distance_matrix",

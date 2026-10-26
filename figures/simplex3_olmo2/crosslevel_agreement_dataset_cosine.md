@@ -1,4 +1,4 @@
-| level | dCor vs ground truth | Procrustes residual (lower=better) | surrogate | metric |
+| level | dCor vs ground truth | Procrustes residual at d=2 (lower=better) | surrogate | metric |
 |---|---|---|---|---|
 | behavioral | 0.9398 | 0.0869 | R=16 · per generation | cosine |
 | functional | 0.9790 | **0.0063** | late third | cosine |

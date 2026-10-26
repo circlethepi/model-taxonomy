@@ -80,6 +80,7 @@ compute cold and agree trivially. See ``docs/notes/caching_collections.md``.
 from __future__ import annotations
 
 import csv
+import dataclasses
 import hashlib
 import os
 import sys
@@ -114,7 +115,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
 import numpy as np  # noqa: E402
 
-from src.analysis import scan_cache  # noqa: E402
+from src.analysis import CacheIndex, datasets_present, scan_cache  # noqa: E402
 from src.analysis.bridge import as_distance_matrix, fit_geometry  # noqa: E402
 from src.analysis.comparison import (  # noqa: E402
     _distances, _distances_via_pairs, resolve_ordered,
@@ -128,7 +129,7 @@ from src.plots.config import set_style  # noqa: E402
 from src.plots.figures import save_figure  # noqa: E402
 from src.plots.simplex import (  # noqa: E402
     crosslevel_mds, dm_grid, mds_grid, mixture_label, mixture_weights,
-    sort_by_mixture, ternary_legend,
+    n_groups, sort_by_mixture, ternary_legend,
 )
 
 # ── Experiment coordinates ────────────────────────────────────────────────────
@@ -172,6 +173,12 @@ SOURCE = "src/plots/simplex_suite.py"
 #: the question-only query draw both inference stages used
 DRAW = {"recipe_hash": "6149cf8055bac2c1", "n_samples": 100, "seed": 1,
         "prompt_format_id": "ea27ccee"}
+#: Defaults, not fixtures: the corpus decides the embedder, and ``run_suite``
+#: replaces both from its *embedder* / *dataset_embedder* arguments. These two
+#: are yahoo's. dolly and oasst1 use nomic-embed-text-v2-moe -- 0b579825f703fb21
+#: behavioral, a831922612fddb96 dataset -- because oasst1's vertices are
+#: languages and a monolingual embedder would make that geometry its own
+#: artefact. A hash is per-corpus, not per-base-model.
 EMBEDDER = "a3c1f067c13d3cc8"          # nomic-embed-text-v1.5, search_document
 DATASET_EMBEDDER = "b37e80a31644dc03"  # authored by the 8B run; recipe-keyed
 SAMP_GREEDY, SAMP_SAMPLED = "6f000f01", "58d3f985"
@@ -683,10 +690,50 @@ def functional_cells(idx, ids, rows, cols=None):
     return list(rows), cells
 
 
-#: `matrix` keeps all 1000 per-document embeddings; `mean` is the (1, 768)
-#: centroid that was the only stored surrogate until 2026-08-24.
+#: `matrix` keeps all per-document embeddings; `mean` is the (1, 768) centroid
+#: that was the only stored surrogate until 2026-08-24.
+#:
+#: The `n_samples`/`seed` here are **defaults for the row label only**. Lookup
+#: never reads them -- ``_dataset_embedding_reps`` keys on the entry's own
+#: ``n_samples``/``seed`` and takes just ``embedder_hash`` and
+#: ``representation`` out of the selector -- and ``dataset_rows`` replaces both
+#: with the draw the index actually holds. They stay here so the dicts are
+#: readable on their own.
 DATASET_MEAN = {"n_samples": 1000, "seed": 0, "representation": "mean"}
 DATASET_MATRIX = {"n_samples": 1000, "seed": 0, "representation": "matrix"}
+
+
+def dataset_draw(idx):
+    """The ``(n_samples, seed)`` every indexed recipe was embedded at.
+
+    The row label has to name a draw, and until now it named ``n1000_s00`` as a
+    string literal. That was yahoo's draw written down, not the index's: dolly
+    trained at n=1000 and agreed by luck, oasst1 trained at n=500 and could not
+    match the key whatever it asked for. Reading the draw off the entries makes
+    the label true per corpus, and leaves every yahoo suite byte-identical
+    because those indexes are all ``(1000, 0)``.
+
+    Returns ``None`` when the entries disagree or carry no draw, which is the
+    caller's cue to fall back to the module defaults rather than assert a draw
+    that only some of the rows were built at.
+    """
+    draws = {(e.n_samples, e.seed) for e in idx.entries}
+    draws.discard((None, None))
+    if len(draws) != 1:
+        return None
+    (n_samples, seed), = draws
+    if n_samples is None or seed is None:
+        return None
+    return n_samples, seed
+
+
+def _dataset_selector(base, draw):
+    """*base* with its draw replaced by *draw*, and the matching label suffix."""
+    if draw is None:
+        n_samples, seed = base["n_samples"], base["seed"]
+        return dict(base), f"n{n_samples}_s{seed:02d}"
+    n_samples, seed = draw
+    return {**base, "n_samples": n_samples, "seed": seed}, f"n{n_samples}_s{seed:02d}"
 
 
 def dataset_rows(idx, ids, surrogates=True):
@@ -696,21 +743,29 @@ def dataset_rows(idx, ids, surrogates=True):
     ``docs/notes/dataset_embedding_layout.md`` §4 — so it exists only if the
     re-embed job has run. Its rows are omitted with a printed note rather than
     raising, so the no-GPU surrogates still render on a cache that predates it.
+
+    The un-centered rows are labelled with the draw :func:`dataset_draw` reads
+    off *idx*, so a driver asks for ``n500_s00`` on oasst1 and ``n1000_s00`` on
+    dolly and yahoo, and each is the truth about the rows underneath it.
     """
-    rows = {"dataset text · mean · n1000_s00": (DATASET_MEAN, None)}
+    draw = dataset_draw(idx)
+    mean_sel, suffix = _dataset_selector(DATASET_MEAN, draw)
+    matrix_sel, _ = _dataset_selector(DATASET_MATRIX, draw)
+
+    rows = {f"dataset text · mean · {suffix}": (mean_sel, None)}
     if not surrogates:
         return rows
     # The 16 centroids share one large "Yahoo answer register" direction, which
     # puts every raw cosine distance in 0.00-0.03. Removing it makes the mixture
     # geometry the whole of what is measured rather than a perturbation on it.
-    rows["dataset text · mean · centered"] = (DATASET_MEAN, centered("grand"))
+    rows["dataset text · mean · centered"] = (mean_sel, centered("grand"))
 
     if _dataset_matrix_available(idx, ids):
         # `grand`, not `rowwise`: row i is the i-th sampled document of *this*
         # recipe. Two recipes' row i are unrelated documents, so a per-row fleet
         # mean would be an average over 16 arbitrary texts.
-        rows["dataset text · matrix · n1000_s00"] = (DATASET_MATRIX, None)
-        rows["dataset text · matrix · centered"] = (DATASET_MATRIX, centered("grand"))
+        rows[f"dataset text · matrix · {suffix}"] = (matrix_sel, None)
+        rows["dataset text · matrix · centered"] = (matrix_sel, centered("grand"))
     else:
         print("    no 'matrix' dataset surrogate in the cache — skipping those "
               "rows. Run jobs/simplex3_qwen/02_embed_matrix.sh to author it.")
@@ -969,39 +1024,136 @@ def structural_projection_specs():
 
 # ── Ground truth, for the layer sweep and the cross-level closer ──────────────
 
-#: The three mixture components, as :mod:`src.analysis.ground_truth` names its
-#: simplex vertices. The order fixes which column of the weight array is which
-#: vertex, so it must match ``mixture_weights``.
-VERTICES = ["g1", "g2", "g3"]
+def vertices(ids):
+    """The mixture components these ids carry, as ground_truth names its vertices.
+
+    Derived from the parsed width rather than written down: yahoo's three groups
+    were a literal here, and a 4-group collection would have been described by a
+    3-vertex list while ``mixture_weights`` returned four columns. The order
+    fixes which column of the weight array is which vertex, so it must agree
+    with ``mixture_weights`` -- deriving it from the same parse is what makes
+    that agreement structural instead of a convention.
+    """
+    return [f"g{i}" for i in range(1, n_groups(ids) + 1)]
 
 
 def truth_weights(ids):
-    """The ``(n, 3)`` ground-truth mixture array, in *ids* order.
+    """The ``(n, K)`` ground-truth mixture array, in *ids* order.
 
     The only experiment-specific part of the ground truth: these adapters carry
     their recipe in their name, so the weights are parsed rather than read from
     a recipe file. Everything downstream of this array — the simplex embedding,
     its distance matrix, and both scores against it — is
     :mod:`src.analysis.ground_truth`.
+
+    ``n_groups`` is called for its check, not its value: a collection mixing
+    three- and four-group ids would otherwise reach ``np.vstack`` and fail there
+    with a shape error that names neither dataset.
     """
+    ids = list(ids)
+    n_groups(ids)
     return np.vstack([mixture_weights(m) for m in ids])
+
+
+def realized_truth_weights(ids, n_samples):
+    """The ground truth as the training draw actually realized it.
+
+    ``truth_weights`` parses what a model's name *asked for*. At a small draw
+    that is not what it got: the sampler allocates whole rows by largest
+    remainder, so a requested ``(25, 50, 25)`` at n=10 becomes 2/5/3 rows, i.e.
+    ``(20, 50, 30)`` — a 5-point error on a 25-point grid. Scoring against the
+    requested simplex would charge that discretisation to the taxonomy level, as
+    if the representation had failed to recover a geometry the training data
+    never had.
+
+    The two converge as the draw grows and are identical wherever ``n_samples``
+    divides evenly, which is why this has never mattered before: every simplex
+    to date trained at n=1000, where a 1% grid is exact. It is the *nsweep* — a
+    sweep over the training draw size — that makes the gap real, and it is
+    largest at exactly the ``nsamples_train`` whose scores are most interesting.
+
+    Returns the same ``(n, K)`` array shape as ``truth_weights``, normalized to
+    sum to 1 per row, so every downstream consumer is unchanged.
+    """
+    from src.datasets.mixed_dataset import _allocate_counts
+
+    ids = list(ids)
+    n_groups(ids)
+    rows = []
+    for m in ids:
+        w = list(mixture_weights(m))
+        counts = _allocate_counts(w, n_samples)
+        total = sum(counts)
+        if total <= 0:
+            raise ValueError(
+                f"Realized mixture for {m!r} at n_samples={n_samples} allocates "
+                f"no rows at all; the draw is too small for {len(w)} groups.")
+        rows.append([c / total for c in counts])
+    return np.vstack(rows)
+
+
+def check_realized_truth(ids, n_samples, tol=1e-12):
+    """Assert the realized mixture is never more than one row off the requested.
+
+    This is the guard on :func:`realized_truth_weights`, and it is deliberately
+    *not* "the two agree at a large draw". They do not, and cannot: the centre of
+    a 3-group simplex is spelled ``033g1_033g2_033g3``, whose parts sum to 99 and
+    normalize to exactly 1/3 each, so it is realizable only when ``n_samples`` is
+    divisible by 3. At n=10000 it is off by one row and stays off however far the
+    draw grows. Asserting convergence there would fail on the one mixture that
+    sits at the centre of every figure.
+
+    What is true at every ``nsamples_train`` is that largest-remainder allocation
+    is off by at
+    most one row per group, so no weight moves by more than ``1/n_samples``. That
+    bounds the discretisation for real, holds at n=10 as well as n=10000, and
+    fails loudly if the allocator is ever swapped for one without the property.
+
+    Returns the observed maximum deviation, so a caller can log it.
+    """
+    ids = list(ids)
+    delta = np.abs(realized_truth_weights(ids, n_samples) - truth_weights(ids))
+    worst = float(delta.max())
+    bound = 1.0 / n_samples
+    if worst > bound + tol:
+        j, k = np.unravel_index(delta.argmax(), delta.shape)
+        raise AssertionError(
+            f"realized mixture for {ids[j]!r} is off by {worst:.6g} in group "
+            f"{k + 1} at n_samples={n_samples}, above the one-row bound "
+            f"{bound:.6g}. Largest-remainder allocation should never do this; "
+            f"_allocate_counts has changed.")
+    return worst
 
 
 def truth_dm(ids):
     """Pairwise distances on the ground-truth simplex, in *ids* order.
 
-    Barycentric coordinates ``W @ simplex_vertices(3)``, not the raw weight
+    Barycentric coordinates ``W @ simplex_vertices(K)``, not the raw weight
     vectors. Those differ by a constant factor of ``1/√2``, and dCor is
     invariant to a constant rescaling, so this reports the same numbers as the
     ``pdist(W)`` this used to compute — while being the same object
     ``truth_geometry`` embeds, rather than a second convention alongside it.
     """
-    return simplex_distance_matrix(truth_weights(ids), list(ids), VERTICES)
+    return simplex_distance_matrix(truth_weights(ids), list(ids), vertices(ids))
 
 
 def truth_geometry(ids):
     """Where each model sits on the ground-truth simplex — the Procrustes target."""
-    return simplex_geometry(truth_weights(ids), list(ids), VERTICES)
+    return simplex_geometry(truth_weights(ids), list(ids), vertices(ids))
+
+
+def realized_truth_dm(ids, n_samples):
+    """``truth_dm`` against the mixture the draw realized. See
+    :func:`realized_truth_weights`."""
+    return simplex_distance_matrix(
+        realized_truth_weights(ids, n_samples), list(ids), vertices(ids))
+
+
+def realized_truth_geometry(ids, n_samples):
+    """``truth_geometry`` against the mixture the draw realized. See
+    :func:`realized_truth_weights`."""
+    return simplex_geometry(
+        realized_truth_weights(ids, n_samples), list(ids), vertices(ids))
 
 
 # ── Restricting a level to a chosen set of perspectives ───────────────────────
@@ -1144,8 +1296,30 @@ class SurrogateScore(NamedTuple):
 
     ``dcor`` runs 0→1 better; ``procrustes`` runs 1→0 better. They are not two
     readings of one quantity: dCor scores the distance matrix and never embeds,
-    while the disparity scores the configuration the MDS panel actually draws
-    and so inherits the distortion ``stress`` reports.
+    while the disparity scores an embedded *configuration* and so inherits the
+    distortion ``stress`` reports.
+
+    **The disparity needs a dimension, and now carries all of them.**  The truth
+    a ``K``-vertex simplex defines lives in ``K-1`` dimensions.  The taxonomy
+    side used to be fitted at a hardcoded 2, which was right only because K=3
+    made ``K-1 == 2`` by coincidence; at K=4 a flat 2-D configuration was being
+    superimposed on a tetrahedral truth, and ``procrustes_compare``'s zero-pad
+    absorbed the mismatch and returned an ordinary-looking number inflated by
+    every bit of truth variance outside the best-fit plane.
+
+    So ``procrustes_by_d`` holds one disparity per ``d`` in ``2 .. K-1``, each
+    fitted under the same ``MDS_SEED``, and ``stress_by_d`` the stress that
+    qualifies it.  ``procrustes`` and ``stress`` are the ``d = K-1`` entries --
+    the truth's own dimension, and the only one no dimensional mismatch can
+    reach.  At K=3 the range degenerates to the single ``d=2`` already reported,
+    so the yahoo suites reproduce their existing numbers exactly.
+
+    Read the stress columns down a row, never across it: stress falls
+    monotonically as ``d`` rises by construction, so it qualifies each disparity
+    and does not compare them.
+
+    ``d=2`` remains the fit the MDS panel draws, which is why it is always in
+    the sweep -- the panel is still showing a configuration that was scored.
     """
 
     dcor: float
@@ -1154,6 +1328,8 @@ class SurrogateScore(NamedTuple):
     row: str
     col: str
     dm: object
+    procrustes_by_d: dict = {}
+    stress_by_d: dict = {}
 
 
 def rank_surrogates(level_cells, ids, tdm=None, tgeo=None):
@@ -1170,9 +1346,24 @@ def rank_surrogates(level_cells, ids, tdm=None, tgeo=None):
     *tdm* and *tgeo* are the ground truth in matrix and configuration form; both
     are rebuilt from *ids* when omitted. Pass them when scoring several levels
     against the same models, which is what ``cross_level`` does.
+
+    The MDS dimension is swept over ``2 .. K-1`` rather than held at 2; see
+    :class:`SurrogateScore` for why the old single number was wrong above K=3.
+    The sweep stops at ``K-1`` because nothing above it can help: the truth has
+    exactly that many real dimensions, and every further dimension only lets the
+    taxonomy configuration spend variance the truth cannot match, measuring
+    headroom rather than agreement.
+
+    Several embeddings are fitted where the comment here used to insist on one.
+    That comment was guarding against fitting twice under *two seeds*, which
+    would let the reported numbers describe different configurations; every fit
+    here is under ``MDS_SEED`` and the drawn panel is still one of them, so the
+    hazard does not arise.
     """
     tdm = truth_dm(ids) if tdm is None else tdm
     tgeo = truth_geometry(ids) if tgeo is None else tgeo
+    truth_dim = np.asarray(tgeo.coordinates).shape[1]
+    dims = list(range(2, max(truth_dim, 2) + 1))
     scored = []
     for (row, col), cell in level_cells.items():
         if cell is None or isinstance(cell, str):
@@ -1180,21 +1371,52 @@ def rank_surrogates(level_cells, ids, tdm=None, tgeo=None):
         if float(np.max(np.abs(cell.matrix))) <= 1e-6:
             continue                     # the h0 control: no geometry to score
         try:
-            # One embedding, three uses: the disparity, the stress that
-            # qualifies it, and nothing else — fitting it twice under two seeds
-            # would let the reported numbers describe different configurations.
-            geo = SUITE_CACHE.geometry(cell, n_components=2,
-                                       random_state=MDS_SEED)
+            geos = {d: SUITE_CACHE.geometry(cell, n_components=d,
+                                            random_state=MDS_SEED)
+                    for d in dims}
+            proc = {d: disparity_vs_truth(cell, tgeo, geometry=_pad_geometry(g, truth_dim))
+                    for d, g in geos.items()}
+            stress = {d: float(kruskal_stress(cell, g)) for d, g in geos.items()}
             scored.append(SurrogateScore(
                 dcor=dcor_vs_truth(cell, tdm),
-                procrustes=disparity_vs_truth(cell, tgeo, geometry=geo),
-                stress=float(kruskal_stress(cell, geo)),
+                # The designated pair is the truth's own dimension: it is the
+                # one fit no padding reaches, and it is what the _procrustes
+                # ranking variant orders by.
+                procrustes=proc[truth_dim],
+                stress=stress[truth_dim],
                 row=row, col=col, dm=cell,
+                procrustes_by_d=proc, stress_by_d=stress,
             ))
         except Exception as exc:
             print(f"    scoring {row!r}/{col} skipped — "
                   f"{type(exc).__name__}: {exc}")
     return sorted(scored, key=lambda s: -s.dcor)
+
+
+def _pad_geometry(geo, width: int):
+    """*geo* embedded in a *width*-dimensional space, by appending zero columns.
+
+    ``procrustes_compare`` would do this itself, silently, for whichever
+    configuration is narrower — which is precisely the failure mode this sweep
+    exists to make visible. Doing it here instead means the padding is a
+    deliberate statement: *this is the d-dimensional fit, placed in the truth's
+    space*, and the column it lands in says which ``d`` that was. A narrower
+    configuration genuinely cannot reach the truth's variance outside its own
+    span, and the disparity should say so rather than hide it.
+    """
+    coords = np.asarray(geo.coordinates, dtype=float)
+    if coords.shape[1] == width:
+        return geo
+    if coords.shape[1] > width:
+        raise ValueError(
+            f"embedding is {coords.shape[1]}-dimensional, wider than the "
+            f"{width}-dimensional truth; nothing above the truth's own "
+            f"dimension is worth fitting."
+        )
+    padded = np.hstack([coords, np.zeros((coords.shape[0], width - coords.shape[1]))])
+    # n_components is corrected too: it names the fit, and a padded configuration
+    # that still claimed 2 would misdescribe itself to anything that read it.
+    return dataclasses.replace(geo, coordinates=padded, n_components=width)
 
 
 def _bold_if(value, flag) -> str:
@@ -1223,18 +1445,41 @@ def write_scores_csv(per_level_scores, path) -> None:
     tables are for reading and this is for diffing — and because ``matrix_sha256`` is
     the evidence a later change would need to show that a cached distance matrix
     is the matrix a cold run produces (see ``docs/notes/caching_collections.md``).
+
+    **The disparity columns are per dimension**: ``procrustes_d2 ..
+    procrustes_d{K-1}``, and the matching ``stress_d*``. Every dimension is
+    reported and none is designated as *the* number. A 3-vertex run therefore
+    has the single ``procrustes_d2``, which is exactly what the plain
+    ``procrustes`` column always was; a 4-vertex run has ``d2`` and ``d3``. The
+    unsuffixed name is deliberately not kept as an alias -- it named a dimension
+    silently, which is the thing being fixed.
     """
+    dims = sorted({d for ranked in per_level_scores.values()
+                   for s in ranked for d in s.procrustes_by_d})
     with open(path, "w", newline="") as fh:
         w = csv.writer(fh)
-        w.writerow(["level", "surrogate", "metric", "dcor", "procrustes", "stress",
-                    "n_models", "matrix_sha256"])
+        w.writerow(["level", "surrogate", "metric", "dcor"]
+                   + [f"procrustes_d{d}" for d in dims]
+                   + [f"stress_d{d}" for d in dims]
+                   + ["n_models", "matrix_sha256"])
         for lvl, ranked in per_level_scores.items():
             for s in ranked:
-                w.writerow([lvl, s.row, s.col, f"{s.dcor:.6f}",
-                            f"{s.procrustes:.6f}", f"{s.stress:.6f}",
-                            len(s.dm.model_ids), _matrix_digest(s.dm)])
+                w.writerow(
+                    [lvl, s.row, s.col, f"{s.dcor:.6f}"]
+                    + [_fmt(s.procrustes_by_d.get(d)) for d in dims]
+                    + [_fmt(s.stress_by_d.get(d)) for d in dims]
+                    + [len(s.dm.model_ids), _matrix_digest(s.dm)]
+                )
 
 
+def _fmt(value) -> str:
+    """A score cell, or an empty one for a dimension this row does not have."""
+    return "" if value is None else f"{value:.6f}"
+
+
+#: Parsed to float on read. These are the *old* unsuffixed spellings, kept so a
+#: CSV written before the dimension sweep still reads back -- several are tracked
+#: under figures/ and are what the aggregate driver plots.
 _SCORE_FIELDS = ("dcor", "procrustes", "stress")
 
 
@@ -1249,9 +1494,20 @@ def read_scores_csv(path) -> list[dict]:
     with open(path, newline="") as fh:
         rows = list(csv.DictReader(fh))
     for r in rows:
-        for f in _SCORE_FIELDS:
-            if r.get(f) not in (None, ""):
-                r[f] = float(r[f])
+        for f in list(r):
+            if f in _SCORE_FIELDS or f.startswith(("procrustes_d", "stress_d")):
+                if r.get(f) not in (None, ""):
+                    r[f] = float(r[f])
+        # A per-dimension file read by something asking for the old unsuffixed
+        # name gets the truth's own dimension -- the widest d present, which is
+        # the designated one and, on a 3-vertex run, is d2 and therefore exactly
+        # what that name always meant.
+        for base in ("procrustes", "stress"):
+            if base not in r:
+                widest = max((int(k.split("_d")[1]) for k in r
+                              if k.startswith(base + "_d")), default=None)
+                if widest is not None:
+                    r[base] = r[f"{base}_d{widest}"]
     return rows
 
 
@@ -1271,11 +1527,21 @@ def select_score(
     ``figures/simplex3_qwen_v4/make_figures.py``). Pass ``None`` when the level
     has a single surrogate.
 
+    *field* is one of ``_SCORE_FIELDS`` or a per-dimension column such as
+    ``"procrustes_d2"``. The unsuffixed ``"procrustes"`` is the truth's own
+    dimension, ``K-1``, whatever that is for the corpus the rows came from (see
+    :func:`read_scores_csv`); naming a dimension explicitly is how a figure asks
+    for the *same* dimension across corpora whose truths differ in width.
+
     Raises if the selection is not exactly one row, so a renamed or missing
     perspective fails loudly instead of silently plotting the wrong cell.
     """
-    if field not in _SCORE_FIELDS:
-        raise ValueError(f"field must be one of {_SCORE_FIELDS}, got {field!r}")
+    if field not in _SCORE_FIELDS and not (
+            field.startswith(("procrustes_d", "stress_d"))
+            and field.split("_d")[1].isdigit()):
+        raise ValueError(
+            f"field must be one of {_SCORE_FIELDS} or a per-dimension column "
+            f"such as 'procrustes_d2', got {field!r}")
     hits = [
         r for r in rows
         if r["level"] == level and r["metric"] == metric
@@ -1304,6 +1570,33 @@ LEVEL_ORDER = [
 ]
 
 
+def corpus_subtitle(ids) -> str:
+    """The figure subtitle for whichever corpus these adapters came from.
+
+    This string used to name yahoo's three topic groups on every figure, which
+    became wrong the moment a four-language or four-task corpus produced one.
+    The corpus token is the prefix the adapter ids carry — the only description
+    of the data these plotting functions are handed — and it selects the caption
+    from the same ``DataSimplexSpec`` the configs were generated from, so the
+    figure and the config cannot disagree about what was mixed.
+
+    An unrecognised corpus falls back to a derived sentence rather than raising:
+    a caption is not worth taking a figure down over.
+    """
+    from src.experiments.data_simplex_spec import SPECS
+
+    corpus = Path(list(ids)[0]).name.split("_", 1)[0]
+    spec = SPECS.get(corpus)
+    if spec is not None:
+        return spec.subtitle
+    return f"Mixtures of {n_groups(ids)} groups from the {corpus} dataset"
+
+
+def _truth_dim(tgeo) -> int:
+    """The ground truth's own dimension, ``K-1`` — the disparity a caption means."""
+    return int(np.asarray(tgeo.coordinates).shape[1])
+
+
 def cross_level(per_level, ids, outdir, metric_override=None, suffix="",
                 rank_by="dcor", label_perspective=False):
     """Each level's best-scoring surrogate side by side, plus the agreement table.
@@ -1326,10 +1619,17 @@ def cross_level(per_level, ids, outdir, metric_override=None, suffix="",
     *rank_by* chooses which of the two scores picks each level's panel:
     ``"dcor"`` takes the highest dCor, ``"procrustes"`` the lowest residual
     disparity. The two disagree often enough to be worth drawing both — dCor
-    scores the distance matrix and never embeds, while the disparity scores the
-    2-D configuration the panel actually draws — so the ``_procrustes`` variant
-    answers "which surrogate *looks* most like the simplex" where the default
-    answers "which surrogate's distances agree with it".
+    scores the distance matrix and never embeds, while the disparity scores an
+    embedded configuration — so the ``_procrustes`` variant answers "which
+    surrogate *looks* most like the simplex" where the default answers "which
+    surrogate's distances agree with it".
+
+    Which disparity, now that there are several? The ``d = K-1`` one: the truth's
+    own dimension, and the only fit no padding reaches. At K=3 that is ``d=2``,
+    which is both the configuration the panel draws and exactly what this
+    variant always ranked by, so nothing about the yahoo runs moves. At K=4 the
+    ranking is by ``procrustes_d3`` while the panel still draws the ``d=2`` fit,
+    and the caption says so rather than leaving the reader to assume they match.
 
     *label_perspective* names the winning perspective (surrogate x metric) under
     each panel's level name. It is on for the ``_procrustes`` variant because
@@ -1404,13 +1704,14 @@ def cross_level(per_level, ids, outdir, metric_override=None, suffix="",
         perspective = f"{s.row} \u00d7 {s.col}"
         return "\n".join([name] + textwrap.wrap(perspective, width=24))
 
-    subtitle = "Mixtures from 3 topic groupings from the Yahoo Answers Dataset"
+    subtitle = corpus_subtitle(ids)
     crosslevel_mds(
         [(panel_label(name, lvl), winners[lvl].dm, winners[lvl].dcor,
           winners[lvl].procrustes)
          for name, lvl in ordered],
         "Cross-Taxonomy Simplex — MDS"
-        + (" (best Procrustes per level)" if rank_by == "procrustes" else ""),
+        + (f" (best Procrustes at d={_truth_dim(tgeo)} per level)"
+           if rank_by == "procrustes" else ""),
         subtitle=subtitle + (f" · {note}" if note else ""),
         savepath=outdir / f"fig_crosslevel_mds{suffix}.png",
         random_state=MDS_SEED,
@@ -1420,15 +1721,17 @@ def cross_level(per_level, ids, outdir, metric_override=None, suffix="",
     cells = {("best surrogate", lbl): winners[lvl].dm for lbl, lvl in labels}
     dm_grid(cells, ["best surrogate"], [lbl for lbl, _ in labels],
             "Cross-level comparison — distance matrices, each level's "
-            + ("lowest-Procrustes" if rank_by == "procrustes" else "best")
+            + (f"lowest-Procrustes (d={_truth_dim(tgeo)})"
+               if rank_by == "procrustes" else "best")
             + " surrogate" + (f" ({note})" if note else ""),
             savepath=outdir / f"fig_crosslevel_dm{suffix}.png")
     plt.close("all")
 
     # Two scores in one table, running in opposite directions, so the header
     # says which way each one reads rather than leaving it to be inferred.
-    header = ["| level | dCor vs ground truth | Procrustes residual (lower=better) "
-              "| surrogate | metric |", "|---|---|---|---|---|"]
+    d = _truth_dim(tgeo)
+    header = [f"| level | dCor vs ground truth | Procrustes residual at d={d} "
+              f"(lower=better) | surrogate | metric |", "|---|---|---|---|---|"]
     best_proc = min((s.procrustes for _, s in table_rows), default=None)
     lines = list(header)
     for lvl, s in table_rows:
@@ -1459,7 +1762,8 @@ def cross_level(per_level, ids, outdir, metric_override=None, suffix="",
             # scores disagree about which surrogate recovers the simplex.
             top3 = {id(s) for s in sorted(ranked, key=lambda s: s.procrustes)[:3]}
             detail += [f"### {lvl}", "",
-                       "| dCor | Procrustes residual (lower=better) | surrogate | metric |",
+                       f"| dCor | Procrustes residual at d={d} (lower=better) "
+                       f"| surrogate | metric |",
                        "|---|---|---|---|"]
             detail += [f"| {s.dcor:.4f} | {_bold_if(s.procrustes, id(s) in top3)} "
                        f"| {s.row} | {s.col} |" for s in ranked]
@@ -1529,7 +1833,9 @@ def _selected_level(idx, ids, names, level, chosen, surrogates):
 def run_suite(*, base_model, draw, outdir, cache_root=None, levels=None,
               skip_sweep=False, skip_detail=False, surrogates=False,
               no_cache=False, select=None, source=None, n_expected=16,
-              crosslevel_only=False):
+              crosslevel_only=False, datasets=None, embedder=None,
+              dataset_embedder=None, train_draw=None, mixtures=None,
+              lora_rank=None, lora_init_seed=None, closer=True):
     """Build the figure suite for one run.
 
     This is the old ``main()`` body with the argument parsing lifted out, so the
@@ -1542,6 +1848,54 @@ def run_suite(*, base_model, draw, outdir, cache_root=None, levels=None,
     every stored collection's ``config.json`` and should name the **driver**, so
     a cached collection says which run wrote it.
 
+    *datasets* restricts the scan to the named corpora, as a sequence of
+    recipe-name prefixes or dataset ids. It is not optional in practice once a
+    base model carries two of them: ``03_adapters/<base_slug>`` holds every
+    adapter for that model whatever it was trained on, so an unfiltered scan of
+    a Qwen cache holding both yahoo and dolly returns 51 models and the
+    ``n_expected`` guard below trips. ``None`` scans everything, which is what
+    every driver did before a second corpus existed.
+
+    *train_draw* restricts the scan to one training draw, as an
+    ``(n_samples, seed)`` pair. It is the same kind of guard *datasets* is, one
+    axis further in: ``03_adapters/<base_slug>`` holds every adapter for a base
+    model whatever it was trained on **and however much it was trained on**, so
+    once the nsweep tree lands, a yahoo-filtered scan of the OLMo cache returns
+    656 models rather than 16 and the ``n_expected`` guard trips. ``None`` scans
+    every draw, which is what every driver did before a second training size
+    existed. A driver over a training grid passes one pair per figure — or, more
+    usefully, iterates ``idx.slices(by=("n_samples", "seed"))`` and calls this
+    once per cell, so the guard checks 40 collections of 16 rather than one of
+    640.
+
+    *mixtures* restricts the scan to a named set of mixtures, as raw integer
+    percentage tuples like ``(25, 50, 25)``. It is the filter of last resort, for
+    when nothing coarser separates two experiments: the 16-point 25%-grid simplex
+    and the 1004-point 1%-grid pool share the yahoo corpus, the OLMo base model
+    *and* the ``(n_samples=1000, seed=0)`` training draw, so ``datasets`` and
+    ``train_draw`` both return all 1020 and only the mixture itself tells them
+    apart. Pass ``spec.mixture_pcts`` from the ``DataSimplexSpec`` the figure is
+    about. ``None`` keeps every mixture.
+
+    *lora_rank* restricts the scan to adapters trained at one LoRA rank. It is
+    the same kind of guard *train_draw* is, for the fourth axis a rank sweep
+    adds: ``lora_ranks=(1, 2, 4, 8, 16, 32, 64, 128)`` trains the whole simplex
+    at each rank, so one corpus, one base model, one training draw and one
+    mixture grid still return eight adapters per mixture and nothing coarser
+    tells them apart. Pass the rank the figure is about -- 16 for every suite
+    that ran before the sweep, which is ``Suite.lora_rank``'s default. ``None``
+    keeps every rank.
+
+    *lora_init_seed* restricts the scan to adapters initialised from one LoRA
+    init seed, and is the same guard again for the fifth axis the init sweep
+    adds: ``lora_init_seeds=(0, ..., 9)`` trains the whole simplex from each
+    draw of ``A``, so one corpus, one base model, one training draw, one rank
+    and one mixture grid still return ten adapters per mixture. Pass the seed
+    the figure is about -- 0 for every suite that ran before the sweep, which is
+    the generator's ``LORA_INIT_SEED`` -- and note that the sweep's ``i00``
+    point *is* the pre-sweep collection rather than a re-run of it, so pinning
+    the seed keeps a figure the measurement it was. ``None`` keeps every seed.
+
     *crosslevel_only* keeps the cross-level closer and drops every other output:
     the per-level grids, the per-metric detail panels, the functional layer sweep
     and the barycentric colour key. It changes what is **written**, never what is
@@ -1550,20 +1904,52 @@ def run_suite(*, base_model, draw, outdir, cache_root=None, levels=None,
     they would in a full run. Use it for a suite that exists to be compared with
     others rather than read on its own.
 
-    The run coordinates other than *base_model* and *draw* — the samplers, the
-    embedders, ``MAX_NEW_TOKENS`` — are deliberately **not** parameters. They are
-    module constants shared by every simplex3 suite, and the three runs agree on
-    all of them; a driver that needed to differ would be a different experiment,
-    not a different argument.
+    *closer* turns the cross-level closer itself off. Together with
+    ``crosslevel_only=True`` that is a call which writes no figure and no table
+    at all, which is what a caller wanting only the computed matrices needs:
+    :func:`run_suite` returns ``(per_level, ids)``, so
+    ``figures/figure2/make_figures.py`` draws the four MDS panels into its own
+    layout rather than re-deriving the cells or reading a picture back off
+    disk. Every perspective is still built, scored and cached; it is the
+    writing that stops.
+
+    *mixtures* restricts the scan further, to an explicit list of mixture
+    labels (``CacheEntry.mixture``, e.g. ``"yahoo_025g1_050g2_025g3"``). It is
+    the finer companion to *datasets*: a corpus filter separates two experiments
+    that share a base model, and this separates two experiments that share both.
+    That happens as soon as a second run trains adapters on the *same* corpus
+    and the same base model at a different mixture resolution -- the group-size
+    sweep put 1004 further yahoo mixtures in the OLMo cache, so an unfiltered
+    scan there returns 1015 models where the simplex3 suite wants its own 16.
+    ``None`` keeps every mixture the corpus filter left, which is what every
+    driver did before such a pool existed.
+
+    *embedder* and *dataset_embedder* name the ``embedder_hash`` the behavioral
+    and dataset_embedding levels read. They default to ``None``, which keeps the
+    module constants and so keeps every yahoo suite exactly what it was. They
+    exist because the corpus decides the embedder: yahoo was embedded with
+    nomic-embed-text-v1.5, and dolly and oasst1 with the multilingual v2-moe,
+    because oasst1's language vertices must not be an artefact of a monolingual
+    embedder. A hash is per-corpus, not per-base-model, so the eight new drivers
+    pass the same two.
+
+    The remaining run coordinates — the samplers, ``MAX_NEW_TOKENS`` — are
+    deliberately **not** parameters. They are module constants shared by every
+    simplex3 suite, and every run agrees on them; a driver that needed to differ
+    would be a different experiment, not a different argument.
     """
     global CACHE_ROOT, ADAPTER_ROOT, SUITE_CACHE
-    global BASE_MODEL, BASE_SLUG, DRAW, SOURCE
+    global BASE_MODEL, BASE_SLUG, DRAW, SOURCE, EMBEDDER, DATASET_EMBEDDER
 
     BASE_MODEL = base_model
     BASE_SLUG = BASE_MODEL.replace("/", "--")
     DRAW = dict(draw)
     if source is not None:
         SOURCE = source
+    if embedder is not None:
+        EMBEDDER = embedder
+    if dataset_embedder is not None:
+        DATASET_EMBEDDER = dataset_embedder
 
     arch = architecture(BASE_MODEL)
     apply_architecture(arch)
@@ -1599,21 +1985,100 @@ def run_suite(*, base_model, draw, outdir, cache_root=None, levels=None,
     set_style("two_col_full")
 
     idx = scan_cache(str(CACHE_ROOT), base_model_id=BASE_MODEL,
-                     behavioral_draw=DRAW, functional_draw=DRAW)
+                     behavioral_draw=DRAW, functional_draw=DRAW,
+                     datasets=datasets)
+    if train_draw is not None:
+        n_samples, seed = train_draw
+        idx = idx.filter(n_samples=n_samples, seed=seed)
+    if lora_rank is not None:
+        idx = idx.filter(lora_rank=lora_rank)
+    if lora_init_seed is not None:
+        idx = idx.filter(lora_init_seed=lora_init_seed)
+    if mixtures is not None:
+        from src.plots.simplex import raw_mixture_pcts
+        wanted = {tuple(m) for m in mixtures}
+        idx = CacheIndex([e for e in idx.entries
+                          if raw_mixture_pcts(e.model_id) in wanted],
+                         idx.cache_root)
+    # The count guard runs before sort_by_mixture, not after: a mixed-corpus
+    # scan is the likeliest reason for a wrong count, and sorting would raise on
+    # the mixed widths first with a message about weight arrays rather than
+    # about the cache.
+    if len(idx.model_ids) != n_expected:
+        found = datasets_present(idx)
+        draws = sorted({(e.n_samples, e.seed) for e in idx.entries
+                        if e.n_samples is not None})
+        ranks = sorted({e.lora_rank for e in idx.entries
+                        if e.lora_rank is not None})
+        seeds = sorted({e.lora_init_seed for e in idx.entries
+                        if e.lora_init_seed is not None})
+        if len(found) > 1:
+            why = ("The cache holds more than one dataset under this base model, "
+                   "which is by design -- pass datasets=[...] to say which one "
+                   "this figure is about.")
+        elif len(draws) > 1:
+            # The nsweep case: one corpus, one base model, several training
+            # draws.  Worth naming separately, because datasets=[...] is the
+            # obvious thing to reach for here and it will not help.
+            why = (f"The cache holds {len(draws)} training draws of this corpus "
+                   f"{draws[:4]}{'...' if len(draws) > 4 else ''}, which is by "
+                   f"design -- pass train_draw=(n_samples, seed) to say which "
+                   f"one this figure is about.")
+        elif len(ranks) > 1:
+            # The rank-sweep case: one corpus, one base model, one training
+            # draw, the same mixture grid trained at every rank. Named before
+            # the mixture branch below because mixtures=[...] is what that
+            # branch asks for and it cannot separate two ranks of one mixture.
+            why = (f"The cache holds {len(ranks)} LoRA ranks of this corpus "
+                   f"{ranks}, which is by design -- pass lora_rank=r to say "
+                   f"which one this figure is about.")
+        elif len(seeds) > 1:
+            # The init-sweep case: everything above agrees and the mixture grid
+            # is the figure's own, but the simplex was trained from several
+            # draws of A. Named before the mixture branch for the rank branch's
+            # reason -- mixtures=[...] cannot separate two seeds of one mixture.
+            why = (f"The cache holds {len(seeds)} LoRA init seeds of this "
+                   f"corpus {seeds}, which is by design -- pass "
+                   f"lora_init_seed=i to say which one this figure is about.")
+        elif len(idx.model_ids) > n_expected:
+            # One corpus, one base model, one draw, still too many: two mixture
+            # grids share all three.  This is the simplex-vs-pool collision, and
+            # neither datasets= nor train_draw= can help with it.
+            why = ("The cache holds more mixtures of this corpus than this "
+                   "figure is about -- a finer mixture grid over the same "
+                   "corpus, base model and training draw is indistinguishable "
+                   "by any of them. Pass mixtures=spec.mixture_pcts to say "
+                   "which grid this figure is about.")
+        else:
+            why = "Cache incomplete?"
+        raise SystemExit(
+            f"expected {n_expected} models, found {len(idx.model_ids)}"
+            + (f" across {len(found)} corpora {found}" if len(found) > 1 else "")
+            + ". " + why
+        )
     ids = sort_by_mixture(idx.model_ids)
     names = [Path(m).name for m in ids]
-    print(f"cache: {CACHE_ROOT}\nmodels: {len(ids)}")
+    print(f"cache: {CACHE_ROOT}\nmodels: {len(ids)}"
+          + (f"\ndatasets: {list(datasets)}" if datasets else ""))
     print(f"reuse: {'reads bypassed (--no-cache), still writing' if no_cache else '06_pairwise'}")
-    if len(ids) != n_expected:
-        raise SystemExit(
-            f"expected {n_expected} models, found {len(ids)} — cache incomplete?")
 
     if not crosslevel_only:
-        fig, ax = plt.subplots(figsize=(4.2, 4.0))
-        ternary_legend(ax, ids, label_models=True)
-        ax.set_title("simplex3 mixtures — barycentric colour key", fontsize=9)
-        save_figure(fig, str(outdir / "fig_ternary_legend.png"))
-        plt.close("all")
+        if n_groups(ids) == 3:
+            fig, ax = plt.subplots(figsize=(4.2, 4.0))
+            ternary_legend(ax, ids, label_models=True)
+            ax.set_title("simplex3 mixtures — barycentric colour key", fontsize=9)
+            save_figure(fig, str(outdir / "fig_ternary_legend.png"))
+            plt.close("all")
+        else:
+            # There is no honest 2-D barycentric picture of a tetrahedron:
+            # `_bary_to_xy` maps to a triangle and `ternary_legend` labels three
+            # corners, and neither has a 4-vertex analogue. Skipped rather than
+            # projected, and said out loud rather than silently omitted -- the
+            # MDS panels remain, coloured by the full weight vector, and they
+            # are what keeps the recipe legible at K > 3.
+            print(f"note: {n_groups(ids)} groups — no ternary legend "
+                  f"(a simplex above 2-D has no barycentric plane); "
+                  f"points are still coloured by their full mixture")
 
     def emit_grid(*args, **kwargs):
         """:func:`emit`, unless the driver wants the cross-level closer alone.
@@ -1698,7 +2163,7 @@ def run_suite(*, base_model, draw, outdir, cache_root=None, levels=None,
                             detail_title)
             per_level["dataset_embedding"] = cells
 
-    if len(per_level) > 1:
+    if len(per_level) > 1 and closer:
         print("cross-level …")
         cross_level(per_level, ids, outdir)
         # The same comparison with the dataset level read under cosine instead of
@@ -1719,3 +2184,4 @@ def run_suite(*, base_model, draw, outdir, cache_root=None, levels=None,
     n = len(list(outdir.glob("*.png")))
     print(f"\nwrote {n} figures to {outdir}")
     print(SUITE_CACHE.report())
+    return per_level, ids

@@ -361,6 +361,57 @@ def distance_correlation(
     return _dcor_from_matrices(a, b, bias_corrected)
 
 
+def distance_correlation_restricted(
+    dm_a: DistanceMatrix,
+    dm_b: DistanceMatrix,
+    keep: Sequence[ModelID],
+    bias_corrected: bool = True,
+    key: Callable[[ModelID], str] | None = None,
+) -> float:
+    """dCor* over *keep*, centred over every row the two matrices hold.
+
+    The **centre-then-restrict** reading of "score a subset of a collection":
+    U-centre both matrices over all their rows, then sum the inner products over
+    the *keep* block alone.  :func:`distance_correlation` is the other reading --
+    restrict-then-score -- reached by handing it matrices already cut down to
+    *keep*.
+
+    The two are not the same number, and the difference is not an artifact.
+    U-centring subtracts, from each entry, row and column means taken over
+    **every row present**; a model outside *keep* therefore enters the centring
+    term of every model inside it.  That is exactly what "these reference models
+    inform the configuration but are not themselves scored" has to mean at the
+    matrix level, since dCor* never embeds and so has no other channel through
+    which an unscored point could inform anything.
+
+    Restrict-then-score, by contrast, is genuinely blind to the extra rows: a
+    pairwise distance depends only on its two models, so cutting both matrices
+    down first yields precisely the matrices a collection of *keep* alone would
+    have produced.  Which of the two a caller wants is a question about the
+    design, not about the estimator, so neither is made the default and this one
+    is named for what it does.
+
+    *keep* may be any subset of the two matrices' common models, and is what
+    orders the block; both matrices are reconciled onto their common ids first,
+    so the two need not agree on row order.
+    """
+    ids, (a, b) = match_models(dm_a, dm_b, key=key)
+    position = {m: i for i, m in enumerate(ids)}
+    try:
+        idx = [position[m] for m in keep]
+    except KeyError as exc:
+        raise ValueError(
+            f"{exc.args[0]!r} is in `keep` but not in both matrices. `keep` must "
+            f"be a subset of the {len(ids)} models the two share."
+        ) from None
+    if len(set(idx)) != len(idx):
+        raise ValueError("`keep` repeats a model; the block would be singular.")
+
+    A = _center(_clean(a), bias_corrected)[np.ix_(idx, idx)]
+    B = _center(_clean(b), bias_corrected)[np.ix_(idx, idx)]
+    return _dcor_from_centered(A, B, bias_corrected)
+
+
 @dataclass
 class DcorResult:
     """Outcome of a permutation test on the distance correlation."""

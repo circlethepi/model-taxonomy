@@ -54,6 +54,49 @@ class Suite:
     torch_dtype: str = "float16"
     target_modules: tuple[str, ...] = ("q_proj", "k_proj", "v_proj", "o_proj")
 
+    #: The LoRA rank every adapter of this run is trained at.  16 for every suite
+    #: that has run, and that is the regression test as much as the default: the
+    #: rank is inside every adapter's directory name (``..._r16_i00_b5008``), so a
+    #: different value here would repoint the whole tree at paths that do not
+    #: exist.
+    #:
+    #: ``lora_alpha`` is NOT a field beside it.  The generator renders
+    #: ``2 * rank``, which is the 32 every existing config carries at rank 16 --
+    #: alpha is the gain on the low-rank update (PEFT scales ``B @ A`` by
+    #: ``alpha / rank``), so pinning the ratio is what keeps a rank sweep a sweep
+    #: over capacity rather than over update magnitude as well.
+    lora_rank: int = 16
+
+    #: The ranks a **rank sweep** trains, if this suite is one.  Empty means "just
+    #: ``lora_rank``", which is every suite that has run, so the existing trees
+    #: emit exactly the files they already carry.
+    #:
+    #: Non-empty makes rank a fourth axis of the adapter list, alongside the
+    #: proportion, the training draw size and the draw seed: the tree trains the
+    #: whole simplex at each rank and extracts over the union.  It is a Suite
+    #: field rather than a ``DataSimplexSpec`` one because rank describes how a
+    #: run is configured and not what corpus it is run over -- the same reason
+    #: ``target_modules`` and ``torch_dtype`` are here.
+    lora_ranks: tuple[int, ...] = ()
+
+    #: The LoRA initialisation seeds an **initsweep** trains, if this suite is
+    #: one.  Empty means "just the generator's ``LORA_INIT_SEED``", which is 0 and
+    #: is every suite that has run, so the existing trees emit exactly the files
+    #: they already carry.
+    #:
+    #: Non-empty makes the initialisation seed an axis of the adapter list beside
+    #: rank: the tree trains the whole simplex once per seed and extracts over
+    #: the union.  The seed is the ``_i00`` token every adapter directory already
+    #: carries (``..._r16_i00_b5008``), so seed 0 resolves to adapters that are
+    #: already on disk and only the other seeds are new work.
+    #:
+    #: A Suite field rather than a ``DataSimplexSpec`` one for the same reason
+    #: ``lora_ranks`` is: initialisation says how a run is configured, not what
+    #: corpus it is run over.  It varies neither the rows trained on nor their
+    #: order -- that is the *dataset draw* seed, the ``s00`` in ``_n1000_s00``,
+    #: which lives on the spec.
+    lora_init_seeds: tuple[int, ...] = ()
+
     #: ``{}`` renders no ``prompt_format:`` block at all, which is what makes the
     #: raw path byte-identical to the pre-prompt-format generator output.
     prompt_format: dict = field(default_factory=dict)
@@ -91,15 +134,75 @@ class Suite:
     #: Replicates per sweep point.  Half the main run's R, which is what buys the
     #: sweep ten points for the cost of five of the existing runs.
     sweep_replicates: int = 8
-    #: Adapters per sweep shard.  Four rather than the main run's eight because
-    #: halving R halves the decode, so four adapters at R=8 lands at the same
-    #: wall the eight-shard R=16 run was sized against — 40 job files instead of
-    #: 80, at no change to the slot length the partitions were chosen for.  Raise
-    #: it and regenerate if the queue is congested; nothing downstream depends on
-    #: the shard count.
+    #: The number of sweep *shards*, not the adapters in one.  The code slices
+    #: ``names[i::sweep_shards]``, so this is a divisor; the two readings happen
+    #: to coincide at yahoo's 16 adapters over 4 shards, which is how the old
+    #: docstring ("adapters per sweep shard") survived.  Resize with that in
+    #: mind.
+    #:
+    #: Four rather than the main run's eight because halving R halves the decode,
+    #: so four adapters at R=8 lands at the same wall the eight-shard R=16 run
+    #: was sized against — 40 job files instead of 80, at no change to the slot
+    #: length the partitions were chosen for.  Raise it and regenerate if the
+    #: queue is congested; nothing downstream depends on the shard count.
     sweep_shards: int = 4
 
+    #: Shard *counts* for training and the R=16 behavioral run, read the same way
+    #: as ``sweep_shards`` above.  They live here rather than in the generator
+    #: because sharding is a property of how much work a run has -- which is the
+    #: number of adapters, times the walls this suite was tuned to -- rather than
+    #: of the model or of the corpus.  The defaults are yahoo's 16 adapters at 4
+    #: and 2 adapters per shard; a 35-adapter corpus holds those ratios by
+    #: raising the counts to 9 and 18 rather than by doubling every wall.
+    train_shards: int = 4
+    behavioral_shards: int = 8
+
+    #: Adapters per sampled-behavioral shard, for the corpora whose shard counts
+    #: ``_suite_for_dataset`` *derives* from the adapter count rather than taking
+    #: from ``behavioral_shards`` above.  2 is the value every existing wall was
+    #: tuned against and is what the generator's
+    #: ``BEHAVIORAL_ADAPTERS_PER_SHARD`` carried, so every tree on disk is
+    #: unmoved.
+    #:
+    #: It is a field because the adapter count is not the only thing that sets a
+    #: shard's length: ``query_n * replicates`` is the decode budget per adapter,
+    #: and a suite that raises either by 40x has the same 16 adapters costing
+    #: forty times the wall.  Cutting to one adapter per shard there is what keeps
+    #: a shard the length the partitions were chosen for, and keeps a shard that
+    #: dies costing one adapter's decode instead of two.
+    behavioral_adapters_per_shard: int = 2
+
+    #: Adapters per sampled-behavioral shard, for the corpora whose shard counts
+    #: ``_suite_for_dataset`` *derives* from the adapter count rather than taking
+    #: from ``behavioral_shards`` above.  2 is the value every existing wall was
+    #: tuned against and is what the generator's
+    #: ``BEHAVIORAL_ADAPTERS_PER_SHARD`` carried, so every tree on disk is
+    #: unmoved.
+    #:
+    #: It is a field because the adapter count is not the only thing that sets a
+    #: shard's length: ``query_n * replicates`` is the decode budget per adapter,
+    #: and a suite that raises either by 40x has the same 16 adapters costing
+    #: forty times the wall.  Cutting to one adapter per shard there is what keeps
+    #: a shard the length the partitions were chosen for, and keeps a shard that
+    #: dies costing one adapter's decode instead of two.
+    behavioral_adapters_per_shard: int = 2
+
+    #: Shards for the greedy run.  One -- i.e. unsharded -- for every suite that
+    #: has 16 adapters to decode, which is what "~7 generate() calls per adapter
+    #: against ~50 for the sampled runs" buys.  It stops being true once a tree
+    #: has a training grid: the same ~17.7 s/model over 1440 adapters is ~7
+    #: hours, and the greedy wall is 1:30.  Sharding is the fix rather than a
+    #: longer wall, because greedy shards write to disjoint adapter directories
+    #: and short slots backfill.
+    greedy_shards: int = 1
+
     emit_embed_jobs: bool = True
+    #: The ``matrix`` re-embed of the trained draws.  Unlike the sweep above this
+    #: defaults on for every suite, because it authors a surrogate that does not
+    #: exist yet under any of them and is model-free, so whichever suite runs
+    #: first satisfies the rest.  A corpus with its own dataset build tree turns
+    #: it off here: that tree owns it, and two trees emitting it would race.
+    emit_embed_matrix_job: bool = True
     #: The standalone build job is a fail-fast gate for the *embedding* sweeps
     #: only.  Every other job runs ``--steps build ...`` and writes the recipes
     #: it needs, so a suite that emits no embed jobs does not need this one.
@@ -143,6 +246,25 @@ class Suite:
     #: skipping the dead name, so every GPU job in the tree failed at submit.
     #: h200 took its place as the large-HBM tier.
     gpu_partitions: str = "h200,h100,l40s,a100"
+
+    #: Partitions for the TRAINING jobs alone, when they may not go everywhere the
+    #: extraction jobs may.  ``None`` means "the same list", which is every suite
+    #: that has run -- their trees must not move by a byte.
+    #:
+    #: It exists because l40s is safe for extraction on some models and not for
+    #: training them: a 48 GB card makes ``device_map="auto"`` offload part of the
+    #: model, the offloaded submodule returns a meta gradient, and the backward
+    #: pass dies with ``expected device meta but got cuda:0`` -- not a clean OOM,
+    #: so it does not read as one in the log.  Thirteen of thirteen train shards
+    #: that landed on an l40s node died this way on 2026-09-05.  Until now the fix
+    #: was to hand-submit training with ``sbatch --partition=h200,h100``, which
+    #: works only for a tree whose training is not driven from ``submit_all.sh``.
+    train_partitions: str | None = None
+
+    @property
+    def train_gpu_partitions(self) -> str:
+        """The partition list the training jobs are emitted with."""
+        return self.train_partitions or self.gpu_partitions
 
     @property
     def model_slug(self) -> str:

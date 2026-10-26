@@ -1,0 +1,12 @@
+level,surrogate,metric,dcor,procrustes_d2,stress_d2,n_models,matrix_sha256
+behavioral,T=0.6 · per query,cosine,0.943694,0.063885,0.251055,16,fafb95a8ec86ae9f
+behavioral,T=0.8 · per query,cosine,0.940871,0.045912,0.278457,16,3ea0891c3d12845c
+behavioral,T=0.7 · per query,cosine,0.933836,0.071480,0.268791,16,fcfe47b6763ec5e2
+behavioral,T=0.1 · per query,cosine,0.916168,0.043298,0.214665,16,97fa0429910e0d41
+behavioral,T=0.4 · per query,cosine,0.910708,0.042681,0.219014,16,681ebbff10595550
+behavioral,T=0.5 · per query,cosine,0.905333,0.064626,0.240714,16,1ffc67345071bd4c
+behavioral,T=0.2 · per query,cosine,0.897168,0.044644,0.208779,16,4c1ec740e77e8189
+behavioral,T=0.3 · per query,cosine,0.895553,0.048882,0.213773,16,78f69de8ed580dde
+behavioral,greedy · per generation (R=1: no per-query mean),cosine,0.821050,0.235098,0.304386,16,47b80387f6eb547e
+behavioral,T=1.0 · per query,cosine,0.409724,0.477677,0.290020,16,627db25e864c84b9
+behavioral,T=0.9 · per query,cosine,0.407410,0.670706,0.281415,16,afda8c5ee92565ee

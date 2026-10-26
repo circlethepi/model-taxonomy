@@ -1,4 +1,4 @@
-| level | dCor vs ground truth | Procrustes residual (lower=better) | surrogate | metric |
+| level | dCor vs ground truth | Procrustes residual at d=2 (lower=better) | surrogate | metric |
 |---|---|---|---|---|
 | behavioral | 0.9051 | 0.7217 | R=16 · per query | bw |
 | functional | 0.9752 | **0.0088** | all 41 layers (reference) | cosine |

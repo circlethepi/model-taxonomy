@@ -1,4 +1,4 @@
-from .config import GLOBAL_FIGURES_DIR, PALETTE, lin_formatter, set_style
+from .config import GLOBAL_FIGURES_DIR, PALETTE, lin_formatter, set_style, shade
 from .figures import (
     PlotSeries,
     encoding_legend,

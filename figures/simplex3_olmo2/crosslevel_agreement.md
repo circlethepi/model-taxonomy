@@ -1,4 +1,4 @@
-| level | dCor vs ground truth | Procrustes residual (lower=better) | surrogate | metric |
+| level | dCor vs ground truth | Procrustes residual at d=2 (lower=better) | surrogate | metric |
 |---|---|---|---|---|
 | behavioral | 0.9398 | 0.0869 | R=16 · per generation | cosine |
 | functional | 0.9790 | **0.0063** | late third | cosine |
@@ -10,7 +10,7 @@
 
 ### behavioral
 
-| dCor | Procrustes residual (lower=better) | surrogate | metric |
+| dCor | Procrustes residual at d=2 (lower=better) | surrogate | metric |
 |---|---|---|---|
 | 0.9398 | **0.0869** | R=16 · per generation | cosine |
 | 0.9383 | **0.0747** | R=16 · per query | cosine |
@@ -30,7 +30,7 @@
 
 ### functional
 
-| dCor | Procrustes residual (lower=better) | surrogate | metric |
+| dCor | Procrustes residual at d=2 (lower=better) | surrogate | metric |
 |---|---|---|---|
 | 0.9790 | **0.0063** | late third | cosine |
 | 0.9770 | **0.0073** | h16 · final hidden state | cosine |
@@ -50,7 +50,7 @@
 
 ### structural
 
-| dCor | Procrustes residual (lower=better) | surrogate | metric |
+| dCor | Procrustes residual at d=2 (lower=better) | surrogate | metric |
 |---|---|---|---|
 | 0.9706 | **0.0087** | v_proj | cosine |
 | 0.9705 | **0.0088** | late third | cosine |
@@ -70,10 +70,12 @@
 | 0.9526 | 0.0302 | q_proj (whole) | frobenius |
 | 0.9522 | 0.0277 | output projections | frobenius |
 | 0.9441 | 0.0357 | early third | frobenius |
+| 0.9306 | 0.0157 | layer 15 · o_proj | cosine |
+| 0.9104 | 0.0471 | layer 15 · o_proj | frobenius |
 
 ### dataset_embedding
 
-| dCor | Procrustes residual (lower=better) | surrogate | metric |
+| dCor | Procrustes residual at d=2 (lower=better) | surrogate | metric |
 |---|---|---|---|
 | 0.9800 | **0.0153** | dataset text · mean · n1000_s00 | frobenius |
 | 0.9797 | **0.0152** | dataset text · mean · n1000_s00 | euclidean |

@@ -62,8 +62,26 @@ REPO_ROOT = HERE.parents[1]
 sys.path.insert(0, str(REPO_ROOT))
 
 from src.plots import simplex_suite as suite  # noqa: E402
+from src.experiments.data_simplex_spec import SPECS  # noqa: E402
 
 BASE_MODEL = "allenai/OLMo-2-0425-1B-Instruct"
+
+#: Which corpus this driver plots. Not optional once a second dataset is trained
+#: on the same base model: `03_adapters/<base_slug>` holds every adapter for that
+#: model regardless of what it was trained on -- the draw arguments set
+#: availability flags and never filter -- so an unfiltered scan would return both
+#: corpora and `n_expected` would trip.
+DATASETS = ["yahoo"]
+
+#: Which mixtures this driver plots. `datasets` is no longer enough on its own:
+#: the 1004-adapter group-size pool is also yahoo, also on this base model, and
+#: also trained at (n_samples=1000, seed=0), so a scan filtered only by corpus
+#: returns 1020 models and `n_expected` trips. It is drawn from the 1% grid while
+#: this figure's simplex is the 25% grid plus the centre, so the mixture is the
+#: only thing that separates them. Taken from the spec rather than written out,
+#: so the figure cannot drift from the tree that produced it.
+MIXTURES = SPECS["yahoo"].mixture_pcts()
+
 
 #: Decoder layers, from the checkpoint's own config. Uniform softmax attention,
 #: no `full_attention_interval` and no `attn_output_gate`, so the suite emits
@@ -117,6 +135,12 @@ SELECT = {
         ("late third", "frobenius"),
         ("v_proj", "cosine"),
         ("output projections", "cosine"),
+        # The last decoder layer's output projection alone, the finest
+        # structural handle in the standing per-level default set. The
+        # all-layer `output projections` row above is the same
+        # projection pooled over the whole stack; the pair says whether
+        # the recipe is legible at one layer or only across them.
+        (f"layer {N_LAYERS - 1} · o_proj", "cosine"),
         ("early third", "cosine"),
     ],
     # Three non-transform perspectives exist in total, so "top ten" is all of them.
@@ -152,6 +176,8 @@ def main() -> None:
         surrogates=False,
         select={k: v for k, v in SELECT.items() if k in levels},
         crosslevel_only=True,
+        datasets=DATASETS,
+        mixtures=MIXTURES,
         source="figures/simplex3_olmo2/make_figures.py",
     )
 

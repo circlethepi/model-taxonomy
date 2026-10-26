@@ -1,4 +1,4 @@
-| level | dCor vs ground truth | Procrustes residual (lower=better) | surrogate | metric |
+| level | dCor vs ground truth | Procrustes residual at d=2 (lower=better) | surrogate | metric |
 |---|---|---|---|---|
 | behavioral | 0.8164 | 0.1973 | R=16 · per query | cka |
 | functional | 0.9746 | **0.0075** | h32 · final hidden state | cosine |

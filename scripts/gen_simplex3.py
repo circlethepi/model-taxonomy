@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Generate every config and sbatch script for the yahoo 3-group simplex experiment.
+"""Generate every config and sbatch script for a grouped-mixture simplex experiment.
 
 Ten yahoo topics are partitioned into three semantic groups, datasets are drawn at
 every 25% composition of those groups, and the resulting mixtures are measured at
@@ -16,77 +16,70 @@ Transposing two group weights in one of them would be invisible on review and wo
 silently mislabel a point of the simplex.  Here the group definitions and the
 simplex enumeration exist once, and the whole tree is reproducible with one command.
 
-One generator, several suites: what the experiment *is* lives here, and what one
-*run* of it is configured as lives in :class:`src.experiments.suite.Suite`.  A
-second base model is a Suite entry plus a model profile, not a forked copy of
-this file -- forking would duplicate the simplex enumeration and the level
-defaults, and the copies would drift the first time a shard count changed.
+One generator, two axes: what the experiment *is* lives here, and the two things
+that vary between runs of it live in dataclasses.  A
+:class:`src.experiments.suite.Suite` says *how* a run is configured -- base
+model, dtype, LoRA targets, walls, sharding.  A
+:class:`src.experiments.data_simplex_spec.DataSimplexSpec` says *what corpus the
+simplex is built over* -- the dataset, the vertex axis, the group partition, the
+projections, the grid, the draw sizes, the embedder.  A second base model is a
+Suite entry plus a model profile; a second dataset is a spec entry.  Neither is a
+forked copy of this file -- forking would duplicate the simplex enumeration and
+the level defaults, and the copies would drift the first time a shard count
+changed.
 
-The default suite must regenerate byte-for-byte::
+The yahoo tree of every existing suite must regenerate byte-for-byte::
 
-    python scripts/gen_simplex3.py && git diff --exit-code experiments/simplex3 jobs/simplex3
+    for s in llama qwen llama3i nemo olmo2; do python scripts/gen_simplex3.py --suite $s; done
+    git diff --exit-code experiments jobs
+
+Four axes, not two: a Suite may also sweep the LoRA *rank*, which crosses the
+simplex with ``Suite.lora_ranks`` and makes every adapter list rank-major (empty
+for every suite but ``olmo2_rsweep``), or the LoRA *initialisation seed*, which
+crosses it with ``Suite.lora_init_seeds`` and makes the list init-seed-major
+(empty for every suite but ``olmo2_initsweep``).  Both empty everywhere else, so
+the trees above are untouched.
+
+The initialisation seed is not the dataset-draw seed.  It is the ``_i00`` token
+in an adapter's directory name, the argument to ``torch.manual_seed`` immediately
+before PEFT draws the LoRA ``A`` and ``B`` matrices; the draw seed is the ``s00``
+in ``_n1000_s00``, it chooses which rows are trained on, and it lives on the
+spec.  An initsweep varies the first and holds the second.
+
+Note that the number of groups is *not* fixed at three despite this file's name:
+yahoo is a 2-simplex over three groups, dolly and oasst1 are 3-simplexes over
+four.  The name is kept because it is in five directory names, five job-name
+prefixes and a great deal of sacct history.
 
 Usage:
-    python scripts/gen_simplex3.py                 # write experiments/simplex3/, jobs/simplex3/
-    python scripts/gen_simplex3.py --suite qwen    # write experiments/simplex3_qwen/, jobs/simplex3_qwen/
-    python scripts/gen_simplex3.py --list          # enumerate the proportions and exit
+    python scripts/gen_simplex3.py                    # yahoo x llama -> experiments/simplex3/
+    python scripts/gen_simplex3.py --suite qwen       # yahoo x qwen  -> experiments/simplex3_qwen/
+    python scripts/gen_simplex3.py --dataset dolly --suite qwen       # -> simplex3_dolly_qwen/
+    python scripts/gen_simplex3.py --suite olmo2_rsweep  # yahoo x 8 LoRA ranks
+    python scripts/gen_simplex3.py --suite olmo2_initsweep  # yahoo x 10 LoRA init seeds
+    python scripts/gen_simplex3.py --dataset dolly --data-tree        # -> simplex3_dolly_data/
+    python scripts/gen_simplex3.py --list             # enumerate the proportions and exit
 """
 
 from __future__ import annotations
 
 import argparse
 import sys
-from math import gcd
+from math import ceil, gcd
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from src.experiments.data_simplex_spec import SPECS, DataSimplexSpec  # noqa: E402
+from src.experiments.query_mixture_spec import QMIX_SPECS, QMixArm  # noqa: E402
 from src.experiments.suite import Suite  # noqa: E402
 
 # ── The experiment's fixed parameters ──────────────────────────────────────────
 
-#: Topic ids per semantic group.  Order matters only for readability.
-GROUPS: dict[str, list[int]] = {
-    "g1": [0, 6, 7, 9],   # politics & government, business & finance,
-                          # society & culture, entertainment & music
-    "g2": [1, 3, 4],      # science & mathematics, computers & internet,
-                          # education & reference
-    "g3": [2, 5, 8],      # sports, family & relationships, health
-}
-
-DATASET_ID = "yahoo_answers_topics"
-CLASS_FIELD = "topic"
-
-#: The training/embedding projection: a row is title + body + answer, so every
-#: level projects the same text.  See docs/notes/TODO.md item 11 for what the
-#: alternative cost last time.
-TEXT_FIELDS = ["question_title", "question_content", "best_answer"]
-#: The question-only projection: question only, so the model must actually answer
-#: rather than continue text that already contains the answer.
-#:
-#: Named rather than lettered.  The two query sets' *roles* invert between a raw
-#: suite and a chat suite -- under a chat template with completion-only loss the
-#: training prompt is the question, so the question-only set becomes the
-#: in-distribution probe and the full-context one the contaminated one, the
-#: reverse of the raw suite -- and a positional letter cannot carry that.
-#:
-#: Still needed on the raw path even though a chat suite expresses the same list
-#: as ``prompt_format.user_fields``: this is what renders the Llama suite's
-#: ``text_fields``, and that output must stay byte-identical.
-QUERY_QUESTION_ONLY_FIELDS = ["question_title", "question_content"]
-
-#: Measured on a 1000-row draw of the even mixture at seed 1:
-#:     question_title      empty in   0.0%
-#:     question_content    empty in  46.3%
-#:     best_answer         empty in   2.2%
-#: So `question_content` is absent from nearly half of yahoo, and query set B is
-#: a bare title for about half its prompts.  That does not invalidate the
-#: ablation -- B is still question-only -- but B's prompts are substantially
-#: shorter than A's and about half carry no body at all, which belongs in any
-#: caption comparing the two.  It also means the three-field training
-#: composition is effectively title+answer for half the corpus, i.e. much closer
-#: to the existing yahoo_qa adapters than the field list suggests.
-FIELD_EMPTINESS_NOTE = "question_content is empty in ~46% of yahoo rows"
+# Everything that describes the *corpus* -- the group partition, the vertex axis,
+# the text projections, the draw sizes, the embedder, the prose caveats -- lives
+# in src/experiments/data_simplex_spec.py, one DataSimplexSpec per dataset. What
+# is left here is what is true of the experiment whichever corpus it is run over.
 
 #: Absolute, so a job started from a worktree still writes into the one shared
 #: cache rather than growing a second copy that disappears with the worktree.
@@ -106,20 +99,235 @@ CACHE_DIR = f"{REPO}/results/shared_cache"
 #: the default is the Llama run, whose emitted files must not change.
 SUITE = Suite()
 
+#: Which corpus.  Rebound by ``main()`` from --dataset; the default is yahoo, for
+#: the same reason -- five trees on disk were emitted under it.
+SPEC = SPECS["yahoo"]
+
+#: True while the standalone dataset build tree is being emitted.  Its configs
+#: name no base model, because nothing in them loads one; see ``base_models_yaml``.
+DATA_TREE = False
+
+#: The bound :class:`QMixSpec` while a **qmix** tree is being emitted, else None.
+#:
+#: qmix ("query mixture") is the axis of query-set *composition*: what fraction
+#: of the 100-row probe is the corpus the adapters were trained on, the rest
+#: being a diluting corpus they never saw.  It varies the probe, never the
+#: adapter -- a qmix tree trains nothing and reuses an existing adapter fleet.
+#: See ``src/experiments/query_mixture_spec.py``.
+#:
+#: Read by exactly two functions that behave differently under it -- ``slug``,
+#: so the tree does not land on top of the suite's own, and
+#: ``prompt_format_block``, which must emit the union field list.  Everything
+#: else a qmix config needs is passed explicitly, so that binding this global
+#: cannot change a file any other mode emits.
+QMIX = None
+
+
+def base_models_yaml() -> str:
+    """The ``base_models:`` block.
+
+    Empty for a dataset build tree.  Every job in that tree runs the dataset
+    level only -- ``extraction.models`` is ``[]`` and fine-tuning is off -- so no
+    model is ever loaded, and naming one would imply the centroids depend on it
+    when ``DatasetEmbeddingCache`` keys on recipe and embedder alone.
+    """
+    if DATA_TREE:
+        return ("base_models: []   # none: this tree builds the dataset level, "
+                "which is model-free\n")
+    return f"base_models:\n  - {SUITE.base_model}\n"
+
+
+def slug() -> str:
+    """The directory leaf both trees are written under.
+
+    Dataset first, then suite, so ``simplex3`` stays ``simplex3`` and a second
+    corpus on the same model reads as ``simplex3_dolly_qwen`` rather than as a
+    variant of the qwen suite.
+    """
+    if DATA_TREE:
+        return f"simplex3{SPEC.suffix}_data"
+    if QMIX is not None:
+        # Between the dataset token and the suite's, so the tree reads as "the
+        # qmix variant of simplex3_olmo2" -- and, more to the point, so it does
+        # not land on top of simplex3_olmo2 itself, whose adapters it reuses and
+        # whose results directory it must not write experiment.yaml into.
+        return f"simplex3{SPEC.suffix}{QMIX.suffix}{SUITE.suffix}"
+    return f"simplex3{SPEC.suffix}{SUITE.suffix}"
+
 
 def output_dir() -> str:
-    return f"{REPO}/results/simplex3{SUITE.suffix}"
+    """Where results and logs land.
+
+    Carries the dataset token as well as the suite's.  It must: adapters live in
+    the shared cache under the base model, but ``experiment.yaml`` here is
+    first-writer-wins and ``logs/`` filenames carry no dataset token, so two
+    corpora sharing one results directory would interleave silently.
+    """
+    return f"{REPO}/results/{slug()}"
+
+
+def samples_seen(n: int | None = None) -> int:
+    """The ``_b5008`` token every adapter is named for.
+
+    Derived from the suite's effective batch rather than written down: the budget
+    quantizes up to a whole number of steps, so the number in the name is not the
+    number in the config, and a suite at another effective batch would otherwise
+    be named for a budget it never saw.
+
+    *n* is the training draw size, and changes the answer only under a spec in
+    budget mode -- where the budget is a fixed number of epochs, so each `nsamples_train` of
+    an nsweep carries its own token (``_b64``, ``_b512``, ``_b5008``,
+    ``_b50000``).  Omitting it means "this spec's single draw", which is what
+    every non-nsweep call site means.
+    """
+    return SPEC.samples_seen(SUITE.effective_batch, n)
+
+
+def train_targets() -> list[tuple[str, int, int, int, int]]:
+    """Every adapter this tree trains, as ``(proportion, n_samples, seed, rank,
+    init_seed)``.
+
+    Ordered init-seed-major, then rank-major, then by `nsamples_train`, then by
+    seed, then by proportion, because
+    that is the order the shards are cut in: a training shard must be one wall,
+    and the walls differ by ~750x between the smallest and largest
+    `nsamples_train`, so a shard may never straddle two values of n.  Rank is
+    outermost for a second reason -- ``lora_rank`` is one scalar in a training
+    config, so a shard *cannot* mix two ranks whatever the walls say.  The
+    initialisation seed is outside rank for exactly that second reason again:
+    ``fine_tuning.lora_init_seed`` is one scalar per config too.  A
+    contiguous slice of this list is within one init seed, one rank and one
+    `nsamples_train` by construction.
+
+    For a spec that never set a training grid, under a suite that sweeps neither
+    rank nor initialisation,
+    this is the 16 proportions at the one draw it has always trained, which is the
+    list the generator used to build inline.
+    """
+    props = [name for name, _ in proportions()]
+    return [(name, n, seed, rank, init_seed)
+            for init_seed in lora_init_seeds()
+            for rank in lora_ranks()
+            for n, seed in SPEC.train_grid()
+            for name in props]
+
+
+def extract_targets() -> list[tuple[str, int, int, int, int]]:
+    """The adapters extraction runs over -- ``train_targets`` minus the `nsamples_train` values
+    ``extract_sizes`` excludes.
+
+    Separate from ``train_targets`` because a declined `nsamples_train` must still be
+    trainable later at the shard index it was generated with: the training
+    shards keep naming it, and only the extraction configs stop.  For every spec
+    that trains its whole grid the two are the same list.
+    """
+    props = [name for name, _ in proportions()]
+    return [(name, n, seed, rank, init_seed)
+            for init_seed in lora_init_seeds()
+            for rank in lora_ranks()
+            for n, seed in SPEC.extract_grid()
+            for name in props]
+
 
 SEEDS = list(range(10))
-N_SWEEP = "tens 3"          # -> [1, 10, 100, 1000]
-TRAIN_N, TRAIN_SEED = 1000, 0
-TOTAL_TRAIN_SAMPLES = 5000  # -> ceil(5000/16) = 313 steps -> 5008 samples seen
-SAMPLES_SEEN = 5008
-LORA_RANK, LORA_INIT_SEED = 16, 0
 
-QUERY_N, QUERY_SEED = 100, 1
-REPLICATES = 16
+
+def sweep_seeds() -> list[int]:
+    """The seeds the sample-size sweep runs at, for the bound spec.
+
+    ``SEEDS`` is the sweep the three original corpora ran; a spec may narrow it,
+    and a spec that sets it empty drops the sweep altogether.  Read through this
+    rather than off ``SEEDS`` directly, so that a corpus which does not want the
+    sweep does not silently emit ten jobs' worth of it.
+    """
+    return SEEDS if SPEC.sweep_seeds is None else list(SPEC.sweep_seeds)
+
+
+#: The LoRA initialisation seed every tree emitted before the initsweep was
+#: added, and still the fallback for every suite that does not set
+#: ``Suite.lora_init_seeds``.  Its companion, the *rank*, moved onto ``Suite``
+#: when the rank sweep was added: rank is something a run is configured with, and
+#: one run now varies it.  The same is now true of this.
+LORA_INIT_SEED = 0
+
+
+def lora_ranks() -> tuple[int, ...]:
+    """The ranks this tree trains the whole simplex at.
+
+    ``(16,)`` for every suite that has run -- ``Suite.lora_ranks`` is empty and
+    ``Suite.lora_rank`` is 16 -- so the emitted trees are unchanged.  A rank sweep
+    sets ``lora_ranks`` and this is its axis.
+    """
+    return SUITE.lora_ranks or (SUITE.lora_rank,)
+
+
+def rank_sweep() -> bool:
+    """Whether rank is an axis of this tree rather than a fixed setting.
+
+    Read wherever emitted *prose* would otherwise assert something true only of a
+    single-rank tree ("all 16 adapters"), so that the thirteen trees already on
+    disk keep the sentences they carry.
+    """
+    return len(lora_ranks()) > 1
+
+
+def lora_init_seeds() -> tuple[int, ...]:
+    """The LoRA initialisation seeds this tree trains the whole simplex at.
+
+    ``(0,)`` for every suite that has run -- ``Suite.lora_init_seeds`` is empty
+    and ``LORA_INIT_SEED`` is 0 -- so the emitted trees are unchanged.  An
+    initsweep sets ``lora_init_seeds`` and this is its axis.
+    """
+    return SUITE.lora_init_seeds or (LORA_INIT_SEED,)
+
+
+def init_sweep() -> bool:
+    """Whether the initialisation seed is an axis of this tree.
+
+    Read wherever emitted *prose* would otherwise assert something true only of a
+    single-seed tree ("all 16 adapters"), so that the trees already on disk keep
+    the sentences they carry.
+    """
+    return len(lora_init_seeds()) > 1
+
+
+def lora_alpha(rank: int) -> int:
+    """The LoRA gain's numerator for *rank*.
+
+    Alpha is not a free parameter beside rank: PEFT scales the low-rank update by
+    ``alpha / rank``, and every adapter that has been trained here used 32 at rank
+    16, i.e. a gain of 2.  Returning ``2 * rank`` renders the same 32 for every
+    existing config and holds the gain fixed across a rank sweep, so the sweep
+    varies capacity alone.  Fixing alpha at 32 instead would sweep the gain from
+    32x down to 0.25x alongside it and confound the axis.
+
+    Not in the adapter name, and it does not need to be: the name carries ``_r``,
+    and alpha is a function of it.
+    """
+    return 2 * rank
+
+
+#: Replicates moved to ``DataSimplexSpec.replicates`` when a spec needed to vary
+#: them; every existing spec carries 16, so the five trees on disk regenerate
+#: unchanged.  Read ``SPEC.replicates``, not a constant.
 MAX_NEW_TOKENS = 128
+
+#: ``generate()`` calls one adapter costs at a given batch width -- the quantity
+#: decode time is actually driven by, since every call runs ``MAX_NEW_TOKENS``
+#: sequential steps regardless of how wide it is.  Derived rather than written
+#: down because the two figures the emitted prose quotes ("~7 calls per adapter
+#: against ~50 for the sampled runs") are only true at ``query_n=100``, and a
+#: spec that probes with 1000 queries would otherwise ship a comment off by 10x.
+def generate_calls(n_queries: int, batch_size: int) -> int:
+    return -(-n_queries // batch_size)
+
+
+#: The batch width every SAMPLED run is pinned to.  See the ``batch_size: 2``
+#: block emitted for the behavioral and sweep levels: one RNG stream serves a
+#: whole ``generate()`` call, so batch shape determines the text, and the value
+#: is excluded from the cache key.  Named here so the prose that counts calls and
+#: the YAML that sets it cannot drift.
+SAMPLED_BATCH_SIZE = 2
 
 #: Sampled runs hold batch_size at 2 because one RNG stream serves a whole
 #: generate() call, so batch shape determines the text (first-order) and the value
@@ -134,9 +342,6 @@ MAX_NEW_TOKENS = 128
 #: producing a sixteenth of the text. At 16 it is ~7 calls per adapter instead of
 #: 50, which is what makes this job cheap.
 GREEDY_BATCH_SIZE = 16
-
-TRAIN_SHARDS = 4
-BEHAVIORAL_SHARDS = 8
 
 #: GPU partition order is a Suite field -- it is a property of what the run needs
 #: from the hardware, not of the experiment.  CPU stays here: nothing about it
@@ -154,32 +359,58 @@ CPU_PARTITION = "med"
 
 # ── The simplex ────────────────────────────────────────────────────────────────
 
-def proportions() -> list[tuple[str, tuple[int, int, int]]]:
-    """``(name, (pct_g1, pct_g2, pct_g3))`` for every point of the 2-simplex.
+def proportions() -> list[tuple[str, tuple[int, ...]]]:
+    """``(name, pct_per_group)`` for every point of the simplex.
 
-    Fifteen grid points -- the compositions of 4 into 3 non-negative parts,
-    ``C(6,2) = 15``: three pure vertices, six edge points, three edge midpoints and
-    three interior points -- plus the even ``(1/3, 1/3, 1/3)`` mixture, which is not
-    on a 25% grid and is the query draw.
+    The grid points are the compositions of ``spec.grid`` into ``K`` non-negative
+    parts, ``C(grid + K - 1, K - 1)`` of them.  Yahoo's three groups on the 25%
+    grid give ``C(6,2) = 15``: three pure vertices, six edge points, three edge
+    midpoints and three interior points.  Four groups on the same grid give
+    ``C(7,3) = 35``.
 
-    The even point's name rounds to ``033g1_033g2_033g3`` and sums to 99, not 100.
-    Only the label rounds; the recipe carries exact 1:1:1 weights.
+    The even mixture is appended only when it is not already a grid point -- that
+    is, only when ``K`` does not divide ``grid``.  Yahoo's ``(1/3, 1/3, 1/3)``
+    is not on a 25% grid, so it is the appended sixteenth and is also the query
+    draw; its name rounds to ``033g1_033g2_033g3`` and sums to 99, not 100.  Only
+    the label rounds, and the recipe underneath carries exact 1:1:1 weights.  At
+    K=4 the even point is ``(25,25,25,25)``, already enumerated and exact, so
+    nothing is appended and nothing rounds.
+
+    Enumeration order is lexicographic on the first ``K-1`` parts with the last
+    determined, which is the order the original hand-written triple loop
+    produced.  It is load-bearing only for byte-parity with the trees already on
+    disk, but that is reason enough not to change it.
+
+    Under a spec carrying ``n_mixtures`` the enumeration is *sampled* instead --
+    a fixed-size uniform draw without replacement from the non-vertex grid
+    points, with the vertices and the even mixture appended as references.  The
+    enumeration itself lives on the spec (``DataSimplexSpec.mixture_pcts``), so
+    the two modes cannot drift apart and the analysis side can reproduce the pool
+    without importing this generator.
     """
-    out: list[tuple[str, tuple[int, int, int]]] = []
-    for i in range(5):
-        for j in range(5 - i):
-            k = 4 - i - j
-            pct = (i * 25, j * 25, k * 25)
-            out.append((name_for(pct), pct))
-    out.append((name_for((33, 33, 33)), (33, 33, 33)))
-    return out
+    return [(name_for(pct), pct) for pct in SPEC.mixture_pcts()]
 
 
-def name_for(pct: tuple[int, int, int]) -> str:
-    return "yahoo_" + "_".join(f"{p:03d}{g}" for p, g in zip(pct, GROUPS))
+def proportions_for(spec: DataSimplexSpec) -> list[tuple[str, tuple[int, ...]]]:
+    """``proportions()`` for a spec that is not the bound one.
+
+    Needed once, in ``main()``: the shard counts follow the adapter count, and
+    that has to be known before the spec is bound for emission.
+    """
+    global SPEC
+    was, SPEC = SPEC, spec
+    try:
+        return proportions()
+    finally:
+        SPEC = was
 
 
-def weights_for(pct: tuple[int, int, int]) -> list[tuple[str, int]]:
+def name_for(pct: tuple[int, ...]) -> str:
+    return f"{SPEC.name_prefix}_" + "_".join(
+        f"{p:03d}{g}" for p, g in zip(pct, SPEC.groups))
+
+
+def weights_for(pct: tuple[int, ...]) -> list[tuple[str, int]]:
     """``(group, integer weight)`` for the non-zero groups, in lowest terms.
 
     Entry weights are relative -- ``normalized_weights`` divides by the sum -- so
@@ -191,7 +422,7 @@ def weights_for(pct: tuple[int, int, int]) -> list[tuple[str, int]]:
     recipe_hash distinct via a differing entry set, and avoids filtering 1.4M rows
     to draw none.
     """
-    nonzero = [(g, p) for g, p in zip(GROUPS, pct) if p > 0]
+    nonzero = [(g, p) for g, p in zip(SPEC.groups, pct) if p > 0]
     divisor = 0
     for _, p in nonzero:
         divisor = gcd(divisor, p)
@@ -205,24 +436,36 @@ def weights_for(pct: tuple[int, int, int]) -> list[tuple[str, int]]:
 # dumped mapping loses every reason.
 
 def entry_yaml(group: str, weight: int, text_fields: list[str], indent: str = "      ") -> str:
+    """One ``entries:`` block: this group's rows, at this relative weight.
+
+    ``text_field:`` names the spec's answer column, not a literal.  It is only
+    the fallback projection -- ``text_fields`` wins -- but a fallback naming a
+    column the dataset does not have is a trap waiting for the first caller that
+    takes the fallback path.
+
+    ``class_filter`` is emitted bare, so string members are unquoted YAML.  Safe
+    for all three datasets as written, and a hazard if a fourth is added: ``no``
+    (Norwegian), ``on``, ``off``, ``y`` and ``n`` are YAML 1.1 booleans and would
+    silently become ``False``/``True`` and match no row.
+    """
     return (
-        f"{indent}- dataset_id: {DATASET_ID}\n"
+        f"{indent}- dataset_id: {SPEC.dataset_id}\n"
         f"{indent}  split: train\n"
         f"{indent}  weight: {weight}.0\n"
-        f"{indent}  text_field: best_answer          # fallback projection; text_fields wins\n"
+        f"{indent}  text_field: {SPEC.answer_field}          # fallback projection; text_fields wins\n"
         f"{indent}  text_fields: [{', '.join(text_fields)}]\n"
         f'{indent}  text_separator: "\\n"\n'
-        f"{indent}  class_field: {CLASS_FIELD}\n"
-        f"{indent}  class_filter: {GROUPS[group]}\n"
+        f"{indent}  class_field: {SPEC.class_field}\n"
+        f"{indent}  class_filter: {SPEC.groups[group]}\n"
         f"{indent}  class_sampling: pooled           # draw from the union, not per-topic quotas\n"
     )
 
 
-def dataset_block(name: str, pct: tuple[int, int, int], *,
+def dataset_block(name: str, pct: tuple[int, ...], *,
                   sweep: str | None = None, seeds: list[int] | None = None,
                   n_samples: int | None = None, seed: int | None = None,
                   text_fields: list[str] | None = None) -> str:
-    fields = text_fields or TEXT_FIELDS
+    fields = text_fields or list(SPEC.text_fields)
     head = f"  - name: {name}\n    recipe_type: class_aware\n"
     if sweep is not None:
         head += f"    n_samples_sweep: {sweep}\n"
@@ -232,15 +475,24 @@ def dataset_block(name: str, pct: tuple[int, int, int], *,
         head += f"    n_samples: {n_samples}\n"
     if seed is not None:
         head += f"    seed: {seed}\n"
-    head += f"    # {pct[0]}% g1 / {pct[1]}% g2 / {pct[2]}% g3\n    entries:\n"
+    mix = " / ".join(f"{p}% {g}" for p, g in zip(pct, SPEC.groups))
+    head += f"    # {mix}\n    entries:\n"
     return head + "".join(
         entry_yaml(g, w, fields) for g, w in weights_for(pct)
     )
 
 
-EVEN = (33, 33, 33)
-QUERY_FULL_CONTEXT_NAME = name_for(EVEN)
-QUERY_QUESTION_ONLY_NAME = QUERY_FULL_CONTEXT_NAME + "_qtc"
+def even() -> tuple[int, ...]:
+    """The equal mixture, which is the query draw for every level."""
+    return SPEC.even_pct
+
+
+def query_full_context_name() -> str:
+    return name_for(even())
+
+
+def query_question_only_name() -> str:
+    return query_full_context_name() + "_qtc"
 
 
 def query_blocks(which: str) -> str:
@@ -256,21 +508,145 @@ def query_blocks(which: str) -> str:
     selects the rows, so it stays as it is.
     """
     if which == "full_context":
-        return dataset_block(QUERY_FULL_CONTEXT_NAME, EVEN, n_samples=QUERY_N, seed=QUERY_SEED)
-    return dataset_block(QUERY_QUESTION_ONLY_NAME, EVEN, n_samples=QUERY_N, seed=QUERY_SEED,
-                         text_fields=QUERY_QUESTION_ONLY_FIELDS)
+        return dataset_block(query_full_context_name(), even(),
+                             n_samples=SPEC.query_n, seed=SPEC.query_seed)
+    return dataset_block(query_question_only_name(), even(),
+                         n_samples=SPEC.query_n, seed=SPEC.query_seed,
+                         text_fields=list(SPEC.query_fields))
 
 
-def adapter_name(name: str) -> str:
+def qmix_entry_yaml(dataset_id: str, weight: int, *, text_fields: tuple[str, ...],
+                    answer_field: str, class_field: str, class_filter: list,
+                    indent: str = "      ") -> str:
+    """One entry of a **qmix** query recipe: one corpus, at one relative weight.
+
+    The single-corpus ``entry_yaml`` cannot serve here -- it reads ``dataset_id``,
+    ``class_field`` and ``answer_field`` off the bound spec, and the whole point
+    of a query mixture is that the two entries disagree about all three.
+    ``ClassDatasetEntry`` has always carried them per entry; nothing in the data
+    layer had to change for this.
+
+    ``text_fields`` is what makes the mixture projectable: ``row_text`` picks the
+    entry "by which of its named columns the row actually has", and the two
+    corpora of either arm have disjoint column sets, so the dispatch is
+    unambiguous.  Under a chat suite the *prompt* is rendered from
+    ``prompt_format.user_fields`` instead, but this block still selects the rows.
+
+    ``class_sampling: pooled`` and a filter naming every value of the axis is how
+    an UNSTRATIFIED draw is spelled: the rows are drawn from the union, with no
+    per-class quota.  That is deliberate -- a qmix point varies how much of the
+    probe is yahoo, and a second quota inside the yahoo share would confound the
+    dilution with a change in the yahoo mixture.
+
+    ``class_filter`` is emitted as a Python repr, so strings arrive quoted.  That
+    is a change from ``entry_yaml``'s bare list and it is the safer spelling:
+    ``no`` (Norwegian), ``on``, ``off``, ``y`` and ``n`` are YAML 1.1 booleans,
+    and a language-filtered arm is exactly where one would turn up.
+    """
+    return (
+        f"{indent}- dataset_id: {dataset_id}\n"
+        f"{indent}  split: train\n"
+        f"{indent}  weight: {weight}.0\n"
+        f"{indent}  text_field: {answer_field}          # fallback projection; text_fields wins\n"
+        f"{indent}  text_fields: [{', '.join(text_fields)}]\n"
+        f'{indent}  text_separator: "\\n"\n'
+        f"{indent}  class_field: {class_field}\n"
+        f"{indent}  class_filter: {class_filter!r}\n"
+        f"{indent}  class_sampling: pooled           # unstratified: draw from the union\n"
+    )
+
+
+def qmix_query_block(arm: QMixArm | None, pct: int, seed: int) -> str:
+    """The ``datasets:`` block for one qmix point at one draw seed.
+
+    Two entries at integer weights *pct* : *100 - pct*, except at the endpoints,
+    where the zero-weight side is dropped rather than carried at ``weight: 0.0``
+    -- matching ``weights_for``'s convention, keeping the endpoint recipes
+    distinct by entry set, and avoiding a filter that selects rows to draw none
+    of.
+
+    Weights are not reduced to lowest terms here, unlike ``weights_for``.  They
+    are relative either way -- 5:95 and 1:19 normalize identically -- and the
+    unreduced pair is the percentage the file name claims, which is the number a
+    reader is checking.
+    """
+    name = QMIX.recipe_name(arm, pct)
+    if arm is None:
+        mix = "100% yahoo, undiluted -- the reference the whole curve is read against"
+    else:
+        mix = (f"{pct}% yahoo / {100 - pct}% {arm.key} "
+               f"({arm.contrast}), seed {seed}")
+    head = (f"  - name: {name}\n"
+            f"    recipe_type: class_aware\n"
+            f"    n_samples: {QMIX.query_n}\n"
+            f"    seed: {seed}\n"
+            f"    # {mix}\n"
+            f"    entries:\n")
+    body = ""
+    if pct > 0:
+        body += qmix_entry_yaml(
+            QMIX.base_spec.dataset_id, pct,
+            text_fields=QMIX.base_query_fields(),
+            answer_field=QMIX.base_spec.answer_field,
+            class_field=QMIX.base_spec.class_field,
+            class_filter=QMIX.base_classes(),
+        )
+    if arm is not None and pct < 100:
+        body += qmix_entry_yaml(
+            arm.dataset_id, 100 - pct,
+            text_fields=arm.query_fields,
+            answer_field=arm.answer_field,
+            class_field=arm.class_field,
+            class_filter=arm.class_filter,
+        )
+    return head + body
+
+
+def qmix_adapter_paths() -> list[str]:
+    """The sixteen literal adapter paths a qmix tree extracts from.
+
+    Resolved with ``QMIX`` temporarily unbound, which is the whole trick.  An
+    adapter's directory leaf carries ``_f{format_id}``, ``format_id`` is a digest
+    of the prompt format, and a qmix tree deliberately renders under a *different*
+    (union) prompt format -- so re-deriving these paths in place would name
+    sixteen directories that do not exist.  The fleet was trained under the stock
+    format and keeps the name it was trained under; only the probe changes.
+
+    Saving and restoring the global mirrors ``proportions_for``, which does the
+    same for ``SPEC`` and for the same reason: one emission needs a value the
+    bound one does not carry.
+    """
+    global QMIX
+    was, QMIX = QMIX, None
+    try:
+        return [adapter_path(*t) for t in extract_targets()]
+    finally:
+        QMIX = was
+
+
+def adapter_name(name: str, n: int | None = None, seed: int | None = None,
+                 rank: int | None = None, init_seed: int | None = None) -> str:
     """The adapter's directory leaf.
 
     The ``_f{format_id}`` suffix appears only for a non-raw prompt format, so
     every existing adapter name is unchanged, and two suites that wrap the same
     base model differently cannot land on the same path.  Downstream joins strip
     it the way they already strip the ``_b{samples}`` budget token.
+
+    *n* and *seed* name the training draw, *rank* the LoRA rank and *init_seed*
+    the seed PEFT initialises ``A`` and ``B`` under.  They default
+    to the spec's single draw, the suite's single rank and ``LORA_INIT_SEED``, so the template is
+    unchanged for every tree that has already run -- and because the template
+    already carried the draw, an nsweep needs no new naming scheme: its 640 adapters are distinct by construction, and its 16
+    ``_n1000_s00_..._b5008`` adapters collide, deliberately, with the ones the
+    yahoo tree already trained.
     """
-    stem = (f"{name}_n{TRAIN_N}_s{TRAIN_SEED:02d}"
-            f"_r{LORA_RANK}_i{LORA_INIT_SEED:02d}_b{SAMPLES_SEEN}")
+    n = SPEC.train_n if n is None else n
+    seed = SPEC.train_seed if seed is None else seed
+    rank = SUITE.lora_rank if rank is None else rank
+    init_seed = LORA_INIT_SEED if init_seed is None else init_seed
+    stem = (f"{name}_n{n}_s{seed:02d}"
+            f"_r{rank}_i{init_seed:02d}_b{samples_seen(n)}")
     return f"{stem}_f{format_id()}" if format_id() else stem
 
 
@@ -291,15 +667,28 @@ def prompt_format_block() -> dict | None:
     """
     if not SUITE.prompt_format:
         return None
+    if QMIX is not None:
+        # A qmix probe holds rows of two corpora with disjoint column names, and
+        # _join_fields SKIPS a column the row does not have rather than raising
+        # -- so the stock single-corpus list would render every diluent row as an
+        # empty user turn, silently. The union renders each row as its own
+        # fields; see QMixSpec.user_fields.
+        return {
+            **SUITE.prompt_format,
+            "user_fields": QMIX.user_fields(),
+            "answer_fields": QMIX.answer_fields(),
+        }
     return {
         **SUITE.prompt_format,
-        "user_fields": list(QUERY_QUESTION_ONLY_FIELDS),
-        "answer_fields": [TEXT_FIELDS[-1]],
+        "user_fields": list(SPEC.query_fields),
+        "answer_fields": [SPEC.answer_field],
     }
 
 
-def adapter_path(name: str) -> str:
-    return f"{CACHE_DIR}/03_adapters/{SUITE.model_slug}/{adapter_name(name)}"
+def adapter_path(name: str, n: int | None = None, seed: int | None = None,
+                 rank: int | None = None, init_seed: int | None = None) -> str:
+    return (f"{CACHE_DIR}/03_adapters/{SUITE.model_slug}/"
+            f"{adapter_name(name, n, seed, rank, init_seed)}")
 
 
 def prompt_format_yaml() -> str:
@@ -343,8 +732,34 @@ def preamble(name: str) -> str:
     )
 
 
-EMBEDDER = """      embedder:
-        model_name: nomic-ai/nomic-embed-text-v1.5
+def embedder_block() -> str:
+    """The ``embedder:`` mapping, whose model is a property of the dataset.
+
+    Multilingual for oasst1 out of necessity -- ``nomic-embed-text-v1.5`` is
+    English-only, and embedding ``ru`` and ``zh`` with it would make the language
+    vertices an artefact of the embedder rather than of the data -- and for dolly
+    so the two new corpora are mutually comparable from the start.  Yahoo stays
+    on v1.5 because its configs have already run; it joins the others through an
+    additive re-embed that writes beside the existing artefacts.
+
+    ``_PREFIX_REQUIRED_MODELS`` matches by prefix on ``nomic-ai/nomic-embed-text``,
+    so v2-moe is already covered by the prefix machinery and uses the same
+    ``search_document: `` spelling.  Both models emit 768 dimensions.
+    """
+    # A qmix probe can hold Chinese: the oasst1-zh arm's queries are zh, so the
+    # generations they elicit are too.  yahoo's v1.5 is English-only, and an
+    # embedder that cannot represent half the text would make the oasst arm's
+    # curve its own artefact -- indistinguishable from the dilution effect the
+    # experiment exists to measure.  v2-moe is multilingual and handles English
+    # equally well, which is why DOLLY and OASST1 already carry it.
+    #
+    # Tree-wide, both arms and the shared undiluted point, so the curves are on
+    # one scale.  It costs nothing in comparability: the unstratified yahoo draw
+    # already puts qmix outside figure 2's numbers. Both models emit 768 dims.
+    model_name = ("nomic-ai/nomic-embed-text-v2-moe" if QMIX is not None
+                  else SPEC.embedder_model)
+    return """      embedder:
+        model_name: """ + model_name + """
         normalize_embeddings: true
         trust_remote_code: true
         # The literal prefix nomic wants is "search_document: ". Note the existing
@@ -356,40 +771,44 @@ EMBEDDER = """      embedder:
 
 
 def write_sweep(seed: int) -> str:
-    """Build + embed config for one seed: all 16 proportions at 4 sizes."""
+    """Build + embed config for one seed: every proportion at every draw size."""
+    props = proportions()
+    sizes = SPEC.sweep_size_list
     body = HEADER + (
-        f"# Seed {seed} of the simplex sweep: 16 proportions x {{1,10,100,1000}} = 64 draws.\n"
+        f"# Seed {seed} of the simplex sweep: {len(props)} proportions x "
+        f"{{{','.join(str(n) for n in sizes)}}} = {len(props) * len(sizes)} draws.\n"
         f"# Sharded by seed rather than by proportion so each shard still touches all\n"
-        f"# three group filters -- source_registry memoises them, so that is three\n"
+        f"# {_num_word(SPEC.n_groups)} group filters -- source_registry memoises them, "
+        f"so that is {_num_word(SPEC.n_groups)}\n"
         f"# filter passes per shard instead of one per draw.\n#\n"
     )
-    if seed == QUERY_SEED:
+    if SPEC.caveats.get("draw"):
+        body += "# " + SPEC.caveats["draw"].replace("\n", "\n# ") + "\n#\n"
+    if seed == SPEC.query_seed:
         body += (
-            f"# This shard also builds the question-only query set ({QUERY_QUESTION_ONLY_NAME}).\n"
+            f"# This shard also builds the question-only query set ({query_question_only_name()}).\n"
             f"# Composition feeds recipe_hash, so it is a distinct recipe -- but\n"
             f"# text_fields never touches the sampler's RNG and the seed is not derived\n"
-            f"# from the hash, so it selects the SAME {QUERY_N} rows as the full-context set.\n"
+            f"# from the hash, so it selects the SAME {SPEC.query_n} rows as the full-context set.\n"
             f"# The two are the same questions projected two ways, which is what makes the\n"
             f"# ablation controlled rather than two different samples.\n#\n"
         )
     body += "\n" + preamble(f"simplex3_sweep_s{seed:02d}")
     body += "datasets:\n"
     body += "\n".join(
-        dataset_block(name, pct, sweep=N_SWEEP, seeds=[seed])
-        for name, pct in proportions()
+        dataset_block(name, pct, sweep=_render_sweep_sizes(), seeds=[seed])
+        for name, pct in props
     )
-    if seed == QUERY_SEED:
+    if seed == SPEC.query_seed:
         body += "\n" + query_blocks("question_only")
     body += f"""
-base_models:
-  - {SUITE.base_model}
-
+{base_models_yaml()}
 fine_tuning:
   enabled: false
 
 # One (1, 768) centroid per draw. The surrogate is authored, not derived -- the
 # full (N, 768) matrix is never stored and `mean` is not invertible -- so adding a
-# second representation later means re-embedding all 640.
+# second representation later means re-embedding all {len(props) * len(sweep_seeds()) * len(sizes)}.
 extraction:
   models: []
   device: cuda
@@ -401,8 +820,39 @@ extraction:
     dataset_embedding:
       enabled: true
       representation: mean
-{EMBEDDER}"""
+{embedder_block()}"""
     return body
+
+
+def _render_sweep_sizes() -> str:
+    """``n_samples_sweep:``'s value, rendered the way the spec spells it.
+
+    A string goes in literally, so ``tens 3`` stays the compact spelling the
+    recipe parser expands; a list renders as itself.
+    """
+    if isinstance(SPEC.sweep_sizes, str):
+        return SPEC.sweep_sizes
+    return "[" + ", ".join(str(n) for n in SPEC.sweep_sizes) + "]"
+
+
+def _num_word(n: int) -> str:
+    """Small numbers spelled out, for prose emitted into a comment."""
+    return {2: "two", 3: "three", 4: "four", 5: "five"}.get(n, str(n))
+
+
+def _embed_walltime() -> str:
+    """Wall clock for the dataset-embedding job, scaled to the number of draws.
+
+    Every suite before the group-size pool embedded at most 52 mixtures, so the
+    flat two hours this used to request was never the binding constraint.  The
+    pool embeds 1004, and a draw costs ~7.7 s of sentence-transformer time on an
+    idle card; that puts the real requirement just over two hours, which is how
+    job 325171 came to die at 702/1004 against exactly that wall.  Budget 12
+    s/draw so a contended card still fits, round up to the hour, and never ask
+    for less than the historical two -- so every existing suite keeps the
+    "2:00:00" it has today and only a pool-sized tree asks for more.
+    """
+    return f"{max(2, ceil(len(proportions()) * 12 / 3600) + 1)}:00:00"
 
 
 def write_embed_matrix() -> str:
@@ -423,26 +873,24 @@ def write_embed_matrix() -> str:
 
     The draws replay from ``SampledDatasetCache`` -- `01_datasets` holds the
     source indices for all 16 -- so this touches the embedder and not HuggingFace.
-    The embedder block is the shared ``EMBEDDER`` literal, unchanged, which is
+    The embedder block is the shared ``embedder_block()`` one, unchanged, which is
     what makes the new surrogate land beside the existing ``mean`` under the same
     ``{embedder_hash}/`` rather than in a directory of its own.
     """
     body = HEADER + (
-        f"# Re-embed the {len(proportions())} trained draws at n={TRAIN_N}, "
-        f"seed={TRAIN_SEED},\n"
+        f"# Re-embed the {len(proportions())} trained draws at n={SPEC.train_n}, "
+        f"seed={SPEC.train_seed},\n"
         f"# keeping the full (n, 768) matrix instead of the (1, 768) centroid.\n"
         f"# Adds a second surrogate beside the existing `mean`; nothing is replaced.\n#\n"
     )
-    body += "\n" + preamble(f"simplex3{SUITE.suffix}_embed_matrix")
+    body += "\n" + preamble(f"{slug()}_embed_matrix")
     body += "datasets:\n"
     body += "\n".join(
-        dataset_block(name, pct, n_samples=TRAIN_N, seed=TRAIN_SEED)
+        dataset_block(name, pct, n_samples=SPEC.train_n, seed=SPEC.train_seed)
         for name, pct in proportions()
     )
     body += f"""
-base_models:
-  - {SUITE.base_model}
-
+{base_models_yaml()}
 fine_tuning:
   enabled: false
 
@@ -457,27 +905,109 @@ extraction:
     dataset_embedding:
       enabled: true
       representation: matrix
-{EMBEDDER}"""
+{embedder_block()}"""
     return body
 
 
-def write_train(shard: int, names: list[str]) -> str:
+def write_train(shard: int, targets: list[tuple[str, int, int, int, int]]) -> str:
+    """One training shard.
+
+    *targets* are ``(proportion, n_samples, seed, rank, init_seed)`` tuples that all share one
+    ``n_samples`` -- the shard planner guarantees it, because a shard is one wall
+    and the `nsamples_train` values differ by ~750x in training time -- and one
+    ``rank``, which the planner also guarantees but which is a *correctness*
+    constraint rather than a scheduling one: ``fine_tuning.lora_rank`` is a single
+    scalar, so a shard holding two ranks would silently train one of them at the
+    other's rank and write it to the other's path.
+
+    ``init_seed`` is the same kind of constraint as ``rank`` and is asserted the
+    same way: ``fine_tuning.lora_init_seed`` is one scalar, and the adapter's
+    directory name is rendered from the loop variable rather than from what PEFT
+    actually seeded, so a shard holding two initialisation seeds would train one
+    of them under the other's seed and write it to the other's path with nothing
+    raised.
+
+    A shard may still span several seeds of that one `nsamples_train`, which is what makes
+    the 80-adapter shards at the cheap `nsamples_train` values possible: ``n_samples_sweep`` and
+    ``seeds`` on a dataset block expand to ``{base}_n{n}_s{seed:02d}`` entries
+    each carrying their own ``n_samples`` and ``seed``, and the trainer reads
+    those per-dataset rather than the ``fine_tuning:`` globals
+    (finetune_lora.py, "Per-dataset overrides for n_samples and seed").  The
+    globals below are the fallback for a config with no sweep, and are what the
+    single-draw trees have always emitted.
+    """
+    n = targets[0][1]
+    rank = targets[0][3]
+    assert all(t[3] == rank for t in targets), (
+        f"training shard {shard} mixes ranks {sorted({t[3] for t in targets})}; "
+        f"lora_rank is one scalar per config"
+    )
+    init_seed = targets[0][4]
+    assert all(t[4] == init_seed for t in targets), (
+        f"training shard {shard} mixes init seeds "
+        f"{sorted({t[4] for t in targets})}; "
+        f"lora_init_seed is one scalar per config"
+    )
+    seeds_for: dict[str, list[int]] = {}
+    for name, _, seed, _, _ in targets:
+        seeds_for.setdefault(name, []).append(seed)
+    names = list(seeds_for)
+    budget = SPEC.budget(n)
+    n_adapters = len(targets)
+    # The single-draw trees must regenerate byte-for-byte, so their header is the
+    # sentence they already carry.  An nsweep shard says which `nsamples_train` it is instead,
+    # because "only n=1000" would be false of the tree and useless on the shard.
+    if rank_sweep():
+        size_note = (
+            f"# LoRA rank {rank} of {{{','.join(str(r) for r in lora_ranks())}}}, the whole "
+            f"{len(proportions())}-point simplex at that one rank.\n"
+            f"# n={SPEC.train_n}, seed={SPEC.train_seed}, as the fixed-rank tree. "
+            f"total_train_samples\n")
+    elif init_sweep():
+        size_note = (
+            f"# LoRA init seed {init_seed} of "
+            f"{{{','.join(str(i) for i in lora_init_seeds())}}}, the whole "
+            f"{len(proportions())}-point simplex at that one seed.\n"
+            f"# n={SPEC.train_n}, seed={SPEC.train_seed} -- the DATASET draw seed, unchanged "
+            f"across the sweep.\n"
+            f"# total_train_samples\n")
+    elif SPEC.train_grid() == ((SPEC.train_n, SPEC.train_seed),):
+        size_note = (
+            f"# Only n={SPEC.train_n}, seed={SPEC.train_seed} is trained on. "
+            f"total_train_samples\n")
+    else:
+        size_note = (
+            f"# nsamples_train={n}, seed(s) {min(s for v in seeds_for.values() for s in v)}"
+            f"-{max(s for v in seeds_for.values() for s in v)}. Five epochs of a "
+            f"{n}-row draw, so total_train_samples\n")
     body = HEADER + (
-        f"# Training shard {shard} of {TRAIN_SHARDS}: {len(names)} adapters.\n"
-        f"# Only n={TRAIN_N}, seed={TRAIN_SEED} is trained on. total_train_samples\n"
-        f"# {TOTAL_TRAIN_SAMPLES} quantizes UP to a step boundary at effective batch 16:\n"
-        f"# ceil({TOTAL_TRAIN_SAMPLES}/16) = 313 steps, so {SAMPLES_SEEN} samples seen and the\n"
-        f"# adapter is named _b{SAMPLES_SEEN}. Every LoRA parameter matches the existing 3B\n"
-        f"# adapters; only the base model and the data differ.\n"
-        f"#\n"
-        f"# max_seq_length 512 is held for consistency, but the composition is three\n"
-        f"# fields here rather than two, so truncation is more frequent than in the\n"
-        f"# question_title + best_answer runs. Flagged, not changed.\n\n"
+        f"# Training shard {shard} of {SUITE.train_shards}: {n_adapters} adapters.\n"
+        + size_note +
+        f"# {budget} quantizes UP to a step boundary at effective batch "
+        f"{SUITE.effective_batch}:\n"
+        f"# ceil({budget}/{SUITE.effective_batch}) = "
+        f"{SPEC.steps(SUITE.effective_batch, n)} steps, so {samples_seen(n)} samples seen and the\n"
+        f"# adapter is named _b{samples_seen(n)}. "
+        + ("Rank and the alpha that scales it are the ONLY\n"
+           f"# things that differ from the r{SUITE.lora_rank} tree: same draws, same seeds, same "
+           f"budget,\n# same targets, same query set. alpha is {lora_alpha(rank)} = 2 x {rank}, "
+           f"holding the gain\n# alpha/rank at the 2 every existing adapter trained under.\n"
+           if rank_sweep() else
+           f"lora_init_seed is the ONLY thing that\n"
+           f"# differs from the i{LORA_INIT_SEED:02d} tree: same draws, same dataset seeds, same "
+           f"rank, same\n# alpha, same budget, same targets, same query set. It seeds "
+           f"torch.manual_seed\n# immediately before PEFT draws A (B starts at zero), so it sets "
+           f"the\n# direction the adapter departs in and nothing else.\n"
+           if init_sweep() else
+           "Every LoRA parameter matches the existing 3B\n"
+           "# adapters; only the base model and the data differ.\n")
+        + f"#\n"
+        f"# {SPEC.caveats.get('train', '').replace(chr(10), chr(10) + '# ')}\n\n"
     ) + preamble(f"simplex3_train_shard{shard}")
     body += "datasets:\n"
     body += "\n".join(
-        dataset_block(name, pct, sweep=f"[{TRAIN_N}]", seeds=[TRAIN_SEED])
-        for name, pct in proportions() if name in names
+        dataset_block(name, pct, sweep=f"[{n}]", seeds=sorted(seeds_for[name]))
+        for name, pct in proportions() if name in seeds_for
     )
     body += f"""
 base_models:
@@ -487,20 +1017,20 @@ base_models:
   enabled: true
   datasets:
 """
-    body += "".join(f"    - {n}\n" for n in names)
-    body += f"""  n_samples: {TRAIN_N}
-  seed: {TRAIN_SEED}
-  lora_rank: {LORA_RANK}
-  lora_alpha: 32
+    body += "".join(f"    - {nm}\n" for nm in names)
+    body += f"""  n_samples: {n}
+  seed: {sorted(seeds_for[names[0]])[0]}
+  lora_rank: {rank}
+  lora_alpha: {lora_alpha(rank)}
   target_modules: [{', '.join(SUITE.target_modules)}]
   lora_dropout: 0.05
-  lora_init_seed: {LORA_INIT_SEED}
+  lora_init_seed: {init_seed}
   learning_rate: 2.0e-4
   per_device_train_batch_size: {SUITE.per_device_train_batch_size}
   gradient_accumulation_steps: {SUITE.gradient_accumulation_steps}
   max_seq_length: 512
   torch_dtype: {SUITE.torch_dtype}
-  total_train_samples: {TOTAL_TRAIN_SAMPLES}
+  total_train_samples: {budget}
 
 extraction:
   models: []
@@ -537,40 +1067,161 @@ def temp_token(t: float) -> str:
     return f"t{int(round(float(t) * 10)):02d}"
 
 
+def _qdesc(which: str) -> str:
+    """How this query set is described in the emitted header.
+
+    ``which`` is a query set name, or ``"chat"``: under a chat template with
+    completion-only loss the training prompt *is* the question, so the
+    question-only set becomes the in-distribution probe and the full-context one
+    the contaminated one -- the reverse of the raw suite.  One description cannot
+    carry both readings, so the spec supplies three.
+
+    The optional ``suffix`` entry is appended to every question-only description.
+    It exists for yahoo, where ``question_content`` is empty in ~46% of rows, so
+    about half of that set's prompts are a bare title -- a fact that belongs in
+    any caption comparing the two sets.
+    """
+    desc = SPEC.query_desc[which]
+    if which in ("chat", "question_only") and SPEC.caveats.get("query"):
+        desc += "; note " + SPEC.caveats["query"] + SPEC.query_desc.get("suffix", "")
+    return desc
+
+
+def qmix_note(qpoint: tuple[QMixArm | None, int, int], level: str,
+              n_models: int) -> str:
+    """The header paragraph of a qmix config: what this job varies, and what it does not.
+
+    Emitted in place of the level-specific notes the other modes carry, because
+    those describe a tree whose adapters vary and whose probe does not, and this
+    is that tree read the other way round.  Getting that backwards in a comment
+    is how a config comes to mean something a reader did not check.
+    """
+    arm, pct, qseed = qpoint
+    what = ("the SAME 100-row probe, undiluted" if arm is None else
+            f"a 100-row probe that is {pct}% yahoo and {100 - pct}% "
+            f"{arm.key} ({arm.contrast})")
+    note = (
+        f"# One point of the QMIX axis: query-set composition. The {n_models} adapters are\n"
+        f"# held completely fixed -- the existing yahoo simplex on this base model, same\n"
+        f"# rank, same init seed, same training draw, same budget. Nothing is trained\n"
+        f"# here. What varies is {what},\n"
+        f"# at draw seed {qseed} of {len(QMIX.seeds)}.\n"
+        f"#\n"
+        f"# extraction.models below is a list of LITERAL paths and must stay one. The\n"
+        f"# adapters were named under the stock prompt format; this config renders under\n"
+        f"# the union one (see prompt_format), which is a different format_id, so a\n"
+        f"# re-derived path would name a directory that does not exist.\n"
+        f"#\n"
+        f"# {QMIX.caveats['unstratified'].replace(chr(10), chr(10) + '# ')}\n"
+        f"#\n"
+        f"# {QMIX.caveats['format'].replace(chr(10), chr(10) + '# ')}\n"
+    )
+    if arm is not None and pct > 0:
+        rows = round(QMIX.query_n * pct / 100)
+        note += (
+            f"#\n"
+            f"# At {pct}% of {QMIX.query_n} rows this probe holds {rows} yahoo "
+            f"{'row' if rows == 1 else 'rows'}. Whole-percent targets\n"
+            f"# against 100 rows, so largest-remainder allocation is exact and the realized\n"
+            f"# composition equals the requested one"
+            + (".\n" if rows > 1 else
+               " -- but WHICH single row it is dominates\n"
+               "# the variance at this point, which is what the ten draw seeds are for.\n")
+        )
+    if arm is not None:
+        note += (
+            f"#\n"
+            f"# The {arm.key} pool is {arm.pool_rows} rows and this draw takes at most "
+            f"{QMIX.query_n}, so\n"
+            f"# ClassMixedDataset has no reason to scale the mixture down. If a log shows\n"
+            f"# 'MixedDataset: recipe capacity', that assumption broke and the realized\n"
+            f"# composition is not the one this file names.\n"
+        )
+    return note + "\n"
+
+
 def write_extract(
     level: str,
     query: str,
     shard: int | None,
-    names: list[str],
+    names: list[tuple[str, int, int, int, int]],
     temperature: float | None = None,
+    models_override: list[str] | None = None,
+    qpoint: tuple[QMixArm | None, int, int] | None = None,
 ) -> str:
-    qname = QUERY_FULL_CONTEXT_NAME if query == "full_context" else QUERY_QUESTION_ONLY_NAME
-    if SUITE.prompt_format:
+    # *names* are ``(proportion, n_samples, seed, rank, init_seed)`` tuples -- every adapter
+    # this job extracts from.  For a single-draw, single-rank tree the tuple is the
+    # one draw it has always trained and the rendered path is unchanged; for an
+    # nsweep the same list carries all four `nsamples_train` values, for a rank
+    # sweep all eight ranks and for an initsweep all ten initialisation seeds,
+    # because inference does not depend on how the adapter
+    # was trained and so is sharded by none of them.
+    #
+    # *models_override* and *qpoint* are the two qmix hooks, and both default to
+    # None so every existing call site emits exactly what it always did.  A qmix
+    # job pins its adapter list to literal paths (the fleet is named under the
+    # stock prompt format, not the union one this tree renders with) and replaces
+    # the query set with one point of the query-mixture axis.
+    if qpoint is not None:
+        arm, pct, qseed = qpoint
+        qname = QMIX.recipe_name(arm, pct)
+        qdesc = (
+            ("100% yahoo, undiluted, unstratified"
+             if arm is None else
+             f"{pct}% yahoo / {100 - pct}% {arm.key}, unstratified")
+            + f", draw seed {qseed}"
+        )
+    else:
+        qname = (query_full_context_name() if query == "full_context"
+                 else query_question_only_name())
         # Under a chat template with completion-only loss the training prompt IS
         # the question, so the roles are the reverse of the raw suite's.  Saying
         # so here rather than carrying the raw suite's phrasing forward, which
         # would be actively wrong.
-        qdesc = ("title + content only, matching the training prompt; note "
-                 + FIELD_EMPTINESS_NOTE + ", so ~half these prompts are a bare title")
-    else:
-        qdesc = ("title + content + answer, matching the training composition"
-                 if query == "full_context" else
-                 "title + content only, question-only ablation; note "
-                 + FIELD_EMPTINESS_NOTE + ", so ~half these prompts are a bare title")
+        qdesc = _qdesc("chat") if SUITE.prompt_format else _qdesc(query)
     token = SUITE.job_token(query)
-    n_shards = SUITE.sweep_shards if level == "sweep" else BEHAVIORAL_SHARDS
+    n_shards = {"sweep": SUITE.sweep_shards,
+                "greedy": SUITE.greedy_shards}.get(level, SUITE.behavioral_shards)
     label = (
         f"simplex3_{level}_{token}"
         + ("" if temperature is None else f"_{temp_token(temperature)}")
         + ("" if shard is None else f"_shard{shard}")
+        + ("" if qpoint is None else f"_{qname}_s{qpoint[2]:02d}")
     )
     body = HEADER + (
-        f"# {level.capitalize()} extraction over the {query} query set ({qdesc}).\n"
+        f"# {level.capitalize()} extraction over the "
+        + ("qmix" if qpoint is not None else query)
+        + f" query set ({qdesc}).\n"
         f"# {len(names)} adapter(s)"
         + ("" if shard is None else f", shard {shard} of {n_shards}")
         + ".\n#\n"
     )
-    if level == "functional":
+    if qpoint is not None:
+        body += qmix_note(qpoint, level, len(names))
+    elif level == "functional" and rank_sweep():
+        body += (
+            f"# One job for all {len(names)}: HFInferenceTaxonomy loads the base model once\n"
+            f"# and swaps adapters onto it, so every rank amortizes a single load, and\n"
+            f"# input-mode extraction is one forward pass per query with no decoding.\n"
+            f"# Measured at 4.4 s/model on the 1004-adapter pool, so ~{round(len(names) * 4.4 / 60)} min here.\n"
+            f"#\n"
+            f"# Rank is not a dimension of what comes back. The stored activations are\n"
+            f"# hidden states of the base model's width, so the {len(lora_ranks())} ranks are\n"
+            f"# {len(lora_ranks())} points of one comparable fleet rather than {len(lora_ranks())} "
+            f"incomparable ones.\n\n"
+        )
+    elif level == "functional" and init_sweep():
+        body += (
+            f"# One job for all {len(names)}: HFInferenceTaxonomy loads the base model once\n"
+            f"# and swaps adapters onto it, so every seed amortizes a single load, and\n"
+            f"# input-mode extraction is one forward pass per query with no decoding.\n"
+            f"# Measured at 4.4 s/model on the 1004-adapter pool, so ~{round(len(names) * 4.4 / 60)} min here.\n"
+            f"#\n"
+            f"# The initialisation seed is not a dimension of what comes back. The stored\n"
+            f"# activations are hidden states of the base model's width, so the\n"
+            f"# {len(lora_init_seeds())} seeds are {len(lora_init_seeds())} points of one comparable fleet.\n\n"
+        )
+    elif level == "functional":
         body += (
             "# One job for all 16: HFInferenceTaxonomy loads the base model once and\n"
             "# swaps adapters onto it, so 16 models amortize a single 8B load, and\n"
@@ -629,19 +1280,19 @@ def write_extract(
             f"# One point of the TEMPERATURE SWEEP: T={temperature}, R={SUITE.sweep_replicates}.\n"
             f"#\n"
             f"# The sweep resolves the log-prob surface along the decoding axis instead\n"
-            f"# of at the single T=1.0 the R={REPLICATES} runs measured. Each point is its own\n"
+            f"# of at the single T=1.0 the R={SPEC.replicates} runs measured. Each point is its own\n"
             f"# cache entry -- temperature is inside the sampling hash and therefore\n"
             f"# inside the filename -- so ten temperatures are ten entries, not one\n"
             f"# silently reused.\n"
             f"#\n"
-            f"# R={SUITE.sweep_replicates}, not {REPLICATES}, and uniformly so across all ten points. The cached\n"
-            f"# R={REPLICATES} entry at T=1.0 is a DIFFERENT entry (replicates are in the\n"
+            f"# R={SUITE.sweep_replicates}, not {SPEC.replicates}, and uniformly so across all ten points. The cached\n"
+            f"# R={SPEC.replicates} entry at T=1.0 is a DIFFERENT entry (replicates are in the\n"
             f"# filename), so this does not collide with it; re-running T=1.0 here is\n"
             f"# what keeps one point of a variance-vs-temperature curve from having half\n"
             f"# the sampling noise of the other nine.\n"
             f"#\n"
             f"# {SUITE.sweep_shards} shards of {len(names)} adapters: halving R halves the decode, so this\n"
-            f"# lands at the same wall the {BEHAVIORAL_SHARDS}-shard R={REPLICATES} runs were sized against.\n\n"
+            f"# lands at the same wall the {SUITE.behavioral_shards}-shard R={SPEC.replicates} runs were sized against.\n\n"
         )
     elif level == "greedy":
         body += (
@@ -659,28 +1310,54 @@ def write_extract(
             f"# behavioral.py:150-151) so a temperature that was never applied cannot\n"
             f"# change the digest; writing them here would only imply they matter.\n"
             f"# This also means greedy lands in its own cache entry and cannot collide\n"
-            f"# with the R={REPLICATES} runs over the same adapters and draw.\n"
+            f"# with the R={SPEC.replicates} runs over the same adapters and draw.\n"
             f"#\n"
-            f"# One job, unsharded: {QUERY_N} queries at batch {GREEDY_BATCH_SIZE} is ~7 generate()\n"
-            f"# calls per adapter against ~50 for the sampled runs, so all 16 adapters\n"
-            f"# finish in well under an hour.\n\n"
+            + (f"# One job, unsharded: {SPEC.query_n} queries at batch {GREEDY_BATCH_SIZE} is "
+               f"~{generate_calls(SPEC.query_n, GREEDY_BATCH_SIZE)} generate()\n"
+               f"# calls per adapter against "
+               f"~{generate_calls(SPEC.query_n, SAMPLED_BATCH_SIZE)} for the sampled runs -- ~17.7 s/model\n"
+               f"# measured on the 1004-adapter pool, so ~{round(len(names) * 17.7 / 60)} min for all "
+               f"{len(names)} here, inside\n"
+               f"# the {SUITE.greedy_time} wall.\n\n"
+               if shard is None and (rank_sweep() or init_sweep()) else
+               f"# One job, unsharded: {SPEC.query_n} queries at batch {GREEDY_BATCH_SIZE} is "
+               f"~{generate_calls(SPEC.query_n, GREEDY_BATCH_SIZE)} generate()\n"
+               f"# calls per adapter against "
+               f"~{generate_calls(SPEC.query_n, SAMPLED_BATCH_SIZE)} for the sampled runs, so all "
+               f"16 adapters\n"
+               # "16" is a LITERAL and is knowingly wrong for the corpora that
+               # have 35 adapters and for the 1004-adapter pool, for the same
+               # reason the "~25,600" above is: it was hardcoded when only the
+               # 16-adapter yahoo tree existed, and deriving it would rewrite
+               # config files belonging to runs that have already happened. It is
+               # right for every 16-adapter tree, which is the yahoo simplex and
+               # everything built on it -- including qbig.
+               f"# finish in {greedy_wall_prose()}.\n\n"
+               if shard is None else
+               f"# {SPEC.query_n} queries at batch {GREEDY_BATCH_SIZE} is "
+               f"~{generate_calls(SPEC.query_n, GREEDY_BATCH_SIZE)} generate() calls per adapter\n"
+               f"# against ~{generate_calls(SPEC.query_n, SAMPLED_BATCH_SIZE)} for the sampled runs "
+               f"-- but that cheapness does not survive\n"
+               f"# a training grid: ~17.7 s/model (measured on the 1004-adapter pool, job\n"
+               f"# 325767) over {len(SPEC.extract_grid()) * len(proportions())} adapters is ~7 hours against a 1:30 wall, which is\n"
+               f"# how that pool job died. {SUITE.greedy_shards} shards of {len(names)} is ~{round(len(names) * 17.7 / 60)} min each.\n\n")
         )
     else:
-        body += (
-            f"# Sharded because this is the expensive half: 16 adapters x {QUERY_N} queries\n"
-            f"# x {REPLICATES} replicates x {MAX_NEW_TOKENS} tokens is ~25,600 generations, ~4 GPU-hours.\n"
-            f"# Shards write to disjoint adapter directories. Paying the 8B load eight\n"
-            f"# times buys eight short slots that actually backfill.\n\n"
-        )
+        body += behavioral_shard_rationale()
     body += preamble(label)
-    body += "datasets:\n" + query_blocks(query)
+    body += "datasets:\n" + (query_blocks(query) if qpoint is None
+                             else qmix_query_block(*qpoint))
     body += f"\nbase_models:\n  - {SUITE.base_model}\n\n"
     body += prompt_format_yaml()
     body += "fine_tuning:\n  enabled: false\n\n"
     body += "extraction:\n  models:\n"
-    body += "".join(f"    - {adapter_path(n)}\n" for n in names)
+    body += "".join(
+        f"    - {m}\n" for m in
+        (models_override if models_override is not None
+         else [adapter_path(*t) for t in names])
+    )
     body += f"""  queries_dataset: {qname}
-  n_queries: {QUERY_N}
+  n_queries: {QMIX.query_n if qpoint is not None else SPEC.query_n}
   device: cuda
   torch_dtype: {SUITE.torch_dtype}
 """
@@ -710,8 +1387,10 @@ def write_extract(
             f"  # runs. Greedy seeds no RNG at all, so batch size only flips argmax on\n"
             f"  # fp16 near-ties -- measured at 6/8 sequences byte-identical between\n"
             f"  # batch 1 and batch 8. Decode cost is driven by the number of generate()\n"
-            f"  # calls, not their width, so this is the difference between ~7 calls per\n"
-            f"  # adapter and ~50. Lower it if an 8B at {GREEDY_BATCH_SIZE} x (prompt + {MAX_NEW_TOKENS}) OOMs.\n"
+            f"  # calls, not their width, so this is the difference between "
+            f"~{generate_calls(SPEC.query_n, GREEDY_BATCH_SIZE)} calls per\n"
+            f"  # adapter and ~{generate_calls(SPEC.query_n, SAMPLED_BATCH_SIZE)}. "
+            f"Lower it if an 8B at {GREEDY_BATCH_SIZE} x (prompt + {MAX_NEW_TOKENS}) OOMs.\n"
             f"  batch_size: {GREEDY_BATCH_SIZE}\n"
         )
         if level == "greedy_logprob":
@@ -780,7 +1459,7 @@ def write_extract(
                 "      # entry rather than replacing it.\n"
                 "      collect_logprobs: true\n"
             )
-        body += EMBEDDER
+        body += embedder_block()
     elif level == "sweep":
         body += f"""    functional:
       enabled: false
@@ -802,7 +1481,7 @@ def write_extract(
       # processor is the identity and the two must coincide, which is a free
       # consistency check on this sweep.
       collect_logprobs: true
-{EMBEDDER}"""
+{embedder_block()}"""
     else:
         body += f"""    functional:
       enabled: false
@@ -811,13 +1490,13 @@ def write_extract(
     behavioral:
       enabled: true
       max_new_tokens: {MAX_NEW_TOKENS}
-      replicates: {REPLICATES}
+      replicates: {SPEC.replicates}
       do_sample: true
       temperature: 1.0
       top_p: 1.0
       top_k: null
       generation_seed: 0
-{EMBEDDER}"""
+{embedder_block()}"""
     return body
 
 
@@ -965,9 +1644,25 @@ SUITES = {
         # a consolidated.safetensors -- and the prefetch job's '*.safetensors'
         # would fetch both.
         prefetch_ignore=("consolidated.safetensors",),
-        # gpu_partitions left at the default, l40s included: 48 GB against
-        # ~24.5 GB of weights leaves real headroom, and the smoke run is where a
-        # wrong guess here shows up cheaply.  Drop l40s only if it actually OOMs.
+        # gpu_partitions left at the default, but l40s is NOT safe for TRAINING
+        # this model, and the note above that said it was has been measured
+        # wrong.  2026-09-05, the dolly and oasst1 trees: 13 of 13 train shards
+        # that landed on an l40s node (gl*) died in the backward pass with
+        #     RuntimeError: Function MmBackward0 returned an invalid gradient at
+        #     index 1 - expected device meta but got cuda:0
+        # while 5 of 5 that landed on gh* (h100/h200) completed.  The mechanism
+        # is device_map="auto": on a 48 GB card accelerate places part of the
+        # model off-device, and the offloaded submodule hands back a meta
+        # gradient.  It is not a clean OOM, so it does not look like one in the
+        # log.  The yahoo tree never caught this because all four of its train
+        # shards happened to schedule onto gh* nodes.
+        #
+        # Extraction is unaffected -- it is forward-only, and a forward through
+        # an offloaded module is correct (just slower) -- so this field stays as
+        # it is and the l40s capacity keeps serving the 18 behavioural shards.
+        # Training was resubmitted with `sbatch --partition=h200,h100`, which
+        # overrides the #SBATCH line without regenerating the tree.  If training
+        # is ever driven from submit_all.sh again, pass that override there.
     ).for_model("mistralai/Mistral-Nemo-Instruct-2407"),
     "olmo2": Suite(
         tag="olmo2",
@@ -984,16 +1679,520 @@ SUITES = {
         # costs only queue priority, while eight invented numbers cost a reader's
         # trust in all of them.  Trim after the first run measures actual walls.
     ).for_model("allenai/OLMo-2-0425-1B-Instruct"),
+    #: The olmo2 suite, stripped to the four canonical perspectives, for the
+    #: 1004-model pool the group-size sweep subsamples from.
+    #:
+    #: Only two fields differ from ``olmo2`` and both are subtractions.  The
+    #: log-probability level is dropped: no canonical perspective reads it, and
+    #: it is priced per adapter, so at 1004 adapters it would cost more than the
+    #: measurement it is not part of.  The temperature sweep is dropped by the
+    #: spec, for the same reason (``YAHOO_POOL.temperature_sweep`` is ``()``,
+    #: which ``main`` applies over whatever the suite carries).
+    #:
+    #: Everything else is deliberately identical, because the point of the pool
+    #: is to be the same experiment at a different *size*: a wall or a batch that
+    #: differed here would make the group-size axis a hardware axis too. The
+    #: shard counts are the exception and are not set here at all --
+    #: ``_suite_for_dataset`` derives them from the adapter count at the cadence
+    #: every existing wall was tuned against, giving 251 train shards and 502
+    #: behavioural shards rather than one job 63x longer than any that has run.
+    "olmo2_pool": Suite(
+        tag="olmo2_pool",
+        query_sets=("question_only",),
+        job_tokens={"question_only": "qonly"},
+        emit_embed_jobs=False,
+        emit_build_job=False,
+        job_prefix="s3po2",
+        emit_logprob_jobs=False,
+        emit_gen_activation_job=True,
+        # See the olmo2 entry: l40s is not safe for TRAINING this model, only for
+        # extraction. Submit training with `sbatch --partition=h200,h100`.
+    ).for_model("allenai/OLMo-2-0425-1B-Instruct"),
+
+    #: The **nsweep** suite: the training-data-size axis, over the same 16-point
+    #: simplex as ``olmo2``.  Three fields differ from it and all three are
+    #: subtractions -- the log-probability level, the generated-activation job and
+    #: the temperature sweep (the last via ``YAHOO_NSWEEP.temperature_sweep``).
+    #: None of the five canonical perspectives reads any of them, and all three
+    #: are priced per adapter, so at 640 adapters they would cost ~230 GPU-hours
+    #: on top of a ~75 GPU-hour experiment that does not use them.
+    #:
+    #: ``train_time`` is the one addition.  The default 2:00:00 was tuned against
+    #: a 4-adapter ``_b5008`` shard; the N=10000 `nsamples_train`'s shard is ~1:04, which does
+    #: not leave enough headroom under a wall nobody has re-measured.  3:00:00 is
+    #: the value the llama suite already carries, so it is precedented rather than
+    #: invented, and it is charged only in queue priority.
+    "olmo2_nsweep": Suite(
+        tag="olmo2_nsweep",
+        query_sets=("question_only",),
+        job_tokens={"question_only": "qonly"},
+        emit_embed_jobs=False,
+        emit_build_job=False,
+        job_prefix="s3no2",
+        emit_logprob_jobs=False,
+        emit_gen_activation_job=False,
+        train_time="3:00:00",
+        # The functional pass is unsharded, and this suite gives it 1440 adapters
+        # rather than the 16 the 2:00:00 default was written for.  The pool suite
+        # measured 4.4 s/model over 1004 adapters (job 325766, 1:13:26), so 1440
+        # is ~1:46 -- inside the default, but not by enough to survive a slower
+        # card.  Charged only in queue priority.
+        func_time="3:00:00",
+        # See the olmo2 entry: l40s is not safe for TRAINING this model, only for
+        # extraction. Submit training with `sbatch --partition=h200,h100`.
+    ).for_model("allenai/OLMo-2-0425-1B-Instruct"),
+
+    #: The **qbig** suite: the standing olmo2 simplex probed an order of magnitude
+    #: harder -- 1000 queries at seed 2 instead of 100 at seed 1, and R=64 instead
+    #: of R=16 (all three on ``YAHOO_QBIG``, not here, because they describe the
+    #: probe rather than the hardware).  It trains nothing new: the sixteen
+    #: adapters it extracts over are the ``_n1000_s00_r16_i00_b5008`` directories
+    #: the ``olmo2`` tree already wrote, so the training shards this suite emits
+    #: are cache hits that print "Already trained -- skipping".
+    #:
+    #: Four fields differ from ``olmo2`` and every one of them follows from the
+    #: probe being 40x the decode:
+    #:
+    #: The log-probability level and the generated-activation job are dropped.
+    #: Neither was asked for here, and ``functional_gen`` in particular measured
+    #: 210 s/model at 100 queries, which is ~9 GPU-hours at 1000 -- more than the
+    #: behavioral level this tree exists for.  The temperature sweep is dropped by
+    #: the spec, for the same reason ``YAHOO_POOL`` drops it.
+    #:
+    #: ``behavioral_adapters_per_shard=1``: at ~2,560 tok/s (measured, job 264147)
+    #: one adapter is 1000 x 64 x 128 / 2560 = ~53 min, so two would not fit a
+    #: wall any partition here backfills well.
+    #:
+    #: ``behav_time`` and ``greedy_time`` at 2:00:00 against ~1:00 and ~0:51 of
+    #: expected work.  Both are sized against the *floor* throughput rather than
+    #: the expected one: 2,560 tok/s was measured at 32 rows per generate() call
+    #: and these runs are 128 rows wide, which a 1B is nowhere near saturated by,
+    #: so the real numbers should come in under these and the wall is charged only
+    #: in queue priority. ``func_time`` and ``train_time`` stay at the defaults --
+    #: input-mode extraction measured 1.1 s/model at 100 queries, so ~3 min for
+    #: the fleet at 1000, and the training shards do no work at all.
+    "olmo2_qbig": Suite(
+        tag="olmo2_qbig",
+        query_sets=("question_only",),
+        job_tokens={"question_only": "qonly"},
+        emit_embed_jobs=False,
+        emit_build_job=False,
+        job_prefix="s3bo2",
+        emit_logprob_jobs=False,
+        emit_gen_activation_job=False,
+        behavioral_adapters_per_shard=1,
+        behav_time="2:00:00",
+        greedy_time="2:00:00",
+        # See the olmo2 entry: l40s is not safe for TRAINING this model, only for
+        # extraction. The shards here retrain nothing, but the list is held the
+        # same so a `--force` retrain from this tree does not die where the
+        # olmo2 tree's would not.
+    ).for_model("allenai/OLMo-2-0425-1B-Instruct"),
+
+    #: The **rsweep** suite: the LoRA-rank axis, over the same 16-point yahoo
+    #: simplex and the same 100-query 33/33/33 draw as ``olmo2``.  Eight ranks,
+    #: 1 to 128 by powers of two, so 128 adapters.
+    #:
+    #: Rank is a Suite axis rather than a spec one -- the corpus, the draws, the
+    #: seeds, the budget, the targets and the query set are all exactly the fixed-
+    #: rank tree's, and ``yahoo`` is the spec unchanged.  That is what makes the
+    #: comparison a comparison: r16 here resolves to the very adapter directories
+    #: ``simplex3_olmo2`` already trained (rank is in the adapter name, and every
+    #: cache is keyed on that name), so the sweep's middle point is not a re-run
+    #: of that tree but the tree itself, and the other seven ranks are the only
+    #: new work.
+    #:
+    #: Levels are the nsweep's, for the nsweep's reason: the log-probability
+    #: level, generation-mode activations and the temperature sweep are dropped
+    #: because no standing representation reads any of them and all three are
+    #: priced per adapter.  What is emitted is what the standing representations
+    #: need -- the adapters themselves (structural reads their weights, with no
+    #: job of its own), input-mode activations, the R=16 sampled behavioral run,
+    #: and greedy.  The dataset level is model-free and already on disk.
+    "olmo2_rsweep": Suite(
+        tag="rsweep_olmo2",
+        lora_ranks=(1, 2, 4, 8, 16, 32, 64, 128),
+        query_sets=("question_only",),
+        job_tokens={"question_only": "qonly"},
+        emit_embed_jobs=False,
+        emit_build_job=False,
+        # The `matrix` re-embed is off here alone among the yahoo suites: it
+        # authors a model-free surrogate that the olmo2 tree has already written,
+        # and two trees emitting it would race for no second artefact.
+        emit_embed_matrix_job=False,
+        job_prefix="s3ro2",
+        # The one field that is NOT the olmo2 tree's: training is pinned off l40s.
+        # Every olmo2 tree before this one says "submit training with
+        # `sbatch --partition=h200,h100`" in a comment, which is a instruction a
+        # reader has to find -- and this tree's training IS driven from
+        # submit_all.sh, across 8 shards, so a comment would be found after the
+        # fact. Extraction keeps the full list: it is forward-only, and a forward
+        # pass through an offloaded module is correct, just slower.
+        train_partitions="h200,h100",
+        emit_logprob_jobs=False,
+        emit_gen_activation_job=False,
+        temperature_sweep=(),
+        # `train_shards` is DERIVED in main() from the rank tuple -- one shard per
+        # rank -- so it is deliberately not written here; a literal would be a
+        # second place to forget when a rank is added.
+        #
+        # 128 adapters at ~2.45 min each (the nsweep's measurement for this 1B at
+        # this draw) is ~5.2 h of sampled decoding: 8 shards of 16 is ~40 min,
+        # which is the cadence every behavioral wall here was tuned against.
+        behavioral_shards=8,
+        # Greedy stays unsharded: ~17.7 s/model over 128 adapters is ~38 min,
+        # inside the 1:30 wall.
+        greedy_shards=1,
+        # As the nsweep suite: the 2:00:00 default was tuned against a 4-adapter
+        # shard, and these are 16-adapter shards (~40 min). 3:00:00 is the value
+        # the llama and nsweep suites already carry, and headroom costs only queue
+        # priority.
+        train_time="3:00:00",
+        # See the olmo2 entry: l40s is not safe for TRAINING this model, only for
+        # extraction. Submit training with `sbatch --partition=h200,h100`.
+    ).for_model("allenai/OLMo-2-0425-1B-Instruct"),
+
+    #: The **initsweep**: the same 16-point yahoo simplex trained ten times over,
+    #: at ten LoRA initialisation seeds, with every other knob held at
+    #: ``olmo2``'s value.  It is the rank sweep's design with the axis swapped,
+    #: and it answers the question the rank sweep's cannot: how much of a
+    #: taxonomy score is the level, and how much is the particular random A draw
+    #: the adapters happened to start from.  Every score this project reports is
+    #: computed over one collection trained from one initialisation, and until
+    #: this runs that axis has no error bar at all -- `lora_init_seed` has been 0
+    #: in every config ever written.
+    #:
+    #: The initialisation seed is a Suite axis rather than a spec one for the
+    #: rank sweep's reason, and the same free-middle-point property follows: the
+    #: seed is in the adapter name (``..._r16_i00_b5008``) and every cache is
+    #: keyed on that name, so i00 resolves to the very directories
+    #: ``simplex3_olmo2`` already trained and `finetune_lora.py` skips them.  The
+    #: new work is 144 adapters, not 160.
+    #:
+    #: NOT the dataset draw seed.  That is the ``s00`` in ``_n1000_s00``, it
+    #: lives on the spec, and it is unchanged here: all ten seeds train on the
+    #: same sixteen draws, the same rows in the same order.  Which is also why
+    #: the dataset level is an exact null control -- its ten replicate scores
+    #: must come out identical, and a difference is a pipeline determinism bug
+    #: rather than a finding about initialisation.
+    #:
+    #: Levels are the rank sweep's, for the rank sweep's reason.
+    "olmo2_initsweep": Suite(
+        tag="initsweep_olmo2",
+        lora_init_seeds=tuple(range(10)),
+        query_sets=("question_only",),
+        job_tokens={"question_only": "qonly"},
+        emit_embed_jobs=False,
+        emit_build_job=False,
+        # Off for the rank sweep's reason and one of its own: the draws here are
+        # byte-identical to `simplex3_olmo2`'s -- the initialisation seed is not
+        # in the draw path at all -- so a second tree emitting the dataset level
+        # would race it for no second artefact.
+        emit_embed_matrix_job=False,
+        job_prefix="s3io2",
+        # As the rank sweep: this tree's training runs from submit_all.sh, so the
+        # "hand-submit off l40s" comment the other olmo2 trees carry would be read
+        # after the fact. Extraction keeps the full partition list.
+        train_partitions="h200,h100",
+        emit_logprob_jobs=False,
+        emit_gen_activation_job=False,
+        temperature_sweep=(),
+        # `train_shards` is DERIVED in main() from the seed tuple -- one shard per
+        # seed -- so it is deliberately not written here, for the same reason the
+        # rank sweep does not write it.
+        #
+        # 160 adapters at ~2.45 min each (the nsweep's measurement for this 1B at
+        # this draw) is ~6.5 h of sampled decoding: 10 shards of 16 is ~40 min,
+        # the cadence every behavioral wall here was tuned against.
+        behavioral_shards=10,
+        # Greedy stays unsharded: ~17.7 s/model over 160 adapters is ~47 min,
+        # inside the 1:30 wall.
+        greedy_shards=1,
+        # As the rank sweep and the nsweep: the 2:00:00 default was sized against
+        # a 4-adapter shard and these are 16-adapter shards (~25 min at the 1.55
+        # min/adapter this base model measured at _b5008).
+        train_time="3:00:00",
+    ).for_model("allenai/OLMo-2-0425-1B-Instruct"),
 }
 
 
+#: Job-name prefixes for a model suite over a non-yahoo corpus, extending the
+#: five already in use -- ``s3`` (llama), ``s3q`` (qwen), ``s3li`` (llama3i),
+#: ``s3nm`` (nemo), ``s3o2`` (olmo2).  These appear in sacct history and in log
+#: filenames and are effectively permanent once submitted, so they are written
+#: down rather than derived from the two names.
+_SUITE_PREFIXES = {
+    ("dolly", "qwen"): "s3dq",
+    ("dolly", "llama3i"): "s3dli",
+    ("dolly", "nemo"): "s3dnm",
+    ("dolly", "olmo2"): "s3do2",
+    ("oasst1", "qwen"): "s3oq",
+    ("oasst1", "llama3i"): "s3oli",
+    ("oasst1", "nemo"): "s3onm",
+    ("oasst1", "olmo2"): "s3oo2",
+    ("yahoo_pool", "olmo2_pool"): "s3po2",
+    ("yahoo_nsweep", "olmo2_nsweep"): "s3no2",
+    ("yahoo_qbig", "olmo2_qbig"): "s3bo2",
+}
+
+#: Adapters per shard, held at the value every existing wall was tuned against.
+#: Sharding is strided (``names[i::shards]``), so only the shard *count* is
+#: chosen and an uneven split needs no special-casing: 35 adapters over 9 train
+#: shards gives 4,4,4,4,4,4,4,4,3.
+#:
+#: Holding the adapters and raising the count, rather than holding the count and
+#: doubling every wall, costs ~120 extra job files across the eight new trees and
+#: buys two things: no wall needs re-tuning on eight suites at once, and a failed
+#: shard's retry stays the size it is today.  These two numbers reproduce the
+#: ``Suite`` defaults at yahoo's 16 adapters, which is why yahoo needs no branch.
+TRAIN_ADAPTERS_PER_SHARD = 4
+BEHAVIORAL_ADAPTERS_PER_SHARD = 2
+
+#: Adapters per training shard for a **rank sweep**: the whole simplex at one
+#: rank, one shard per rank.  Rank cannot be split across shards anyway
+#: (``lora_rank`` is one scalar per config), so the only question is whether one
+#: rank is one wall, and it is: the nsweep measured ~2.5 min/adapter for this 1B
+#: at N=1000/_b5008, so 16 adapters is ~40 min against a 3:00:00 wall.  Rank moves
+#: that number hardly at all -- the LoRA branch is a rounding error beside the
+#: base forward, and the optimizer step count is fixed by the budget, not by the
+#: rank -- so the largest rank sits at the same wall as the smallest.
+TRAIN_ADAPTERS_PER_SHARD_RSWEEP = 16
+
+#: Adapters per training shard for an **initsweep**: the whole simplex at one
+#: initialisation seed, one shard per seed.  The seed cannot be split across
+#: shards anyway (``lora_init_seed`` is one scalar per config), and the wall
+#: argument is the rank sweep's unchanged -- the initialisation seed moves
+#: training time not at all, since it changes where the optimizer starts and
+#: neither the step count nor the cost of a step.  16 adapters at ~1.55
+#: min/adapter measured for this 1B at N=1000/_b5008 is ~25 min against a
+#: 3:00:00 wall.
+TRAIN_ADAPTERS_PER_SHARD_INITSWEEP = 16
+
+#: Adapters per training shard **by `nsamples_train`**, for a spec that carries a training
+#: grid.  A shard is one wall, and training time is proportional to the budget,
+#: so a single number cannot serve four `nsamples_train` values that span ~750x: at 4 per shard the
+#: cheap `nsamples_train` values would emit 40 near-instant jobs each, and at 80 per shard the
+#: N=10000 `nsamples_train` would need 21 hours.
+#:
+#: Sized from the 2026-09-08 smoke shards, which measured both ends of the range
+#: rather than extrapolating either: 80 adapters at N=10 in 4:29 (3.4 s each) and
+#: 4 at N=10000 in 1:31:44 (22.8 min each).  Those two fix the model used for the
+#: rest -- ``ceil(5N/16)`` optimizer steps at ~2.2 it/s, plus a per-adapter fixed
+#: cost of ~1.3 s for the model load and roughly ``N/1100`` s to build the draw.
+#:
+#:     N=10     _b64        3.4 s/adapter   80/shard -> 0:04:29  (measured)
+#:     N=20     _b112       4.5 s/adapter   80/shard -> ~0:06
+#:     N=50     _b256       8.6 s/adapter   80/shard -> ~0:12
+#:     N=100    _b512      ~18  s/adapter   80/shard -> ~0:24
+#:     N=200    _b1008      30  s/adapter   80/shard -> ~0:40
+#:     N=500    _b2512      73  s/adapter   40/shard -> ~0:49
+#:     N=1000   _b5008     ~2.5 min/adapter 16/shard -> ~0:40
+#:     N=2000   _b10000     4.8 min/adapter 16/shard -> ~1:17
+#:     N=5000   _b25008    11.9 min/adapter  8/shard -> ~1:35
+#:     N=10000  _b50000    22.8 min/adapter  4/shard -> 1:31:44  (measured)
+#:
+#: 94 shards rather than the 1600 a flat 4-per-shard would give, every one inside
+#: the suite's 3:00:00 wall with the largest at just over half of it.
+#:
+#: An earlier version of this comment claimed the assumed fixed cost could only
+#: make large shards look worse than they are, so that a smoke run "can lower
+#: these numbers and never has to raise them".  That was wrong: N=10000 measured
+#: 22.8 min/adapter against 16.0 assumed, because the marginal cost per step was
+#: underestimated, not the fixed cost.  4/shard survived only because it had
+#: headroom.  Do not treat a shard size here as safe without a measured wall at
+#: that `nsamples_train` or one above it.
+TRAIN_ADAPTERS_PER_SHARD_BY_N = {
+    10: 80, 20: 80, 50: 80, 100: 80, 200: 80,
+    500: 40, 1000: 16, 2000: 16, 5000: 8, 10000: 4,
+}
+
+#: Behavioral sharding for a tree with a training grid.  Inference cost does not
+#: depend on the training draw, so this is one number for all ten `nsamples_train` values.  At
+#: ~2.45 min/adapter measured, 16 per shard is a ~40 min wall; the default of 2
+#: would emit 800 near-identical job files for 1600 adapters.
+NSWEEP_BEHAVIORAL_ADAPTERS_PER_SHARD = 16
+
+#: Greedy sharding for a tree with a training grid.  One continuation per query
+#: rather than sixteen, measured at ~17.7 s/model on the pool, so 90 per shard is
+#: a ~27 min wall -- comfortably inside the 1:30 the greedy jobs already ask for,
+#: and 16 shards rather than the 90 that matching the behavioral cut would emit.
+NSWEEP_GREEDY_ADAPTERS_PER_SHARD = 90
+
+
+def _has_train_grid() -> bool:
+    """Whether this spec sweeps the training draw at all."""
+    return bool(SPEC.train_sizes or SPEC.train_seeds)
+
+
+def greedy_wall_prose() -> str:
+    """How long the unsharded greedy job is claimed to take, as prose.
+
+    "well under an hour" is a measured statement about ONE shape -- 16 adapters
+    over a 100-query draw, which ran in 5:05 -- and it stops being true when a
+    spec probes with ten times the queries: the same ~19 s/model becomes ~190,
+    i.e. most of an hour rather than a twelfth of it.  Branching here rather than
+    inflating the sentence keeps the five trees on disk regenerating byte-for-byte
+    while refusing to ship a claim the new tree would falsify on its first run.
+    """
+    if SPEC.query_n == 100:
+        return "well under an hour"
+    # ~19 s/model at 100 queries (job 264150, 16 adapters in 5:05), and decode is
+    # linear in the query count at fixed batch width.
+    minutes = round(len(proportions()) * 19.1 * SPEC.query_n / 100 / 60)
+    return f"~{minutes} min"
+
+
+def behavioral_shard_rationale() -> str:
+    """The comment explaining why the sampled behavioral level is sharded.
+
+    Two shapes, and the split is not cosmetic.  The original sentence quotes a
+    *measured* cost -- 25,600 generations at ~4 GPU-hours -- which is an 8B over
+    a 100-query draw at R=16, and every number in it is wrong for a spec that
+    changes ``query_n`` or ``replicates``.  The second branch recomputes the
+    generation count from the spec and prices it off the 1B's own measurement
+    rather than the 8B's, because the two differ by more than an order of
+    magnitude per token and quoting the wrong one is how a wall gets sized wrong.
+    """
+    gens = len(proportions()) * SPEC.query_n * SPEC.replicates
+    if SPEC.query_n == 100 and SPEC.replicates == 16:
+        # "~25,600" is a LITERAL, not `gens`, and knowingly wrong for the
+        # 35-adapter corpora: dolly and oasst1 are 56,000 generations and their
+        # emitted configs say 25,600, because the count was hardcoded when only
+        # the 16-adapter yahoo tree existed. Deriving it here would be correct
+        # and would rewrite ~150 config files belonging to runs that have already
+        # happened, for a comment no code reads. Left as it is; fix it in a commit
+        # whose whole subject is that, so the diff is legible as a prose fix
+        # rather than hiding inside a feature.
+        return (
+            f"# Sharded because this is the expensive half: {len(proportions())} adapters x {SPEC.query_n} queries\n"
+            f"# x {SPEC.replicates} replicates x {MAX_NEW_TOKENS} tokens is ~25,600 generations, ~4 GPU-hours.\n"
+            f"# Shards write to disjoint adapter directories. Paying the 8B load eight\n"
+            f"# times buys eight short slots that actually backfill.\n\n"
+        )
+    per_shard = -(-len(proportions()) // SUITE.behavioral_shards)
+    # 80 s/model for 1600 sequences of 128 tokens on an h200 (job 264147, the
+    # R=16 100-query shard) = ~2,560 tok/s, taken as a FLOOR: that ran 32 rows
+    # per generate() call and this runs batch 2 x R={R}, which is wider and no
+    # slower per row. Pricing at the floor is what keeps the wall honest if the
+    # width buys nothing.
+    secs_per_model = SPEC.query_n * SPEC.replicates * MAX_NEW_TOKENS / 2560
+    return (
+        f"# Sharded because this is the expensive half: {len(proportions())} adapters x {SPEC.query_n} queries\n"
+        f"# x {SPEC.replicates} replicates x {MAX_NEW_TOKENS} tokens is ~{gens:,} generations.\n"
+        f"# At the ~2,560 tok/s this 1B measured on an h200 over the R=16 100-query\n"
+        f"# draw (job 264147) that is ~{secs_per_model / 60:.0f} min/adapter, so ~{gens * MAX_NEW_TOKENS / 2560 / 3600:.0f} GPU-hours\n"
+        f"# for the fleet. That rate is a FLOOR: it was measured at {SAMPLED_BATCH_SIZE} x R=16 = 32\n"
+        f"# rows per generate() call and this runs {SAMPLED_BATCH_SIZE} x R={SPEC.replicates} = "
+        f"{SAMPLED_BATCH_SIZE * SPEC.replicates} rows,\n"
+        f"# which a 1B is nowhere near saturated by, so expect better and size the\n"
+        f"# wall for worse.\n"
+        f"# {SUITE.behavioral_shards} shards of {per_shard} write to disjoint adapter directories, so a\n"
+        f"# shard that dies costs one adapter's decode rather than the fleet's.\n\n"
+    )
+
+
+def train_shard_plan(train_shards: int | None = None) -> list[list[tuple[str, int, int, int, int]]]:
+    """The training shards, as lists of ``(proportion, n_samples, seed, rank, init_seed)``.
+
+    With no training grid, no rank sweep and no initsweep the shards are strided over the
+    proportions, which is what the existing trees carry and must keep carrying.
+    Otherwise they are cut **within one init seed, one rank and one `nsamples_train`**: contiguous
+    chunks of ``TRAIN_ADAPTERS_PER_SHARD_BY_N[n]`` (or of
+    ``TRAIN_ADAPTERS_PER_SHARD_RSWEEP`` for a rank sweep, or of
+    ``TRAIN_ADAPTERS_PER_SHARD_INITSWEEP`` for an initsweep), so no shard ever mixes
+    two budgets, two ranks or two initialisation seeds, and every shard is one wall.
+
+    *train_shards* lets a caller pass the count before ``SUITE`` exists, which is
+    how the suite's own ``train_shards`` field gets computed.
+    """
+    targets = train_targets()
+    if not _has_train_grid() and not rank_sweep() and not init_sweep():
+        k = SUITE.train_shards if train_shards is None else train_shards
+        return [targets[i::k] for i in range(k)]
+    plan: list[list[tuple[str, int, int, int, int]]] = []
+    for init_seed in lora_init_seeds():
+        for rank in lora_ranks():
+            for n in SPEC.train_sizes or (SPEC.train_n,):
+                block = [t for t in targets
+                         if t[1] == n and t[3] == rank and t[4] == init_seed]
+                size = (TRAIN_ADAPTERS_PER_SHARD_BY_N.get(n, TRAIN_ADAPTERS_PER_SHARD)
+                        if _has_train_grid()
+                        else TRAIN_ADAPTERS_PER_SHARD_INITSWEEP if init_sweep()
+                        else TRAIN_ADAPTERS_PER_SHARD_RSWEEP)
+                plan += [block[i:i + size] for i in range(0, len(block), size)]
+    return plan
+
+
+def _suite_for_dataset(suite: Suite, dataset: str, suite_name: str,
+                       n_adapters: int) -> Suite:
+    """*suite* adjusted for the corpus it is being run over.
+
+    Three things depend on the pair rather than on either half: the job-name
+    prefix, the shard counts (which follow the adapter count), and whether this
+    tree emits the dataset-level jobs -- a corpus with its own build tree owns
+    those, so no model suite over it emits any.
+
+    Yahoo is returned untouched: its five trees have already run.
+    """
+    if dataset == "yahoo":
+        return suite
+    from dataclasses import replace
+
+    try:
+        prefix = _SUITE_PREFIXES[(dataset, suite_name)]
+    except KeyError:
+        raise SystemExit(
+            f"No job prefix for --dataset {dataset} --suite {suite_name}. Add one "
+            f"to _SUITE_PREFIXES, checking it collides with none of "
+            f"{sorted(_SUITE_PREFIXES.values())} nor with s3, s3q, s3li, s3nm, s3o2."
+        ) from None
+    # With a training grid the adapter count is the grid's, not the simplex's,
+    # and the training shards are cut per `nsamples_train` rather than by one flat divisor.
+    if _has_train_grid():
+        train_shards = len(train_shard_plan())
+        # The behavioral shards are cut over the adapters that get EXTRACTED, not
+        # over every adapter the grid declares: a `nsamples_train` excluded from extraction
+        # contributes no work, and counting it would emit shards whose whole
+        # adapter list is missing from disk.
+        n_extract = n_adapters * len(SPEC.extract_grid())
+        behavioral_shards = -(-n_extract // NSWEEP_BEHAVIORAL_ADAPTERS_PER_SHARD)
+        greedy_shards = -(-n_extract // NSWEEP_GREEDY_ADAPTERS_PER_SHARD)
+    else:
+        train_shards = -(-n_adapters // TRAIN_ADAPTERS_PER_SHARD)
+        # The divisor is the suite's, defaulting to BEHAVIORAL_ADAPTERS_PER_SHARD,
+        # because a shard's length is the adapter count times the decode budget
+        # per adapter -- and `query_n * replicates` moves the second by 40x while
+        # leaving the first at 16.
+        behavioral_shards = -(-n_adapters // suite.behavioral_adapters_per_shard)
+        greedy_shards = suite.greedy_shards
+    return replace(
+        suite,
+        job_prefix=prefix,
+        train_shards=train_shards,
+        behavioral_shards=behavioral_shards,
+        greedy_shards=greedy_shards,
+        emit_build_job=False,
+        emit_embed_jobs=False,
+        emit_embed_matrix_job=False,
+    )
+
+
 def main() -> None:
-    global SUITE
+    global SUITE, SPEC
 
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--suite", default="llama", choices=sorted(SUITES),
                         help="Which configuration to emit (default: llama).")
+    parser.add_argument("--dataset", default="yahoo", choices=sorted(SPECS),
+                        help="Which corpus the simplex is built over (default: yahoo).")
+    parser.add_argument("--qmix", action="store_true",
+                        help="Emit the qmix tree instead: the query-set composition "
+                             "axis over an EXISTING adapter fleet. Trains nothing; "
+                             "both diluent arms and the shared undiluted point.")
+    parser.add_argument("--data-tree", action="store_true",
+                        help="Emit only the dataset build tree -- the build job and the "
+                             "embedding sweeps -- detached from any model suite.")
     parser.add_argument("--base-model", help="Override the suite's base model.")
     parser.add_argument("--tag", help="Override the suite's directory suffix.")
     parser.add_argument("--torch-dtype", help="Override the suite's dtype.")
@@ -1006,7 +2205,47 @@ def main() -> None:
 
     from dataclasses import replace
 
-    SUITE = SUITES[args.suite]
+    SPEC = SPECS[args.dataset]
+    props = proportions()
+
+    # Listing the simplex is a property of the corpus alone, so it runs before
+    # the suite is resolved -- otherwise `--dataset dolly --list` would fail on
+    # the default suite's missing job prefix rather than printing 35 lines.
+    if args.list:
+        for name, pct in props:
+            ratio = ":".join(str(w) for _, w in weights_for(pct))
+            groups = ",".join(g for g, _ in weights_for(pct))
+            print(f"  {name}   {pct}   {groups} = {ratio}")
+        sizes = len(SPEC.sweep_size_list)
+        print(f"\n{len(props)} proportions "
+              f"x {len(sweep_seeds())} seeds x {sizes} sizes = "
+              f"{len(props) * len(sweep_seeds()) * sizes} draws; {len(props)} adapters")
+        return
+
+    if args.data_tree:
+        write_data_tree(Path(args.root))
+        return
+
+    # Before the suite is adjusted for a corpus, because a qmix tree does not
+    # vary the corpus: it holds one fleet fixed and varies the probe, so none of
+    # the shard-count and prefix machinery below applies to it.
+    if args.qmix:
+        if args.dataset != "yahoo":
+            raise SystemExit(
+                "--qmix is defined over the yahoo fleet only. The diluents are "
+                "the arms of the qmix spec, not --dataset; see "
+                "src/experiments/query_mixture_spec.py."
+            )
+        write_qmix_tree(Path(args.root), args.suite)
+        return
+
+    SUITE = _suite_for_dataset(SUITES[args.suite], args.dataset, args.suite,
+                               len(props))
+    # The temperature sweep is a Suite field, but dropping it is a decision about
+    # how much a *corpus* is worth measuring. A spec that leaves it None inherits
+    # the suite's; yahoo does, so the five existing trees are unaffected.
+    if SPEC.temperature_sweep is not None:
+        SUITE = replace(SUITE, temperature_sweep=SPEC.temperature_sweep)
     if args.base_model:
         SUITE = SUITE.for_model(args.base_model)
     overrides = {}
@@ -1020,22 +2259,20 @@ def main() -> None:
         )
     if overrides:
         SUITE = replace(SUITE, **overrides)
-
-    props = proportions()
-    if args.list:
-        for name, pct in props:
-            ratio = ":".join(str(w) for _, w in weights_for(pct))
-            groups = ",".join(g for g, _ in weights_for(pct))
-            print(f"  {name}   {pct}   {groups} = {ratio}")
-        print(f"\n{len(props)} proportions "
-              f"x {len(SEEDS)} seeds x 4 sizes = {len(props) * len(SEEDS) * 4} draws; "
-              f"{len(props)} adapters")
-        return
+    # A rank sweep's training shards are one rank each, so the count is a function
+    # of the rank tuple. Derived rather than declared because `submit_all.sh`
+    # iterates `range(SUITE.train_shards)` while the files come from
+    # `train_shard_plan()`, and the two disagreeing would submit a job name that
+    # does not exist -- the failure dd70b48 already shipped once for greedy.
+    # An initsweep's shards are one seed each, for the same reason and with the
+    # same failure if the count and the files disagree.
+    if rank_sweep() or init_sweep():
+        SUITE = replace(SUITE, train_shards=len(train_shard_plan()))
 
     root = Path(args.root)
-    slug = f"simplex3{SUITE.suffix}"
-    exp = root / "experiments" / slug
-    jobs = root / "jobs" / slug
+    tree = slug()
+    exp = root / "experiments" / tree
+    jobs = root / "jobs" / tree
     logs = f"{output_dir()}/logs"
     exp.mkdir(parents=True, exist_ok=True)
     jobs.mkdir(parents=True, exist_ok=True)
@@ -1090,12 +2327,12 @@ def main() -> None:
     #    embedding, so this job is a fail-fast gate rather than the sampling work:
     #    640 recipe blocks are resolved and hashed before any GPU is held.
     if SUITE.emit_embed_jobs:
-        for seed in SEEDS:
+        for seed in sweep_seeds():
             emit(exp / f"sweep_s{seed:02d}.yaml", write_sweep(seed))
             emit(jobs / f"02_embed_s{seed:02d}.sh", sbatch(
                 f"{SUITE.job_prefix}_embed_s{seed:02d}", SUITE.gpu_partitions, True,
                 48, "2:00:00",
-                f"python scripts/run_experiment.py experiments/{slug}/sweep_s{seed:02d}.yaml"
+                f"python scripts/run_experiment.py experiments/{tree}/sweep_s{seed:02d}.yaml"
                 f" --steps build extract --taxonomy dataset_embedding",
                 logs,
             ))
@@ -1107,45 +2344,55 @@ def main() -> None:
     #    under either suite. It is also model-free -- the same 16 recipes hash the
     #    same way whichever base model is being studied -- so whichever suite is
     #    run first satisfies both.
-    emit(exp / "embed_matrix.yaml", write_embed_matrix())
-    emit(jobs / "02_embed_matrix.sh", sbatch(
-        f"{SUITE.job_prefix}_embed_matrix", SUITE.gpu_partitions, True,
-        48, "2:00:00",
-        f"python scripts/run_experiment.py experiments/{slug}/embed_matrix.yaml"
-        f" --steps build extract --taxonomy dataset_embedding",
-        logs,
-    ))
+    if SUITE.emit_embed_matrix_job:
+        emit(exp / "embed_matrix.yaml", write_embed_matrix())
+        emit(jobs / "02_embed_matrix.sh", sbatch(
+            f"{SUITE.job_prefix}_embed_matrix", SUITE.gpu_partitions, True,
+            48, _embed_walltime(),
+            f"python scripts/run_experiment.py experiments/{tree}/embed_matrix.yaml"
+            f" --steps build extract --taxonomy dataset_embedding",
+            logs,
+        ))
 
     if SUITE.emit_build_job:
         emit(jobs / "01_build.sh", sbatch(
             f"{SUITE.job_prefix}_build", CPU_PARTITION, False, 32, "1:00:00",
             "\n".join(
                 f"python scripts/run_experiment.py"
-                f" experiments/{slug}/sweep_s{seed:02d}.yaml --steps build"
-                for seed in SEEDS
+                f" experiments/{tree}/sweep_s{seed:02d}.yaml --steps build"
+                for seed in sweep_seeds()
             ),
             logs,
         ))
 
     # 3. Training, four adapters per shard.
-    names = [n for n, _ in props]
-    shards = [names[i::TRAIN_SHARDS] for i in range(TRAIN_SHARDS)]
+    # Every adapter as a (proportion, n_samples, seed, rank, init_seed) tuple.
+    # Without a training
+    # grid this is the 16 proportions at the one draw the tree has always
+    # trained, in the same order, so the strided shards below are the ones the
+    # existing trees already carry.
+    names = train_targets()
+    shards = train_shard_plan()
     for i, shard_names in enumerate(shards):
         emit(exp / f"train_shard{i}.yaml", write_train(i, shard_names))
         emit(jobs / f"03_train_shard{i}.sh", sbatch(
-            f"{SUITE.job_prefix}_train{i}", SUITE.gpu_partitions, True,
+            f"{SUITE.job_prefix}_train{i}", SUITE.train_gpu_partitions, True,
             SUITE.train_mem_gb, SUITE.train_time,
-            f"python scripts/run_experiment.py experiments/{slug}/train_shard{i}.yaml"
+            f"python scripts/run_experiment.py experiments/{tree}/train_shard{i}.yaml"
             f" --steps build finetune",
             logs,
         ))
 
-    # 4-7. Extraction, one pair of stages per query set.
-    bshards = [names[i::BEHAVIORAL_SHARDS] for i in range(BEHAVIORAL_SHARDS)]
+    # 4-7. Extraction, one pair of stages per query set.  Over `extracted`, not
+    # `names`: a `nsamples_train` excluded by `extract_sizes` is trained (or, having been
+    # declined, is not) but never read.
+    extracted = extract_targets()
+    bshards = [extracted[i::SUITE.behavioral_shards]
+               for i in range(SUITE.behavioral_shards)]
     for k, q in enumerate(SUITE.query_sets):
         tok = SUITE.job_token(q)
         num = 4 + 2 * k
-        emit(exp / f"functional_{tok}.yaml", write_extract("functional", q, None, names))
+        emit(exp / f"functional_{tok}.yaml", write_extract("functional", q, None, extracted))
         emit(jobs / f"0{num}_functional_{tok}.sh", sbatch(
             f"{SUITE.job_prefix}_func_{tok}", SUITE.gpu_partitions, True,
             SUITE.extract_mem_gb, SUITE.func_time,
@@ -1153,7 +2400,7 @@ def main() -> None:
             # query recipe from {output_dir}/datasets/{queries_dataset}.recipe.json,
             # and this config's query block is named differently from the sweep's
             # expanded blocks, so nothing else writes that file.
-            f"python scripts/run_experiment.py experiments/{slug}/functional_{tok}.yaml"
+            f"python scripts/run_experiment.py experiments/{tree}/functional_{tok}.yaml"
             f" --steps build extract --taxonomy functional",
             logs,
         ))
@@ -1164,7 +2411,7 @@ def main() -> None:
                 f"{SUITE.job_prefix}_behav_{tok}{i}", SUITE.gpu_partitions, True,
                 SUITE.extract_mem_gb, SUITE.behav_time,
                 f"python scripts/run_experiment.py"
-                f" experiments/{slug}/behavioral_{tok}_shard{i}.yaml"
+                f" experiments/{tree}/behavioral_{tok}_shard{i}.yaml"
                 f" --steps build extract --taxonomy behavioral",
                 logs,
             ))
@@ -1173,14 +2420,23 @@ def main() -> None:
     #    against ~50 for the sampled runs, so 16 adapters fit comfortably in an hour.
     for q in SUITE.query_sets:
         tok = SUITE.job_token(q)
-        emit(exp / f"greedy_{tok}.yaml", write_extract("greedy", q, None, names))
-        emit(jobs / f"08_greedy_{tok}.sh", sbatch(
-            f"{SUITE.job_prefix}_greedy_{tok}", SUITE.gpu_partitions, True,
-            SUITE.extract_mem_gb, SUITE.greedy_time,
-            f"python scripts/run_experiment.py experiments/{slug}/greedy_{tok}.yaml"
-            f" --steps build extract --taxonomy behavioral",
-            logs,
-        ))
+        # `greedy_shards == 1` emits the single unsharded job the four existing
+        # trees already carry, under the name they already carry, so a suite that
+        # never sharded greedy regenerates byte-identical.
+        gshards = ([(None, extracted)] if SUITE.greedy_shards == 1 else
+                   [(i, extracted[i::SUITE.greedy_shards])
+                    for i in range(SUITE.greedy_shards)])
+        for i, shard_names in gshards:
+            stem = f"greedy_{tok}" + ("" if i is None else f"_shard{i}")
+            emit(exp / f"{stem}.yaml", write_extract("greedy", q, i, shard_names))
+            emit(jobs / f"08_{stem}.sh", sbatch(
+                f"{SUITE.job_prefix}_greedy_{tok}" + ("" if i is None else str(i)),
+                SUITE.gpu_partitions, True,
+                SUITE.extract_mem_gb, SUITE.greedy_time,
+                f"python scripts/run_experiment.py experiments/{tree}/{stem}.yaml"
+                f" --steps build extract --taxonomy behavioral",
+                logs,
+            ))
 
     # 9. Input log-probabilities, one unsharded job per query set. Nothing is
     #    decoded, so this is the cheapest GPU job in the suite.
@@ -1188,12 +2444,12 @@ def main() -> None:
         for q in SUITE.query_sets:
             tok = SUITE.job_token(q)
             emit(exp / f"logprob_input_{tok}.yaml",
-                 write_extract("logprob", q, None, names))
+                 write_extract("logprob", q, None, extracted))
             emit(jobs / f"09_logprob_input_{tok}.sh", sbatch(
                 f"{SUITE.job_prefix}_lp_input", SUITE.gpu_partitions, True,
                 SUITE.extract_mem_gb, SUITE.logprob_time,
                 f"python scripts/run_experiment.py"
-                f" experiments/{slug}/logprob_input_{tok}.yaml"
+                f" experiments/{tree}/logprob_input_{tok}.yaml"
                 f" --steps build extract --taxonomy logprob",
                 logs,
             ))
@@ -1201,7 +2457,7 @@ def main() -> None:
     # 10. The temperature sweep: one job per (temperature, shard). This is the
     #     expensive half of the addition -- ten decoding points over 16 adapters.
     if SUITE.temperature_sweep:
-        sshards = [names[i::SUITE.sweep_shards] for i in range(SUITE.sweep_shards)]
+        sshards = [extracted[i::SUITE.sweep_shards] for i in range(SUITE.sweep_shards)]
         for q in SUITE.query_sets:
             tok = SUITE.job_token(q)
             for t in SUITE.temperature_sweep:
@@ -1214,7 +2470,7 @@ def main() -> None:
                         SUITE.gpu_partitions, True,
                         SUITE.extract_mem_gb, SUITE.behav_time,
                         f"python scripts/run_experiment.py"
-                        f" experiments/{slug}/behavioral_{tok}_{tt}_shard{i}.yaml"
+                        f" experiments/{tree}/behavioral_{tok}_{tt}_shard{i}.yaml"
                         f" --steps build extract --taxonomy behavioral",
                         logs,
                     ))
@@ -1224,12 +2480,12 @@ def main() -> None:
         for q in SUITE.query_sets:
             tok = SUITE.job_token(q)
             emit(exp / f"greedy_logprob_{tok}.yaml",
-                 write_extract("greedy_logprob", q, None, names))
+                 write_extract("greedy_logprob", q, None, extracted))
             emit(jobs / f"11_greedy_logprob_{tok}.sh", sbatch(
                 f"{SUITE.job_prefix}_greedy_lp_{tok}", SUITE.gpu_partitions, True,
                 SUITE.extract_mem_gb, SUITE.greedy_time,
                 f"python scripts/run_experiment.py"
-                f" experiments/{slug}/greedy_logprob_{tok}.yaml"
+                f" experiments/{tree}/greedy_logprob_{tok}.yaml"
                 f" --steps build extract --taxonomy behavioral",
                 logs,
             ))
@@ -1240,12 +2496,12 @@ def main() -> None:
         for q in SUITE.query_sets:
             tok = SUITE.job_token(q)
             emit(exp / f"functional_gen_{tok}.yaml",
-                 write_extract("functional_gen", q, None, names))
+                 write_extract("functional_gen", q, None, extracted))
             emit(jobs / f"12_functional_gen_{tok}.sh", sbatch(
                 f"{SUITE.job_prefix}_func_gen_{tok}", SUITE.gpu_partitions, True,
                 SUITE.extract_mem_gb, SUITE.func_gen_time,
                 f"python scripts/run_experiment.py"
-                f" experiments/{slug}/functional_gen_{tok}.yaml"
+                f" experiments/{tree}/functional_gen_{tok}.yaml"
                 f" --steps build extract --taxonomy functional",
                 logs,
             ))
@@ -1256,9 +2512,362 @@ def main() -> None:
     print(f"Wrote {len(written)} files:")
     print(f"  {len(list(exp.glob('*.yaml')))} configs in {exp}")
     print(f"  {len(list(jobs.glob('*.sh')))} scripts in {jobs}")
-    print(f"\n{len(props)} proportions, {len(props) * len(SEEDS) * 4} draws, "
-          f"{len(props)} adapters.")
+    n_sizes = len(SPEC.sweep_size_list)
+    # The adapter count is the simplex crossed with the training grid, which is
+    # the simplex itself for every tree without one.  Printed rather than assumed
+    # because it is the number the GPU budget is a function of.
+    n_adapters = (len(props) * len(SPEC.train_grid()) * len(lora_ranks())
+                  * len(lora_init_seeds()))
+    grid_note = ""
+    if _has_train_grid():
+        grid_note = (f" ({len(props)} x {len(SPEC.train_grid())} training draws,"
+                     f" {len(train_shard_plan())} train shards)")
+    elif rank_sweep():
+        grid_note = (f" ({len(props)} x {len(lora_ranks())} ranks"
+                     f" {{{','.join(str(r) for r in lora_ranks())}}},"
+                     f" {len(train_shard_plan())} train shards)")
+    elif init_sweep():
+        grid_note = (f" ({len(props)} x {len(lora_init_seeds())} init seeds"
+                     f" {{{','.join(str(i) for i in lora_init_seeds())}}},"
+                     f" {len(train_shard_plan())} train shards)")
+    print(f"\n{len(props)} proportions, {len(props) * len(sweep_seeds()) * n_sizes} draws, "
+          f"{n_adapters} adapters{grid_note}.")
     print(f"Submit with: bash {jobs}/submit_all.sh")
+
+
+def _embed_sweep_submit() -> str:
+    """The sample-size sweep's submit block, or nothing when it was not emitted.
+
+    Returned as text rather than inlined because ``for s in ; do`` is a bash
+    syntax error, not an empty loop -- a spec that drops the sweep would emit a
+    submit script that fails on its first line.
+    """
+    seeds = sweep_seeds()
+    if not seeds:
+        return ""
+    return f"""for s in {' '.join(f'{s:02d}' for s in seeds)}; do
+  J=$(sb --dependency=afterok:$BUILD 02_embed_s$s.sh)
+  echo "embed   s$s   $J"
+done
+
+"""
+
+
+def write_data_tree(root: Path) -> None:
+    """Emit the standalone per-dataset build tree.
+
+    The draws and the dataset-level centroids are model-free -- ``DatasetEmbeddingCache``
+    keys on recipe and embedder, never on the model -- so they are built exactly
+    once per corpus rather than once per suite.  Yahoo's were built by whichever
+    suite carried ``emit_build_job``, which puts a dataset property on a Suite and
+    makes "which model do we run first" load-bearing for a reason unrelated to the
+    model.  A new corpus gets its own tree instead, and every model suite over it
+    emits neither the build job nor the embedding sweeps.
+
+    The jobs' resources -- partitions, memory, wall -- come from ``Suite()``'s
+    defaults, which is what the yahoo embed jobs already ran under.  Nothing here
+    loads a base model, so no suite's model-specific tuning applies.
+    """
+    global SUITE, DATA_TREE
+    SUITE = Suite(job_prefix=_data_tree_prefix())
+    DATA_TREE = True
+
+    tree = slug()
+    exp = root / "experiments" / tree
+    jobs = root / "jobs" / tree
+    logs = f"{output_dir()}/logs"
+    exp.mkdir(parents=True, exist_ok=True)
+    jobs.mkdir(parents=True, exist_ok=True)
+
+    written: list[str] = []
+
+    def emit(path: Path, text: str) -> None:
+        path.write_text(text)
+        written.append(str(path))
+
+    for seed in sweep_seeds():
+        emit(exp / f"sweep_s{seed:02d}.yaml", write_sweep(seed))
+        emit(jobs / f"02_embed_s{seed:02d}.sh", sbatch(
+            f"{SUITE.job_prefix}_embed_s{seed:02d}", SUITE.gpu_partitions, True,
+            48, "2:00:00",
+            f"python scripts/run_experiment.py experiments/{tree}/sweep_s{seed:02d}.yaml"
+            f" --steps build extract --taxonomy dataset_embedding",
+            logs,
+        ))
+    emit(exp / "embed_matrix.yaml", write_embed_matrix())
+    emit(jobs / "02_embed_matrix.sh", sbatch(
+        f"{SUITE.job_prefix}_embed_matrix", SUITE.gpu_partitions, True,
+        48, _embed_walltime(),
+        f"python scripts/run_experiment.py experiments/{tree}/embed_matrix.yaml"
+        f" --steps build extract --taxonomy dataset_embedding",
+        logs,
+    ))
+    # The build gate covers whichever configs this tree actually emitted.  A
+    # corpus that drops the sweep still has `embed_matrix.yaml` to fail fast on,
+    # and joining over an empty seed list would otherwise emit a job body that
+    # runs nothing while the embed jobs still declare a dependency on it.
+    build_configs = [f"sweep_s{seed:02d}.yaml" for seed in sweep_seeds()]
+    build_configs.append("embed_matrix.yaml")
+    emit(jobs / "01_build.sh", sbatch(
+        f"{SUITE.job_prefix}_build", CPU_PARTITION, False, 32, "1:00:00",
+        "\n".join(
+            f"python scripts/run_experiment.py"
+            f" experiments/{tree}/{cfg} --steps build"
+            for cfg in build_configs
+        ),
+        logs,
+    ))
+
+    props = proportions()
+    n_sizes = len(SPEC.sweep_size_list)
+    emit(jobs / "submit_all.sh", f"""#!/bin/bash
+# GENERATED BY scripts/gen_simplex3.py --dataset {_spec_key()} --data-tree
+# -- do not edit by hand.
+#
+# The {SPEC.name_prefix} dataset level, built once and shared by every model suite over
+# this corpus. No model is loaded anywhere in this tree: DatasetEmbeddingCache
+# keys on recipe and embedder, so the centroids these jobs write are the same
+# centroids whichever base model is later studied against them.
+#
+# CHECK THE QUEUE FIRST -- the partition ordering and the walls were chosen
+# against a snapshot of free capacity, and a snapshot written into a config is
+# stale by the time it runs:
+#
+#     sinfo -o "%P %a %D %t %G"
+#     squeue --states=PD -o "%P %R" | sort | uniq -c
+
+set -euo pipefail
+cd "$(dirname "$0")"
+mkdir -p {output_dir()}/logs
+
+sb() {{ sbatch --parsable "$@"; }}
+
+# One cheap CPU job: it writes {len(props) * len(sweep_seeds()) * n_sizes} recipe blocks and nothing else, so it is a
+# fail-fast gate rather than the sampling work. Draws are materialised on demand
+# by the sample cache during embedding.
+BUILD=$(sb 01_build.sh)
+echo "build         $BUILD"
+
+{_embed_sweep_submit()}J=$(sb --dependency=afterok:$BUILD 02_embed_matrix.sh)
+echo "embed   mat   $J"
+
+echo
+echo "Submitted. Watch with: squeue -u $USER -o '%.10i %.14j %.9P %.2t %.10M %R'"
+""")
+    (jobs / "submit_all.sh").chmod(0o755)
+
+    print(f"Wrote {len(written)} files:")
+    print(f"  {len(list(exp.glob('*.yaml')))} configs in {exp}")
+    print(f"  {len(list(jobs.glob('*.sh')))} scripts in {jobs}")
+    print(f"\n{len(props)} proportions x {len(sweep_seeds())} seeds x {n_sizes} sizes = "
+          f"{len(props) * len(sweep_seeds()) * n_sizes} draws, plus {len(props)} for embed_matrix.")
+    print(f"Submit with: bash {jobs}/submit_all.sh")
+
+
+#: Job-name prefixes for the dataset build trees.  They land in sacct history and
+#: in log filenames and are effectively permanent, so they are written down here
+#: rather than derived from the dataset name.
+#:
+#: Keyed on ``suffix`` rather than ``name_prefix`` because the suffix is what
+#: names the tree, and the two came apart once a spec appeared that shares
+#: yahoo's adapter names -- deliberately, so its reference adapters are reused --
+#: while writing a tree of its own.  Both existing entries are unchanged: dolly's
+#: suffix is ``_dolly`` and oasst1's is ``_oasst1``.
+_DATA_TREE_PREFIXES = {"_dolly": "s3dd", "_oasst1": "s3od", "_pool": "s3pd",
+                       "_nsweep": "s3nd"}
+
+
+def _spec_key() -> str:
+    """The ``--dataset`` value that selects the bound spec.
+
+    ``SPEC.name_prefix`` is the corpus ("yahoo"), which is not the same thing:
+    ``yahoo``, ``yahoo_pool`` and ``yahoo_nsweep`` all carry it, and only the key
+    regenerates the tree that is being written.
+    """
+    for key, spec in SPECS.items():
+        if spec is SPEC:
+            return key
+    return SPEC.name_prefix
+
+
+def _data_tree_prefix() -> str:
+    try:
+        return _DATA_TREE_PREFIXES[SPEC.suffix]
+    except KeyError:
+        raise SystemExit(
+            f"--data-tree has no job prefix for suffix {SPEC.suffix!r}. Add one "
+            f"to _DATA_TREE_PREFIXES, checking it collides with none of "
+            f"{sorted(_DATA_TREE_PREFIXES.values())} or the suite prefixes."
+        ) from None
+
+
+#: The three levels a qmix tree collects, as
+#: ``(write_extract level, file prefix, job token, Suite wall attribute)``.
+#:
+#: Ordered cheapest-last on purpose: the sampled behavioral level is ~85% of the
+#: bill, so it is what a partial submission should start with.
+#:
+#: ``functional_gen`` and the log-prob level are deliberately absent.  Neither
+#: was asked for, both are priced per adapter, and both could be added later over
+#: these same query sets without regenerating a single generation -- they read
+#: the probe, they do not define it.
+QMIX_LEVELS = (
+    ("behavioral", "05_behavioral", "behav", "behav_time"),
+    ("greedy", "08_greedy", "greedy", "greedy_time"),
+    ("functional", "04_functional", "func", "func_time"),
+)
+
+
+def qmix_job_token(arm: QMixArm | None, pct: int, seed: int) -> str:
+    """The point's token inside a job name: ``d005_s00``, ``o050_s03``, ``pure_s00``.
+
+    Short because it sits inside a job name that already carries a prefix and a
+    level, and sacct truncates.  One letter for the arm -- ``d`` for dolly, ``o``
+    for oasst1-zh -- then the yahoo percentage, then the draw seed.
+    """
+    if arm is None:
+        return f"pure_s{seed:02d}"
+    return f"{arm.name_token[0]}{pct:03d}_s{seed:02d}"
+
+
+def write_qmix_tree(root: Path, suite_name: str) -> None:
+    """Emit the **qmix** tree: one fixed adapter fleet, many query compositions.
+
+    A standalone emitter in the shape of ``write_data_tree``, rather than a set
+    of branches through ``main``.  ``main`` is a training pipeline -- prefetch,
+    build, train shards, then extraction gated on them -- and a qmix tree has
+    none of that: no training, no build barrier, no dependency chain at all, just
+    independent extraction jobs over adapters that already exist.  Threading that
+    through ``main`` would add a dozen ``if`` statements to the emitter that
+    thirteen trees on disk must keep regenerating byte-for-byte.
+
+    What it does *not* fork is the file-writing itself: ``write_extract``,
+    ``sbatch``, ``embedder_block``, ``prompt_format_yaml`` and ``preamble`` are
+    the shared functions, so a wall or a batch size that changes for one mode
+    changes for this one too.
+    """
+    global SUITE, QMIX
+
+    QMIX = QMIX_SPECS["yahoo"]
+    from dataclasses import replace
+    SUITE = replace(SUITES[suite_name], job_prefix=QMIX.job_prefix)
+
+    tree = slug()
+    exp = root / "experiments" / tree
+    jobs = root / "jobs" / tree
+    logs = f"{output_dir()}/logs"
+    exp.mkdir(parents=True, exist_ok=True)
+    jobs.mkdir(parents=True, exist_ok=True)
+
+    # Resolved once, with QMIX temporarily unbound, and then passed to every
+    # config: the fleet is the one thing this whole tree holds constant, so it is
+    # computed in one place rather than sixteen times per job.
+    models = qmix_adapter_paths()
+
+    written: list[str] = []
+
+    def emit(path: Path, text: str) -> None:
+        path.write_text(text)
+        written.append(str(path))
+
+    names = extract_targets()
+    for arm, pct in QMIX.points():
+        for seed in QMIX.seeds:
+            point = (arm, pct, seed)
+            stem = f"{QMIX.recipe_name(arm, pct)}_s{seed:02d}"
+            tok = qmix_job_token(arm, pct, seed)
+            for level, num, jtok, wall in QMIX_LEVELS:
+                cfg = f"{level}_{stem}.yaml"
+                taxonomy = "functional" if level == "functional" else "behavioral"
+                emit(exp / cfg, write_extract(
+                    level, "question_only", None, names,
+                    models_override=models, qpoint=point,
+                ))
+                emit(jobs / f"{num}_{stem}.sh", sbatch(
+                    f"{SUITE.job_prefix}_{jtok}_{tok}", SUITE.gpu_partitions, True,
+                    SUITE.extract_mem_gb, getattr(SUITE, wall),
+                    # --steps build extract, not extract alone: make_queries reads
+                    # the query recipe from
+                    # {output_dir}/datasets/{queries_dataset}.recipe.json, and
+                    # nothing else in this tree writes that file.
+                    f"python scripts/run_experiment.py experiments/{tree}/{cfg}"
+                    f" --steps build extract --taxonomy {taxonomy}",
+                    logs,
+                ))
+
+    emit(jobs / "submit_all.sh", qmix_submit_all(tree))
+    (jobs / "submit_all.sh").chmod(0o755)
+
+    n_points = len(QMIX.points())
+    print(f"Wrote {len(written)} files:")
+    print(f"  {len(list(exp.glob('*.yaml')))} configs in {exp}")
+    print(f"  {len(list(jobs.glob('*.sh')))} scripts in {jobs}")
+    print(f"\n{n_points} query compositions x {len(QMIX.seeds)} draw seeds = "
+          f"{QMIX.n_configs()} query sets, x {len(QMIX_LEVELS)} levels = "
+          f"{QMIX.n_configs() * len(QMIX_LEVELS)} jobs over {len(models)} fixed adapters.")
+    print(f"Submit with: bash {jobs}/submit_all.sh")
+
+
+def qmix_submit_all(tree: str) -> str:
+    """The qmix submit script: three flat stages, no dependencies anywhere.
+
+    Every other tree in this generator submits an ``afterok`` chain, because
+    extraction there waits on training.  Nothing here trains, so every job is
+    independent and the only ordering that matters is which stage is worth
+    spending the queue on first.
+    """
+    stages = "\n".join(
+        f'for f in {num}_*.sh; do\n'
+        f'  J=$(sb "$f"); echo "{jtok:<6} ${{f%.sh}}   $J"\n'
+        f'done\n'
+        for _, num, jtok, _ in QMIX_LEVELS
+    )
+    n_sets = QMIX.n_configs()
+    n_jobs = n_sets * len(QMIX_LEVELS)
+    # Per-job GPU-hours from the measured per-adapter costs on this 1B (147 s
+    # sampled at R=16, 18.6 s greedy, 1.9 s functional over 16 adapters), plus a
+    # per-job base-model load. Printed because a submit script for 450 jobs that
+    # does not say what it costs is one nobody can check before running it.
+    behav_h = round(n_sets * 0.75)
+    other_h = round(n_sets * (0.12 + 0.05))
+    return f"""#!/bin/bash
+# GENERATED BY scripts/gen_simplex3.py --qmix --suite ... -- do not edit by hand.
+#
+# The QMIX tree: {n_sets} query sets x {len(QMIX_LEVELS)} levels = {n_jobs} jobs, over ONE fixed
+# adapter fleet. Nothing here trains, so there are no dependencies at all --
+# every job below is independent and the stages are ordered by what is worth
+# spending the queue on first, not by what must finish before what.
+#
+# THIS SUBMITS {n_jobs} JOBS. Read the cost note before running it whole:
+#   - {n_sets} sampled behavioral jobs at ~45 min each is ~{behav_h} GPU-h, ~85% of the bill
+#   - the greedy and functional stages together are ~{other_h} GPU-h
+# Under a 16-GPU cap the whole thing is ~8-9 h of wall clock.
+#
+# Levers, both without touching a config: run one stage at a time by copying the
+# loop you want, or run one arm first --
+#   for f in 05_behavioral_qmix_yahoo*_dolly*.sh; do sbatch "$f"; done
+#
+# sbatch on this cluster refuses without --comment=accept_cost, and the gate
+# quotes the REQUESTED wall rather than elapsed time. It is added by hand at
+# submit time and is deliberately not baked in here.
+#
+# CHECK THE QUEUE FIRST -- the partition ordering and the walls were chosen
+# against a snapshot of free capacity, and a snapshot written into a config is
+# stale by the time it runs:
+#
+#     sinfo -o "%P %a %D %t %G"
+#     squeue --states=PD -o "%P %R" | sort | uniq -c
+
+set -euo pipefail
+cd "$(dirname "$0")"
+mkdir -p {output_dir()}/logs
+
+sb() {{ sbatch --parsable "$@"; }}
+
+{stages}
+echo
+echo "Submitted. Watch with: squeue -u $USER -o '%.10i %.14j %.9P %.2t %.10M %R'"
+"""
 
 
 def submit_all() -> str:
@@ -1289,7 +2898,7 @@ PREFETCH=$(sb 00_prefetch.sh)
 echo "prefetch      $PREFETCH"
 {_submit_build()}
 TRAIN=""
-for i in {' '.join(str(i) for i in range(TRAIN_SHARDS))}; do
+for i in {' '.join(str(i) for i in range(SUITE.train_shards))}; do
   J=$(sb --dependency=afterok:$PREFETCH{'':s}{_train_dep()} 03_train_shard$i.sh)
   TRAIN="$TRAIN:$J"
   echo "train   $i     $J"
@@ -1299,13 +2908,7 @@ TRAIN=${{TRAIN#:}}
 # Extraction depends only on training, so every extraction job is eligible at
 # once and the queue orders them.
 {_submit_extract()}
-# Greedy: the deterministic control, one job per query set. Its own cache entries
-# (GREEDY_SAMPLING nulls the sampling fields), so it cannot collide with the
-# R={REPLICATES} runs over the same adapters and draw.
-for q in {' '.join(SUITE.job_token(q) for q in SUITE.query_sets)}; do
-  J=$(sb --dependency=afterok:$TRAIN 08_greedy_$q.sh)
-  echo "greedy  $q     $J"
-done
+{_submit_greedy()}
 {_submit_logprob()}
 echo
 echo "Submitted. Watch with: squeue -u $USER -o '%.10i %.14j %.9P %.2t %.10M %R'"
@@ -1329,7 +2932,7 @@ def _submit_build() -> str:
 BUILD=$(sb 01_build.sh)
 echo "build         $BUILD"
 
-for s in {' '.join(f'{s:02d}' for s in SEEDS)}; do
+for s in {' '.join(f'{s:02d}' for s in sweep_seeds())}; do
   J=$(sb --dependency=afterok:$BUILD 02_embed_s$s.sh)
   echo "embed   s$s   $J"
 done
@@ -1403,6 +3006,46 @@ def _train_dep() -> str:
     return ":$BUILD" if SUITE.emit_build_job else ""
 
 
+def _submit_greedy() -> str:
+    """The greedy stanza, sharded or not.
+
+    ``greedy_shards == 1`` reproduces the single-job loop the suites that have
+    already run were generated with, byte for byte.  A suite that shards greedy
+    gets one submission per shard instead.
+
+    This exists because the emitter and the submitter disagreed.  ``dd70b48``
+    taught :func:`write_extract` to cut greedy into ``greedy_shards`` files but
+    left this stanza naming the unsharded ``08_greedy_{tok}.sh``, so a sharded
+    tree wrote sixteen ``_shard{i}`` scripts and then submitted a seventeenth
+    name that does not exist -- ``submit_all.sh`` died on the first greedy line.
+    The nsweep tree is the only sharded one today, and its greedy pass was
+    submitted by hand, which is why the mismatch survived a full run.
+    """
+    toks = " ".join(SUITE.job_token(q) for q in SUITE.query_sets)
+    if SUITE.greedy_shards == 1:
+        return (
+            "# Greedy: the deterministic control, one job per query set. Its own cache entries\n"
+            "# (GREEDY_SAMPLING nulls the sampling fields), so it cannot collide with the\n"
+            f"# R={SPEC.replicates} runs over the same adapters and draw.\n"
+            f"for q in {toks}; do\n"
+            "  J=$(sb --dependency=afterok:$TRAIN 08_greedy_$q.sh)\n"
+            '  echo "greedy  $q     $J"\n'
+            "done"
+        )
+    idx = " ".join(str(i) for i in range(SUITE.greedy_shards))
+    return (
+        f"# Greedy: the deterministic control, {SUITE.greedy_shards} shards per query set. Its own\n"
+        "# cache entries (GREEDY_SAMPLING nulls the sampling fields), so it cannot collide\n"
+        f"# with the R={SPEC.replicates} runs over the same adapters and draw.\n"
+        f"for q in {toks}; do\n"
+        f"  for i in {idx}; do\n"
+        "    J=$(sb --dependency=afterok:$TRAIN 08_greedy_${q}_shard$i.sh)\n"
+        '    echo "greedy  $q $i   $J"\n'
+        "  done\n"
+        "done"
+    )
+
+
 def _submit_extract() -> str:
     out = []
     for k, q in enumerate(SUITE.query_sets):
@@ -1411,7 +3054,7 @@ def _submit_extract() -> str:
         out.append(
             f'J=$(sb --dependency=afterok:$TRAIN 0{num}_functional_{tok}.sh); '
             f'echo "func    {tok}     $J"\n'
-            f"for i in {' '.join(str(i) for i in range(BEHAVIORAL_SHARDS))}; do\n"
+            f"for i in {' '.join(str(i) for i in range(SUITE.behavioral_shards))}; do\n"
             f"  J=$(sb --dependency=afterok:$TRAIN 0{num + 1}_behavioral_{tok}_shard$i.sh)\n"
             f'  echo "behav   {tok}$i    $J"\n'
             f"done\n"

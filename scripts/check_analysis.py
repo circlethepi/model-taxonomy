@@ -22,18 +22,28 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+from scipy.spatial.distance import pdist, squareform
+
 from src.analysis import (
+    APPROX_MIN_N,
     align_to_reference,
     anchor_weight_vs_truth,
     as_distance_matrix,
+    band_quantiles,
     barycentric,
     compare_simplices,
     correlation_table,
+    dcor_null_direct,
+    disparity_null_analytic,
+    disparity_null_approx,
+    disparity_null_direct,
     fit_geometry,
     kruskal_stress,
     dcor_test,
     distance_correlation,
     mantel_test,
+    simplex_vertices,
+    truth_singular_values,
     matrix_correlation,
     per_point_residuals,
     point_dispersion,
@@ -309,6 +319,117 @@ def t_dcor_bias():
     )
 
 
+@check("dcor: the two readings of scoring a subset are different numbers")
+def t_dcor_restricted():
+    """`distance_correlation_restricted` is not `distance_correlation` on a subset.
+
+    The design question it answers: a group of `n` models is scored inside a
+    matrix that also holds a few *reference* models, which are meant to inform
+    the configuration without being scored themselves. There are two readings.
+
+    **Restrict-then-score** cuts both matrices down to the `n` first. A pairwise
+    distance depends only on its two models, so the extra rows are genuinely
+    invisible and the result equals what a collection of the `n` alone would
+    give -- pinned below as an exact identity.
+
+    **Centre-then-restrict** U-centres over all rows present and then sums over
+    the block. dCor* never embeds, so the centring term is the *only* channel by
+    which an unscored model could inform the score; the reference rows enter
+    every row's centring term on both sides, and the number differs.
+
+    Both are pinned because an earlier draft of the group-size sweep asserted
+    they were provably equal and reported the statistic once. They are equal only
+    under the first reading.
+    """
+    from src.analysis.matrices import distance_correlation_restricted
+
+    a = _random_dm(24, seed=5)
+    b = _random_dm(24, seed=6)
+    keep = [f"m{i}" for i in range(16)]
+
+    # restrict-then-score IS the sub-collection, exactly
+    sub_a, sub_b = a.reindex(keep), b.reindex(keep)
+    restrict_then_score = distance_correlation(sub_a, sub_b)
+    assert abs(distance_correlation_restricted(sub_a, sub_b, keep)
+               - restrict_then_score) < 1e-12
+
+    # centre-then-restrict sees the eight extra rows
+    centre_then_restrict = distance_correlation_restricted(a, b, keep)
+    gap = abs(centre_then_restrict - restrict_then_score)
+    assert gap > 1e-6, gap
+
+    # keeping everything is just dCor*
+    everything = [f"m{i}" for i in range(24)]
+    assert abs(distance_correlation_restricted(a, b, everything)
+               - distance_correlation(a, b)) < 1e-12
+
+    # a model outside the shared set is an error, not a silent drop
+    try:
+        distance_correlation_restricted(a, b, keep + ["nope"])
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("an unknown id in `keep` should raise")
+
+    return (f"restrict-then-score={restrict_then_score:+.4f}, "
+            f"centre-then-restrict={centre_then_restrict:+.4f}, "
+            f"gap={gap:.3e}")
+
+
+@check("simplex spec: sampled mixtures, and the exhaustive grid unchanged")
+def t_data_simplex_spec_sampling():
+    """`n_mixtures` draws a pool; `None` reproduces the enumeration that ran.
+
+    The second half is the regression that matters: three corpora's trees are
+    already on disk and their mixtures must not move by a byte, so the exhaustive
+    path is pinned against the counts and the exact enumeration order the
+    hand-written triple loop produced.
+    """
+    from dataclasses import replace
+
+    from src.experiments.data_simplex_spec import (
+        DOLLY, OASST1, YAHOO, YAHOO_POOL,
+    )
+
+    # -- exhaustive: unchanged -----------------------------------------------
+    assert len(YAHOO.mixture_pcts()) == 16
+    assert len(DOLLY.mixture_pcts()) == 35
+    assert len(OASST1.mixture_pcts()) == 35
+    assert YAHOO.mixture_pcts()[0] == (0, 0, 100)
+    assert YAHOO.mixture_pcts()[-1] == (33, 33, 33)   # even appended, sums to 99
+    assert all(sum(p) == 100 for p in DOLLY.mixture_pcts())  # K divides grid
+
+    # -- sampled --------------------------------------------------------------
+    pcts = YAHOO_POOL.mixture_pcts()
+    assert len(pcts) == 1004, len(pcts)
+    assert len(set(pcts)) == 1004                     # distinct
+    k = YAHOO_POOL.n_groups
+    vertices = YAHOO_POOL.vertex_pcts()
+    assert pcts[-k - 1:-1] == vertices                # references appended
+    assert pcts[-1] == YAHOO_POOL.even_pct
+    sampled = pcts[:-k - 1]
+    assert not (set(sampled) & set(vertices))         # no pure endpoint sampled
+    assert all(sum(p) == 100 for p in sampled)
+    # every weight lands on a whole number of the 1000 training rows
+    assert all(p * YAHOO_POOL.train_n % 100 == 0 for pct in sampled for p in pct)
+
+    # deterministic in the seed, and only in the seed
+    assert YAHOO_POOL.mixture_pcts() == pcts
+    other = replace(YAHOO_POOL, mixture_seed=1).mixture_pcts()
+    assert other != pcts and len(other) == 1004
+
+    # a grid that cannot be named in whole percent is refused
+    try:
+        replace(YAHOO, grid=3).step_pct
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("grid=3 does not divide 100 and should raise")
+
+    return (f"exhaustive 16/35/35 unchanged; sampled pool {len(pcts)} = "
+            f"{len(sampled)} drawn + {k} vertices + 1 even, all on the 1% grid")
+
+
 @check("dcor: exact enumeration, and a calibrated null")
 def t_dcor_test():
     # 5! = 120 <= 999, so every relabelling is enumerated and p is exact.
@@ -497,6 +618,370 @@ def t_procrustes():
     return f"disparity={res.disparity:.2e}, protest p={pt.p_value:.4f}"
 
 
+# ── uninformed baselines ──────────────────────────────────────────────────────
+#
+# An *uninformed baseline* is the level a taxonomy that learned nothing would
+# score; the *uninformed band* is its 5-95 interval.  These checks are all
+# synthetic on purpose: they build their own ground truth and never read
+# `results/baselines/constants.json`, which is generated and gitignored, so they
+# pass in a fresh clone and in a worktree.
+
+
+def _baseline_truth(n, k, seed=0):
+    """A Dirichlet(1) ground truth at *n* on a *k*-vertex simplex."""
+    rng = np.random.default_rng(seed)
+    return rng.dirichlet(np.ones(k), size=n) @ simplex_vertices(k)
+
+
+@check("uninformed: analytic disparity null matches the full scoring path")
+def t_uninformed_disparity_analytic():
+    """The closed form against a Monte Carlo of draw -> standardise -> superimpose.
+
+    This is the load-bearing check of the whole module: everything else trusts
+    that ``1 - ||L Z||_*^2 / (||Z||_F^2 + W_n)`` really is the disparity's null.
+    Both band edges and the centre, at three n spanning the range, at d=2 and
+    d=3.
+    """
+    worst = 0.0
+    for k, ns in ((3, (5, 50, 500)), (4, (5, 50, 500))):
+        for n in ns:
+            truth = _baseline_truth(n, k, seed=n + k)
+            lam = truth_singular_values(truth)
+            got = np.array(band_quantiles(
+                disparity_null_analytic(n, lam, n_mc=40_000, seed=1)))
+            ref = np.array(band_quantiles(
+                disparity_null_direct(n, truth, n_mc=4_000, seed=2)))
+            worst = max(worst, float(np.abs(got - ref).max()))
+    # 4k direct draws put the Monte Carlo error on a 5th percentile at ~0.01.
+    assert worst < 0.02, f"analytic and direct disagree by {worst:.4f}"
+    return f"max |analytic - direct| = {worst:.4f} over 6 (k, n) cells"
+
+
+@check("uninformed: the large-n approximation holds above its threshold, and "
+       "fails below")
+def t_uninformed_approx_threshold():
+    """``APPROX_MIN_N`` is a tested claim, not a comment.
+
+    The approximation replaces the random denominator with its mean while the
+    numerator's ``Z`` is *inside* that denominator, so it fails at small n --
+    and it has to be shown failing, or the threshold means nothing.
+    """
+    lam = truth_singular_values(_baseline_truth(200, 3, seed=5))
+
+    def err(n):
+        a = np.array(band_quantiles(disparity_null_analytic(n, lam, seed=1)))
+        b = np.array(band_quantiles(disparity_null_approx(n, lam, seed=1)))
+        return float(np.abs(a - b).max())
+
+    above = max(err(n) for n in (APPROX_MIN_N, 50, 100, 500))
+    assert above < 0.01, f"approximation is off by {above:.4f} at n >= {APPROX_MIN_N}"
+    below = err(5)
+    assert below > 0.05, (
+        f"approximation is only off by {below:.4f} at n=5; if it no longer "
+        f"fails there, APPROX_MIN_N={APPROX_MIN_N} is too conservative"
+    )
+    return f"err <= {above:.4f} at n >= {APPROX_MIN_N}, {below:.3f} at n=5"
+
+
+@check("uninformed: a perfect recovery falls outside the band")
+def t_uninformed_separates_truth():
+    """A baseline that cannot separate the truth from noise is broken.
+
+    Scores the truth against itself -- disparity 0, dCor* 1 -- and requires both
+    to sit outside the uninformed band at every n.  This is the check that would
+    catch a band drawn on the wrong scale or with its edges swapped.
+    """
+    for k in (3, 4):
+        for n in (5, 20, 500):
+            truth = _baseline_truth(n, k, seed=n)
+            lam = truth_singular_values(truth)
+            lo, _, hi = band_quantiles(
+                disparity_null_analytic(n, lam, n_mc=20_000, seed=3))
+            assert 0.0 < lo, (
+                f"k={k} n={n}: perfect disparity 0 is inside the band "
+                f"[{lo:.4f}, {hi:.4f}]"
+            )
+            dm = squareform(pdist(truth))
+            dlo, _, dhi = band_quantiles(
+                dcor_null_direct(n, dm, k=k, n_mc=600, seed=4))
+            assert 1.0 > dhi, (
+                f"k={k} n={n}: perfect dCor* 1 is inside the band "
+                f"[{dlo:.4f}, {dhi:.4f}]"
+            )
+    return "disparity 0 and dCor* 1 both clear the band at every (k, n)"
+
+
+@check("uninformed: the dCor structure null has mean zero and a shrinking skew")
+def t_uninformed_dcor_centre():
+    """dCor*'s null is centred at zero *in the mean*, and is right-skewed.
+
+    The analytic claim is about the mean and only the mean: the bias-corrected
+    numerator is an unbiased estimator of dCov^2, which is 0 when the two
+    matrices are independent.  The **median** is a different story and is pinned
+    separately here, because it is the number a band's centre line actually
+    draws.
+
+    dCor* is a ratio with a random denominator, so its null is right-skewed and
+    the median sits *below* the mean.  Measured at k=3, 8000 draws:
+
+    .. code-block:: text
+
+        n        mean      median
+        10     +0.0025    -0.027
+        50     +0.0002    -0.0055
+        200    -0.0001    -0.0014
+
+    The skew is real, not noise -- it is ~10x the median's standard error at
+    every n -- and it decays like 1/n, so it matters only where the band is
+    already ~0.27 wide.  Both facts are pinned: the mean must be ~0 everywhere,
+    and the median's offset must shrink by at least 4x from n=10 to n=200.  A
+    median that stopped shrinking, or a mean that did not sit at 0, would both
+    mean the U-centring was wrong.
+    """
+    means, medians = {}, {}
+    for generator in ("gaussian", "dirichlet"):
+        for n in (10, 50, 200):
+            dm = squareform(pdist(_baseline_truth(n, 3, seed=n)))
+            sample = dcor_null_direct(n, dm, k=3, generator=generator,
+                                      n_mc=4_000, seed=6)
+            means[generator, n] = float(np.mean(sample))
+            medians[generator, n] = float(np.median(sample))
+
+    worst_mean = max(abs(v) for v in means.values())
+    assert worst_mean < 0.01, f"dCor* null mean is {worst_mean:.4f}, not 0"
+
+    for generator in ("gaussian", "dirichlet"):
+        small = abs(medians[generator, 10])
+        large = abs(medians[generator, 200])
+        assert small > 4 * large, (
+            f"{generator}: median offset {small:.4f} at n=10 vs {large:.4f} at "
+            "n=200 — the skew is not shrinking with n"
+        )
+    return (f"max |mean| = {worst_mean:.4f}; median offset "
+            f"{abs(medians['gaussian', 10]):.3f} -> "
+            f"{abs(medians['gaussian', 200]):.4f} from n=10 to 200")
+
+
+@check("uninformed: lambda matches the standardisation Procrustes applies")
+def t_uninformed_lambda_matches_standardize():
+    """``truth_singular_values`` must be the *same* standardisation as the score.
+
+    The analytic law is stated in terms of the singular values of the truth
+    *after* ``_standardize`` -- centred and unit Frobenius norm.  If these two
+    ever diverge the band would be computed for a differently-scaled truth than
+    the one the disparity is measured against, silently.
+    """
+    from src.analysis.configurations import _standardize
+
+    for k in (3, 4):
+        truth = _baseline_truth(37, k, seed=8)
+        mine = truth_singular_values(truth)
+        theirs = np.linalg.svd(_standardize(truth, True)[0], compute_uv=False)
+        assert np.allclose(mine, theirs, atol=1e-12), (mine, theirs)
+        assert abs(float((mine ** 2).sum()) - 1.0) < 1e-12
+    return "identical at k=3 and k=4, and sum(l^2) = 1"
+
+
+# ── the permutation band and its cache tier ───────────────────────────────────
+#
+# A *label null* keeps both real geometries and permutes which model is which;
+# the *permutation band* is its 5-95 interval, and `docs/terminology.md` records
+# that the two names are one concept.  Synthetic like the block above: these
+# build their own data and write into a temporary cache root, so nothing here
+# depends on `results/shared_cache` or on a cluster run.
+
+
+@check("permutation cache: the key carries everything that changes the numbers")
+def t_permutation_key_completeness():
+    """Anything that moves the null must move the key, and nothing else may.
+
+    A key that omits a parameter does not make the cache smaller; it makes two
+    different measurements share a name, and the second one silently reads the
+    first.  ``random_state`` and ``n_permutations`` are the two that are easy to
+    forget -- the same omission ``CollectionCache.geometry_key`` had to correct
+    one level down -- so they are pinned here alongside the rest.
+    """
+    from src.cache import PermutationCache
+
+    cache = PermutationCache("/nonexistent")     # keys are pure; no I/O
+    base = dict(members=["m3", "m1", "m2"], source_handle="structural/a/cosine_b",
+                truth_kind="simplex", test="protest",
+                params={"n_permutations": 9999, "random_state": 0,
+                        "n_components": 2})
+    key = cache.test_key(**base)
+
+    def moved(**over):
+        merged = dict(base)
+        merged.update(over)
+        return cache.test_key(**merged) != key
+
+    assert not moved(members=["m1", "m2", "m3"]), (
+        "the key depends on member *order*; a subgroup assembled in a different "
+        "order would miss its own stored null")
+    for field, value in (
+            ("params", {**base["params"], "random_state": 1}),
+            ("params", {**base["params"], "n_permutations": 999}),
+            ("params", {**base["params"], "n_components": 3}),
+            ("members", ["m1", "m2", "m3", "m4"]),
+            ("test", "dcor"),
+            ("truth_kind", "realized"),
+            ("source_handle", "structural/a/cosine_OTHER")):
+        assert moved(**{field: value}), f"{field}={value!r} does not change the key"
+    return "order-free in members; sensitive to all 7 of the rest"
+
+
+@check("permutation cache: a stored null reloads bit-identically")
+def t_permutation_cache_roundtrip():
+    """float64 in, the same float64 out.
+
+    Stored at float64 for the reason ``CollectionCache.save_distance_matrix``
+    gives: a cached value must be indistinguishable from a freshly computed one,
+    or the only test that the reuse is correct stops testing anything.
+    """
+    import tempfile
+
+    from src.cache import PermutationCache
+
+    with tempfile.TemporaryDirectory() as root:
+        cache = PermutationCache(root)
+        null = np.random.default_rng(3).standard_normal(2_500)
+        params = {"n_permutations": 2_500, "random_state": 0, "n_components": 2}
+        gk, tk = cache.save_result(
+            test="protest", members=["a", "b", "c"], source_handle="h",
+            truth_kind="simplex", params=params, statistic=0.0651,
+            p_value=0.0004, null=null, n_models=3, n_permutations=2_500)
+        got = cache.load_result("protest", gk, tk)
+        assert got["null"].dtype == np.float64, got["null"].dtype
+        assert np.array_equal(got["null"], null), "null is not bit-identical"
+        assert got["statistic"] == 0.0651 and got["p_value"] == 0.0004
+        band = got["band"]
+        assert band["lo"] <= band["mid"] <= band["hi"], band
+        assert cache.list_results() == [("protest", gk, tk)]
+        # The catalogue is never load-bearing: a read must survive losing it.
+        (Path(root) / "07A_permutation_tests" / "index.json").unlink()
+        assert cache.load_result("protest", gk, tk, with_null=False) is not None
+        assert cache.list_results() == [("protest", gk, tk)]
+    return "float64 round-trip exact; reads survive a deleted index.json"
+
+
+@check("bands: span mode covers only its own x range")
+def t_band_span_extent():
+    """``span`` is what a grouped bar chart needs and ``horizontal`` is not.
+
+    A bar panel whose groups do not share a baseline -- figure 2's corpus panel,
+    where yahoo is 16 models on a 3-vertex simplex and dolly and oasst1 are 35 on
+    a 4-vertex one -- would otherwise get the first group's level drawn across
+    all of them.
+    """
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    from src.plots.figures import (PERMUTATION_LABEL, draw_permutation_band,
+                                   draw_uninformed_band)
+
+    band = (0.77, 0.92, 0.98)
+    fig, ax = plt.subplots()
+    try:
+        ax.set_xlim(-0.5, 3.5)
+        draw_uninformed_band(ax, mode="span", generator="dirichlet",
+                             band=band, x=(0.6, 1.4), label=True)
+        ext = ax.collections[-1].get_paths()[0].get_extents()
+        assert abs(ext.x0 - 0.6) < 1e-9 and abs(ext.x1 - 1.4) < 1e-9, ext
+        assert abs(ext.y0 - 0.77) < 1e-9 and abs(ext.y1 - 0.98) < 1e-9, ext
+        # One legend entry for the pair, never two: the dashed centre line must
+        # not carry its own label.
+        assert len(ax.get_legend_handles_labels()[1]) == 1
+    finally:
+        plt.close(fig)
+
+    fig, ax = plt.subplots()
+    try:
+        draw_permutation_band(ax, mode="span", band=band, x=(0.0, 1.0),
+                              label=True)
+        assert ax.get_legend_handles_labels()[1] == [PERMUTATION_LABEL]
+    finally:
+        plt.close(fig)
+
+    for mode, kw in (("span", {}), ("radial", {})):
+        fig, ax = plt.subplots()
+        try:
+            draw_uninformed_band(ax, mode=mode, generator="g", band=band, **kw)
+        except ValueError as exc:
+            assert "needs x" in str(exc), exc
+        else:
+            raise AssertionError(f"mode={mode!r} without x should raise")
+        finally:
+            plt.close(fig)
+    return "span covers exactly (x0, x1); one legend entry per band"
+
+
+@check("bands: a complete mixture grid has an isotropic truth")
+def t_grid_specs_isotropic():
+    """Every suite grid is symmetric, so its Lambda is ``1/sqrt(d)`` exactly.
+
+    This is what lets ``figures/figure2_v2`` compute those panels' uninformed
+    bands directly instead of interpolating the pooled table -- no estimated
+    Lambda, and no log-n interpolation between grid rungs.  Pinned because it is
+    a property of the mixture grids rather than of the code: a spec that stops
+    being a complete grid must fail here loudly rather than quietly acquire a
+    band computed for a truth it does not have.
+
+    ``yahoo_pool`` is the control.  It is a random scatter over the simplex
+    rather than a grid, so it must *not* be isotropic -- otherwise this check
+    would pass on an implementation that returned ``1/sqrt(d)`` unconditionally.
+    """
+    from src.experiments.data_simplex_spec import SPECS
+
+    rows = []
+    for name in ("yahoo", "yahoo_nsweep", "dolly", "oasst1"):
+        W = np.array(SPECS[name].mixture_pcts(), dtype=float) / 100.0
+        k = W.shape[1]
+        lam = truth_singular_values(W @ simplex_vertices(k))
+        want = 1.0 / np.sqrt(k - 1)
+        assert np.allclose(lam, want, atol=1e-12), (name, lam, want)
+        rows.append(f"{name} n={len(W)} K={k} l={lam[0]:.4f}")
+
+    W = np.array(SPECS["yahoo_pool"].mixture_pcts(), dtype=float) / 100.0
+    lam = truth_singular_values(W @ simplex_vertices(W.shape[1]))
+    assert not np.allclose(lam, 1.0 / np.sqrt(W.shape[1] - 1), atol=1e-3), (
+        "yahoo_pool is a scatter, not a grid, and must not come out isotropic — "
+        "this check would otherwise pass on a constant")
+    return "; ".join(rows) + f"; yahoo_pool anisotropic {lam}"
+
+
+@check("bands: the exact grid band agrees with the tabulated one")
+def t_exact_band_matches_table():
+    """Two routes to one quantity, and they must not be two conventions.
+
+    ``figures/figure2_v2`` computes panels 1, 2 and 4 from the suite's own grid
+    and reads panel 3 from ``results/baselines/constants.json``.  If those
+    disagreed, one figure would carry two different definitions of the same
+    band.  Compared against a freshly sampled table-style band rather than the
+    generated file, so this stays synthetic.
+    """
+    from src.experiments.data_simplex_spec import SPECS
+
+    W = np.array(SPECS["yahoo"].mixture_pcts(), dtype=float) / 100.0
+    n, k = len(W), W.shape[1]
+    lam_grid = truth_singular_values(W @ simplex_vertices(k))
+    exact = band_quantiles(disparity_null_analytic(n, lam_grid, n_mc=40_000,
+                                                   seed=0))
+    # The table's route: a Lambda pooled over Dirichlet(1) truths rather than
+    # the grid's own.
+    lam_pooled = np.mean([truth_singular_values(_baseline_truth(n, k, seed=s))
+                          for s in range(50)], axis=0)
+    lam_pooled = lam_pooled / np.linalg.norm(lam_pooled)
+    pooled = band_quantiles(disparity_null_analytic(n, lam_pooled, n_mc=40_000,
+                                                    seed=0))
+    for label, a, b in zip(("q05", "q50", "q95"), exact, pooled):
+        assert abs(a - b) < 0.05, (
+            f"{label}: exact {a:.4f} vs pooled {b:.4f} — the two routes to the "
+            "uninformed band disagree by more than sampling noise")
+    return (f"exact [{exact[0]:.4f} {exact[1]:.4f} {exact[2]:.4f}] vs pooled "
+            f"[{pooled[0]:.4f} {pooled[1]:.4f} {pooled[2]:.4f}]")
+
+
 @check("procrustes: matches scipy.spatial.procrustes")
 def t_procrustes_vs_scipy():
     from scipy.spatial import procrustes as sp_procrustes
@@ -677,6 +1162,218 @@ def t_mixture_weights():
     assert set(got) == {"dsA[c=0]", "dsA[c=1]", "dsB"}, got
     assert abs(sum(got.values()) - 1.0) < 1e-12
     return "3 datasets, 2 classes, dict==object, and the mixed case"
+
+
+@check("adapter names: the mixture parser returns a K-vector, never a truncated one")
+def t_mixture_name_k_vector():
+    """The regression test for a bug that produced plausible wrong numbers.
+
+    The pattern was ``_(\\d{3})g1_(\\d{3})g2_(\\d{3})g3_``, which requires a
+    trailing underscore after ``g3`` -- and a 4-group name supplies one, because
+    ``g4`` follows. So a 4-group id *matched*, the fourth group fell off the end,
+    and a renormalized 3-vector came back with no exception and no warning. That
+    array is what ``simplex_suite.truth_weights`` builds the ground truth from,
+    so it is a scoring bug wearing a plotting bug's clothes.
+    """
+    from src.plots.simplex import (mixture_label, mixture_weights, n_groups,
+                                   sort_by_mixture)
+
+    # The three cases from the design note. The third is the damaging one: an
+    # edge midpoint that the old pattern reported as a pure vertex.
+    assert mixture_weights("dolly_025g1_025g2_025g3_025g4_n1000_s00") == \
+        (0.25, 0.25, 0.25, 0.25)
+    assert mixture_weights("dolly_100g1_000g2_000g3_000g4_n1000_s00") == \
+        (1.0, 0.0, 0.0, 0.0)
+    assert mixture_weights("oasst1_000g1_000g2_050g3_050g4_n500_s00") == \
+        (0.0, 0.0, 0.5, 0.5), "an edge midpoint must not read as a pure vertex"
+
+    # Yahoo's names are unchanged, including the centre, whose parts sum to 99.
+    assert mixture_weights("yahoo_100g1_000g2_000g3_n1000_s00") == (1.0, 0.0, 0.0)
+    centre = mixture_weights("yahoo_033g1_033g2_033g3_n1000_s00")
+    assert len(centre) == 3 and abs(sum(centre) - 1.0) < 1e-12
+    assert all(abs(w - 1 / 3) < 1e-12 for w in centre)
+    assert mixture_label("dolly_025g1_025g2_025g3_025g4_n1") == "25/25/25/25"
+
+    # A non-consecutive index sequence is a malformed name, not a 4-group one
+    # with something after it. Raising is the point: the old pattern would have
+    # returned three weights here.
+    try:
+        mixture_weights("x_025g1_025g2_025g3_025g5_n1")
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("a g5 after g1..g3 must raise, not truncate")
+
+    # Mixed widths cannot be stacked, and truth_weights stacks whatever
+    # sort_by_mixture hands it -- so the failure belongs here, named, rather
+    # than at an np.vstack that mentions neither dataset.
+    mixed = ["yahoo_100g1_000g2_000g3_n1", "dolly_025g1_025g2_025g3_025g4_n1"]
+    for fn in (n_groups, sort_by_mixture):
+        try:
+            fn(mixed)
+        except ValueError as exc:
+            assert "3" in str(exc) and "4" in str(exc), str(exc)
+        else:
+            raise AssertionError(f"{fn.__name__} accepted a mixed-width collection")
+
+    return "4-group ids give 4 weights, yahoo is unchanged, mixed widths raise"
+
+
+@check("procrustes: the disparity is swept over d = 2..K-1, and cannot zero-pad silently")
+def t_procrustes_dimension_sweep():
+    """The second silent-failure bug, and it is the same shape as the first.
+
+    ``truth_geometry`` builds the ground truth in ``K-1`` dimensions -- 2-D for
+    three vertices, 3-D for four -- while ``rank_surrogates`` fitted the taxonomy
+    side at a hardcoded ``n_components=2``. That mismatch did not error:
+    ``procrustes_compare`` takes ``d = max(a.shape[1], b.shape[1])`` and
+    zero-pads the narrower one, so a flat 2-D configuration was superimposed on a
+    tetrahedral truth and the disparity absorbed every bit of truth variance
+    outside the best-fit plane -- a floor no surrogate can beat, reported as an
+    ordinary number. It was honest only because K=3 makes ``K-1 == 2``.
+    """
+    import numpy as np
+
+    from src.analysis import disparity_vs_truth
+    from src.core.distance import DistanceMatrix
+    from src.plots.simplex_suite import rank_surrogates, truth_geometry, vertices
+
+    def ids_for(k, mixes):
+        return [f"c_" + "_".join(f"{p:03d}g{i + 1}" for i, p in enumerate(m))
+                + "_n1000_s00" for m in mixes]
+
+    # A 3-simplex and a 2-simplex, each with a distance matrix that IS the truth,
+    # so the disparity should be ~0 at the truth's own dimension.
+    cases = {
+        3: [(100, 0, 0), (0, 100, 0), (0, 0, 100), (33, 33, 33),
+            (50, 50, 0), (0, 50, 50), (50, 0, 50)],
+        4: [(100, 0, 0, 0), (0, 100, 0, 0), (0, 0, 100, 0), (0, 0, 0, 100),
+            (25, 25, 25, 25), (50, 50, 0, 0), (0, 0, 50, 50), (50, 0, 50, 0)],
+    }
+    out = []
+    for k, mixes in cases.items():
+        ids = ids_for(k, mixes)
+        assert len(vertices(ids)) == k
+        tgeo = truth_geometry(ids)
+        coords = np.asarray(tgeo.coordinates)
+        assert coords.shape[1] == k - 1, f"K={k} truth is {coords.shape[1]}-D"
+
+        # The truth's own pairwise distances, presented as a taxonomy result.
+        d = np.linalg.norm(coords[:, None, :] - coords[None, :, :], axis=-1)
+        dm = DistanceMatrix(matrix=d, model_ids=list(ids), metric="euclidean",
+                            taxonomy="synthetic")
+
+        scored = rank_surrogates({("truth", "euclidean"): dm}, ids, tgeo=tgeo)
+        assert len(scored) == 1
+        sc = scored[0]
+
+        assert sorted(sc.procrustes_by_d) == list(range(2, k)), sc.procrustes_by_d
+        assert sorted(sc.stress_by_d) == list(range(2, k))
+        # The designated scalar is the truth's own dimension, K-1.
+        assert sc.procrustes == sc.procrustes_by_d[k - 1]
+        assert sc.stress == sc.stress_by_d[k - 1]
+        # At its own dimension the truth recovers itself. The tolerance is
+        # MDS convergence, not float noise: SMACOF stops on a stress delta, so
+        # an exact recovery lands around 1e-5 rather than at machine epsilon.
+        assert sc.procrustes < 1e-4, f"K={k}: d{k-1} disparity {sc.procrustes}"
+
+        if k == 4:
+            # And a flat fit of a genuinely 3-D truth cannot: the d2 column is
+            # the honest report of what the drawn panel shows, and it is worse.
+            assert sc.procrustes_by_d[2] > 100 * sc.procrustes_by_d[3], \
+                sc.procrustes_by_d
+            # Stress falls monotonically with d, which is why the stress columns
+            # qualify each disparity rather than comparing across them.
+            assert sc.stress_by_d[3] <= sc.stress_by_d[2] + 1e-9
+        out.append(f"K={k}: d{sorted(sc.procrustes_by_d)}")
+
+        # The mismatch itself must now raise rather than be absorbed.
+        if k == 4:
+            from src.analysis.bridge import fit_geometry
+            flat = fit_geometry(dm, method="mds", n_components=2, random_state=0)
+            try:
+                disparity_vs_truth(dm, tgeo, geometry=flat)
+            except ValueError as exc:
+                assert "zero-pad" in str(exc), str(exc)
+            else:
+                raise AssertionError(
+                    "a 2-D embedding against a 3-D truth must raise, not zero-pad")
+
+    return "; ".join(out) + "; width mismatch raises"
+
+
+@check("plots: the colour map takes K anchors and the ternary panel is skipped above 3")
+def t_simplex_colours_at_k_vertices():
+    """What a fourth vertex does to a colour system built for three.
+
+    The barycentric blend had exactly three anchors, so a 4-vector had nowhere to
+    put its last weight: two recipes differing only in g4 would have come out the
+    same colour, which is the specific way a 4-vertex figure would have lied. And
+    the ternary legend draws a *triangle* -- there is no honest 2-D barycentric
+    picture of a tetrahedron -- so at K=4 it must be skipped rather than
+    projected.
+    """
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import numpy as np
+
+    from src.plots.simplex import (ANCHORS, _hex_to_rgb, anchors_for,
+                                   barycentric_color, frame_labels,
+                                   group_display, mixture_weights,
+                                   oklab_delta_e, ternary_legend)
+
+    # Three anchors are exactly the ones every yahoo figure already uses.
+    assert anchors_for(3) == ANCHORS
+    four = anchors_for(4)
+    assert list(four) == ["g1", "g2", "g3", "g4"]
+    assert all(four[g] == ANCHORS[g] for g in ANCHORS)
+
+    # A pure vertex reproduces its anchor exactly, so the points and any legend
+    # agree by construction rather than by eye.
+    for i, g in enumerate(four):
+        w = [0.0] * 4
+        w[i] = 1.0
+        assert np.allclose(barycentric_color(w), _hex_to_rgb(four[g]), atol=1e-6), g
+
+    # The failure a 3-anchor map would have hidden: these two differ only past g3.
+    a = barycentric_color(mixture_weights("dolly_025g1_025g2_050g3_000g4_n1"))
+    b = barycentric_color(mixture_weights("dolly_025g1_025g2_000g3_050g4_n1"))
+    assert oklab_delta_e(a, b) > 0.05, oklab_delta_e(a, b)
+
+    # The four anchors must stay separable under deuteranopia, which is the
+    # constraint the fourth was chosen against -- teal and cyan pass in normal
+    # vision and collapse onto the blue here.
+    def deut(rgb):
+        m = np.array([[0.625, 0.375, 0.0], [0.7, 0.3, 0.0], [0.0, 0.3, 0.7]])
+        return np.clip(m @ np.asarray(rgb), 0, 1)
+
+    import itertools
+    rgbs = [_hex_to_rgb(h) for h in four.values()]
+    worst = min(oklab_delta_e(deut(x), deut(y))
+                for x, y in itertools.combinations(rgbs, 2))
+    assert worst > 0.15, f"deuteranopic worst pair {worst:.3f}"
+
+    # Labels and the panel frame widen with K rather than staying 3-group.
+    assert frame_labels(3) == ("33/33/33", "100/0/0", "0/100/0")
+    assert frame_labels(4) == ("25/25/25/25", "100/0/0/0", "0/100/0/0")
+    assert group_display(4, ("en", "es", "ru", "zh"))["g4"] == "zh"
+
+    # And the triangle is refused rather than drawn for the wrong simplex.
+    ids4 = ["d_100g1_000g2_000g3_000g4_n1", "d_025g1_025g2_025g3_025g4_n1"]
+    fig, ax = plt.subplots()
+    try:
+        ternary_legend(ax, ids4)
+    except ValueError as exc:
+        assert "barycentric plane" in str(exc) or "2-simplex" in str(exc), str(exc)
+    else:
+        raise AssertionError("ternary_legend drew a triangle for a 4-group set")
+    ternary_legend(ax, ["y_100g1_000g2_000g3_n1", "y_033g1_033g2_033g3_n1"])
+    plt.close("all")
+
+    return (f"4 anchors, pure vertices exact, g4 separates (dE "
+            f"{oklab_delta_e(a, b):.3f}), deuteranopic worst {worst:.3f}, "
+            f"ternary refused at K=4")
 
 
 @check("ground truth: a dataset cannot be both split and whole in one collection")
@@ -1662,6 +2359,77 @@ def t_recipe_relabelling():
     )
 
 
+@check("discovery: a dataset filter separates two corpora under one base model")
+def t_scan_cache_dataset_filter():
+    """The guard that keeps the yahoo drivers working once dolly is trained.
+
+    ``03_adapters/<base_slug>`` holds every adapter for a base model whatever it
+    was trained on — that is the design, and it is what makes the cache shared.
+    The ``*_draw`` arguments set per-entry availability *flags* and never filter
+    the list, and no adapter path contains ``output_dir``. So a second corpus on
+    the same base model is invisible to every existing selector, and the only
+    symptom is a count guard tripping on 51 models where 16 were expected.
+    """
+    import json
+    import tempfile
+
+    from src.analysis import datasets_present, scan_cache
+
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        slug = "Qwen--Qwen3.5-4B"
+        planted = {"yahoo": 0, "dolly": 0}
+        for corpus, mixes, n, ds_id in [
+            ("yahoo", ["100g1_000g2_000g3", "000g1_100g2_000g3", "033g1_033g2_033g3"],
+             1000, "yahoo_answers_topics"),
+            ("dolly", ["100g1_000g2_000g3_000g4", "025g1_025g2_025g3_025g4"],
+             1000, "databricks/databricks-dolly-15k"),
+        ]:
+            for mix in mixes:
+                name = f"{corpus}_{mix}_n{n}_s00_r16_i00_b5008_fdeadbeef"
+                d = root / "03_adapters" / slug / name
+                d.mkdir(parents=True)
+                (d / "adapter_model.safetensors").write_bytes(b"")
+                (d / "experiment_meta.json").write_text(json.dumps({
+                    "base_model_id": "Qwen/Qwen3.5-4B",
+                    "dataset_name": f"{corpus}_{mix}_n{n}_s00",
+                    "dataset_recipe_hash": f"hash_{corpus}",
+                    "lora_config": {"r": 16},
+                    "training": {"samples_seen": 5008},
+                }))
+                planted[corpus] += 1
+
+        total = planted["yahoo"] + planted["dolly"]
+
+        # No filter: today's behaviour, unchanged. This is the default, so every
+        # existing caller has to land here.
+        assert len(scan_cache(root).model_ids) == total
+
+        # One corpus at a time — the case that makes the yahoo drivers correct
+        # again rather than merely making the new ones possible.
+        for corpus, want in planted.items():
+            got = scan_cache(root, datasets=[corpus]).model_ids
+            assert len(got) == want, f"{corpus}: {len(got)} != {want}"
+            assert all(Path(m).name.startswith(corpus + "_") for m in got)
+
+        # Several at once. Accepting a sequence rather than one name is an
+        # explicit requirement: the filter must not make a deliberately
+        # cross-dataset comparison impossible to express.
+        both = scan_cache(root, datasets=["yahoo", "dolly"])
+        assert len(both.model_ids) == total
+
+        # A prefix is compared token-wise, not with startswith, so a corpus name
+        # cannot also match a longer one that begins with it.
+        assert len(scan_cache(root, datasets=["doll"]).model_ids) == 0
+
+        # And the message the count guard needs can name what it found.
+        assert datasets_present(scan_cache(root)) == ["dolly", "yahoo"]
+        assert datasets_present(scan_cache(root, datasets=["dolly"])) == ["dolly"]
+
+    return (f"{total} planted, filtered to {planted['yahoo']} yahoo / "
+            f"{planted['dolly']} dolly, union {total}, default unfiltered")
+
+
 @check("[data] discovery: the cache scan joins adapters to their recipes")
 def t_scan_cache():
     from src.analysis import scan_cache
@@ -2186,26 +2954,41 @@ def t_adapter_name_agreement():
 
     gen = importlib.import_module("scripts.gen_simplex3")
     checked = []
-    for suite_name, suite in gen.SUITES.items():
-        gen.SUITE = suite
-        # The generator names from the proportion and appends the draw itself;
-        # the trainer is handed the already-expanded block name.  Same leaf.
-        want = gen.adapter_name("yahoo_000g1_000g2_100g3")
-        got = adapter_dir(
-            Path("/root"), suite.base_model, "yahoo_000g1_000g2_100g3_n1000_s00",
-            gen.LORA_RANK, gen.LORA_INIT_SEED,
-            samples_seen=gen.SAMPLES_SEEN,
-            prompt_format_id=gen.format_id(),
-        ).name
-        assert want == got, f"{suite_name}: generator says {want!r}, trainer says {got!r}"
-        # The realized-sample retag has to survive whatever suffix follows it.
-        assert retag_adapter_dir(Path("/root") / got, gen.SAMPLES_SEEN).name == got
-        assert retag_adapter_dir(Path("/root") / got, 99).name == got.replace(
-            f"_b{gen.SAMPLES_SEEN}", "_b99"
-        )
-        checked.append(f"{suite_name}={want}")
+    # Every corpus, not only yahoo: the samples-seen token is now derived from
+    # the suite's effective batch rather than written down, so oasst1's smaller
+    # budget gives _b2512 where the other two give _b5008. That derivation is
+    # exactly the kind of thing that drifts between the two call sites.
+    for ds_name, spec in gen.SPECS.items():
+        gen.SPEC = spec
+        base = gen.name_for(spec.even_pct)
+        for suite_name, suite in gen.SUITES.items():
+            gen.SUITE = suite
+            seen = gen.samples_seen()
+            block = f"{base}_n{spec.train_n}_s{spec.train_seed:02d}"
+            # The generator names from the proportion and appends the draw
+            # itself; the trainer is handed the already-expanded block name.
+            # Same leaf.
+            want = gen.adapter_name(base)
+            got = adapter_dir(
+                Path("/root"), suite.base_model, block,
+                suite.lora_rank, gen.LORA_INIT_SEED,
+                samples_seen=seen,
+                prompt_format_id=gen.format_id(),
+            ).name
+            assert want == got, (
+                f"{ds_name}/{suite_name}: generator says {want!r}, "
+                f"trainer says {got!r}"
+            )
+            # The realized-sample retag has to survive whatever suffix follows it.
+            assert retag_adapter_dir(Path("/root") / got, seen).name == got
+            assert retag_adapter_dir(Path("/root") / got, 99).name == got.replace(
+                f"_b{seen}", "_b99"
+            )
+        checked.append(f"{ds_name}=_b{gen.samples_seen()}")
+    gen.SPEC = gen.SPECS["yahoo"]
     gen.SUITE = gen.SUITES["llama"]
-    return "; ".join(checked)
+    return f"{len(gen.SPECS)} corpora x {len(gen.SUITES)} suites agree; " + \
+           ", ".join(checked)
 
 
 @check("figures: the structural spec set follows the model's attention layout")
@@ -5813,13 +6596,25 @@ SYNTHETIC = [
     t_anchor_fixed, t_similarity_invariance, t_affine_invariance_in_hull,
     t_known_mixture, t_simplex_high_dim, t_degenerate_anchors, t_compare_simplices,
     t_mantel, t_dcor_bias, t_dcor_test, t_dcor_unsigned, t_dcor_u_centering_symmetry,
+    t_dcor_restricted, t_data_simplex_spec_sampling,
     t_procrustes, t_procrustes_vs_scipy, t_per_point_residuals,
+    t_uninformed_disparity_analytic, t_uninformed_approx_threshold,
+    t_uninformed_separates_truth, t_uninformed_dcor_centre,
+    t_uninformed_lambda_matches_standardize,
+    t_permutation_key_completeness,
+    t_permutation_cache_roundtrip,
+    t_band_span_extent,
+    t_grid_specs_isotropic,
+    t_exact_band_matches_table,
     t_dispersion, t_quality, t_correlation_table, t_match_models, t_fit_geometry,
     t_similarity_conversion, t_simplex_roundtrip, t_cosine_equivalence,
     t_bures_wasserstein_equivalence, t_bures_wasserstein_invariance,
     t_relabel_collision,
     # ground truth from recipes, and the storage it needs
-    t_mixture_weights, t_split_and_whole_rejected, t_simplex_geometry,
+    t_mixture_weights, t_mixture_name_k_vector, t_procrustes_dimension_sweep,
+    t_simplex_colours_at_k_vertices,
+    t_split_and_whole_rejected,
+    t_simplex_geometry,
     t_disparity_vs_truth_exact, t_disparity_vs_truth_label_keyed,
     t_simplex_dimension_requirement, t_projection_dimension_matters,
     t_procrustes_transform, t_collection_multidim, t_analysis_geometries,
@@ -5861,6 +6656,7 @@ SYNTHETIC = [
     # the two inference caches are addressed by one piece of code, and the
     # things that used to be spelled twice
     t_draw_keyed_shared_key, t_generated_surrogate_writeback, t_adapter_name_unique,
+    t_scan_cache_dataset_filter,
     t_replay_queries_uses_recipe_text_field,
 ]
 DATA_BACKED = [

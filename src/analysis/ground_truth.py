@@ -459,6 +459,15 @@ def disparity_vs_truth(
     second one here. *dm* is then unused, and *random_state* / *n_components*
     describe nothing, so it is on the caller to pass the geometry that actually
     came from *dm*.
+
+    **Widths are checked here rather than left to the zero-pad.**
+    ``procrustes_compare`` takes ``d = max(a.shape[1], b.shape[1])`` and pads the
+    narrower configuration with zero columns, which makes a genuine mismatch
+    invisible: a flat 2-D embedding superimposed on a tetrahedral 3-D truth
+    absorbs all the truth variance outside the best-fit plane and reports it as
+    an ordinary disparity. That was harmless while every truth was 2-D and is
+    not once a simplex has four vertices, so a narrower embedding must be padded
+    *by the caller*, deliberately, and this raises otherwise.
     """
     from .bridge import fit_geometry
     from .configurations import procrustes_compare
@@ -467,6 +476,16 @@ def disparity_vs_truth(
     if geo is None:
         geo = fit_geometry(dm, method="mds", n_components=n_components,
                            random_state=random_state)
+    t_dim = np.asarray(truth_geometry.coordinates).shape[1]
+    g_dim = np.asarray(geo.coordinates).shape[1]
+    if t_dim != g_dim:
+        raise ValueError(
+            f"the ground truth is {t_dim}-dimensional and the embedding is "
+            f"{g_dim}-dimensional. procrustes_compare would zero-pad the "
+            f"narrower one and report the mismatch as ordinary disparity. Fit "
+            f"at n_components={t_dim}, or pad the embedding explicitly and say "
+            f"in the column name which dimension it was fitted at."
+        )
     return float(procrustes_compare(truth_geometry, geo).disparity)
 
 

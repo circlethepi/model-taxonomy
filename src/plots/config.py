@@ -20,6 +20,28 @@ GLOBAL_FIGURES_DIR = _REPO_ROOT / "figures"
 # ── Colorblind-safe palette ───────────────────────────────────────────────────
 PALETTE = sns.color_palette("colorblind", 10)
 
+
+def shade(color, amount: float):
+    """*color* moved *amount* of the way towards white (>0) or black (<0).
+
+    ``amount`` is a fraction in ``[-1, 1]``: ``0.0`` returns the colour
+    untouched, ``0.4`` mixes in 40% white, ``-0.4`` mixes in 40% black.  The
+    result is an ``(r, g, b)`` tuple; any alpha on the input is dropped, since a
+    tint is a colour and not a transparency.
+
+    It exists so one encoding can carry two nested categories at once — a base
+    colour per model and a tint per corpus, say — without inventing a second
+    palette whose hues would compete with the first.  Mixing towards the page
+    keeps the family recognisably one hue, which a second palette cannot.
+    """
+    if not -1.0 <= amount <= 1.0:
+        raise ValueError(f"amount must be in [-1, 1], got {amount}")
+    r, g, b = mpl.colors.to_rgb(color)
+    target = 1.0 if amount > 0 else 0.0
+    f = abs(amount)
+    return tuple(c + (target - c) * f for c in (r, g, b))
+
+
 # ── Font registration (silent no-op if file not found) ───────────────────────
 #   Checked in order; the first hit wins.  When none resolve, set_style() falls
 #   back to DejaVu Sans (see "font.sans-serif" below).

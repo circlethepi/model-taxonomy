@@ -409,6 +409,8 @@ def plot_radar(
     tick_len: float = 0.018,
     rlabel_spoke: int | None = 0,
     rlabel_pad: float = 5.0,
+    spoke_groups: list[tuple[str, int]] | None = None,
+    group_pad: float = 0.18,
     title: str | None = None,
     legend: bool = True,
     legend_kwargs: dict | None = None,
@@ -439,6 +441,16 @@ def plot_radar(
     the line and of the tick marks; the offset is perpendicular and measured on
     the page, so every label clears by the same amount whatever its radius.
 
+    *spoke_groups* names a partition of the spokes, as ``(label, n_spokes)``
+    pairs whose counts sum to ``len(axis_labels)``, in spoke order.  Each group
+    gets its label set outside the ring, centred on the arc its spokes span, and
+    a faint radial rule is drawn on each boundary between two groups.  It is for
+    a radar whose spokes are a nested category -- three corpora within each of
+    four models, say -- where the spoke label should carry only the inner name
+    and the outer one would otherwise have to be repeated on every spoke.
+    *group_pad* is how far past the outer ring the group labels sit, as a
+    fraction of the radial range.
+
     ``NaN`` values are drawn as gaps rather than pulling the polygon to zero.
     Passing *rlim* fixes the radial range, which is what makes two radars
     comparable; leaving it ``None`` autoscales each figure independently.
@@ -449,6 +461,12 @@ def plot_radar(
     n = len(axis_labels)
     if n < 3:
         raise ValueError(f"a radar needs at least 3 spokes, got {n}")
+    if spoke_groups is not None:
+        total = sum(c for _, c in spoke_groups)
+        if total != n:
+            raise ValueError(
+                f"spoke_groups covers {total} spoke(s) for {n} axis labels"
+            )
 
     if ax is None:
         fig, ax = plt.subplots(subplot_kw={"projection": "polar"})
@@ -492,6 +510,9 @@ def plot_radar(
         _draw_spoke_axes(ax, theta, tick_len, rlabel_spoke, rlabel_pad,
                          start_angle, direction)
 
+    if spoke_groups:
+        _draw_spoke_groups(ax, theta, spoke_groups, group_pad)
+
     if title:
         ax.set_title(title)
     if legend and any(s.label for s in series):
@@ -501,6 +522,48 @@ def plot_radar(
     if savefig:
         _save(fig, _resolve_savepath(savepath, title))
     return fig, ax
+
+
+def _draw_spoke_groups(ax, theta, spoke_groups, group_pad):
+    """Outer group labels and boundary rules for :func:`plot_radar`.
+
+    The label goes at the circular mean of its group's spoke angles, which for a
+    contiguous run is simply the midpoint, and is rotated to sit tangentially so
+    a long model name does not overhang its neighbours.  Text below the
+    horizontal is flipped so it never reads upside down.
+
+    The boundary rule is placed halfway between the last spoke of one group and
+    the first of the next, so it separates the groups without landing on a
+    spoke.  There is one rule per *seam*, not one per group: the seam after the
+    final group is the same seam as the one before the first.
+    """
+    rmin, rmax = ax.get_ylim()
+    span = rmax - rmin
+    step = 2 * np.pi / len(theta)
+    start = 0
+    for label, count in spoke_groups:
+        mid = theta[start] + (count - 1) * step / 2
+        #   Horizontal, not tangential: a group label is a name to be read, and
+        #   at four or five groups there is room for it. The anchor is chosen
+        #   from the direction it sits in, so the text grows away from the ring
+        #   rather than across it -- a label to the right of the figure is
+        #   left-aligned, one below it is top-aligned, and so on.
+        #   The theta offset and direction are applied on the display side, so
+        #   the drawn angle is what decides the quadrant, not the index order.
+        angle = ax.get_theta_direction() * mid + ax.get_theta_offset()
+        dx, dy = np.cos(angle), np.sin(angle)
+        ha = "center" if abs(dx) < 0.25 else ("left" if dx > 0 else "right")
+        va = "center" if abs(dy) < 0.25 else ("bottom" if dy > 0 else "top")
+        ax.text(mid, rmax + span * group_pad, label,
+                ha=ha, va=va, clip_on=False, zorder=5)
+        #   The seam sits between two groups' spokes and stops just past the
+        #   ring: long enough to read as a division, short enough not to run out
+        #   into the legend.
+        seam = theta[start] - step / 2
+        ax.plot([seam, seam], [rmin, rmax * 1.04],
+                color="darkgray", linewidth=0.6, linestyle=(0, (2, 2)),
+                clip_on=False, zorder=1)
+        start += count
 
 
 def _draw_spoke_axes(ax, theta, tick_len, rlabel_spoke, rlabel_pad,
@@ -654,3 +717,196 @@ def plot_grouped_bars(
     if savefig:
         _save(fig, _resolve_savepath(savepath, title))
     return fig, ax
+
+
+# ── uninformed baselines ──────────────────────────────────────────────────────
+
+#: One colour for every uninformed band, on every figure in the project.  Grey,
+#: deliberately: the band is the backdrop a real score is read against, and a
+#: hued band competes with the series it exists to contextualise.
+UNINFORMED_COLOUR = "0.45"
+
+#: The one legend label.
+#:
+#: "random config" names what the null actually *is* — a configuration drawn at
+#: random and scored — where "uninformed baseline" named only what it is for.
+#: ``docs/terminology.md`` records it as the display name of the **structure
+#: null**; the code keeps ``UNINFORMED_*`` so that the identifiers still match
+#: the note and the tier they come from.
+#:
+#: Neither the generator nor the interval appears in the key.  Both are figure
+#: *provenance* — which sampler drew the configurations, and that the band is
+#: a 5–95 interval rather than a full range — and provenance belongs in the
+#: caption, where a reader who wants it is looking anyway.  The key is read at
+#: a glance against a bar, and at that glance the only thing it has to say is
+#: which backdrop this is.  The format field is kept so that every call site
+#: still passes its generator and a figure that wants it back needs one edit
+#: here.
+UNINFORMED_LABEL = "random config"
+
+#: One colour for every permutation band.  Warm, and outside both series ramps
+#: this project uses — the model bars are blues and the corpus bars greens — so
+#: a reader never mistakes a backdrop for a series.  It has to differ from
+#: :data:`UNINFORMED_COLOUR` too: the two bands appear on one axis, and the
+#: whole point of drawing both is that they are different levels.
+PERMUTATION_COLOUR = "#9A6A4F"
+
+#: The **permutation band**'s one legend label.  The band displays the *label
+#: null* of ``docs/notes/chance_baselines.md`` — keep both real geometries and
+#: permute which model is which.  The figures say "permutation" and the note
+#: says "label"; ``docs/terminology.md`` records that they are one concept, and
+#: neither spelling is a second null.  No generator appears here, because there
+#: is nothing to generate: the null is built from the real data.
+#:
+#: "permutation", not "permutation null": the key sits beside "random config",
+#: which does not say "null" either, and the word earned its place only while
+#: the two keys had to be told apart as nulls rather than as procedures.  The
+#: 5–95 interval is left to the caption for the reason given at
+#: :data:`UNINFORMED_LABEL`.
+PERMUTATION_LABEL = "permutation"
+
+
+def load_baseline_table(path=None) -> dict:
+    """Parse ``results/baselines/constants.json``, or explain how to make it.
+
+    That path is gitignored, so a fresh clone genuinely does not have it; this
+    fails by naming the command that writes it rather than with a bare
+    ``FileNotFoundError`` four frames deep in a figure driver.
+    """
+    import json
+
+    if path is None:
+        path = Path(__file__).resolve().parents[2] / "results/baselines/constants.json"
+    path = Path(path)
+    if not path.exists():
+        raise SystemExit(
+            f"no uninformed baselines at {path}.\n"
+            "Run `python scripts/make_baselines.py` first (a few seconds); the "
+            "file is generated, not tracked."
+        )
+    with path.open() as fh:
+        return json.load(fh)
+
+
+def draw_uninformed_band(
+    ax: plt.Axes,
+    *,
+    mode: str,
+    generator: str | None = None,
+    band,
+    x=None,
+    label: bool = False,
+    colour: str = UNINFORMED_COLOUR,
+    alpha: float = 0.13,
+    label_text: str | None = None,
+) -> None:
+    """Shade the level a taxonomy that learned nothing would have scored.
+
+    An **uninformed baseline** is that level; the **uninformed band** is its
+    5–95 interval.  Drawn as a shaded region with a dashed centre line, and one
+    legend entry for the pair — never two.
+
+    Four modes, one per figure shape this project draws:
+
+    ``curve``
+        ``band`` is ``(lo, mid, hi)`` arrays over *x*, for a figure whose x-axis
+        is the collection size.  The only mode where the baseline moves.
+    ``horizontal``
+        ``band`` is one ``(lo, mid, hi)`` triple spanning the whole axis — bar
+        charts, and any sweep that varies something *other* than ``n`` at fixed
+        collection size.
+    ``span``
+        the same triple over **part** of the axis, with *x* the ``(x0, x1)``
+        data-coordinate pair to cover.  For a grouped bar chart whose groups do
+        not share a baseline: one level's four bars sit at one ``n`` and ``K``,
+        the next group's may not, and ``horizontal`` would draw the first
+        group's level across all of them.
+    ``radial``
+        the same triple closed into a polygon on a radar axis, with *x* the
+        spoke angles.
+
+    *label_text* overrides the composed label outright, for a band that is not
+    a structure null — see :func:`draw_permutation_band`.  Without it the label
+    names the *generator*, which is then required.
+
+    The band is drawn **behind** everything already on the axis (``zorder`` below
+    the default 2) so it never occludes a series.
+
+    One caveat this helper cannot enforce, and every caller must state in the
+    figure text: the structure null is scored directly as a configuration and
+    never passes through MDS, so on an MDS-mediated score such as the Procrustes
+    disparity the baseline is mildly optimistic.
+    """
+    lo, mid, hi = band
+    if label:
+        if label_text is not None:
+            text = label_text
+        elif generator is None:
+            raise ValueError("label=True needs either generator or label_text")
+        else:
+            text = UNINFORMED_LABEL.format(generator=generator)
+    else:
+        text = None
+
+    if mode == "curve":
+        if x is None:
+            raise ValueError("mode='curve' needs x")
+        ax.fill_between(x, lo, hi, color=colour, alpha=alpha, linewidth=0,
+                        zorder=0.5, label=text)
+        ax.plot(x, mid, color=colour, ls="--", lw=1.0, zorder=0.6)
+    elif mode == "horizontal":
+        ax.axhspan(lo, hi, color=colour, alpha=alpha, linewidth=0,
+                   zorder=0.5, label=text)
+        ax.axhline(mid, color=colour, ls="--", lw=1.0, zorder=0.6)
+    elif mode == "span":
+        if x is None:
+            raise ValueError("mode='span' needs x (the (x0, x1) pair to cover)")
+        x0, x1 = (float(v) for v in x)
+        edges = np.array([x0, x1])
+        ax.fill_between(edges, np.full(2, lo), np.full(2, hi), color=colour,
+                        alpha=alpha, linewidth=0, zorder=0.5, label=text)
+        ax.plot(edges, np.full(2, mid), color=colour, ls="--", lw=1.0,
+                zorder=0.6)
+    elif mode == "radial":
+        if x is None:
+            raise ValueError("mode='radial' needs x (the spoke angles)")
+        theta = np.concatenate([np.asarray(x), np.asarray(x)[:1]])
+        ax.fill_between(theta, np.full(theta.shape, lo), np.full(theta.shape, hi),
+                        color=colour, alpha=alpha, linewidth=0, zorder=0.5,
+                        label=text)
+        ax.plot(theta, np.full(theta.shape, mid), color=colour, ls="--", lw=1.0,
+                zorder=0.6)
+    else:
+        raise ValueError(
+            f"unknown mode {mode!r}; have 'curve', 'horizontal', 'span', 'radial'"
+        )
+
+
+def draw_permutation_band(
+    ax: plt.Axes,
+    *,
+    mode: str,
+    band,
+    x=None,
+    label: bool = False,
+    colour: str = PERMUTATION_COLOUR,
+    alpha: float = 0.13,
+) -> None:
+    """Shade the level reached by permuting which model is which.
+
+    The **permutation band** is the 5–95 interval of the **label null**: keep
+    both real geometries and permute the correspondence between them.  Same
+    modes, same zorder and same one-legend-entry rule as
+    :func:`draw_uninformed_band`, which does the drawing.
+
+    The two bands answer different questions and belong on the same axis.  The
+    uninformed band asks *what would any arrangement of points have scored*,
+    and because the structure null is scored directly as a configuration it
+    never passes through MDS — so on an MDS-mediated score it is mildly
+    optimistic.  This band asks *what would these same two geometries have
+    scored had the labels been shuffled*, and it carries the real geometries
+    through the real scoring path, so it has no such gap.
+    """
+    draw_uninformed_band(ax, mode=mode, band=band, x=x, label=label,
+                         colour=colour, alpha=alpha,
+                         label_text=PERMUTATION_LABEL)

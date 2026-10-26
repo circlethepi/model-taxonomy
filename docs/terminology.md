@@ -47,6 +47,88 @@ the ids do not match.
 
 ---
 
+## The simplex experiments
+
+**`DataSimplexSpec`** — the dataset-side counterpart of
+`src/experiments/suite.py::Suite`, defined in
+`src/experiments/data_simplex_spec.py`. Where a `Suite` says *how* a run is
+configured — base model, dtype, LoRA targets, walls, sharding — a
+`DataSimplexSpec` says *what corpus the simplex is built over*: dataset id,
+vertex axis, group partition, field projections, grid denominator, draw sizes,
+embedder, and the prose caveats emitted into that dataset's configs.
+`scripts/gen_simplex3.py` is a function of the pair, which is what lets a second
+corpus be a spec entry rather than a forked generator.
+
+**Vertex axis** — the categorical column whose values become the pure corners of
+the simplex. Yahoo's is `topic`, dolly's is `category`, oasst1's is `lang`. It is
+the `class_field` of every emitted recipe; the separate name exists because
+"class field" says where it lives rather than what it does.
+
+**Grid denominator** — the integer `G` such that mixtures are drawn at every
+multiple of `1/G`. All three datasets use 4, i.e. the 25% grid. The grid points
+are the compositions of `G` into `K` parts: 15 at `K=3`, 35 at `K=4`. The even
+mixture is appended as an extra point only when `K` does not divide `G` — which
+is why yahoo has 16 proportions and not 15, and why dolly and oasst1 have exactly
+35.
+
+**qmix** (*query mixture*) — the axis of **query-set composition**: what fraction
+of the query set an adapter is probed with is the corpus it was trained on, the
+rest being a diluting corpus it never saw. One value of qmix is one
+`(base-corpus percentage, diluent)` pair. Named on 2026-09-16. It reaches code as
+`QMixSpec` in `src/experiments/query_mixture_spec.py`, the third dataclass beside
+`Suite` and `DataSimplexSpec`, and as `scripts/gen_simplex3.py --qmix`.
+
+qmix varies the *probe*, never the adapter — a qmix tree trains nothing and
+reuses an existing adapter fleet — which is what distinguishes it from the three
+mixtures and sizes already in this list, all of which vary a subject:
+
+| axis | varies | fixed under qmix at |
+|---|---|---|
+| the mixture simplex | what an adapter was *trained* on | the existing 16 points |
+| [nsamples_train](#nsamples_train) | the size of the *training* draw | 1000 |
+| `n_samples_sweep` | the size of the *embedding* draw | unused |
+| **qmix** | the *composition of the query draw* | — |
+
+The trap the word exists to avoid: "the mixture" in a simplex context has always
+meant the training mixture, and adapter names spell one as `100g1_000g2_000g3`.
+A qmix query set deliberately does **not** wear that shape — it is spelled
+`qmix_yahoo001_dolly099_qtc` — because `src/plots/simplex.py` parses `NNNg1_NNNg2`
+out of adapter ids, and a query set wearing it would invite a parse that means
+the wrong thing. See `docs/notes/qmix_dataset_composition.md`.
+
+**qbig** (*big query set*) — the axis of **probe depth**: the same adapter fleet
+and the same query-set *composition*, measured with more queries and more
+replicates per query. Named on 2026-09-17. It reaches code as `YAHOO_QBIG` in
+`src/experiments/data_simplex_spec.py` and the `olmo2_qbig` suite, emitted with
+`scripts/gen_simplex3.py --suite olmo2_qbig --dataset yahoo_qbig`.
+
+Like [qmix](#the-simplex-experiments), qbig varies the probe and never the
+adapter — it trains nothing and reuses the existing sixteen
+`_n1000_s00_r16_i00_b5008` adapters — but it is the *orthogonal* probe axis:
+qmix asks **what the queries are made of**, qbig asks **how many of them there
+are and how hard each one is sampled**. The standing yahoo tree sits at
+`query_n=100, replicates=16`; the qbig tree at `query_n=1000, replicates=64`.
+
+| axis | varies | qbig holds it at |
+|---|---|---|
+| the mixture simplex | what an adapter was *trained* on | the existing 16 points |
+| [nsamples_train](#nsamples_train) | the size of the *training* draw | 1000 |
+| qmix | the *composition* of the query draw | 100% base corpus, undiluted |
+| **qbig** | the *size* of the query draw, and R | — |
+
+Two traps. First, the query **draw seed** moves with the size and must: seed 0 is
+what the adapters were trained on, so probing with it would score every model on
+its own training rows, and seed 1 is the standing 100-query set. qbig draws at
+seed 2, which shares no row with either.
+
+Second, **R does not apply to greedy**. `replicates: 64` describes the sampled
+run only; `BehavioralTaxonomy` raises on `replicates > 1` with `do_sample: false`
+rather than storing 64 copies of one deterministic continuation
+(`src/taxonomy/behavioral.py:110-114`), so the greedy control in a qbig tree is
+emitted at R=1 and lands in its own cache entry.
+
+---
+
 ## The shared cache
 
 **Shared cache** — the numbered store under `results/shared_cache`. Directories
@@ -64,6 +146,7 @@ the objects at that stage**, as in `03A_adapter_alignments`.
 | `05A_logprobs` | Per-token log-probabilities and entropies |
 | `06_pairwise` | Individual pairwise distances, one entry per model pair |
 | `07_collections` | Distance matrices and geometry results |
+| `07A_permutation_tests` | Label-null permutation tests over those collections |
 
 **Draw** — one sampled subset of a dataset, spelled `n{n}_s{seed:02d}` with the
 seed zero-padded. `src/cache/_draw.py` owns the spelling. Writing is narrow and
@@ -96,6 +179,56 @@ datasets.
 
 **Slice** — a sub-collection grouped by named fields, usually `(n_samples,
 seed)`, from `CacheIndex.slices()`. The unit a taxonomy comparison runs over.
+
+**nsweep** — a sweep over `n_samples`, the size of the *training* draw, holding
+the mixture grid, the seeds and every optimizer setting fixed. The word predates
+the simplex work: `results/yahoo_topics_mean_cosine_10seeds_nsweep` and
+`experiments/archive/yahoo_topics_mean_cosine_{3,10}seeds_nsweep.yaml` are a
+two-vertex, dataset-level-only version of the same axis. The trap is that a
+training nsweep is not the same object as the *embedding* sweep already spelled
+`n_samples_sweep:` in every emitted build config — that one varies the draw a
+dataset representation is computed over, and exists at every `n` regardless of
+what was trained. See `docs/notes/nsweep_dataset_size.md`.
+
+**rsweep** — a sweep over the LoRA **rank**, holding the corpus, the mixture
+grid, the training draw, the seeds and every other optimizer setting fixed. Named
+on 2026-09-11 for its parallel with [nsweep](#nsweep) above: `n` there is the
+training draw size, `r` here is the rank. It reaches code as `Suite.lora_ranks`,
+a Suite field rather than a `DataSimplexSpec` one, because rank says how a run is
+configured and not what corpus it is run over — the same split that puts
+`target_modules` and `torch_dtype` on the Suite.
+
+Two things the word does not mean. It is not a sweep over `lora_alpha`: alpha is
+the *gain* on the low-rank update (PEFT scales `B @ A` by `alpha / rank`), and
+the generator renders `2 * rank`, which is the 32 every adapter trained at rank
+16 already carries — so an rsweep holds the gain at 2 and varies capacity alone.
+And it is not a re-run of the fixed-rank tree at its own middle point: rank is
+inside every adapter directory name (`..._r16_i00_b5008_f…`) and every cache is
+keyed on that name, so the `r16` point of an rsweep resolves to the adapters and
+activations `simplex3_olmo2` already wrote. See
+`docs/notes/rank_sweep.md`.
+
+**initsweep** — a sweep over the LoRA **initialisation seed**, the argument to
+`torch.manual_seed()` immediately before PEFT initialises the LoRA `A` and `B`
+matrices, holding the corpus, the mixture grid, the training draw, the dataset
+seeds, the rank and every other optimizer setting fixed. Named for its parallel
+with [nsweep](#nsweep) and [rsweep](#rsweep) above: `n` there is the training
+draw size, `r` there is the rank, `i` here is the initialisation seed, and all
+three are the letter the adapter directory name already carries
+(`..._n1000_s00_r16_i00_b5008`). It reaches code as `Suite.lora_init_seeds`, a
+Suite field rather than a `DataSimplexSpec` one for rsweep's reason: how a run is
+configured, not what corpus it is run over.
+
+Spelled out rather than shortened because **seed** is already taken. Everywhere
+else in this repo it means the *dataset-draw* seed — the `s00` in `n1000_s00`,
+the thing `results/yahoo_topics_mean_cosine_10seeds` swept. An initsweep varies
+neither the rows trained on nor their order, which is why the dataset level is an
+exact null control across it: all its seeds read the same draws.
+
+It is not a re-run of the fixed-seed tree at its own `i00` point, for rsweep's
+reason — the seed is in the adapter name and every cache is keyed on that name —
+so a ten-seed initsweep over the 16-point yahoo simplex is 144 new adapters and
+not 160. See `docs/notes/init_seed_sweep.md`.
 
 **Prompt format** — an optional `_f{fmt}` suffix on a draw directory, recording
 which chat template was applied. Deliberately kept out of `recipe_hash`, which
@@ -145,12 +278,94 @@ design, because a `06_pairwise` handle addresses exactly one **perspective**.
 | **surrogate** | What a selector produces: the representation view being compared. One **row** of the figure grid, e.g. `late third · centered`. |
 | **perspective** | A surrogate together with a similarity metric. One **cell** of the figure grid, e.g. `late third · centered` × `cosine`. |
 
+**Canonical perspective** — a perspective designated as a *default reading* of a
+taxonomy level, so that levels can be compared one-to-one without sweeping
+metrics. There are seven over five levels: one each at the dataset and
+behavioral levels, three **scopes** at the structural level and two at the
+functional one.
+
+| perspective | level | surrogate | metric |
+|---|---|---|---|
+| `dataset_embedding` | dataset embedding | mean embedding (`representation="mean"`, n=1000, seed 0) | euclidean |
+| `structural_all_o` | structural | every layer, output projections only | cosine |
+| `structural_all_qkvo` | structural | every layer, all four LoRA projections | cosine |
+| `structural_last_o` | structural | the last decoder layer's output projection | cosine |
+| `functional_all` | functional | every hidden state, input mode, mean pooling | cosine |
+| `functional_last` | functional | the final hidden state (`h{N_LAYERS}`) alone | cosine |
+| `behavioral` | behavioral | per-query replicate mean at R=16 | cosine |
+
+A level carries more than one row when it can be read at more than one **scope**
+and the scopes answer different questions — structural narrows by layer *and* by
+projection, functional only by layer, and neither has a reason to move together
+as an experiment's other axes change. The functional level has no projection
+axis at all: it reads hidden states, so its mirror of the structural
+all-versus-last contrast is exactly its two rows.
+
+They are fixed in `canonical_perspectives()` in
+`figures/simplex_collection_size/sweep_group_size.py` and are the standing
+default for new experiments: compute these seven, score each against the
+ground-truth simplex with dcorr and Procrustes disparity, and add an eighth only
+after asking. The dataset level's normalised sibling metric (`frobenius`, which
+L2-normalises each mean before subtracting) is a second legitimate reading of
+"euclidean norm" and the simplex3 drivers carry both; whether a given suite
+wants it is a per-suite decision, not part of this list.
+
+**Primary representations** — the four canonical perspectives to plot by
+default: `dataset_embedding`, `structural_all_o`, `functional_all` and
+`behavioral`. One per taxonomy level that reads a model, plus the dataset
+reference that no adapter touches. Designated 2026-09-15; fixed in
+`figures/simplex_collection_size/sweep_group_size.py::PRIMARY_REPRESENTATIONS`
+and imported by the figure drivers rather than relisted in each.
+
+The other four canonical perspectives are **controls on the read, not levels**:
+`structural_all_qkvo` and `structural_last_o` move the structural scope,
+`functional_last` moves the functional scope, and `behavioral_greedy` moves
+decoding alone. They answer *does the scope matter on this axis*, which is a
+different question from *do the levels agree with the simplex*, and asking both
+in one panel grid crowds the headline.
+
+This is a **plotting** default and nothing more. Every sweep still scores all
+eight, because the controls are what make the primary rows interpretable —
+`structural_last_o` is how you know `structural_all_o` is not an artefact of
+reading the whole stack — and because narrowing at measure time would mean a
+re-run to get a control back. Narrow at plot time, never at measure time.
+
+Note the wording: *representation*, not *perspective*. The two are the same
+objects here; "primary representations" is the phrase used when the emphasis is
+on which few to show, and "canonical perspective" when the emphasis is on what a
+level's default reading is.
+
+Two things this term is **not**. It is unrelated to `_canonical(dm)` in
+`src/analysis/comparison.py`, which means a distance matrix's *sorted row order*
+— a different layer of the problem entirely, which is why this is always written
+as the two-word phrase and never as bare "canonical". And it is not a claim that
+the chosen perspective is the *best* one at its level; it is the one the project
+agreed to read by default, chosen so that a level's number means the same thing
+across runs.
+
+**nsamples_train** — one value of `n_samples`, i.e. one size of the *training*
+draw, as varied by an [nsweep](#nsweep). Named on 2026-09-10, replacing the
+"rung" this axis had been called informally in `docs/notes/nsweep_dataset_size.md`
+since 2026-09-07. The rename is because `rung` was already carrying two unrelated
+senses in this project — see the note directly below — and a third would have
+made the word useless. It reaches code as the `train_sizes` / `extract_sizes`
+tuples on `DataSimplexSpec`, not as a field of its own; the term names the axis,
+not a variable.
+
 **`rung` is retired**, replaced by `surrogate`. This was a unification rather
 than a rename: `surrogate` already meant "a read-time view of a stored artifact,
 computed on demand and written back", the module applying fleet transforms was
 already `src/analysis/surrogates.py`, and the figure suite's own docstring
 section was already headed "Surrogate rungs". The two words were describing one
 thing at two layers.
+
+One live use survives the retirement and is *not* covered by it: the **scale
+ladder** of base model sizes, where `src/models/profiles/olmo2.py` calls itself
+"the 1B rung" and `mistral_nemo.py` "the 12B rung" of a 1B/4B/8B/12B family. That
+is a third sense again — neither a way of reading a level nor a training draw
+size — and it is left alone because it is confined to the model profiles and
+`docs/guides/experiment_suites.md`, where no other ladder is in scope. If it ever
+leaves those files, rename it there rather than reviving `rung` generally.
 
 One caveat to keep in mind: the cached `surrogates/{hash}/` in `04`/`05` covers
 view, pooling and normalize, while the *fleet* transform is applied later in
@@ -235,3 +450,52 @@ visible in the figure. The gaps are structural: CKA, MMD and energy all need
 more than one row, so none can run on a `model mean` representation, and
 Bures-Wasserstein stacks per-block factors before its SVD, so a selection mixing
 2560-input and 4096-input projections has no BW value.
+
+---
+
+## Reference levels
+
+Two ways of asking *what would this score have been if the taxonomy had learned
+nothing?*. They answer different questions and the difference is the point, so
+the names are kept apart even though both produce a shaded 5–95 interval drawn
+behind the real scores. Defined in `docs/notes/chance_baselines.md` and
+implemented in `src/analysis/baselines.py`.
+
+**Structure null** — replace the taxonomy with a structureless configuration
+drawn from a generator (`gaussian` or `dirichlet`), keep the real ground truth,
+and score. Its 5–95 interval is the **uninformed band**, and the level itself
+the **uninformed baseline**. Because the configuration is scored *directly*, it
+never passes through MDS, so against an MDS-mediated score such as the
+Procrustes disparity the uninformed band is mildly **optimistic**.
+
+**Random config** — what the figures *call* the structure null, as of
+2026-09-17. It replaces "uninformed baseline" on every band legend
+(`UNINFORMED_LABEL` in `src/plots/figures.py`) and names what the null is — a
+configuration drawn at random and scored — rather than what it is for. **Not a
+third null**: structure null, uninformed baseline and random config are one
+concept, with "structure null" the note's name, "random config" the figures',
+and `UNINFORMED_*` the code's. The identifiers and the `--baseline` flag are
+deliberately unchanged, so a grep for `uninformed` still finds all of it. The
+key is those two words and nothing else: the generator that drew the
+configurations and the fact that the band is a 5–95 interval are figure
+provenance, and belong in the caption rather than in a key read at a glance.
+
+**Label null** — keep *both* real geometries and permute which model is which,
+destroying only the correspondence between them. Built from
+`src.analysis.configurations.protest` and `src.analysis.matrices.dcor_test`, and
+stored in `07A_permutation_tests`. It carries the real geometries through the
+real scoring path, so unlike the uninformed band it has no MDS gap.
+
+**Permutation band** — the label null's 5–95 interval, as drawn on a figure.
+The same object the note calls the label null: the figures say *permutation*
+because PROTEST and `dcor_test` are permutation tests, and the note says *label*
+because what is permuted is the labelling. **They are one concept under two
+names, not two nulls.** `figures/figure2_v2` draws both bands together; where
+they agree, the MDS gap above is small. The legend key reads **permutation**
+alone as of 2026-09-17 — it used to read "permutation null (5–95)", and dropped
+the noun to sit beside "random config", which does not carry it either, and the
+interval for the reason given there.
+
+**Generator** — how a structure null's configuration is drawn. Only two:
+`gaussian` and `dirichlet`. Dirichlet(1) *is* uniform on the simplex, so a
+separate "uniform" generator would be a duplicate.

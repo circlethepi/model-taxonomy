@@ -17,16 +17,22 @@ R.  This file is purely plotting.
 The figures (embedder ``v2moe`` unless ``--embedder`` says otherwise)
 ---------------------------------------------------------------------
 ``fig_qbig_depth_<embedder>.pdf``   **the main figure**
-    Rows: Procrustes disparity, dCor*.  Columns: behavioral (sampled, one line
-    per R), behavioral (greedy), functional (all hidden states), functional
-    (final hidden state).  x is the number of queries.
+    Rows: Procrustes disparity, dCor*.  Columns: behavioral (sampled at T=1,
+    one line per R, with greedy as T=0), functional (all hidden states),
+    functional (final hidden state).  x is the number of queries.
+
+``fig_qbig_temperature_<embedder>.pdf``
+    Sampled behavioral at R=64, one line per decoding temperature (0.25, 0.5,
+    0.75, 1.0; the qbigtemp tree), with greedy as T=0.
+    Columns: Procrustes disparity, dCor*.  The other figures read T=1.0.
 
 ``fig_qbig_*_<embedder>_linear.pdf``
-    The same two figures with disparity on a linear 0-1 axis.
+    The same figures with disparity on a linear 0-1 axis.
 
 ``fig_qbig_replicates_<embedder>.pdf``
     The sampled behavioral read alone, one column per R, so the R lines that
-    share one panel in the main figure can be read without overplotting.
+    share one panel in the main figure can be read without overplotting.  The
+    same greedy (T=0) curve is drawn in every panel as the reference.
 
 Reading the figures
 -------------------
@@ -36,6 +42,9 @@ Reading the figures
   replicate draws inside each of ten query draws), ten where R=64 (one replicate
   set exists), and none at 1000 queries with R=64, where exactly one subset exists
   and the marker *is* the measurement.  The line is the median.
+* **Greedy is drawn as T=0, solid grey, in every figure.**  It has no R --
+  its replicates would all be identical -- so it is one curve wherever it
+  appears.
 * **The dotted vertical line is 100 queries**, the depth of the standing probe
   every other simplex figure reads; R=16 is its replicate count.  The qbig
   queries are a different draw (seed 2) from that probe (seed 1), so the point
@@ -90,14 +99,27 @@ BAND_Q = (10.0, 90.0)
 R_CMAP = "Oranges"
 R_CMAP_RANGE = (0.38, 1.0)
 
+#: The temperature the depth and replicate figures read -- the standing
+#: decoding point.  The temperature figure reads every temperature in the CSV.
+MAIN_TEMPERATURE = 1.0
+#: The R the temperature figure holds fixed: the full replicate count, so each
+#: line is the deepest read of its temperature.
+TEMPERATURE_R = 64
+#: One hue, light to dark, for T: a magnitude like R, so sequential, but a
+#: different family from R's so the two figures are not read as one key.
+T_CMAP = "Reds"
+T_CMAP_RANGE = (0.35, 1.0)
+#: Greedy is drawn as T=0 in every figure: grey, solid, outside both ramps.
+GREEDY_COLOR = "0.35"
+GREEDY_LABEL = "T=0 (greedy)"
+
 #: The standing probe's depth, marked on every panel.
 STANDING_QUERIES = 100
 QUERY_TICKS = [1, 10, 100, 1000]
 
 #: ``(level, perspective in the CSV, panel title, level colour key)``.
 PANELS = [
-    ("behavioral", "sampled", "Behavioral · sampled, T=1", "Behavioral"),
-    ("behavioral", "greedy", "Behavioral · greedy", "Behavioral"),
+    ("behavioral", "sampled", "Behavioral · T=1 by R, and T=0", "Behavioral"),
     ("functional", "all_states", "Functional · all states", "Functional"),
     ("functional", "final_state", "Functional · final state", "Functional"),
 ]
@@ -137,13 +159,21 @@ def read_rows(path: Path) -> list[dict]:
     return rows
 
 
-def select(rows, embedder, level, perspective, replicates=None):
-    """The trials of one curve.  Functional rows carry embedder ``n/a``."""
+def select(rows, embedder, level, perspective, replicates=None,
+           temperature=MAIN_TEMPERATURE):
+    """The trials of one curve.  Functional rows carry embedder ``n/a``.
+
+    Sampled rows are filtered to *temperature* -- ``MAIN_TEMPERATURE`` unless
+    a figure asks for another, or ``None`` for every temperature.  Greedy and
+    functional rows carry no temperature and are not filtered on it.
+    """
     want_emb = "n/a" if level == "functional" else embedder
     return [r for r in rows
             if r["embedder"] == want_emb and r["level"] == level
             and r["perspective"] == perspective
-            and (replicates is None or int(r["replicates"]) == replicates)]
+            and (replicates is None or int(r["replicates"]) == replicates)
+            and (perspective != "sampled" or temperature is None
+                 or float(r["temperature"]) == temperature)]
 
 
 def band(trials, column):
@@ -158,13 +188,18 @@ def r_colours(rs):
     return dict(zip(rs, cmap(np.linspace(*R_CMAP_RANGE, len(rs)))))
 
 
-def draw(ax, trials, column, colour, label=None):
+def t_colours(ts):
+    cmap = plt.get_cmap(T_CMAP)
+    return dict(zip(ts, cmap(np.linspace(*T_CMAP_RANGE, len(ts)))))
+
+
+def draw(ax, trials, column, colour, label=None, ls="-"):
     xs, lo, mid, hi, _n = band(trials, column)
     if not xs:
         return
     if any(h > l for l, h in zip(lo, hi)):
         ax.fill_between(xs, lo, hi, color=colour, alpha=BAND_ALPHA, lw=0)
-    ax.plot(xs, mid, "-", color=colour, lw=SWEEP_LINEWIDTH,
+    ax.plot(xs, mid, ls, color=colour, lw=SWEEP_LINEWIDTH,
             marker=SWEEP_MARKER, ms=SWEEP_MARKER_SIZE, label=label)
 
 
@@ -179,11 +214,11 @@ def style_axes(ax, scale, lims):
     ax.axvline(STANDING_QUERIES, color="0.55", lw=0.7, ls=":", zorder=0)
 
 
-def caption(embedder, what):
+def caption(embedder, what, decode=f"sampled at T={MAIN_TEMPERATURE:g}"):
     return (
         f"{what} vs. probe depth · OLMo-2-1B-Instruct · ONE fixed 16-adapter "
         "yahoo simplex\n"
-        "subsampled from one run at 1000 queries (seed 2) x R=64 · behavioral "
+        f"subsampled from one run at 1000 queries (seed 2) x R=64, {decode} · "
         f"embedder {EMBEDDER_LABEL.get(embedder, embedder)}\n"
         "line = median · band = 10-90% over query x replicate draws · "
         f"dotted = {STANDING_QUERIES} queries, the standing probe's depth"
@@ -208,6 +243,8 @@ def fig_depth(rows, embedder, outdir, ext, yscale="log") -> Path:
                 for r in rs:
                     draw(ax, select(rows, embedder, level, persp, r), col,
                          colours[r], label=f"R={r}")
+                draw(ax, select(rows, embedder, level, "greedy"), col,
+                     GREEDY_COLOR, label=GREEDY_LABEL)
             else:
                 draw(ax, select(rows, embedder, level, persp), col,
                      LEVEL_COLORS[ckey])
@@ -222,7 +259,8 @@ def fig_depth(rows, embedder, outdir, ext, yscale="log") -> Path:
     if handles:
         fig.legend(handles, labs, loc="lower center", ncol=len(handles),
                    frameon=False, bbox_to_anchor=(0.5, 0.0),
-                   title="sampled behavioral: replicates per query")
+                   title="behavioral: replicates per query at T=1, "
+                         "and greedy")
     place_caption(fig, caption(embedder, "Recovery of the mixture simplex"),
                   font, height, bottom=0.085)
     embolden(fig)
@@ -234,7 +272,8 @@ def fig_replicates(rows, embedder, outdir, ext, yscale="log") -> Path:
     sampled = select(rows, embedder, "behavioral", "sampled")
     rs = sorted({int(r["replicates"]) for r in sampled})
     colours = r_colours(rs)
-    height = 4.6
+    greedy = select(rows, embedder, "behavioral", "greedy")
+    height = 4.9
     font = apply_style(PAGE_WIDTH)
     rows_m = metrics(yscale)
     fig, axes = plt.subplots(len(rows_m), len(rs),
@@ -243,6 +282,8 @@ def fig_replicates(rows, embedder, outdir, ext, yscale="log") -> Path:
     for mi, (col, ylabel, scale, lims) in enumerate(rows_m):
         for ri, r in enumerate(rs):
             ax = axes[mi][ri]
+            draw(ax, greedy, col, GREEDY_COLOR,
+                 label=GREEDY_LABEL if ri == 0 else None)
             draw(ax, [t for t in sampled if int(t["replicates"]) == r], col,
                  colours[r])
             style_axes(ax, scale, lims)
@@ -254,11 +295,48 @@ def fig_replicates(rows, embedder, outdir, ext, yscale="log") -> Path:
                 ax.set_xlabel("queries")
             if ri == 0:
                 ax.set_ylabel(ylabel)
+    handles, _labs = axes[0][0].get_legend_handles_labels()
+    fig.legend(handles, [GREEDY_LABEL + ", the same curve in every panel"],
+               loc="lower center", frameon=False, bbox_to_anchor=(0.5, 0.0))
     place_caption(fig, caption(embedder, "Sampled behavioral recovery"),
-                  font, height)
+                  font, height, bottom=0.06)
     embolden(fig)
     return save_figure(fig,
                        Path(outdir) / f"fig_qbig_replicates_{embedder}"
+                       f"{YSCALE_SUFFIX[yscale]}.{ext}")
+
+
+def fig_temperature(rows, embedder, outdir, ext, yscale="log") -> Path:
+    """Sampled behavioral at R=64, one line per temperature, greedy as T=0."""
+    sampled = select(rows, embedder, "behavioral", "sampled",
+                     TEMPERATURE_R, temperature=None)
+    ts = sorted({float(r["temperature"]) for r in sampled})
+    colours = t_colours(ts)
+    greedy = select(rows, embedder, "behavioral", "greedy")
+    height = 3.9
+    font = apply_style(PAGE_WIDTH)
+    rows_m = metrics(yscale)
+    fig, axes = plt.subplots(1, len(rows_m), figsize=(PAGE_WIDTH, height),
+                             squeeze=False)
+    for mi, (col, ylabel, scale, lims) in enumerate(rows_m):
+        ax = axes[0][mi]
+        draw(ax, greedy, col, GREEDY_COLOR, label=GREEDY_LABEL)
+        for t in ts:
+            draw(ax, [r for r in sampled if float(r["temperature"]) == t], col,
+                 colours[t], label=f"T={t:g}")
+        style_axes(ax, scale, lims)
+        ax.set_xlabel("queries")
+        ax.set_ylabel(ylabel)
+    handles, labs = axes[0][0].get_legend_handles_labels()
+    fig.legend(handles, labs, loc="lower center", ncol=len(handles),
+               frameon=False, bbox_to_anchor=(0.5, 0.0),
+               title=f"behavioral: temperature (sampled at R={TEMPERATURE_R})")
+    place_caption(fig, caption(embedder, "Behavioral recovery by temperature",
+                               decode="all temperatures decoded on l40s only"),
+                  font, height, bottom=0.16)
+    embolden(fig)
+    return save_figure(fig,
+                       Path(outdir) / f"fig_qbig_temperature_{embedder}"
                        f"{YSCALE_SUFFIX[yscale]}.{ext}")
 
 
@@ -284,7 +362,7 @@ def main() -> None:
     scales = (list(DISPARITY_YLIMS) if args.yscale == "both"
               else [args.yscale])
     for yscale in scales:
-        for fig in (fig_depth, fig_replicates):
+        for fig in (fig_depth, fig_replicates, fig_temperature):
             path = fig(rows, args.embedder, args.outdir, args.ext, yscale)
             print(f"wrote {path}")
 

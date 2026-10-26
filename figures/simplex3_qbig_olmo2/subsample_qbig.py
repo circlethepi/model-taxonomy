@@ -32,6 +32,14 @@ exactly one subset of the replicates.  Those are drawn once, and carry
 ``n_draws = 1`` in the CSV so the plotting side can render them as points rather
 than as zero-width bands.
 
+**Sampled behavioral is read at every temperature on disk.**  The qbigtemp tree
+(2026-10-13) decoded the same draw at T = 0.25, 0.5, 0.75 and 1.0, each its own
+cache entry, all on one GPU architecture.  Each temperature runs the full
+``(n_queries, replicates)`` grid over the **same** query subsets and the same
+replicate subsets, so two temperatures differ trial by trial only in T.  The
+T=1.0 entry is qbigtemp's l40s decode; qbig's original mixed-GPU T=1.0 entry
+was moved to ``results/archive/qbig_t10_mixed_gpu/`` and is not read.
+
 **Greedy decoding has no replicate axis.**  Greedy is deterministic, so the tree
 stores one generation per query; it appears on the query axis only, as its own
 perspective.
@@ -114,6 +122,26 @@ QUERY_GRID = [1, 2, 5, 10, 20, 50, 100, 200, 500, 1000]
 REPLICATE_GRID = [2, 4, 8, 16, 32, 64]
 N_DRAWS = 10
 
+#: The sampling temperatures the qbigtemp tree decoded.  Every other sampling
+#: field is the tree's: top_p 1.0, no top_k, generation seed 0.
+TEMPERATURES = [0.25, 0.5, 0.75, 1.0]
+
+
+def sampling_hash(temperature: float) -> str:
+    """The cache's sampling hash for qbigtemp's decode at *temperature*.
+
+    Computed through ``GeneratedTextCache.sampling_hash`` rather than listed, so
+    a temperature that was never decoded fails at load instead of reading
+    nothing; T=1.0 is checked against the suite's ``SAMP_SAMPLED``.
+    """
+    h = GeneratedTextCache.sampling_hash({
+        "do_sample": True, "temperature": float(temperature), "top_p": 1.0,
+        "top_k": None, "generation_seed": 0})
+    if temperature == 1.0 and h != suite.SAMP_SAMPLED:
+        raise RuntimeError(f"T=1.0 hashes to {h}, not the suite's "
+                           f"{suite.SAMP_SAMPLED}; the sampling key changed.")
+    return h
+
 #: The four training fields that separate qbig's fleet from everything else in
 #: the shared cache.  The mixture filter alone is not enough: the nsweep's
 #: n=10000 adapters, the 1004-model group-size pool and the qmix fleet all carry
@@ -132,8 +160,10 @@ DEFAULT_EMBEDDERS = ["v2moe"]
 #: different computation.
 PIPELINE_TOL = 1e-5
 
-#: CSV columns, one row per trial.
-FIELDS = ["embedder", "level", "perspective", "n_queries", "replicates",
+#: CSV columns, one row per trial.  ``temperature`` is blank for greedy and
+#: functional rows, which have none.
+FIELDS = ["embedder", "level", "perspective", "temperature", "n_queries",
+          "replicates",
           "query_draw", "rep_draw", "n_query_draws", "n_rep_draws", "dcor",
           "disparity"]
 
@@ -232,12 +262,12 @@ def unit_rows(V):
 
 # ── The cross-check against the standard pipeline ────────────────────────────
 
-def pipeline_specs(embedder_hash) -> dict:
+def pipeline_specs(embedder_hash, samp_hash=suite.SAMP_SAMPLED) -> dict:
     """The canonical perspectives this script reproduces, pointed at qbig.
 
-    Only the draw, the embedder and (for sampled behavioral) R change; every
-    other selector field is the canonical one.  Keyed by this script's own
-    ``(level, perspective)`` names.
+    Only the draw, the embedder and (for sampled behavioral) R and the sampling
+    hash change; every other selector field is the canonical one.  Keyed by
+    this script's own ``(level, perspective)`` names.
     """
     specs = canonical_perspectives()
     out = {}
@@ -245,7 +275,8 @@ def pipeline_specs(embedder_hash) -> dict:
             (("functional", "all_states"), "functional_all", {}),
             (("functional", "final_state"), "functional_last", {}),
             (("behavioral", "sampled"), "behavioral",
-             {"replicates": R_TOTAL, "embedder_hash": embedder_hash}),
+             {"replicates": R_TOTAL, "embedder_hash": embedder_hash,
+              "sampling_hash": samp_hash}),
             (("behavioral", "greedy"), "behavioral_greedy",
              {"embedder_hash": embedder_hash})]:
         spec = specs[name]
@@ -263,15 +294,17 @@ def pipeline_matrix(index, ids, spec):
     return dm.reindex(list(ids))
 
 
-def check_against_pipeline(index, ids, full, embedder_hash):
+def check_against_pipeline(index, ids, full, embedder_hash,
+                           samp_hash=suite.SAMP_SAMPLED):
     """Stop unless each full-probe matrix here equals the pipeline's.
 
     *full* maps ``(level, perspective)`` to this script's ``(M, Q, d)`` read at
     the full probe; a key it lacks is skipped (the functional reads are loaded
-    under the first embedder only).  Returns ``{(level, perspective): max |gap|}``.
+    under the first embedder only, and the sampled read once per temperature).
+    Returns ``{(level, perspective): max |gap|}``.
     """
     gaps = {}
-    for key, spec in pipeline_specs(embedder_hash).items():
+    for key, spec in pipeline_specs(embedder_hash, samp_hash).items():
         if key not in full:
             continue
         mine = cosine_parts(full[key], ids).distance_matrix(
@@ -330,9 +363,49 @@ def run(args) -> None:
         emb = EMBEDDERS[name]
         print(f"\n=== embedder {name} ({emb}) ===", flush=True)
 
-        print("  loading sampled …", flush=True)
-        X = load_behavioral(index, ids, emb, replicates=R_TOTAL,
-                            sampling_hash=suite.SAMP_SAMPLED)
+        # Query sets are drawn once per embedder pass, from an RNG seeded from
+        # the run seed, so a rerun reproduces them and two embedders see the
+        # *same* subsets.  Every temperature and every perspective below reads
+        # these same sets, which is what makes them comparable trial by trial.
+        rng_q = np.random.default_rng(args.seed)
+        qdraws = {n_q: pool.draw_queries(n_q, 1 if n_q == pool.n else N_DRAWS,
+                                         rng_q, by=by, composition=None)
+                  for n_q in QUERY_GRID}
+
+        # Sampled behavioral, one temperature at a time: one (M, Q, R, d) read
+        # in memory at once.  The replicate RNG is re-seeded per temperature
+        # and consumed in the same order, so each temperature draws the same
+        # replicate subsets as the others.
+        for T in args.temperatures:
+            samp = sampling_hash(T)
+            print(f"  loading sampled T={T} ({samp}) …", flush=True)
+            X = load_behavioral(index, ids, emb, replicates=R_TOTAL,
+                                sampling_hash=samp)
+            check_against_pipeline(
+                index, ids, {("behavioral", "sampled"): reduce_replicates(X)},
+                emb, samp)
+            rng_r = np.random.default_rng([args.seed, 1])
+            for n_q, qsets in qdraws.items():
+                n_qd = len(qsets)
+                for qi, qidx in enumerate(qsets):
+                    Xq = X[:, qidx]                 # (M, n_q, R, d)
+                    for r in REPLICATE_GRID:
+                        n_rd = 1 if r == R_TOTAL else N_DRAWS
+                        for ri in range(n_rd):
+                            ridx = (None if r == R_TOTAL
+                                    else draw_replicates(R_TOTAL, r, 1, rng_r)[0])
+                            V = reduce_replicates(Xq, ridx, renormalize=True)
+                            rows.append(dict(
+                                embedder=name, level="behavioral",
+                                perspective="sampled", temperature=T,
+                                n_queries=n_q, replicates=r, query_draw=qi,
+                                rep_draw=ri, n_query_draws=n_qd,
+                                n_rep_draws=n_rd,
+                                **score(V, ids, "behavioral")))
+                print(f"  T={T} n_queries={n_q:4d}: {len(rows)} rows, "
+                      f"{time.time() - t_start:.0f}s elapsed", flush=True)
+            del X, Xq
+
         print("  loading greedy …", flush=True)
         G = load_behavioral(index, ids, emb, replicates=1,
                             sampling_hash=suite.SAMP_GREEDY)[:, :, 0, :]
@@ -348,60 +421,35 @@ def run(args) -> None:
         else:
             F_all = F_last = None
 
-        # One RNG per embedder pass, seeded from the run seed, so a rerun
-        # reproduces the same draws and two embedders see the *same* subsets --
-        # which is what makes the two reads comparable trial by trial.
-        rng = np.random.default_rng(args.seed)
-
-        full = {("behavioral", "sampled"): reduce_replicates(X),
-                ("behavioral", "greedy"): unit_rows(G)}
+        full = {("behavioral", "greedy"): unit_rows(G)}
         if F_all is not None:
             full[("functional", "all_states")] = F_all
             full[("functional", "final_state")] = F_last
         check_against_pipeline(index, ids, full, emb)
         del full
 
-        for n_q in QUERY_GRID:
-            n_qd = 1 if n_q == pool.n else N_DRAWS
-            qdraws = pool.draw_queries(n_q, n_qd, rng, by=by,
-                                       composition=None)
-            for qi, qidx in enumerate(qdraws):
-                Xq = X[:, qidx]                     # (M, n_q, R, d)
-
-                for r in REPLICATE_GRID:
-                    n_rd = 1 if r == R_TOTAL else N_DRAWS
-                    for ri in range(n_rd):
-                        ridx = (None if r == R_TOTAL
-                                else draw_replicates(R_TOTAL, r, 1, rng)[0])
-                        V = reduce_replicates(Xq, ridx, renormalize=True)
-                        rows.append(dict(
-                            embedder=name, level="behavioral",
-                            perspective="sampled", n_queries=n_q,
-                            replicates=r, query_draw=qi, rep_draw=ri,
-                            n_query_draws=n_qd, n_rep_draws=n_rd,
-                            **score(V, ids, "behavioral")))
-
-                Vg = unit_rows(G[:, qidx])
+        for n_q, qsets in qdraws.items():
+            n_qd = len(qsets)
+            for qi, qidx in enumerate(qsets):
                 rows.append(dict(
                     embedder=name, level="behavioral", perspective="greedy",
-                    n_queries=n_q, replicates=1, query_draw=qi, rep_draw=0,
-                    n_query_draws=n_qd, n_rep_draws=1,
-                    **score(Vg, ids, "behavioral")))
-
+                    temperature="", n_queries=n_q, replicates=1,
+                    query_draw=qi, rep_draw=0, n_query_draws=n_qd,
+                    n_rep_draws=1,
+                    **score(unit_rows(G[:, qidx]), ids, "behavioral")))
                 if F_all is not None:
                     for persp, F in (("all_states", F_all),
                                      ("final_state", F_last)):
                         rows.append(dict(
                             embedder="n/a", level="functional",
-                            perspective=persp, n_queries=n_q, replicates=0,
-                            query_draw=qi, rep_draw=0, n_query_draws=n_qd,
-                            n_rep_draws=1,
+                            perspective=persp, temperature="", n_queries=n_q,
+                            replicates=0, query_draw=qi, rep_draw=0,
+                            n_query_draws=n_qd, n_rep_draws=1,
                             **score(F[:, qidx], ids, "functional")))
+        print(f"  greedy + functional: {len(rows)} rows, "
+              f"{time.time() - t_start:.0f}s elapsed", flush=True)
 
-            print(f"  n_queries={n_q:4d}: {len(rows)} rows, "
-                  f"{time.time() - t_start:.0f}s elapsed", flush=True)
-
-        del X, G, F_all, F_last
+        del G, F_all, F_last
 
     out = HERE / args.out
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -419,6 +467,10 @@ def main() -> None:
     p.add_argument("--by", default="none", choices=["none", "group", "topic"],
                    help="stratify query draws by this label axis "
                         "(default: uniform over the whole pool)")
+    p.add_argument("--temperatures", nargs="+", type=float,
+                   default=TEMPERATURES,
+                   help="sampled-behavioral temperatures to read "
+                        "(default: all four qbigtemp decoded)")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--quick", action="store_true",
                    help="trim the grids to a shape check, not a result")

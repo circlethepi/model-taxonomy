@@ -15,13 +15,15 @@ sets per query count.  This file is purely plotting.
     * **single layers** -- h1 … h16, one line each, light to dark by depth.
       ``h0`` (the embeddings, identical across all sixteen models) has no
       score and is not in the CSV.
-    * **thirds** -- early (h1-h5), middle (h6-h10), late (h11-h16), each joined,
-      coloured at their place on the same depth ramp.
-    * **every Nth layer** -- one layer from each evenly spaced step of h1-h16,
-      joined: every 15th (h1, h16), 5th, 3rd, and every layer (h1-h16).
+    * **layer subsets** -- groups of layers joined, each labelled by its layers.
+      The contiguous thirds (``1–5``, ``6–10``, ``11–16``) are
+      coloured at their place on the singles' depth ramp; the evenly spaced
+      sets (``1, 16``, ``1, 6, 11, 16``, ``1, 4, 7, 10, 13, 16``) on a ramp of
+      their own.
 
-    **All hidden states** (h0-h16), the standing functional row, is drawn in
-    black in every panel as the reference.  x is the number of queries.
+    **all (1–16)** -- h1-h16 joined -- is drawn in black in every panel as the
+    reference.  It scores as the standing all-hidden-states row does: that row
+    also carries h0, which only rescales every distance.  x is the number of queries.
 
 Usage::
 
@@ -56,8 +58,8 @@ HERE = Path(__file__).resolve().parent
 #: short of the palest end, which vanishes on white.
 DEPTH_CMAP = "YlOrBr"
 DEPTH_CMAP_RANGE = (0.3, 1.0)
-#: "Every Nth layer" is a density, not a depth, so it takes a ramp of its own:
-#: light = fewest layers kept.
+#: The evenly spaced subsets differ in density, not depth, so they take a ramp
+#: of their own: light = fewest layers kept.
 DENSITY_CMAP = "PuBu"
 DENSITY_CMAP_RANGE = (0.4, 1.0)
 REFERENCE_COLOR = "black"
@@ -66,8 +68,7 @@ KEY_STRIP = 0.17
 
 #: ``(layer_set in the CSV, panel title)`` per column.
 COLUMNS = [("single", "Single layers"),
-           ("third", "Thirds"),
-           ("every_nth", "Every Nth layer")]
+           ("subset", "Layer subsets")]
 
 
 def depth_colours(top):
@@ -93,8 +94,7 @@ def caption():
         "Functional recovery of the mixture simplex, by hidden state, vs. "
         "probe depth · OLMo-2-1B-Instruct · ONE fixed 16-adapter yahoo simplex\n"
         "subsampled from one run at 1000 queries (seed 2) · input mode, mean "
-        "pooling, layer-normalized concatenation, cosine · black = all hidden "
-        "states (h0–h16)\n"
+        "pooling, layer-normalized concatenation, cosine · black = all (1–16)\n"
         "line = median · band = 10-90% over query draws · "
         f"dotted = {mq.STANDING_QUERIES} queries, the standing probe's depth"
     )
@@ -104,10 +104,15 @@ def fig_layers(rows, outdir, ext, yscale="log") -> Path:
     cs = curves(rows)
     top = max(ls[0] for _l, s, ls, _t in cs.values() if s == "single")
     dcol = depth_colours(top)
-    nth = sorted((v for v in cs.values() if v[1] == "every_nth"),
-                 key=lambda v: len(v[2]))
-    ncol = dict(zip((v[0] for v in nth), plt.get_cmap(DENSITY_CMAP)(
-        np.linspace(*DENSITY_CMAP_RANGE, len(nth)))))
+    subsets = [v for v in cs.values() if v[1] == "subset"]
+    # A contiguous subset sits at its place on the depth ramp (by its middle
+    # layer); a spaced one spans the stack, so it is coloured by density.
+    contiguous = [v for v in subsets if v[2] == list(range(v[2][0], v[2][-1] + 1))]
+    spaced = sorted((v for v in subsets if v not in contiguous),
+                    key=lambda v: len(v[2]))
+    scol = {v[0]: dcol[v[2][len(v[2]) // 2]] for v in contiguous}
+    scol.update(zip((v[0] for v in spaced), plt.get_cmap(DENSITY_CMAP)(
+        np.linspace(*DENSITY_CMAP_RANGE, len(spaced)))))
     ref = next(v for v in cs.values() if v[1] == "all")
 
     height = 6.0
@@ -120,20 +125,14 @@ def fig_layers(rows, outdir, ext, yscale="log") -> Path:
         for ci, (layer_set, title) in enumerate(COLUMNS):
             ax = axes[mi][ci]
             mq.draw(ax, ref[3], col, REFERENCE_COLOR,
-                    label="all hidden states" if ci == 0 else None)
+                    label=ref[0] if ci == 0 else None)
             if layer_set == "single":
                 for label, s, layers, trials in cs.values():
                     if s == "single":
                         mq.draw(ax, trials, col, dcol[layers[0]])
-            elif layer_set == "third":
-                for label, s, layers, trials in cs.values():
-                    if s == "third":
-                        mid = layers[len(layers) // 2]
-                        mq.draw(ax, trials, col, dcol[mid],
-                                label=f"{label} (h{layers[0]}–h{layers[-1]})")
             else:
-                for label, _s, _ls, trials in nth:
-                    mq.draw(ax, trials, col, ncol[label], label=label)
+                for label, _s, _ls, trials in contiguous + spaced:
+                    mq.draw(ax, trials, col, scol[label], label=label)
             mq.style_axes(ax, scale, lims)
             if mi == 0:
                 ax.set_title(title)
@@ -142,8 +141,8 @@ def fig_layers(rows, outdir, ext, yscale="log") -> Path:
             if ci == 0:
                 ax.set_ylabel(ylabel)
 
-    # One key per column, under it: a depth colorbar for the singles, legends
-    # for the other two.  The reference sits under the singles' bar.
+    # One key per column, under it: a depth colorbar for the singles, a legend
+    # for the subsets.  The reference sits under the singles' bar.
     # place_caption runs tight_layout, so it reserves the keys' strip first and
     # the keys are placed against the axes' final positions.
     place_caption(fig, caption(), font, height, bottom=KEY_STRIP)
@@ -165,9 +164,10 @@ def fig_layers(rows, outdir, ext, yscale="log") -> Path:
         else:
             # The reference is unlabelled here: it is keyed once, under singles.
             h, l = axes[0][ci].get_legend_handles_labels()
-            fig.legend(h, l, loc="upper left", frameon=False,
+            fig.legend(h, l, loc="upper left", frameon=False, ncol=2,
                        bbox_to_anchor=(box.x0 - 0.01, KEY_STRIP - 0.025),
-                       fontsize=font * 0.75, handlelength=1.4)
+                       fontsize=font * 0.75, handlelength=1.4,
+                       columnspacing=1.0)
     embolden(fig)
     return save_figure(fig, Path(outdir) /
                        f"fig_qbig_layers{mq.YSCALE_SUFFIX[yscale]}.{ext}")

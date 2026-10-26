@@ -19,16 +19,21 @@ cosine -- with only ``layers`` changed.  OLMo-2-1B has 16 decoder layers, so
 * **single layers** -- each of ``h1`` … ``h16`` alone.  ``h0`` is not scored:
   LoRA never touches the embedding matrix, so all sixteen models are identical
   there, every distance is 0, and neither score is defined (Procrustes stops on
-  a configuration whose points all coincide).  It stays inside "all hidden
-  states", as it does in the standing row.
-* **thirds** -- ``early third`` (h1-h5), ``middle third`` (h6-h10), ``late
-  third`` (h11-h16): the suite's ``thirds()`` split of h1-h16, under the labels
-  ``simplex_suite.functional_group_rows`` already uses.
-* **every Nth layer** -- one layer from each evenly spaced step of h1-h16,
-  joined.  Both ends are kept, so the steps are the divisors of 15: every 15th
-  (h1, h16), every 5th (h1, h6, h11, h16), every 3rd (h1, h4, … h16) and every
-  layer (h1-h16, i.e. all hidden states but ``h0``).
-* **all hidden states** -- h0-h16, the standing row, as the reference.
+  a configuration whose points all coincide).
+* **layer subsets** -- groups of layers joined, each labelled by the layers it
+  includes.  Two kinds:
+
+  - *contiguous*: the suite's ``thirds()`` split of h1-h16, labelled as ranges
+    -- ``1–5``, ``6–10`` and ``11–16`` (the rows
+    ``simplex_suite.functional_group_rows`` calls early/middle/late third);
+  - *evenly spaced*: both ends kept, so the steps that divide h1-h16 evenly are
+    the divisors of 15; steps 15, 5 and 3 give ``1, 16``, ``1, 6, 11, 16`` and
+    ``1, 4, 7, 10, 13, 16``.  Step 1 is the reference below.
+* **all (1–16)** -- h1-h16, the reference.  The standing all-hidden-states row
+  also carries ``h0``, but with every model identical there, adding h0 only
+  rescales each distance by 16/17, and neither score moves under a uniform
+  rescaling -- so h1-h16 scores as the standing row does, and ``--compare``
+  checks exactly that.
 
 **Every combination is a mean of per-layer parts, exactly.**  Under
 ``normalize="layer"`` each layer block is scaled to unit length per query
@@ -47,7 +52,8 @@ with (a) ``build_taxonomy_artifacts``, the path every other figure takes, and
 (b) the same surrogates read through ``ActivationCache.load``, as
 ``subsample_qbig.py`` reads them.  The query sets are drawn with the same seed
 and calls as ``subsample_qbig.py``, so the all-states and final-state rows here
-must equal that CSV's functional rows trial for trial; ``make_qbig_layer_figures``
+must equal that CSV's functional rows trial for trial (``all (1–16)`` against
+its all-states rows, ``h16`` against its final-state rows); ``make_qbig_layer_figures``
 does not re-check this, so run ``--compare`` once after a rescore.
 
 Writes ``qbig_layers.csv`` beside this file.
@@ -89,30 +95,29 @@ def surrogates(n_states: int) -> list[tuple[str, str, str, list[int]]]:
     """``(perspective, label, layer_set, layers)`` for every surrogate scored.
 
     Derived from the hidden-state count rather than written down, so the
-    "every Nth" steps are the ones that divide this model's h1..h(L) evenly.
+    subsets' steps are the ones that divide this model's h1..h(L) evenly.
     """
     top = n_states - 1                                  # h16 on OLMo-2-1B
     span = list(range(1, n_states))                     # h1..h16
     # h0 is left out: identical across the fleet, so no score exists for it.
     out = [(f"h{ell}", f"h{ell}", "single", [ell]) for ell in span]
-    early, mid, late = suite.thirds(span)
-    out += [("early_third", "early third", "third", list(early)),
-            ("middle_third", "middle third", "third", list(mid)),
-            ("late_third", "late third", "third", list(late))]
-    for step in sorted(s for s in range(1, top) if (top - 1) % s == 0):
-        layers = list(range(1, n_states, step))
-        name = "every layer" if step == 1 else f"every {_ordinal(step)} layer"
-        span_txt = (f"h1–h{top}" if step == 1
-                    else ", ".join(f"h{ell}" for ell in layers))
-        out.append((f"every_{step}", f"{name} ({span_txt})", "every_nth", layers))
-    out.append(("all_states", f"all hidden states (h0–h{top})", "all",
-                list(range(n_states))))
+    subsets = [list(t) for t in suite.thirds(span)]
+    # Step 1 is left out here: h1..h(L) is the reference, appended last.
+    for step in sorted((s for s in range(2, top) if (top - 1) % s == 0),
+                       reverse=True):
+        subsets.append(list(range(1, n_states, step)))
+    out += [(f"subset_{'_'.join(map(str, layers))}", _subset_label(layers),
+             "subset", layers)
+            for layers in subsets]
+    out.append((f"all_1_{top}", f"all (1–{top})", "all", span))
     return out
 
 
-def _ordinal(n: int) -> str:
-    suffix = "th" if 10 <= n % 100 <= 20 else {1: "st", 2: "nd", 3: "rd"}.get(n % 10, "th")
-    return f"{n}{suffix}"
+def _subset_label(layers: list[int]) -> str:
+    """A contiguous run as a range (``1–5``), anything else as a list."""
+    if len(layers) > 2 and layers == list(range(layers[0], layers[-1] + 1)):
+        return f"{layers[0]}–{layers[-1]}"
+    return ", ".join(map(str, layers))
 
 
 # ── Per-layer parts ──────────────────────────────────────────────────────────
@@ -189,9 +194,10 @@ def compare(out: Path) -> None:
                     for r in csv.DictReader(fh) if keep(r)}
     ref = read(HERE / "qbig_subsample.csv", lambda r: r["level"] == "functional")
     top = max(int(k[0][1:]) for k in read(out, lambda r: r["layer_set"] == "single"))
-    mine = read(out, lambda r: r["perspective"] in ("all_states", f"h{top}"))
-    mine = {(("final_state" if p == f"h{top}" else p), n, d): v
-            for (p, n, d), v in mine.items()}
+    # all (1-16) stands in for the standing all-states row (h0 only rescales).
+    alias = {f"all_1_{top}": "all_states", f"h{top}": "final_state"}
+    mine = read(out, lambda r: r["perspective"] in alias)
+    mine = {(alias[p], n, d): v for (p, n, d), v in mine.items()}
     missing = set(ref) ^ set(mine)
     if missing:
         raise RuntimeError(f"{len(missing)} trials in one CSV and not the other, "

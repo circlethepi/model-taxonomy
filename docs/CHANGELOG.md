@@ -7,20 +7,24 @@
 ### qbig: functional recovery per hidden state and per layer combination
 
 `figures/simplex3_qbig_olmo2/layers_qbig.py` scores qbig's functional level (input
-mode, mean pooling, layer-normalized concatenation, cosine) through 24 surrogates
+mode, mean pooling, layer-normalized concatenation, cosine) through 23 surrogates
 that differ only in `layers`, each over the same query-count grid and the same query
-draws as `qbig_subsample.csv`. The output is `qbig_layers.csv` (2184 rows), which
+draws as `qbig_subsample.csv`. The output is `qbig_layers.csv` (2093 rows), which
 lists each surrogate's layers explicitly. `make_qbig_layer_figures.py` draws
 `fig_qbig_layers{,_linear}.pdf`. `jobs/qbig_layers.sh` runs the scoring on `med` in
 about 15 minutes.
 
 - **Single layers:** h1 … h16. h0 (the embeddings) is left out, because LoRA never
   touches it, so all 16 models are identical there and neither score is defined.
-- **Thirds:** early (h1–h5), middle (h6–h10), late (h11–h16).
-- **Every Nth layer:** evenly spaced layers of h1–h16, both ends kept, joined:
-  every 15th (h1, h16), 5th (h1, h6, h11, h16), 3rd (h1, h4, … h16), and every layer
-  (h1–h16).
-- **All hidden states:** h0–h16, the standing row, as the reference.
+- **Layer subsets:** groups of layers joined, each labelled by the layers it
+  includes, in one panel. They come in two kinds:
+  - the contiguous thirds of h1–h16, labelled as ranges: `1–5`; `6–10`; `11–16`;
+  - evenly spaced layers with both ends kept: `1, 16`; `1, 6, 11, 16`;
+    `1, 4, 7, 10, 13, 16`.
+
+- **all (1–16):** h1–h16, the reference. The standing all-hidden-states row also
+  carries h0, but with every model identical there, adding h0 only rescales each
+  distance by 16/17, so h1–h16 scores as the standing row does.
 
 **How combinations are computed.** Under `normalize="layer"`, the inner product of
 two joined rows is the mean of their per-layer inner products. So each layer is
@@ -31,18 +35,15 @@ parts. The script stops on a zero-norm block, where this identity breaks.
 
 - At the full probe, the all-states and final-state matrices built from parts match
   `build_taxonomy_artifacts` and `ActivationCache.load` to within 1e-10.
-- The all-states and h16 rows match `qbig_subsample.csv` trial for trial, to within
-  2.5e-9.
+- The `all (1–16)` and h16 rows match `qbig_subsample.csv`'s all-states and
+  final-state rows trial for trial.
 
 **Results** (median scores at 100 queries; every curve is flat from about 10 queries
 on):
 
 - Recovery rises with depth, from dCor* 0.947 at h1 to 0.979 at h11.
-- The late third (dCor* 0.979, disparity 0.0065) beats all hidden states (0.975,
-  0.0076).
-- Every 5th layer matches all hidden states.
-- "Every layer (h1–h16)" scores identically to all hidden states. With every model
-  identical at h0, adding h0 only rescales each distance by 16/17.
+- `11–16` (dCor* 0.979, disparity 0.0065) beats `all (1–16)` (0.975, 0.0076).
+- `1, 6, 11, 16` matches `all (1–16)`; `1, 16` falls slightly short (0.973, 0.0098).
 
 ### qbig: scored at every qbigtemp temperature, with greedy drawn as T=0
 

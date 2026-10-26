@@ -19,8 +19,10 @@ this directory unchanged:
 
 The four panels, one row, y = Procrustes disparity on one shared axis
 ----------------------------------------------------------------------
-1. **Functional layers** -- the contiguous layer subsets (thirds), h1, h9 and
-   h16 alone, and ``all (1–16)`` as the reference; x = number of queries.
+1. **Functional layers** -- the contiguous layer subsets (thirds: early 1–5,
+   middle 6–10, late 11–16) solid, the single layers h1, h9 and h16 dotted in
+   their third's colour, and all of h1–h16 as the reference (black,
+   triangles); x = number of queries.
 2. **Query mixture** -- sampled behavioral (T=1, R=16) and functional (all
    hidden states), 100-row probe, level by colour (figure 2's), corpus by
    dash (dolly solid, oasst1-zh dashed);
@@ -78,6 +80,9 @@ HERE = Path(__file__).resolve().parent
 #: end stays ochre rather than brown, so it is not read as panel 4's red.
 DEPTH_RAMP = ["#EDB84A", "#E69F00", "#7A5400"]
 REFERENCE_COLOR = ml.REFERENCE_COLOR
+#: Panel 1's curves (and their key entries) are drawn at this opacity, so the
+#: overlapping layer curves show through one another.
+LAYER_LINE_ALPHA = 0.8
 #: ``all (1–16)`` is marked with a triangle, apart from the layer curves' dots.
 REFERENCE_MARKER = "^"
 #: Single layers dotted, so they do not read as subsets on the shared ramp.
@@ -117,8 +122,9 @@ QMIX_LEVELS = [("behavioral", "behavioral"),
 ARM_LINESTYLES = {"dolly": "-", "oasst1zh": "--"}
 #: The order the corpora are keyed in panel 2's legend.
 KEY_ARM_ORDER = ["oasst1zh", "dolly"]
-#: The neutral colour of the corpus entries (solid / dashed) in panel 2's key.
-ARM_KEY_COLOR = "0.35"
+#: The neutral colour of the line-kind entries in panels 1 and 2's keys
+#: (group / single; dolly / oasst1-zh).
+KEY_COLOR = "0.35"
 #: Short arm names for the in-axes legend.
 ARM_LABELS = {"dolly": "dolly", "oasst1zh": "oasst1-zh"}
 
@@ -159,8 +165,9 @@ LEGEND_LOC = {"layers": "upper left", "qmix": "upper center"}
 #: Legend handle length per panel: panel 1's is just long enough to show the
 #: single layers' dots on both sides of the marker.
 HANDLE_LENGTH = {"layers": 1.6, "qmix": 1.0}
-#: Panel 1's groupings column: the three thirds, then ``all (1–16)``.
-LAYER_GROUPS = ("1–5", "6–10", "11–16", "all (1–16)")
+#: Panel 1's key names the thirds by depth, in order ``1–5``, ``6–10``,
+#: ``11–16``; their colours also mark the single layers that fall in them.
+DEPTH_NAMES = ("early", "middle", "late")
 #: The gap between panels, as a fraction of what ``tight_layout`` leaves.
 #: 0.5 runs the end tick labels together ("1000" into the next panel's "100");
 #: 0.65 keeps about two thirds of a character between them.
@@ -179,14 +186,15 @@ def ramp(colours, n):
     return list(cmap(np.linspace(0.0, 1.0, n)))
 
 
-def draw(ax, by_x, colour, label=None, ls="-", marker="o", zorder=2):
+def draw(ax, by_x, colour, label=None, ls="-", marker="o", zorder=2,
+         alpha=1.0):
     xs, lo, mid, hi, _n = quantile_band(by_x, BAND_Q)
     if not xs:
         return
     if any(h > l for l, h in zip(lo, hi)):
         ax.fill_between(xs, lo, hi, color=colour, alpha=BAND_ALPHA, lw=0)
     ax.plot(xs, mid, linestyle=ls, color=colour, lw=LINEWIDTH, marker=marker,
-            ms=MARKER_SIZE, label=label, zorder=zorder)
+            ms=MARKER_SIZE, label=label, zorder=zorder, alpha=alpha)
 
 
 def by_queries(trials, column="disparity"):
@@ -214,16 +222,29 @@ def panel_layers(ax, rows, yscale):
     ref = next(v for v in cs.values() if v[1] == "all")
 
     # Drawn above the layer curves, so its triangles are not buried under them.
-    draw(ax, by_queries(ref[3]), REFERENCE_COLOR, label=ref[0],
-         marker=REFERENCE_MARKER, zorder=3)
+    draw(ax, by_queries(ref[3]), REFERENCE_COLOR,
+         marker=REFERENCE_MARKER, zorder=3, alpha=LAYER_LINE_ALPHA)
     for label, _s, _ls, trials in contiguous:
-        draw(ax, by_queries(trials), scol[label], label=label)
+        draw(ax, by_queries(trials), scol[label], alpha=LAYER_LINE_ALPHA)
     for label, s, layers, trials in cs.values():
         if s == "single" and layers[0] in SINGLE_LAYERS:
-            # A single layer is labelled by its number alone ("h9" -> "9").
-            draw(ax, by_queries(trials), dcol[layers[0]],
-                 label=label.removeprefix("h"),
-                 ls=SINGLE_LS)
+            # A single layer takes the colour of the third it falls in, so the
+            # key's early / middle / late colours name both line kinds.
+            third = next(v for v in contiguous if layers[0] in v[2])
+            draw(ax, by_queries(trials), scol[third[0]], ls=SINGLE_LS,
+                 alpha=LAYER_LINE_ALPHA)
+
+    # The key: colour (column 1), then line kind (column 2).
+    for (label, _s, _ls, _t), name in zip(contiguous, DEPTH_NAMES):
+        ax.plot([], [], "-", color=scol[label], lw=LINEWIDTH, marker="o",
+                ms=MARKER_SIZE, label=name, alpha=LAYER_LINE_ALPHA)
+    ax.plot([], [], "-", color=KEY_COLOR, lw=LINEWIDTH, label="group",
+            alpha=LAYER_LINE_ALPHA)
+    ax.plot([], [], linestyle=SINGLE_LS, color=KEY_COLOR, lw=LINEWIDTH,
+            label="single", alpha=LAYER_LINE_ALPHA)
+    ax.plot([], [], "-", color=REFERENCE_COLOR, lw=LINEWIDTH,
+            marker=REFERENCE_MARKER, ms=MARKER_SIZE, label="all",
+            alpha=LAYER_LINE_ALPHA)
     query_axes(ax, yscale)
     ax.set_title("Functional layers")
 
@@ -244,7 +265,7 @@ def panel_qmix(ax, rows, yscale):
         ax.plot([], [], "-", color=LEVEL_COLORS[level], lw=LINEWIDTH,
                 marker="o", ms=MARKER_SIZE, label=level)
     for arm in KEY_ARM_ORDER:
-        ax.plot([], [], ARM_LINESTYLES[arm], color=ARM_KEY_COLOR,
+        ax.plot([], [], ARM_LINESTYLES[arm], color=KEY_COLOR,
                 lw=LINEWIDTH, label=ARM_LABELS[arm])
     # qmix's axes without its one-yahoo-row (99% dilution) dotted line.
     ax.set_yscale(yscale)
@@ -355,17 +376,12 @@ def build(layers, subsample, qmix, outdir, ext, yscale) -> Path:
 
     for ax, (key, loc) in zip(axes, LEGEND_LOC.items()):
         # Figure 2's legend style (the house rc), in two columns filled
-        # column-first: panel 1's groupings then its single layers; panel 2's
-        # levels (colour) then its corpora (linestyle).  Only the handle and column gaps are
+        # column-first: colour entries, then line-kind entries -- panel 1's
+        # early/middle/late then group/single/all; panel 2's levels then its
+        # corpora.  Only the handle and column gaps are
         # trimmed, so two columns fit a quarter-page panel.  Kept out of the
         # layout so the four panels stay evenly spaced.
         handles, labels = ax.get_legend_handles_labels()
-        if key == "layers":
-            # The reference is drawn first but keyed last in the groupings
-            # column.
-            n = len(LAYER_GROUPS)
-            handles.insert(n - 1, handles.pop(0))
-            labels.insert(n - 1, labels.pop(0))
         ax.legend(handles, labels, loc=loc, ncol=2,
                   handlelength=HANDLE_LENGTH[key], handletextpad=0.3,
                   columnspacing=0.5, borderaxespad=0.3).set_in_layout(False)

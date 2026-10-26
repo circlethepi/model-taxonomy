@@ -50,6 +50,9 @@ The figures
     The same four curves on one axes -- level by colour, arm by dash -- for
     reading the two arms against each other instead.
 
+``fig_qmix_disparity*_<variant>_linear.pdf``
+    The two curve figures again, with disparity on a linear 0-1 axis.
+
 ``fig_qmix_mds_<arm>_<variant>.pdf``
     The geometry the disparities summarise: rows are levels, columns are yahoo
     percentages.  Each panel carries three things at once, per :func:`draw_mds`:
@@ -114,8 +117,11 @@ import matplotlib  # noqa: E402
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
 
-from src.plots import save_figure, set_style  # noqa: E402
-from src.plots.config import bold_capable_family  # noqa: E402
+from src.plots import save_figure  # noqa: E402
+from src.plots.sweep_figures import (  # noqa: E402
+    AXIS_COLOR, CAPTION_LINES, REFERENCE_WIDTH, apply_style, embolden,
+    place_caption, quantile_band,
+)
 from src.plots.simplex import (  # noqa: E402
     frame_labels, mixture_label, model_colors, n_groups, sort_by_mixture,
 )
@@ -134,24 +140,6 @@ HERE = Path(__file__).resolve().parent
 #: Taxonomy level -> colour. Gold functional, red behavioral: figure 2's entries
 #: for the two levels that read the query set.
 LEVEL_COLORS = {"Functional": "#E69F00", "Behavioral": "#D55E00"}
-
-#: One text size for everything, at one weight -- panel titles, axis labels,
-#: tick labels, legends and the caption alike. Figure 2's value, and its rule:
-#: several panels in one frame typed at different sizes reads as emphasis rather
-#: than as provenance, so there is one size and no sub-scaling of it.
-FONT_SIZE = 13
-
-#: The width :data:`FONT_SIZE` is written for -- figure 2's own reference, so a
-#: build of this file at a given width is typed the same as a build of that one.
-#: 19 in is its nine-panel full build; these figures are narrower and so read
-#: the size through :func:`apply_style`.
-REFERENCE_WIDTH = 19.0
-
-#: The smallest the text may get whatever the width asks for. Figure 2's value,
-#: and its argument: scaling 13 pt down with the width would type a 7.5 in build
-#: at 5.1 pt, which is a picture of a figure rather than a figure -- a reader
-#: cannot read 5 pt in print, so the panels give up the room instead.
-FONT_SIZE_FLOOR = 7.0
 
 #: The curves carry the panel, so they are drawn heavier than a default line.
 SWEEP_LINEWIDTH = 2.1
@@ -172,9 +160,6 @@ BAND_ALPHA = 0.12
 MIXTURE_MARKER_SHAPE = "o"
 FRAME_MARKER_SHAPE = "^"
 FRAME_MARKER_SCALE = 1.3
-
-#: Figure 2's axis colour, so the two figures' frames match.
-AXIS_COLOR = "0.35"
 
 # ── this figure's own vocabulary ─────────────────────────────────────────────
 
@@ -236,6 +221,10 @@ SINGLE_ROW_AT = 1
 #: perfect", so both are kept and neither is a correction of the other.
 YLIMS = {"log": (2e-3, 1.4), "linear": (-0.03, 1.03)}
 
+#: File-name suffix per scale, so the linear build sits beside the log one
+#: instead of overwriting it.  Log is the unsuffixed default.
+YSCALE_SUFFIX = {"log": "", "linear": "_linear"}
+
 #: How much room to leave around the outermost point of a geometry grid, as a
 #: fraction of the span it has to cover. Without it the pure-mixture markers sit
 #: on the panel's own frame and are clipped by it -- and those are exactly the
@@ -271,56 +260,6 @@ def read_rows(path: Path) -> list[dict]:
     return rows
 
 
-def apply_style(width: float) -> float:
-    """The house style, then one text size over the top of it.
-
-    Returns the font size actually used.  ``set_style`` scales tick labels and
-    legends to three quarters of the base size and leaves titles at it, which is
-    right for a panel that is a figure in its own right; here several panels sit
-    in one frame and that difference reads as emphasis rather than as
-    provenance, so it is flattened.
-
-    The weight needs the family changed with it: ``set_style`` prefers Libre
-    Franklin, a *variable* font matplotlib registers at exactly one weight --
-    Thin -- so ``fontweight="bold"`` against it is a silent no-op that renders
-    Thin.  ``bold_capable_family`` probes for the first family in the stack that
-    actually ships more than one weight.
-    """
-    font = max(FONT_SIZE * min(1.0, width / REFERENCE_WIDTH),
-               FONT_SIZE_FLOOR)
-    set_style("two_col_full")
-    matplotlib.rcParams.update({
-        "font.size": font, "axes.titlesize": font, "axes.labelsize": font,
-        "xtick.labelsize": font, "ytick.labelsize": font,
-        "legend.fontsize": font, "legend.title_fontsize": font,
-        "figure.titlesize": font,
-        "font.sans-serif": [bold_capable_family(), "DejaVu Sans"],
-        "font.weight": "bold", "axes.labelweight": "bold",
-        "axes.titleweight": "bold", "axes.edgecolor": AXIS_COLOR,
-    })
-    return font
-
-
-def embolden(fig) -> None:
-    """Tick labels and legend entries to the same weight as everything else.
-
-    ``font.weight`` reaches text matplotlib creates from the rc defaults, but
-    tick labels and legend entries are not among them: there is no
-    ``xtick.labelweight`` rc, and a legend builds its texts from the handles'
-    labels.
-    """
-    family = bold_capable_family()
-    for ax in fig.axes:
-        for lbl in ax.get_xticklabels() + ax.get_yticklabels():
-            lbl.set_fontweight("bold")
-            lbl.set_fontfamily(family)
-    for legend in [ax.get_legend() for ax in fig.axes] + fig.legends:
-        if legend is not None:
-            for txt in legend.get_texts():
-                txt.set_fontweight("bold")
-                txt.set_fontfamily(family)
-
-
 # ── the disparity curves ─────────────────────────────────────────────────────
 
 def series(rows, perspective, arm, column="disparity"):
@@ -347,12 +286,7 @@ def series(rows, perspective, arm, column="disparity"):
         if v in (None, ""):
             continue
         by_pct[int(r["yahoo_pct"])].append(float(v))
-    pcts = sorted(by_pct)
-    return (pcts,
-            [float(np.percentile(by_pct[p], 25)) for p in pcts],
-            [float(np.median(by_pct[p])) for p in pcts],
-            [float(np.percentile(by_pct[p], 75)) for p in pcts],
-            {p: len(by_pct[p]) for p in pcts})
+    return quantile_band(by_pct, (25, 75))
 
 
 def seed_report(counts: dict) -> str:
@@ -393,28 +327,6 @@ def style_curve_axes(ax, yscale) -> None:
     ax.set_xticklabels(["0", "1", "2", "5", "10", "20", "50", "100"])
     # The one-yahoo-row mark. Behind the curves: it is a reference, not a series.
     ax.axvline(SINGLE_ROW_AT, color="0.55", lw=0.7, ls=":", zorder=0)
-
-
-#: Lines in a caption, and the padding around it, in multiples of the text
-#: size.  The caption is a fixed number of lines by construction -- see
-#: :func:`caption` -- so the band it needs is arithmetic rather than a measured
-#: bounding box.
-CAPTION_LINES = 3.6
-
-
-def place_caption(fig, text, font, height, *, bottom=0.0) -> None:
-    """Lay the axes out, then put the caption in the band left for it.
-
-    **The order matters and is the reason this is a function.**
-    ``tight_layout`` accounts for a suptitle that already exists *in addition to*
-    whatever ``rect`` reserves, so laying out first against a rect and adding the
-    caption afterwards is the only way to reserve the band exactly once.  Doing
-    it the other way round double-counts: the panels lose the caption's height
-    twice and the figure grows a band of dead space between the two.
-    """
-    band = CAPTION_LINES * font / 72.0 / height
-    fig.tight_layout(rect=(0, bottom, 1, 1.0 - band))
-    fig.suptitle(text, fontsize=font, y=0.995, va="top")
 
 
 def caption(variant: str, counts, extra: str = "") -> str:
@@ -467,7 +379,8 @@ def fig_disparity_arms(rows, variant, yscale, outdir, ext="pdf") -> Path:
                   bottom=0.07)
     embolden(fig)
     return save_figure(fig, Path(outdir) /
-                       f"fig_qmix_disparity_arms_{variant}.{ext}")
+                       f"fig_qmix_disparity_arms_{variant}"
+                       f"{YSCALE_SUFFIX[yscale]}.{ext}")
 
 
 def fig_disparity_one_axes(rows, variant, yscale, outdir,
@@ -492,7 +405,8 @@ def fig_disparity_one_axes(rows, variant, yscale, outdir,
     place_caption(fig, caption(variant, counts), font, ONE_AXES_HEIGHT)
     embolden(fig)
     return save_figure(fig, Path(outdir) /
-                       f"fig_qmix_disparity_{variant}.{ext}")
+                       f"fig_qmix_disparity_{variant}"
+                       f"{YSCALE_SUFFIX[yscale]}.{ext}")
 
 
 # ── the geometry grid ────────────────────────────────────────────────────────
@@ -704,8 +618,10 @@ def main() -> None:
                     help="draw one decoding variant instead of both")
     ap.add_argument("--figure", choices=["all", "main", "one-axes", "mds"],
                     default="all")
-    ap.add_argument("--yscale", choices=["log", "linear"], default="log",
-                    help="y range of the disparity curves; see YLIMS")
+    ap.add_argument("--yscale", choices=["both"] + list(YLIMS),
+                    default="both",
+                    help="y range of the disparity curves; see YLIMS. 'both' "
+                         "writes the log figures and the _linear ones")
     # pdf is what goes in the paper; png is for looking at one on a terminal
     # that cannot open a pdf, and for a quick diff between two builds.
     ap.add_argument("--ext", default="pdf", choices=["pdf", "png", "svg"])
@@ -722,12 +638,14 @@ def main() -> None:
             print(f"skipping {variant}: none of {sorted(wanted)} is in "
                   f"{args.scores} (found {sorted(present)})")
             continue
-        if args.figure in ("all", "main"):
-            written.append(fig_disparity_arms(rows, variant, args.yscale,
-                                              args.outdir, args.ext))
-        if args.figure in ("all", "one-axes"):
-            written.append(fig_disparity_one_axes(
-                rows, variant, args.yscale, args.outdir, args.ext))
+        scales = list(YLIMS) if args.yscale == "both" else [args.yscale]
+        for yscale in scales:
+            if args.figure in ("all", "main"):
+                written.append(fig_disparity_arms(rows, variant, yscale,
+                                                  args.outdir, args.ext))
+            if args.figure in ("all", "one-axes"):
+                written.append(fig_disparity_one_axes(
+                    rows, variant, yscale, args.outdir, args.ext))
 
     if args.figure in ("all", "mds"):
         geo_rows = read_rows(Path(args.geometry))

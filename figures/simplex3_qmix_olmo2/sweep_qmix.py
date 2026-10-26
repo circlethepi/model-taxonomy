@@ -434,15 +434,15 @@ def score_point(dm, ids, vertex_names):
     training-mixture misspecification at small draws, and nothing here varies a
     training draw -- these sixteen adapters are the ``n=1000`` fleet throughout,
     where the requested and realized mixtures already coincide.
+
+    *vertex_names* must be ``suite.vertices(ids)``, which is what
+    :func:`suite.truth_scores` scores against; it is kept as an argument so the
+    check below says so loudly if a caller ever passes anything else.
     """
-    weights = suite.truth_weights(ids)
-    tdm = simplex_distance_matrix(weights, list(ids), vertex_names)
-    tgeo = simplex_geometry(weights, list(ids), vertex_names)
-    return (
-        dcor_vs_truth(dm, tdm),
-        disparity_vs_truth(dm, tgeo, random_state=suite.MDS_SEED,
-                           n_components=tgeo.coordinates.shape[1]),
-    )
+    if list(vertex_names) != suite.vertices(ids):
+        raise ValueError(f"vertex names {vertex_names} are not "
+                         f"{suite.vertices(ids)}")
+    return suite.truth_scores(dm, ids)
 
 
 def write_csv(path, fields, rows):

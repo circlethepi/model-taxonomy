@@ -4,6 +4,137 @@
 
 ## Unreleased
 
+### qbig: functional recovery per hidden state and per layer combination
+
+`figures/simplex3_qbig_olmo2/layers_qbig.py` scores qbig's functional level (input
+mode, mean pooling, layer-normalized concatenation, cosine) through 23 surrogates
+that differ only in `layers`, each over the same query-count grid and the same query
+draws as `qbig_subsample.csv`. The output is `qbig_layers.csv` (2093 rows), which
+lists each surrogate's layers explicitly. `make_qbig_layer_figures.py` draws
+`fig_qbig_layers{,_linear}.pdf`. `jobs/qbig_layers.sh` runs the scoring on `med` in
+about 15 minutes.
+
+- **Single layers:** h1 … h16. h0 (the embeddings) is left out, because LoRA never
+  touches it, so all 16 models are identical there and neither score is defined.
+- **Layer subsets:** groups of layers joined, each labelled by the layers it
+  includes, in one panel. They come in two kinds:
+  - the contiguous thirds of h1–h16, labelled as ranges: `1–5`; `6–10`; `11–16`;
+  - evenly spaced layers with both ends kept: `1, 16`; `1, 6, 11, 16`;
+    `1, 4, 7, 10, 13, 16`.
+
+- **all (1–16):** h1–h16, the reference. The standing all-hidden-states row also
+  carries h0, but with every model identical there, adding h0 only rescales each
+  distance by 16/17, so h1–h16 scores as the standing row does.
+
+**How combinations are computed.** Under `normalize="layer"`, the inner product of
+two joined rows is the mean of their per-layer inner products. So each layer is
+decomposed into `CosineParts` once, and every combination is an average of those
+parts. The script stops on a zero-norm block, where this identity breaks.
+
+**Checks.**
+
+- At the full probe, the all-states and final-state matrices built from parts match
+  `build_taxonomy_artifacts` and `ActivationCache.load` to within 1e-10.
+- The `all (1–16)` and h16 rows match `qbig_subsample.csv`'s all-states and
+  final-state rows trial for trial.
+
+**Results** (median scores at 100 queries; every curve is flat from about 10 queries
+on):
+
+- Recovery rises with depth, from dCor* 0.947 at h1 to 0.979 at h11.
+- `11–16` (dCor* 0.979, disparity 0.0065) beats `all (1–16)` (0.975, 0.0076).
+- `1, 6, 11, 16` matches `all (1–16)`; `1, 16` falls slightly short (0.973, 0.0098).
+
+### qbig: scored at every qbigtemp temperature, with greedy drawn as T=0
+
+- `subsample_qbig.py` reads sampled behavioral at each of qbigtemp's four
+  temperatures over the same query and replicate subsets. The rescored
+  `qbig_subsample.csv` (18,837 rows) gains a `temperature` column.
+- New figure `fig_qbig_temperature_v2moe{,_linear}.pdf`: one line per T at R=64.
+- Greedy is now drawn as "T=0 (greedy)", a solid grey line, in every qbig figure:
+  - The depth figure folds greedy into its sampled panel, so it drops from four
+    columns to three.
+  - The replicates figure draws the same greedy curve under each R panel.
+- On the l40s-only decode, sampled dCor* at R=16 and 100 queries is 0.930 at T=1.
+  The mixed-GPU run gave 0.38.
+
+### qbigtemp: qbig's sampled run at four temperatures, on one GPU architecture
+
+`scripts/gen_simplex3.py --suite olmo2_qbig_temp --dataset yahoo_qbig` emits a new
+tree, `simplex3_qbig_olmo2_qbigtemp`. It is qbig's R=64 sampled behavioral run over
+the 1000-query seed-2 draw, repeated at T = 0.25, 0.5, 0.75 and 1.0: 64 shards, one
+adapter each, all pinned to `l40s`.
+
+**Why one architecture.** qbig's T=1.0 shards landed on A100, L40S and Hopper. At
+one seed and one batch shape, adapters decoding the same (query, replicate) slot share
+a random stream, and that coupling does not survive a change of architecture: in qbig,
+pairs on the same GPU type wrote the same opening in 38% of slots against 4.7% across
+types, and its sampled scores fell to dCor* 0.40 where the standing run has 0.94.
+`l40s` because it bills at well under half an A100's rate. qbig's two l40s shards ran
+in ~33 min at 2.6 GB host RSS against the 2 h / 64 GB the shards ask for.
+
+**qbig's T=1.0 entry is archived, not overwritten.** The GPU is not in the cache key,
+so qbigtemp's T=1.0 point is the same entry (`generation128_64r_58d3f985`). Its
+generations, both embeddings, the two surrogates built on them and their run records
+(112 paths, 6.5 GB) were moved to `results/archive/qbig_t10_mixed_gpu/` with a
+`MANIFEST.json`. Greedy and functional entries for the draw are untouched, and
+qbigtemp emits no jobs for them.
+
+**Generator changes, all defaulting to what every existing tree emits** (all 26
+emittable trees regenerate byte-for-byte):
+
+- `Suite.behavioral_temperatures`: repeat the main sampled run once per
+  temperature. This is distinct from `temperature_sweep`, which stores log-probs at
+  a reduced R.
+- `Suite.behavioral_partitions`: the partition list for sampled behavioral jobs
+  alone.
+- `Suite.emit_functional_jobs` / `emit_greedy_jobs`: off for a tree that re-decodes
+  a draw another tree already extracted.
+- `temp_token(t, places=)` plus `temp_places()`: the old one-decimal token would
+  have named T=0.25 `t02` and T=0.75 `t08`. It now raises on a temperature it cannot
+  represent. qbigtemp's tokens are `t025 t050 t075 t100`.
+
+### qbig scored by subsampling, and the qmix tree rescored over all ten seeds
+
+**qbig** (*big query set*, the probe-depth axis: the standing 16-adapter OLMo-2-1B
+yahoo simplex probed once at 1000 queries x R=64) is scored for the first time.
+`figures/simplex3_qbig_olmo2/subsample_qbig.py` reads the one full-depth run at
+smaller depths: ten query draws per size (1…1000), and inside each, ten replicate
+draws per R (2…64). That gives 4,914 trials, each scored with dCor* and Procrustes
+disparity against the truth simplex. `make_qbig_figures.py` draws
+`fig_qbig_depth_v2moe.pdf` (rows: disparity, dCor*; columns: sampled, greedy,
+functional all/final) and `fig_qbig_replicates_v2moe.pdf` (one column per R). Job:
+`jobs/qbig_subsample.sh`, ~11 min on `med`. Before any smaller cell is read, every
+full-probe matrix is checked against `build_taxonomy_artifacts` on the canonical
+perspectives (gaps of 1e-15 to 1e-9).
+
+**The result.** Functional is flat at every depth: disparity ~0.007 and dCor* ~0.975
+from a single query to 1000. Greedy behavioral improves steadily with queries, to
+0.053 / 0.942 at 1000. **Sampled behavioral is not comparable to the standing tree's,
+and the reason is in how it was decoded, not in this analysis.** Its R=16 / 100-query
+cell scores 0.70 / 0.38, while the standing probe scores 0.053 / 0.938 at the same
+depth under the same embedder. In the standing run, two different adapters write the
+same opening text in the same (query, replicate) slot 39% of the time (0.2% at offset
+slots): with one seed and one batch shape, their sampling streams are shared, and the
+shared randomness cancels between models. In qbig the same holds only for adapters
+decoded on the same GPU type (38%). The 16 behavioral shards landed on A100, L40S and
+Hopper cards, and pairs that crossed GPU types fell to 4.7%. The standing run used
+Hopper GPUs only.
+
+**qmix, ten seeds.** `qmix_scores.csv` / `qmix_geometry.csv` and the eight figures now
+cover all ten draw seeds. The seed-0 rows are unchanged. Medians, with no yahoo left
+in the probe: functional 0.0095 (dolly) / 0.0094 (oasst1-zh) against 0.0076 undiluted.
+Behavioral 0.056 / 0.149 against 0.051. Greedy 0.175 / 0.307 against 0.112. The
+oasst1-zh cost is larger, and the dolly cost smaller, than seed 0 alone suggested.
+
+**Shared code.** `simplex_suite.truth_scores(dm, ids)` returns the (dCor*, disparity)
+pair, and `sweep_qmix.score_point` now calls it. `src/plots/sweep_figures.py` holds
+`apply_style` / `embolden` / `place_caption` / `quantile_band`, which were moved out of
+`make_qmix_figures.py`; all eight qmix figures re-render pixel-identical.
+`src/analysis/subsample.py` scores any query or replicate subset of a cached probe
+without re-reading it. `scripts/reembed_behavioral.py` (the second-embedder pass that
+produced qbig's v2-moe embeddings) is merged here from its unmerged branch.
+
 ### The qmix tree scored, and what dilution costs each level
 
 `sweep_qmix.py` runs against the extracted tree and writes two files:

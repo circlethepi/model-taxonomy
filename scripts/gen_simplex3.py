@@ -1132,13 +1132,46 @@ LEVEL_DEFAULTS_NOTE = """  # All three levels carry an explicit `enabled`. Omitt
 # other way -- is documented at its one decision point, extract_reprs.py.
 
 
-def temp_token(t: float) -> str:
+def temp_token(t: float, places: int = 1) -> str:
     """``t05`` for 0.5 — the temperature x10, zero-padded.
 
     Two digits so the files sort in temperature order, and prefixed so the token
     is unambiguous inside a job name that already carries a shard number.
+
+    *places* is the number of decimals the token resolves: 2 gives ``t025`` for
+    0.25 and ``t100`` for 1.0.  A temperature the resolution cannot represent
+    raises rather than rounds -- at the default, 0.25 would round to ``t02`` and
+    0.75 to ``t08``, so the filename would name a temperature the config does not
+    run at.
     """
-    return f"t{int(round(float(t) * 10)):02d}"
+    scaled = float(t) * 10 ** places
+    if abs(scaled - round(scaled)) > 1e-9:
+        raise ValueError(f"T={t} needs more than {places} decimal place(s); "
+                         f"pass places= (see temp_places)")
+    return f"t{int(round(scaled)):0{places + 1}d}"
+
+
+def temp_places(temps: tuple[float, ...]) -> int:
+    """The fewest decimals (at least one) that name every one of *temps* exactly.
+
+    One resolution for a whole tuple, so the tokens of one tree share a width
+    and still sort in temperature order.
+    """
+    places = 1
+    while any(abs(t * 10 ** places - round(t * 10 ** places)) > 1e-9 for t in temps):
+        places += 1
+    return places
+
+
+def _temp_places(level: str) -> int:
+    """The token resolution for *level*'s temperatures.
+
+    The sweep keeps the one decimal its files on disk were named at; the main
+    behavioral run's temperatures pick the resolution that names them exactly.
+    """
+    if level == "behavioral":
+        return temp_places(SUITE.behavioral_temperatures)
+    return 1
 
 
 def _qdesc(which: str) -> str:
@@ -1258,7 +1291,7 @@ def write_extract(
                 "greedy": SUITE.greedy_shards}.get(level, SUITE.behavioral_shards)
     label = (
         f"simplex3_{level}_{token}"
-        + ("" if temperature is None else f"_{temp_token(temperature)}")
+        + ("" if temperature is None else f"_{temp_token(temperature, _temp_places(level))}")
         + ("" if shard is None else f"_shard{shard}")
         + ("" if qpoint is None else f"_{qname}_s{qpoint[2]:02d}")
     )
@@ -1418,6 +1451,8 @@ def write_extract(
         )
     else:
         body += behavioral_shard_rationale()
+        if temperature is not None:
+            body += behavioral_temperature_note(temperature)
     body += preamble(label)
     body += "datasets:\n" + (query_blocks(query) if qpoint is None
                              else qmix_query_block(*qpoint))
@@ -1566,7 +1601,7 @@ def write_extract(
       max_new_tokens: {MAX_NEW_TOKENS}
       replicates: {SPEC.replicates}
       do_sample: true
-      temperature: 1.0
+      temperature: {1.0 if temperature is None else float(temperature)}
       top_p: 1.0
       top_k: null
       generation_seed: 0
@@ -1863,6 +1898,51 @@ SUITES = {
         # olmo2 tree's would not.
     ).for_model("allenai/OLMo-2-0425-1B-Instruct"),
 
+    #: The **qbigtemp** suite: qbig's sampled behavioral run repeated at four
+    #: temperatures -- 0.25, 0.5, 0.75 and 1.0 -- over the same sixteen adapters,
+    #: the same 1000-query seed-2 draw and the same R=64.  Run with
+    #: ``--dataset yahoo_qbig``, like qbig.
+    #:
+    #: Two things separate it from ``olmo2_qbig`` beyond the temperatures.
+    #:
+    #: Every sampled shard is pinned to l40s.  qbig's shards landed on A100, L40S
+    #: and Hopper, which broke the random-stream coupling between adapters that
+    #: the standing run's sampled scores rest on; one architecture keeps all
+    #: sixteen on one stream.  l40s because it bills at well under half an A100's
+    #: rate, and because the qbig shards that landed there finished in ~33 min
+    #: at 2.6 GB host RSS (jobs 512202, 512207) -- a 1B in bf16 at 2 x R=64 rows
+    #: is a few GB of weights and KV cache against a 48 GB card.
+    #:
+    #: T=1.0 is in the tuple, and it is the same cache entry qbig's T=1.0 run
+    #: wrote (the GPU is not in the cache key).  Move qbig's entry aside before
+    #: submitting, or the T=1.0 shards are cache hits that decode nothing.
+    #:
+    #: Functional and greedy are not emitted: qbig extracted both over this draw
+    #: and neither depends on temperature.  Training shards are still emitted
+    #: (as qbig's are, as cache hits) because ``submit_all.sh`` chains on them.
+    "olmo2_qbig_temp": Suite(
+        tag="olmo2_qbigtemp",
+        query_sets=("question_only",),
+        job_tokens={"question_only": "qonly"},
+        emit_embed_jobs=False,
+        emit_build_job=False,
+        job_prefix="s3bt2",
+        emit_logprob_jobs=False,
+        emit_gen_activation_job=False,
+        emit_functional_jobs=False,
+        emit_greedy_jobs=False,
+        behavioral_temperatures=(0.25, 0.5, 0.75, 1.0),
+        behavioral_partitions="l40s",
+        behavioral_adapters_per_shard=1,
+        # ~33 min measured on l40s at T=1.0. A lower temperature does not
+        # shorten the decode: generate() runs until every one of the 128 rows in
+        # a call stops, and in qbig's T=1.0 run every call (500 of 500 checked)
+        # had a row reach the 128-token cap. Lower T runs longer if anything --
+        # greedy reaches the cap on 31% of texts against 16% at T=1.0. The wall
+        # is qbig's, ~3.6x the measurement.
+        behav_time="2:00:00",
+    ).for_model("allenai/OLMo-2-0425-1B-Instruct"),
+
     #: The **rsweep** suite: the LoRA-rank axis, over the same 16-point yahoo
     #: simplex and the same 100-query 33/33/33 draw as ``olmo2``.  Eight ranks,
     #: 1 to 128 by powers of two, so 128 adapters.
@@ -2077,6 +2157,7 @@ _SUITE_PREFIXES = {
     ("yahoo_pool", "olmo2_pool"): "s3po2",
     ("yahoo_nsweep", "olmo2_nsweep"): "s3no2",
     ("yahoo_qbig", "olmo2_qbig"): "s3bo2",
+    ("yahoo_qbig", "olmo2_qbig_temp"): "s3bt2",
 }
 
 #: Adapters per shard, held at the value every existing wall was tuned against.
@@ -2263,6 +2344,24 @@ def behavioral_shard_rationale() -> str:
         f"# wall for worse.\n"
         f"# {SUITE.behavioral_shards} shards of {per_shard} write to disjoint adapter directories, so a\n"
         f"# shard that dies costs one adapter's decode rather than the fleet's.\n\n"
+    )
+
+
+def behavioral_temperature_note(temperature: float) -> str:
+    """The comment on one point of ``Suite.behavioral_temperatures``."""
+    temps = ", ".join(str(t) for t in SUITE.behavioral_temperatures)
+    return (
+        f"# One of {len(SUITE.behavioral_temperatures)} temperatures of the main sampled run "
+        f"(T in {{{temps}}}), at the\n"
+        f"# full R={SPEC.replicates} and with no log-probs -- not the log-prob temperature sweep. Each\n"
+        f"# temperature is its own cache entry: temperature is inside the sampling hash\n"
+        f"# and so inside the filename. Batch shape, seed and query draw are qbig's,\n"
+        f"# so the only thing that differs between the points is T.\n"
+        f"#\n"
+        f"# Pinned to {SUITE.behavioral_gpu_partitions}: at one seed and one batch shape adapters\n"
+        f"# decoding the same (query, replicate) slot share a random stream, and that\n"
+        f"# coupling does not survive a change of GPU architecture. A run spread across\n"
+        f"# architectures scores worse for a reason that has nothing to do with T.\n\n"
     )
 
 
@@ -2590,33 +2689,39 @@ def main() -> None:
     for k, q in enumerate(SUITE.query_sets):
         tok = SUITE.job_token(q)
         num = 4 + 2 * k
-        emit(exp / f"functional_{tok}.yaml", write_extract("functional", q, None, extracted))
-        emit(jobs / f"0{num}_functional_{tok}.sh", sbatch(
-            f"{SUITE.job_prefix}_func_{tok}", SUITE.gpu_partitions, True,
-            SUITE.extract_mem_gb, SUITE.func_time,
-            # --steps build extract, not extract alone: make_queries reads the
-            # query recipe from {output_dir}/datasets/{queries_dataset}.recipe.json,
-            # and this config's query block is named differently from the sweep's
-            # expanded blocks, so nothing else writes that file.
-            f"python scripts/run_experiment.py experiments/{tree}/functional_{tok}.yaml"
-            f" --steps build extract --taxonomy functional",
-            logs,
-        ))
-        for i, shard_names in enumerate(bshards):
-            emit(exp / f"behavioral_{tok}_shard{i}.yaml",
-                 write_extract("behavioral", q, i, shard_names))
-            emit(jobs / f"0{num + 1}_behavioral_{tok}_shard{i}.sh", sbatch(
-                f"{SUITE.job_prefix}_behav_{tok}{i}", SUITE.gpu_partitions, True,
-                SUITE.extract_mem_gb, SUITE.behav_time,
-                f"python scripts/run_experiment.py"
-                f" experiments/{tree}/behavioral_{tok}_shard{i}.yaml"
-                f" --steps build extract --taxonomy behavioral",
+        if SUITE.emit_functional_jobs:
+            emit(exp / f"functional_{tok}.yaml", write_extract("functional", q, None, extracted))
+            emit(jobs / f"0{num}_functional_{tok}.sh", sbatch(
+                f"{SUITE.job_prefix}_func_{tok}", SUITE.gpu_partitions, True,
+                SUITE.extract_mem_gb, SUITE.func_time,
+                # --steps build extract, not extract alone: make_queries reads the
+                # query recipe from {output_dir}/datasets/{queries_dataset}.recipe.json,
+                # and this config's query block is named differently from the sweep's
+                # expanded blocks, so nothing else writes that file.
+                f"python scripts/run_experiment.py experiments/{tree}/functional_{tok}.yaml"
+                f" --steps build extract --taxonomy functional",
                 logs,
             ))
+        # One pass with no temperature token unless the suite names temperatures,
+        # which is the single T=1.0 run every existing tree carries.
+        for t in SUITE.behavioral_temperatures or (None,):
+            tt = "" if t is None else "_" + temp_token(t, _temp_places("behavioral"))
+            for i, shard_names in enumerate(bshards):
+                emit(exp / f"behavioral_{tok}{tt}_shard{i}.yaml",
+                     write_extract("behavioral", q, i, shard_names, temperature=t))
+                emit(jobs / f"0{num + 1}_behavioral_{tok}{tt}_shard{i}.sh", sbatch(
+                    f"{SUITE.job_prefix}_behav_{tok}{tt}{'_' if tt else ''}{i}",
+                    SUITE.behavioral_gpu_partitions, True,
+                    SUITE.extract_mem_gb, SUITE.behav_time,
+                    f"python scripts/run_experiment.py"
+                    f" experiments/{tree}/behavioral_{tok}{tt}_shard{i}.yaml"
+                    f" --steps build extract --taxonomy behavioral",
+                    logs,
+                ))
 
     # 8. Greedy, one unsharded job per query set. ~7 generate() calls per adapter
     #    against ~50 for the sampled runs, so 16 adapters fit comfortably in an hour.
-    for q in SUITE.query_sets:
+    for q in (SUITE.query_sets if SUITE.emit_greedy_jobs else ()):
         tok = SUITE.job_token(q)
         # `greedy_shards == 1` emits the single unsharded job the four existing
         # trees already carry, under the name they already carry, so a suite that
@@ -3223,6 +3328,9 @@ def _submit_greedy() -> str:
     The nsweep tree is the only sharded one today, and its greedy pass was
     submitted by hand, which is why the mismatch survived a full run.
     """
+    if not SUITE.emit_greedy_jobs:
+        return ("# No greedy jobs: this tree's draw was decoded greedily by another tree,\n"
+                "# and those cache entries are already on disk.")
     toks = " ".join(SUITE.job_token(q) for q in SUITE.query_sets)
     if SUITE.greedy_shards == 1:
         return (
@@ -3250,15 +3358,31 @@ def _submit_greedy() -> str:
 
 def _submit_extract() -> str:
     out = []
+    idx = " ".join(str(i) for i in range(SUITE.behavioral_shards))
     for k, q in enumerate(SUITE.query_sets):
         tok = SUITE.job_token(q)
         num = 4 + 2 * k
+        if SUITE.emit_functional_jobs:
+            out.append(
+                f'J=$(sb --dependency=afterok:$TRAIN 0{num}_functional_{tok}.sh); '
+                f'echo "func    {tok}     $J"\n'
+            )
+        if not SUITE.behavioral_temperatures:
+            out.append(
+                f"for i in {idx}; do\n"
+                f"  J=$(sb --dependency=afterok:$TRAIN 0{num + 1}_behavioral_{tok}_shard$i.sh)\n"
+                f'  echo "behav   {tok}$i    $J"\n'
+                f"done\n"
+            )
+            continue
+        places = _temp_places("behavioral")
+        tts = " ".join(temp_token(t, places) for t in SUITE.behavioral_temperatures)
         out.append(
-            f'J=$(sb --dependency=afterok:$TRAIN 0{num}_functional_{tok}.sh); '
-            f'echo "func    {tok}     $J"\n'
-            f"for i in {' '.join(str(i) for i in range(SUITE.behavioral_shards))}; do\n"
-            f"  J=$(sb --dependency=afterok:$TRAIN 0{num + 1}_behavioral_{tok}_shard$i.sh)\n"
-            f'  echo "behav   {tok}$i    $J"\n'
+            f"for t in {tts}; do\n"
+            f"  for i in {idx}; do\n"
+            f"    J=$(sb --dependency=afterok:$TRAIN 0{num + 1}_behavioral_{tok}_${{t}}_shard$i.sh)\n"
+            f'    echo "behav   {tok} $t $i  $J"\n'
+            f"  done\n"
             f"done\n"
         )
     return "".join(out)

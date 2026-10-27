@@ -172,6 +172,20 @@ differences from qbig:
   from the cached text in minutes. Re-running the config would re-decode
   instead.
 
+**qbig_v2_temp** (*qbig_v2, temperature sweep*) — qbig_v2's sampled run repeated
+at **T = 0.1, 0.2, …, 0.9**, named on 2026-10-27. Everything but T is qbig_v2's:
+the same 2000-query `qbig_v2_uniform` probe, R=64 decoded, the same batch shape
+and seed, l40s only, v2-moe only. T=1.0, greedy and functional are not decoded
+again; qbig_v2's are used. It reaches code as the `olmo2_qbig_v2_temp` suite (job
+prefix `s3bv2t`), emitted with `scripts/gen_simplex3.py --suite olmo2_qbig_v2_temp
+--dataset yahoo_qbig_v2` into `experiments/simplex3_qbig_v2_olmo2_qbig_v2_temp/`.
+
+It is scored at **R=16, read as one fixed replicate set: replicates 0–15**, the
+same sixteen at every temperature, including qbig_v2's T=1.0. There are no
+replicate draws, so every trial is a query draw and the spread is query-sampling
+spread alone. qbig's scoring crossed 10 query draws with 10 replicate draws
+instead, so the two sets of bands do not measure the same spread.
+
 ---
 
 ## The shared cache

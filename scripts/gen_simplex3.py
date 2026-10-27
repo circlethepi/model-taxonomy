@@ -2016,6 +2016,32 @@ SUITES = {
         greedy_time="4:00:00",
     ).for_model("allenai/OLMo-2-0425-1B-Instruct"),
 
+    #: The **qbig_v2_temp** suite: qbig_v2's sampled run repeated at nine more
+    #: temperatures, 0.1 to 0.9, approved 2026-10-27.  Run with ``--dataset
+    #: yahoo_qbig_v2``.  Everything but T is qbig_v2's -- the 2000-query probe,
+    #: R=64, the batch shape, the seed, l40s only, one adapter per shard -- and
+    #: T=1.0 is left out because qbig_v2 already decoded it under the same key.
+    #: Greedy and functional come from qbig_v2 too, so neither is emitted.
+    #:
+    #: The wall is qbig_v2's: qbigtemp measured no temperature dependence at
+    #: 1000 queries (T=0.25 and T=1.0 both ~33 min on l40s), so ~67 min here.
+    "olmo2_qbig_v2_temp": Suite(
+        tag="olmo2_qbig_v2_temp",
+        query_sets=("question_only",),
+        job_tokens={"question_only": "qonly"},
+        emit_embed_jobs=False,
+        emit_build_job=False,
+        job_prefix="s3bv2t",
+        emit_logprob_jobs=False,
+        emit_gen_activation_job=False,
+        emit_functional_jobs=False,
+        emit_greedy_jobs=False,
+        behavioral_temperatures=(0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9),
+        behavioral_partitions="l40s",
+        behavioral_adapters_per_shard=1,
+        behav_time="3:00:00",
+    ).for_model("allenai/OLMo-2-0425-1B-Instruct"),
+
     #: The **rsweep** suite: the LoRA-rank axis, over the same 16-point yahoo
     #: simplex and the same 100-query 33/33/33 draw as ``olmo2``.  Eight ranks,
     #: 1 to 128 by powers of two, so 128 adapters.
@@ -2232,6 +2258,7 @@ _SUITE_PREFIXES = {
     ("yahoo_qbig", "olmo2_qbig"): "s3bo2",
     ("yahoo_qbig", "olmo2_qbig_temp"): "s3bt2",
     ("yahoo_qbig_v2", "olmo2_qbig_v2"): "s3bv2",
+    ("yahoo_qbig_v2", "olmo2_qbig_v2_temp"): "s3bv2t",
 }
 
 #: Adapters per shard, held at the value every existing wall was tuned against.

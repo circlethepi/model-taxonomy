@@ -136,6 +136,7 @@ Three things are worth knowing before reading any of these:
 | `simplex3_qbig_olmo2_qbig` | **qbig** — probe *depth*: the same fleet at 1000 queries (a third per group), seed 2, R=64 at T=1.0, plus greedy and functional. Its sampled T=1.0 entry decoded on mixed GPUs and is archived; qbigtemp replaces it | `python scripts/gen_simplex3.py --suite olmo2_qbig --dataset yahoo_qbig` |
 | `simplex3_qbig_olmo2_qbigtemp` | **qbigtemp** — qbig's sampled run at T = 0.25, 0.5, 0.75, 1.0, l40s only; no functional or greedy (qbig's are reused) | `python scripts/gen_simplex3.py --suite olmo2_qbig_temp --dataset yahoo_qbig` |
 | `simplex3_qbig_v2_olmo2_qbig_v2` | **qbig_v2** — probe depth over a 2000-query probe drawn uniformly from yahoo, seed 2, R=64 at T=1.0, plus greedy and functional; sampled and greedy on l40s; v2-moe only | `python scripts/gen_simplex3.py --suite olmo2_qbig_v2 --dataset yahoo_qbig_v2` |
+| `simplex3_qbig_v2_olmo2_qbig_v2_temp` | **qbig_v2_temp** — qbig_v2's sampled run at T = 0.1, 0.2, …, 0.9, R=64, l40s only; no T=1.0, greedy or functional (qbig_v2's are reused); v2-moe only | `python scripts/gen_simplex3.py --suite olmo2_qbig_v2_temp --dataset yahoo_qbig_v2` |
 
 `--qmix` reuses the existing `_n1000_s00_r16_i00_b5008` fleet and emits no training
 jobs at all — 450 configs across the behavioral, functional and greedy families, and
@@ -158,6 +159,15 @@ functional all states, the thirds and h1/h9/h16. **It was embedded with v2-moe
 only** -- there is no v1.5 embedding. To add one, re-embed the cached text with
 `scripts/reembed_behavioral.py --draw n2000_s02_fea27ccee --embedder-model
 nomic-ai/nomic-embed-text-v1.5`; re-running the configs would re-decode.
+
+qbig_v2_temp is scored by `figures/simplex3_qbig_v2_olmo2/subsample_qbig_v2_temp.py`
+(`sbatch jobs/qbig_v2_temp_subsample.sh`), behavioral only: sampled at T = 0.1 …
+0.9 and qbig_v2's T=1.0, plus qbig_v2's greedy. **Sampled is read at R=16 as one
+fixed replicate set, replicates 0–15**, with no replicate draws, so every trial
+is a query draw. The query subsets are qbig_v2's, the same sets trial for
+trial. Like qbig_v2 it was embedded with v2-moe only; the v1.5 re-embed above
+covers every temperature in one run, since its default `--variant-glob`
+takes every generation variant under the draw.
 
 ## The dataset trees — model-free, one per corpus
 

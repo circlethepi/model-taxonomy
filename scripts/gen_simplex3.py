@@ -541,6 +541,43 @@ def query_question_only_name() -> str:
     return query_full_context_name() + "_qtc"
 
 
+def query_pooled_name(which: str) -> str:
+    """The query set's name under ``SPEC.query_pooled``: ``SPEC.query_name``.
+
+    Not ``name_for(even())``: that names a third from each group, which an
+    unstratified draw is not.  Only the question-only set is named, because the
+    only pooled spec (qbig_v2) probes with that set alone.
+    """
+    if not SPEC.query_name:
+        raise SystemExit("a query_pooled spec must set query_name")
+    if which == "full_context":
+        raise SystemExit("query_pooled names only the question_only query set")
+    return SPEC.query_name
+
+
+def query_pooled_block(which: str) -> str:
+    """The unstratified query recipe: one pooled entry over the whole axis.
+
+    Spelled through ``qmix_entry_yaml`` at weight 100, the way qmix spells its
+    undiluted point, so the two hash to one recipe.  The filter is every value
+    the groups partition, sorted, which for yahoo is topics 0-9.
+    """
+    fields = (tuple(SPEC.text_fields) if which == "full_context"
+              else tuple(SPEC.query_fields))
+    classes = sorted(v for vals in SPEC.groups.values() for v in vals)
+    return (f"  - name: {query_pooled_name(which)}\n"
+            f"    recipe_type: class_aware\n"
+            f"    n_samples: {SPEC.query_n}\n"
+            f"    seed: {SPEC.query_seed}\n"
+            f"    # 100% {SPEC.name_prefix}, unstratified: drawn uniformly from every "
+            f"{SPEC.class_field}\n"
+            f"    entries:\n"
+            + qmix_entry_yaml(SPEC.dataset_id, 100, text_fields=fields,
+                              answer_field=SPEC.answer_field,
+                              class_field=SPEC.class_field,
+                              class_filter=classes))
+
+
 def query_blocks(which: str) -> str:
     """The query recipe, defined inline so make_queries can find it.
 
@@ -553,6 +590,8 @@ def query_blocks(which: str) -> str:
     prompt is rendered from ``prompt_format.user_fields`` -- but the block still
     selects the rows, so it stays as it is.
     """
+    if SPEC.query_pooled:
+        return query_pooled_block(which)
     if which == "full_context":
         return dataset_block(query_full_context_name(), even(),
                              n_samples=SPEC.query_n, seed=SPEC.query_seed)
@@ -1279,7 +1318,8 @@ def write_extract(
             + f", draw seed {qseed}"
         )
     else:
-        qname = (query_full_context_name() if query == "full_context"
+        qname = (query_pooled_name(query) if SPEC.query_pooled else
+                 query_full_context_name() if query == "full_context"
                  else query_question_only_name())
         # Under a chat template with completion-only loss the training prompt IS
         # the question, so the roles are the reverse of the raw suite's.  Saying
@@ -1453,6 +1493,8 @@ def write_extract(
         body += behavioral_shard_rationale()
         if temperature is not None:
             body += behavioral_temperature_note(temperature)
+    if qpoint is None and SPEC.caveats.get("probe"):
+        body += "# " + SPEC.caveats["probe"].replace("\n", "\n# ") + "\n\n"
     body += preamble(label)
     body += "datasets:\n" + (query_blocks(query) if qpoint is None
                              else qmix_query_block(*qpoint))
@@ -1943,6 +1985,37 @@ SUITES = {
         behav_time="2:00:00",
     ).for_model("allenai/OLMo-2-0425-1B-Instruct"),
 
+    #: The **qbig_v2** suite: qbig over a 2000-query probe drawn uniformly from
+    #: yahoo (``YAHOO_QBIG_V2``), approved 2026-10-27.  Run with ``--dataset
+    #: yahoo_qbig_v2``.  The levels are qbig's -- sampled R=64 at T=1.0 only,
+    #: greedy and input-mode functional -- and so is the sharding, one adapter per
+    #: sampled shard.
+    #:
+    #: Sampled behavioral is pinned to l40s, as qbigtemp's is and for qbigtemp's
+    #: reason: one architecture keeps the sixteen adapters on one random stream.
+    #: Greedy is pinned there too, for cost alone (an h100 bills ~6x an l40s);
+    #: functional keeps the extraction list, as qbig's did.
+    #:
+    #: The walls follow the doubled draw.  qbigtemp's T=1.0 shards took 33.4 min
+    #: on l40s at 1000 queries (max 33.9), so ~67 min here against 3:00:00; qbig's
+    #: greedy job took 42 min on an h100 at 1000, so ~84 min here before any l40s
+    #: slowdown, against 4:00:00.  Both charged only in queue priority.
+    "olmo2_qbig_v2": Suite(
+        tag="olmo2_qbig_v2",
+        query_sets=("question_only",),
+        job_tokens={"question_only": "qonly"},
+        emit_embed_jobs=False,
+        emit_build_job=False,
+        job_prefix="s3bv2",
+        emit_logprob_jobs=False,
+        emit_gen_activation_job=False,
+        behavioral_partitions="l40s",
+        greedy_partitions="l40s",
+        behavioral_adapters_per_shard=1,
+        behav_time="3:00:00",
+        greedy_time="4:00:00",
+    ).for_model("allenai/OLMo-2-0425-1B-Instruct"),
+
     #: The **rsweep** suite: the LoRA-rank axis, over the same 16-point yahoo
     #: simplex and the same 100-query 33/33/33 draw as ``olmo2``.  Eight ranks,
     #: 1 to 128 by powers of two, so 128 adapters.
@@ -2158,6 +2231,7 @@ _SUITE_PREFIXES = {
     ("yahoo_nsweep", "olmo2_nsweep"): "s3no2",
     ("yahoo_qbig", "olmo2_qbig"): "s3bo2",
     ("yahoo_qbig", "olmo2_qbig_temp"): "s3bt2",
+    ("yahoo_qbig_v2", "olmo2_qbig_v2"): "s3bv2",
 }
 
 #: Adapters per shard, held at the value every existing wall was tuned against.
@@ -2734,7 +2808,7 @@ def main() -> None:
             emit(exp / f"{stem}.yaml", write_extract("greedy", q, i, shard_names))
             emit(jobs / f"08_{stem}.sh", sbatch(
                 f"{SUITE.job_prefix}_greedy_{tok}" + ("" if i is None else str(i)),
-                SUITE.gpu_partitions, True,
+                SUITE.greedy_gpu_partitions, True,
                 SUITE.extract_mem_gb, SUITE.greedy_time,
                 f"python scripts/run_experiment.py experiments/{tree}/{stem}.yaml"
                 f" --steps build extract --taxonomy behavioral",

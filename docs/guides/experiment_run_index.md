@@ -133,6 +133,9 @@ Three things are worth knowing before reading any of these:
 | Run | Axis | Generate with |
 |---|---|---|
 | `simplex3_qmix_olmo2` | **qmix** — what the 100-row probe is *made of*: 0/1/2/5/10/20/50% yahoo against a dolly or an oasst1-zh diluent, ×10 seeds, plus the shared undiluted 100% point | `python scripts/gen_simplex3.py --qmix --suite olmo2` |
+| `simplex3_qbig_olmo2_qbig` | **qbig** — probe *depth*: the same fleet at 1000 queries (a third per group), seed 2, R=64 at T=1.0, plus greedy and functional. Its sampled T=1.0 entry decoded on mixed GPUs and is archived; qbigtemp replaces it | `python scripts/gen_simplex3.py --suite olmo2_qbig --dataset yahoo_qbig` |
+| `simplex3_qbig_olmo2_qbigtemp` | **qbigtemp** — qbig's sampled run at T = 0.25, 0.5, 0.75, 1.0, l40s only; no functional or greedy (qbig's are reused) | `python scripts/gen_simplex3.py --suite olmo2_qbig_temp --dataset yahoo_qbig` |
+| `simplex3_qbig_v2_olmo2_qbig_v2` | **qbig_v2** — probe depth over a 2000-query probe drawn uniformly from yahoo, seed 2, R=64 at T=1.0, plus greedy and functional; sampled and greedy on l40s; v2-moe only | `python scripts/gen_simplex3.py --suite olmo2_qbig_v2 --dataset yahoo_qbig_v2` |
 
 `--qmix` reuses the existing `_n1000_s00_r16_i00_b5008` fleet and emits no training
 jobs at all — 450 configs across the behavioral, functional and greedy families, and
@@ -144,10 +147,17 @@ The qmix slug is `simplex3` + corpus + `_qmix` + suite, which keeps the tree off
 `simplex3_olmo2` — whose adapters it reuses and whose results directory it must not
 write an `experiment.yaml` into.
 
-> **Not on `main` yet:** `qbig`, the probe-*depth* axis (the same fleet at 1000
-> queries and R=64, `--suite olmo2_qbig --dataset yahoo_qbig` →
-> `simplex3_qbig_olmo2_qbig`), lives on branch `worktree-qbig-olmo2-1000q-r64`. It
-> belongs in the table above once that branch merges.
+qbig and qbigtemp are scored by `figures/simplex3_qbig_olmo2/subsample_qbig.py`
+(`sbatch jobs/qbig_subsample.sh`) and their per-layer functional reads by
+`layers_qbig.py` (`jobs/qbig_layers.sh`).
+
+qbig_v2's query set is named `qbig_v2_uniform`. It is scored by `figures/simplex3_qbig_v2_olmo2/subsample_qbig_v2.py`
+(`sbatch jobs/qbig_v2_subsample.sh`): 100 uniform query subsets at each of 1, 2,
+5, …, 1000 queries plus the full 2000 once, at the full R=64, for sampled, greedy,
+functional all states, the thirds and h1/h9/h16. **It was embedded with v2-moe
+only** -- there is no v1.5 embedding. To add one, re-embed the cached text with
+`scripts/reembed_behavioral.py --draw n2000_s02_fea27ccee --embedder-model
+nomic-ai/nomic-embed-text-v1.5`; re-running the configs would re-decode.
 
 ## The dataset trees — model-free, one per corpus
 

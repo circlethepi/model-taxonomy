@@ -196,6 +196,22 @@ class DataSimplexSpec:
     query_n: int = 100
     query_seed: int = 1
 
+    #: **Unstratified query draw.**  ``False`` draws the probe as the even
+    #: mixture -- one pooled entry per group at equal weight, so each group is
+    #: exactly a third of the rows -- which is what every spec that has run does.
+    #: ``True`` draws it as ONE pooled entry over every value of the vertex axis,
+    #: so the rows come uniformly from the corpus and the group shares follow the
+    #: corpus's own class sizes (for yahoo, 4:3:3 in expectation) and vary by
+    #: draw.  The entry is spelled exactly as qmix's undiluted 100%-yahoo point
+    #: spells its yahoo entry, so the two are one recipe hash.
+    query_pooled: bool = False
+
+    #: The query set's name under ``query_pooled``.  A label only --
+    #: ``recipe_hash`` covers the entries, not the name -- but the even-mixture
+    #: name (``yahoo_033g1_033g2_033g3_qtc``) would claim a third per group,
+    #: which an unstratified draw is not, so a pooled spec must give its own.
+    query_name: str = ""
+
     #: Continuations drawn per query at the behavioral level -- the ``R`` in
     #: ``(n_queries * R, d)``.  16 for every spec that has run, and that is the
     #: regression test as much as the default: it was a module constant in the
@@ -239,7 +255,8 @@ class DataSimplexSpec:
     #: Keys: ``query`` (appended to the query-set description in every
     #: extraction config), ``train`` (the truncation note in the training
     #: configs), ``draw`` (a note about the draws themselves, in the sweep
-    #: configs).  A missing key emits nothing.
+    #: configs), ``probe`` (a note about the probe, in every extraction
+    #: config's header).  A missing key emits nothing.
     caveats: dict = field(default_factory=dict)
 
     #: The figure subtitle for this corpus, printed under the cross-level MDS
@@ -725,8 +742,45 @@ YAHOO_QBIG = replace(
 )
 
 
+#: **qbig_v2**: qbig re-run over a 2000-query probe, approved 2026-10-27.  Same
+#: sixteen adapters, the same seed and R, and the same levels; three fields move:
+#:
+#: ``query_n=2000`` doubles the pool, so a 1000-query subsample of it is a
+#: genuine subsample (half the pool) rather than the whole of it, as it was in
+#: qbig.
+#:
+#: ``query_pooled=True`` draws the queries uniformly from yahoo instead of a
+#: third from each group.  So qbig_v2's 2000 rows do NOT contain qbig's 1000:
+#: the recipe differs, and the two compare in distribution, not query by query.
+#: Seed 2 is kept to stay close to qbig, though under this recipe seeds 0 and 1
+#: no longer name the training draw and the standing probe.
+#:
+#: ``embedder_model`` is v2-moe, the embedder every qbig figure reads, embedded
+#: in the extraction job itself rather than by re-embedding.  No v1.5 embedding
+#: is made; ``scripts/reembed_behavioral.py --draw n2000_s02_fea27ccee`` adds one
+#: from the cached text if it is ever wanted.
+YAHOO_QBIG_V2 = replace(
+    YAHOO_QBIG,
+    suffix="_qbig_v2",
+    query_n=2000,
+    query_pooled=True,
+    query_name="qbig_v2_uniform",
+    embedder_model="nomic-ai/nomic-embed-text-v2-moe",
+    caveats={**YAHOO_QBIG.caveats, "probe": (
+        "qbig_v2: a 2000-query probe drawn uniformly from yahoo (one pooled entry\n"
+        "over topics 0-9, spelled as qmix's 100%-yahoo entry), seed 2, R=64 at T=1.0.\n"
+        "Embedded with nomic-embed-text-v2-moe ONLY; no v1.5 embedding exists. If\n"
+        "one is ever needed, re-embed the cached text (minutes, not GPU-hours):\n"
+        "  python scripts/reembed_behavioral.py --base-model allenai/OLMo-2-0425-1B-Instruct \\\n"
+        "      --draw n2000_s02_fea27ccee --embedder-model nomic-ai/nomic-embed-text-v1.5\n"
+        "Re-running this config would re-decode instead.")},
+    subtitle=("Mixtures from 3 topic groupings of the Yahoo Answers Dataset, "
+              "probed with 2000 uniformly drawn queries at 64 replicates"),
+)
+
+
 #: The corpora this generator knows how to emit.  ``yahoo`` is the one that
 #: already ran and must regenerate unchanged.
 SPECS = {"yahoo": YAHOO, "dolly": DOLLY, "oasst1": OASST1,
          "yahoo_pool": YAHOO_POOL, "yahoo_nsweep": YAHOO_NSWEEP,
-         "yahoo_qbig": YAHOO_QBIG}
+         "yahoo_qbig": YAHOO_QBIG, "yahoo_qbig_v2": YAHOO_QBIG_V2}

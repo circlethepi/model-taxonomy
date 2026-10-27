@@ -144,6 +144,34 @@ in the cache key, qbigtemp's T=1.0 point is the *same* cache entry qbig wrote, s
 qbig's entry was moved to `results/archive/qbig_t10_mixed_gpu/` before re-decoding
 (see that directory's `MANIFEST.json`).
 
+**qbig_v2** (*qbig, version 2*) — qbig re-run over a **2000-query** probe drawn
+**uniformly** from yahoo: one pooled entry over topics 0–9 instead of a third
+from each group, so the group shares follow yahoo's own class sizes (4:3:3 in
+expectation; this draw is 824/579/597) and vary from one subsample to the next.
+Named on 2026-10-27. Everything else is qbig's: the same sixteen adapters, seed
+2, R=64 at T=1.0 only, greedy at R=1, and input-mode functional. Sampled and
+greedy are pinned to l40s, for sampling coupling and for cost respectively. It reaches code
+as `YAHOO_QBIG_V2` and the `olmo2_qbig_v2` suite (job prefix `s3bv2`), emitted
+with `scripts/gen_simplex3.py --suite olmo2_qbig_v2 --dataset yahoo_qbig_v2` into
+`experiments/simplex3_qbig_v2_olmo2_qbig_v2/`.
+
+The pool is twice the largest depth scored (1000), so every depth below 2000 is a
+real subsample with a spread, which qbig's 1000-query point was not. Three
+differences from qbig:
+
+- **The draw does not contain qbig's.** The recipe differs, so qbig_v2 and qbig
+  compare in distribution, not query by query; the two draws share 4 rows. The
+  recipe *is* qmix's undiluted 100%-yahoo recipe (hash `075110fbec1c029d`), drawn
+  at n=2000 rather than 100.
+- **Training overlap.** The draw shares 3 rows with the union of the adapters'
+  yahoo training draws and none with the standing seed-1 probe. (qbig's own draw
+  shares 5 with the training draws, not none as the qbig entry above says.)
+- **Embedded with nomic-embed-text-v2-moe only**, inside the extraction job. No
+  v1.5 embedding exists; `scripts/reembed_behavioral.py --draw
+  n2000_s02_fea27ccee --embedder-model nomic-ai/nomic-embed-text-v1.5` adds one
+  from the cached text in minutes. Re-running the config would re-decode
+  instead.
+
 ---
 
 ## The shared cache

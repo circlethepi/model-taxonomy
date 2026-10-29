@@ -54,9 +54,9 @@ decoupling happens.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
-from src.experiments.data_simplex_spec import DOLLY, OASST1, YAHOO
+from src.experiments.data_simplex_spec import DOLLY, OASST1, OASST1_PAIRS_CJK, YAHOO
 
 
 def _all_classes(spec) -> list:
@@ -116,6 +116,11 @@ class QMixArm:
     #: One sentence describing what dilution by this corpus is a contrast in.
     contrast: str
 
+    #: Rows this arm's probe draws, when it differs from the spec's ``query_n``.
+    #: None for both qmix arms; set by **qmix_v2**, whose two pools are drawn
+    #: once at their own sizes (2000 dolly, 859 CJK) and subsampled afterwards.
+    query_n: int | None = None
+
 
 #: dolly, all eight categories pooled: an English instruction corpus.  Same
 #: language as yahoo, different task shape -- an instruction with an optional
@@ -149,6 +154,26 @@ OASST1ZH_ARM = QMixArm(
     answer_field=OASST1.answer_field,
     pool_rows=738,
     contrast="different language entirely",
+)
+
+
+#: oasst1 best-reply pairs in zh, ja and ko: the **oasst1cjk** arm of
+#: **qmix_v2**.  The same ``rank == 0`` rule as ``OASST1ZH_ARM``, over the
+#: ``oasst1_pairs_cjk`` table, which also reads oasst1's validation split: 859
+#: rows (zh 768, ja 86, ko 5).  The qmix_v2 draw takes all of them -- it is the
+#: pool every oasst1cjk subsample is cut from -- so n equals capacity here on
+#: purpose, not by accident.
+OASST1CJK_ARM = QMixArm(
+    key="oasst1cjk",
+    name_token="oasstcjk",
+    dataset_id=OASST1_PAIRS_CJK,
+    class_field=OASST1.class_field,
+    class_filter=["ja", "ko", "zh"],
+    query_fields=OASST1.query_fields,
+    answer_field=OASST1.answer_field,
+    pool_rows=859,
+    contrast="different language entirely",
+    query_n=859,
 )
 
 
@@ -199,6 +224,20 @@ class QMixSpec:
     #: ``s3o2``, ``s3po2``, ``s3no2``, ``s3d*``, ``s3o*``.
     job_prefix: str = "s3qm"
 
+    #: Whether the 100%-yahoo point is emitted.  qmix_v2 takes its yahoo pool
+    #: from qbig_v2 instead, so it emits none.
+    emit_pure: bool = True
+
+    #: ``Suite`` fields this tree overrides, applied on top of ``--suite`` by
+    #: ``write_qmix_tree``.  Empty for qmix; qmix_v2 pins sampled and greedy to
+    #: l40s and sets the walls its 2000-row pools need.
+    suite_overrides: dict = field(default_factory=dict)
+
+    #: One sampled-behavioral job per adapter rather than one for the fleet.  At
+    #: 100 rows the whole fleet fits one job; at 2000 rows x R=16 it would run
+    #: ~13 h, so qmix_v2 shards it the way qbig_v2 does.
+    shard_sampled: bool = False
+
     caveats: dict = field(default_factory=lambda: {
         "unstratified": (
             "The yahoo component is drawn UNSTRATIFIED -- all ten topics as one "
@@ -220,6 +259,12 @@ class QMixSpec:
             "is pinned to literal paths rather than re-derived."
         ),
     })
+
+    def n_for(self, arm: "QMixArm | None") -> int:
+        """Rows the probe at *arm* draws: the arm's own size if it has one."""
+        if arm is not None and arm.query_n is not None:
+            return arm.query_n
+        return self.query_n
 
     def base_query_fields(self) -> tuple[str, ...]:
         return tuple(self.base_spec.query_fields)
@@ -263,8 +308,9 @@ class QMixSpec:
         pure-yahoo probe from an oasst-arm one, and building it twice would
         spend the same GPU hours to write the same numbers into two directories.
         """
-        return [(None, 100)] + [(arm, pct) for arm in self.arms
-                                for pct in self.yahoo_pcts]
+        pure = [(None, 100)] if self.emit_pure else []
+        return pure + [(arm, pct) for arm in self.arms
+                       for pct in self.yahoo_pcts]
 
     def recipe_name(self, arm: QMixArm | None, pct: int) -> str:
         """The query recipe's name, which is also a cache path component.
@@ -283,7 +329,51 @@ class QMixSpec:
         return len(self.points()) * len(self.seeds)
 
 
-#: The one qmix spec, kept in a registry for the same reason ``SPECS`` is: a
+#: **qmix_v2** (approved 2026-10-29): qmix rebuilt from one pool per corpus.
+#: Instead of a separate 100-row draw at every (yahoo %, seed), each diluent is
+#: drawn ONCE, at its 0%-yahoo recipe and seed 0 -- dolly at 2000 rows, oasst1cjk
+#: at all 859 -- and every (arm, yahoo %, query count) cell is then composed by
+#: subsampling that pool together with qbig_v2's 2000-row yahoo pool
+#: (``figures/simplex3_qmix_v2_olmo2/subsample_qmix_v2.py``).  So this tree emits
+#: only the two pools, and no 100% point: qbig_v2 is that point.
+#:
+#: Same fleet, same sampling (T=1.0, R=16, batch 2, seed 0) and same v2-moe
+#: embedder as qmix.  Sampled and greedy are pinned to l40s, as qbig_v2's are,
+#: so the pools share one architecture -- and therefore one random stream per
+#: adapter -- with the yahoo pool they are composed with.
+#:
+#: Walls: qbig_v2's sampled shards ran ~67 min per adapter at 2000 rows x R=64
+#: on l40s; R=16 is ~2/3 of that per row (qmix's own measurements), so ~45 min
+#: against 3:00:00.  Greedy is qbig_v2's 2000-row job, ~84 min against 4:00:00.
+DOLLY_ARM_2000 = replace(DOLLY_ARM, query_n=2000)
+
+QMIX_V2 = QMixSpec(
+    arms=(DOLLY_ARM_2000, OASST1CJK_ARM),
+    yahoo_pcts=(0,),
+    seeds=(0,),
+    suffix="_qmix_v2",
+    job_prefix="s3qm2",
+    emit_pure=False,
+    shard_sampled=True,
+    suite_overrides={
+        "behavioral_partitions": "l40s",
+        "greedy_partitions": "l40s",
+        "behav_time": "3:00:00",
+        "greedy_time": "4:00:00",
+    },
+    caveats={
+        "unstratified": (
+            "A qmix_v2 POOL, not a probe: the diluent alone, drawn once at seed 0, "
+            "from which\nevery (yahoo %, query count) cell is later composed by "
+            "subsampling together with\nqbig_v2's 2000-row uniform yahoo pool "
+            "(seed 2, format ea27ccee). Nothing reads\nthis draw as a probe in its "
+            "own right."
+        ),
+        "format": QMixSpec().caveats["format"],
+    },
+)
+
+#: Every qmix spec, kept in a registry for the same reason ``SPECS`` is: a
 #: second one (a different base corpus, or a third diluent) is an entry here
 #: rather than a forked generator.
-QMIX_SPECS = {"yahoo": QMixSpec()}
+QMIX_SPECS = {"yahoo": QMixSpec(), "yahoo_v2": QMIX_V2}

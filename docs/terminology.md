@@ -186,6 +186,54 @@ replicate draws, so every trial is a query draw and the spread is query-sampling
 spread alone. qbig's scoring crossed 10 query draws with 10 replicate draws
 instead, so the two sets of bands do not measure the same spread.
 
+**qmix_v2** (*qmix, version 2*) — qmix rebuilt from **pools**. Named on
+2026-10-29. qmix decoded a separate 100-row probe for every (yahoo %, seed).
+qmix_v2 decodes each corpus once, as one large draw (a *pool*), and builds every
+cell by subsampling the pools:
+
+- **yahoo**: qbig_v2's 2000-row uniform draw (seed 2), read at replicates 0–15;
+- **dolly**: 2000 rows of qmix's 0%-yahoo dolly recipe, seed 0, R=16;
+- **oasst1cjk**: all 859 rows of `oasst1_pairs_cjk` (defined below), seed 0, R=16.
+
+A **cell** is one (arm, yahoo %, query count). Its 100 trials are drawn
+independently. Each trial draws its yahoo count as k ~ Binomial(n, p), so the
+mix itself varies from trial to trial. It then takes k rows from the yahoo pool
+and n − k from the arm's pool, each uniformly without replacement.
+
+- **Levels:** yahoo % is 0, 1, 2, 5, 10, 20 or 50 per arm. 100% is scored once,
+  as arm `yahoo`, and shared by both arms.
+- **Query counts:** 1–1000 on the {1,2,5}×10^k grid, up to 500 for oasst1cjk.
+  oasst1cjk also gets one point at its whole 859-row pool, at 0% yahoo.
+- **Readings and scores:** qbig_v2's nine readings, with the same two scores.
+- **Code:** `QMIX_SPECS["yahoo_v2"]` in `src/experiments/query_mixture_spec.py`
+  (job prefix `s3qm2`), emitted with `scripts/gen_simplex3.py --qmix --qmix-spec
+  yahoo_v2 --suite olmo2` into `experiments/simplex3_qmix_v2_olmo2/`.
+- **Scoring:** `figures/simplex3_qmix_v2_olmo2/subsample_qmix_v2.py`.
+
+Sampled and greedy run on l40s only, as qbig_v2's did, so all three pools share
+the same per-adapter sampling streams (sampling coupling). Three differences
+from qmix:
+
+- **The yahoo share is drawn uniformly over all ten topics** (qbig_v2's recipe,
+  which is qmix's own 100% recipe at n=2000). It comes from a different draw
+  and seed, so the two trees compare in distribution, not query by query.
+- **The prompt formats differ**: the yahoo pool uses `ea27ccee`, the two
+  diluent pools use qmix's union format `631eeef5`. Every yahoo row renders as
+  the same string under both, which the scoring script checks before it scores.
+- **The language arm is CJK, not zh alone.**
+
+**oasst1cjk** — qmix_v2's language arm: oasst1 queries in Chinese, Japanese and
+Korean. It replaces qmix's `oasst1zh` arm, and its recipe-name token is
+`oasstcjk`.
+
+**`oasst1_pairs_cjk`** — the oasst1 prompt/response table oasst1cjk draws from,
+built by `scripts/build_oasst1_pairs.py --langs zh ja ko --splits train
+validation --version cjk`. It applies the same `rank == 0` best-reply rule as
+`oasst1_pairs_v1`, but also reads oasst1's validation split. That gives 859
+pairs: zh 768, ja 86, ko 5. It contains every zh row of v1 (738), and its 859
+prompts include 831 distinct strings. It is a query pool only, never a
+training corpus.
+
 ---
 
 ## The shared cache

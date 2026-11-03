@@ -76,9 +76,14 @@ HERE = Path(__file__).resolve().parent
 # ── colours, built from figure 2's palette ───────────────────────────────────
 # figure 2: Functional gold, Behavioral red, models a blue ramp, corpora greens.
 
-#: Panel 1: depth, light to dark, through figure 2's functional gold.  The dark
-#: end stays ochre rather than brown, so it is not read as panel 4's red.
-DEPTH_RAMP = ["#EDB84A", "#E69F00", "#7A5400"]
+#: Panel 1: one colour per third (early, middle, late), light to dark in the
+#: functional level's gold family.  Picked directly rather than sampled from a
+#: ramp, so early and middle sit as far apart as middle and late (CIELAB
+#: delta-E ~21 and ~28; a ramp sampled at layers 3 / 8 / 14 gave them ~10).
+#: ``all`` stays black: in functional gold it disappears into the middle and
+#: late curves it runs between.
+#: The single layers take their third's colour.
+THIRD_COLORS = ("#ECA81E", "#BC7A0C", "#76500A")
 REFERENCE_COLOR = ml.REFERENCE_COLOR
 #: Panel 1's curves (and their key entries) are drawn at this opacity, so the
 #: overlapping layer curves show through one another.
@@ -113,6 +118,8 @@ T_RAMP = ["#5A7598", "#D55E00"]
 #: Panel 3 holds T fixed; panel 4 holds R fixed.  Panel 2 is qmix, which was
 #: decoded only at T=1, R=16, so these match it.
 FIXED_T = 1.0
+#: qmix's probe size, given as M in panel 2's title.
+QMIX_QUERIES = 100
 FIXED_R = 16
 #: ``(perspective in qmix_scores.csv, legend name)``: figure 2's pinned
 #: perspectives for the two levels that read the query set.
@@ -213,12 +220,10 @@ def query_axes(ax, yscale):
 
 def panel_layers(ax, rows, yscale):
     cs = ml.curves(rows)
-    top = max(ls[0] for _l, s, ls, _t in cs.values() if s == "single")
-    dcol = dict(zip(range(1, top + 1), ramp(DEPTH_RAMP, top)))
     # Only the contiguous subsets: the evenly spaced ones are left out.
     contiguous = [v for v in cs.values() if v[1] == "subset"
                   and v[2] == list(range(v[2][0], v[2][-1] + 1))]
-    scol = {v[0]: dcol[v[2][len(v[2]) // 2]] for v in contiguous}
+    scol = {v[0]: c for v, c in zip(contiguous, THIRD_COLORS)}
     ref = next(v for v in cs.values() if v[1] == "all")
 
     # Drawn above the layer curves, so its triangles are not buried under them.
@@ -276,7 +281,8 @@ def panel_qmix(ax, rows, yscale):
     ax.set_xticks(QMIX_TICKS)
     ax.set_xticklabels([str(100 - t) for t in QMIX_TICKS])
     ax.set_xlabel("Dilution %")
-    ax.set_title("Query mixture")
+    ax.set_title(f"Query mixture\n(M={QMIX_QUERIES}, T={FIXED_T:g}, "
+                 f"R={FIXED_R})")
 
 
 def matched_xlim(ax, lo, hi):
@@ -309,8 +315,8 @@ def panel_replicates(ax, rows, yscale):
         draw(ax, by_queries([t for t in sampled if int(t["replicates"]) == r]),
              colour)
     query_axes(ax, yscale)
-    inset_colorbar(ax, rs, colours, [str(r) for r in rs], "replicates", yscale)
-    ax.set_title(f"Replicates (T={FIXED_T:g})")
+    inset_colorbar(ax, rs, colours, [str(r) for r in rs], "Replicates (R)", yscale)
+    ax.set_title(f"Replicates\n(T={FIXED_T:g})")
 
 
 def panel_temperature(ax, rows, yscale):
@@ -324,8 +330,8 @@ def panel_temperature(ax, rows, yscale):
                              if float(r["temperature"]) == t]),
              colour)
     query_axes(ax, yscale)
-    inset_colorbar(ax, ts, colours, [f"{t:g}" for t in ts], "temperature", yscale)
-    ax.set_title(f"Temperature (R={FIXED_R})")
+    inset_colorbar(ax, ts, colours, [f"{t:g}" for t in ts], "Temperature (T)", yscale)
+    ax.set_title(f"Temperature\n(R={FIXED_R})")
 
 
 def inset_colorbar(ax, values, colours, labels, title, yscale):

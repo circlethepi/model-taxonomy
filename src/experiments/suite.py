@@ -194,6 +194,12 @@ class Suite:
     #: one stream.
     behavioral_partitions: str | None = None
 
+    #: Partitions for the greedy job alone, read the same way: ``None`` is the
+    #: extraction list.  Greedy shares no random stream, so this is a choice of
+    #: card, not of numbers -- qbig_v2 pins it to l40s, which bills at a fraction
+    #: of the Hopper rate.
+    greedy_partitions: str | None = None
+
     #: Whether to emit the input-mode functional and greedy behavioral jobs.  On
     #: for every suite that has run.  Off for a tree that re-decodes the sampled
     #: level over a draw another tree already extracted: those jobs would only
@@ -325,6 +331,11 @@ class Suite:
     def behavioral_gpu_partitions(self) -> str:
         """The partition list the sampled behavioral jobs are emitted with."""
         return self.behavioral_partitions or self.gpu_partitions
+
+    @property
+    def greedy_gpu_partitions(self) -> str:
+        """The partition list the greedy jobs are emitted with."""
+        return self.greedy_partitions or self.gpu_partitions
 
     @property
     def model_slug(self) -> str:

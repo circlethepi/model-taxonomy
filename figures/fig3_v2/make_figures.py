@@ -16,13 +16,13 @@ directory unchanged:
 * ``qbig_v2_subsample.csv``      from ``simplex3_qbig_v2_olmo2/subsample_qbig_v2.py``
 * ``qbig_v2_temp_subsample.csv`` from ``simplex3_qbig_v2_olmo2/subsample_qbig_v2_temp.py``
 * ``qmix_v2_subsample.csv``      from ``simplex3_qmix_v2_olmo2/subsample_qmix_v2.py``
-  -- **PENDING** (scoring job 1473695)
-* ``qbig_v2_replicates.csv``     a replicate-axis scoring of the qbig_v2 R=64
-  decode -- **PENDING** (no script yet)
+  (scoring job 1473695; collapsed trials are NaN)
+* ``qbig_v2_replicates.csv``     from ``simplex3_qbig_v2_olmo2/subsample_qbig_v2_replicates.py``,
+  a replicate-axis scoring of the qbig_v2 R=64 decode
 
-A panel whose CSV is missing is drawn as a **placeholder**: its real axes,
-title and key, no curves, and a grey "data pending" note.  Once the file is
-copied in, the panel fills itself.
+All four are in place.  Should one go missing, its panel is drawn as a
+**placeholder**: its real axes, title and key, no curves, and a grey "data
+pending" note.  Once the file is copied back in, the panel fills itself.
 
 Two variants, which differ only in how query mixture is shown
 ---------------------------------------------------------------

@@ -137,6 +137,7 @@ Three things are worth knowing before reading any of these:
 | `simplex3_qbig_olmo2_qbigtemp` | **qbigtemp** — qbig's sampled run at T = 0.25, 0.5, 0.75, 1.0, l40s only; no functional or greedy (qbig's are reused) | `python scripts/gen_simplex3.py --suite olmo2_qbig_temp --dataset yahoo_qbig` |
 | `simplex3_qbig_v2_olmo2_qbig_v2` | **qbig_v2** — probe depth over a 2000-query probe drawn uniformly from yahoo, seed 2, R=64 at T=1.0, plus greedy and functional; sampled and greedy on l40s; v2-moe only | `python scripts/gen_simplex3.py --suite olmo2_qbig_v2 --dataset yahoo_qbig_v2` |
 | `simplex3_qbig_v2_olmo2_qbig_v2_temp` | **qbig_v2_temp** — qbig_v2's sampled run at T = 0.1, 0.2, …, 0.9, R=64, l40s only; no T=1.0, greedy or functional (qbig_v2's are reused); v2-moe only | `python scripts/gen_simplex3.py --suite olmo2_qbig_v2_temp --dataset yahoo_qbig_v2` |
+| `simplex3_qmix_v2_olmo2` | **qmix_v2** — qmix rebuilt from pools: a dolly pool (2000 rows) and an **oasst1cjk** pool (859 zh/ja/ko rows), each the 0%-yahoo recipe at seed 0, R=16 at T=1.0, plus greedy and functional; sampled one adapter per job; sampled and greedy on l40s; v2-moe only. The yahoo pool is qbig_v2's | `python scripts/gen_simplex3.py --qmix --qmix-spec yahoo_v2 --suite olmo2` |
 
 `--qmix` reuses the existing `_n1000_s00_r16_i00_b5008` fleet and emits no training
 jobs at all — 450 configs across the behavioral, functional and greedy families, and
@@ -168,6 +169,20 @@ is a query draw. The query subsets are qbig_v2's, the same sets trial for
 trial. Like qbig_v2 it was embedded with v2-moe only; the v1.5 re-embed above
 covers every temperature in one run, since its default `--variant-glob`
 takes every generation variant under the draw.
+
+qmix_v2 is scored by `figures/simplex3_qmix_v2_olmo2/subsample_qmix_v2.py`
+(`sbatch jobs/qmix_v2_subsample.sh`, once all three pools are decoded). A
+**cell** is one (arm, yahoo %, query count), and each gets 100 independent
+trials. A trial draws its yahoo count as k ~ Binomial(n, p), then takes k rows
+from qbig_v2's yahoo pool and n − k from the arm's pool.
+- **Levels:** 0, 1, 2, 5, 10, 20, 50% per arm, plus 100% once.
+- **Query counts:** 1–1000, up to 500 for oasst1cjk, plus one full-pool point at
+  859 and 0% yahoo.
+- **Replicates:** sampled is read at R=16; the yahoo pool contributes its
+  replicates 0–15.
+- **CJK source:** the CJK pool's table is `oasst1_pairs_cjk`, built by
+  `scripts/build_oasst1_pairs.py --langs zh ja ko --splits train validation
+  --version cjk`.
 
 ## The dataset trees — model-free, one per corpus
 

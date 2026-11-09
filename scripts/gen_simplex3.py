@@ -663,7 +663,7 @@ def qmix_query_block(arm: QMixArm | None, pct: int, seed: int) -> str:
                f"({arm.contrast}), seed {seed}")
     head = (f"  - name: {name}\n"
             f"    recipe_type: class_aware\n"
-            f"    n_samples: {QMIX.query_n}\n"
+            f"    n_samples: {QMIX.n_for(arm)}\n"
             f"    seed: {seed}\n"
             f"    # {mix}\n"
             f"    entries:\n")
@@ -1243,8 +1243,9 @@ def qmix_note(qpoint: tuple[QMixArm | None, int, int], level: str,
     is how a config comes to mean something a reader did not check.
     """
     arm, pct, qseed = qpoint
-    what = ("the SAME 100-row probe, undiluted" if arm is None else
-            f"a 100-row probe that is {pct}% yahoo and {100 - pct}% "
+    n = QMIX.n_for(arm)
+    what = (f"the SAME {n}-row probe, undiluted" if arm is None else
+            f"a {n}-row probe that is {pct}% yahoo and {100 - pct}% "
             f"{arm.key} ({arm.contrast})")
     note = (
         f"# One point of the QMIX axis: query-set composition. The {n_models} adapters are\n"
@@ -1263,10 +1264,10 @@ def qmix_note(qpoint: tuple[QMixArm | None, int, int], level: str,
         f"# {QMIX.caveats['format'].replace(chr(10), chr(10) + '# ')}\n"
     )
     if arm is not None and pct > 0:
-        rows = round(QMIX.query_n * pct / 100)
+        rows = round(n * pct / 100)
         note += (
             f"#\n"
-            f"# At {pct}% of {QMIX.query_n} rows this probe holds {rows} yahoo "
+            f"# At {pct}% of {n} rows this probe holds {rows} yahoo "
             f"{'row' if rows == 1 else 'rows'}. Whole-percent targets\n"
             f"# against 100 rows, so largest-remainder allocation is exact and the realized\n"
             f"# composition equals the requested one"
@@ -1278,7 +1279,7 @@ def qmix_note(qpoint: tuple[QMixArm | None, int, int], level: str,
         note += (
             f"#\n"
             f"# The {arm.key} pool is {arm.pool_rows} rows and this draw takes at most "
-            f"{QMIX.query_n}, so\n"
+            f"{n}, so\n"
             f"# ClassMixedDataset has no reason to scale the mixture down. If a log shows\n"
             f"# 'MixedDataset: recipe capacity', that assumption broke and the realized\n"
             f"# composition is not the one this file names.\n"
@@ -1344,7 +1345,9 @@ def write_extract(
         + ".\n#\n"
     )
     if qpoint is not None:
-        body += qmix_note(qpoint, level, len(names))
+        # The fleet's size, not this job's: a qmix_v2 sampled shard carries one
+        # adapter, but the note is about the fleet the probe is held against.
+        body += qmix_note(qpoint, level, len(extract_targets()))
     elif level == "functional" and rank_sweep():
         body += (
             f"# One job for all {len(names)}: HFInferenceTaxonomy loads the base model once\n"
@@ -1508,7 +1511,7 @@ def write_extract(
          else [adapter_path(*t) for t in names])
     )
     body += f"""  queries_dataset: {qname}
-  n_queries: {QMIX.query_n if qpoint is not None else SPEC.query_n}
+  n_queries: {QMIX.n_for(qpoint[0]) if qpoint is not None else SPEC.query_n}
   device: cuda
   torch_dtype: {SUITE.torch_dtype}
 """
@@ -2573,6 +2576,9 @@ def main() -> None:
                         help="Emit the qmix tree instead: the query-set composition "
                              "axis over an EXISTING adapter fleet. Trains nothing; "
                              "both diluent arms and the shared undiluted point.")
+    parser.add_argument("--qmix-spec", default="yahoo", choices=sorted(QMIX_SPECS),
+                        help="Which qmix spec --qmix emits (default: yahoo, the "
+                             "original tree; yahoo_v2 is qmix_v2's two pools).")
     parser.add_argument("--data-tree", action="store_true",
                         help="Emit only the dataset build tree -- the build job and the "
                              "embedding sweeps -- detached from any model suite.")
@@ -2619,7 +2625,7 @@ def main() -> None:
                 "the arms of the qmix spec, not --dataset; see "
                 "src/experiments/query_mixture_spec.py."
             )
-        write_qmix_tree(Path(args.root), args.suite)
+        write_qmix_tree(Path(args.root), args.suite, args.qmix_spec)
         return
 
     SUITE = _suite_for_dataset(SUITES[args.suite], args.dataset, args.suite,
@@ -3138,7 +3144,7 @@ def qmix_job_token(arm: QMixArm | None, pct: int, seed: int) -> str:
     return f"{arm.name_token[0]}{pct:03d}_s{seed:02d}"
 
 
-def write_qmix_tree(root: Path, suite_name: str) -> None:
+def write_qmix_tree(root: Path, suite_name: str, spec_key: str = "yahoo") -> None:
     """Emit the **qmix** tree: one fixed adapter fleet, many query compositions.
 
     A standalone emitter in the shape of ``write_data_tree``, rather than a set
@@ -3156,9 +3162,10 @@ def write_qmix_tree(root: Path, suite_name: str) -> None:
     """
     global SUITE, QMIX
 
-    QMIX = QMIX_SPECS["yahoo"]
+    QMIX = QMIX_SPECS[spec_key]
     from dataclasses import replace
-    SUITE = replace(SUITES[suite_name], job_prefix=QMIX.job_prefix)
+    SUITE = replace(SUITES[suite_name], job_prefix=QMIX.job_prefix,
+                    **QMIX.suite_overrides)
 
     tree = slug()
     exp = root / "experiments" / tree
@@ -3179,35 +3186,56 @@ def write_qmix_tree(root: Path, suite_name: str) -> None:
         written.append(str(path))
 
     names = extract_targets()
+    # Per level, so a spec's ``suite_overrides`` can pin sampled and greedy to
+    # one architecture.  For qmix every one of these is ``gpu_partitions``.
+    partitions = {"behavioral": SUITE.behavioral_gpu_partitions,
+                  "greedy": SUITE.greedy_gpu_partitions,
+                  "functional": SUITE.gpu_partitions}
+    if QMIX.shard_sampled:
+        SUITE = replace(SUITE, behavioral_shards=len(models))
     for arm, pct in QMIX.points():
         for seed in QMIX.seeds:
             point = (arm, pct, seed)
             stem = f"{QMIX.recipe_name(arm, pct)}_s{seed:02d}"
             tok = qmix_job_token(arm, pct, seed)
             for level, num, jtok, wall in QMIX_LEVELS:
-                cfg = f"{level}_{stem}.yaml"
                 taxonomy = "functional" if level == "functional" else "behavioral"
-                emit(exp / cfg, write_extract(
-                    level, "question_only", None, names,
-                    models_override=models, qpoint=point,
-                ))
-                emit(jobs / f"{num}_{stem}.sh", sbatch(
-                    f"{SUITE.job_prefix}_{jtok}_{tok}", SUITE.gpu_partitions, True,
-                    SUITE.extract_mem_gb, getattr(SUITE, wall),
-                    # --steps build extract, not extract alone: make_queries reads
-                    # the query recipe from
-                    # {output_dir}/datasets/{queries_dataset}.recipe.json, and
-                    # nothing else in this tree writes that file.
-                    f"python scripts/run_experiment.py experiments/{tree}/{cfg}"
-                    f" --steps build extract --taxonomy {taxonomy}",
-                    logs,
-                ))
+                # ``(shard, adapter names, adapter paths, file suffix, job suffix)``:
+                # one entry for the whole fleet, or one per adapter when the
+                # spec shards the sampled level.
+                if level == "behavioral" and QMIX.shard_sampled:
+                    shards = [(k, [names[k]], [models[k]], f"_shard{k:02d}", f"_{k}")
+                              for k in range(len(models))]
+                else:
+                    shards = [(None, names, models, "", "")]
+                for shard, sh_names, sh_models, fsuf, jsuf in shards:
+                    cfg = f"{level}_{stem}{fsuf}.yaml"
+                    emit(exp / cfg, write_extract(
+                        level, "question_only", shard, sh_names,
+                        models_override=sh_models, qpoint=point,
+                    ))
+                    emit(jobs / f"{num}_{stem}{fsuf}.sh", sbatch(
+                        f"{SUITE.job_prefix}_{jtok}_{tok}{jsuf}", partitions[level], True,
+                        SUITE.extract_mem_gb, getattr(SUITE, wall),
+                        # --steps build extract, not extract alone: make_queries reads
+                        # the query recipe from
+                        # {output_dir}/datasets/{queries_dataset}.recipe.json, and
+                        # nothing else in this tree writes that file.
+                        f"python scripts/run_experiment.py experiments/{tree}/{cfg}"
+                        f" --steps build extract --taxonomy {taxonomy}",
+                        logs,
+                    ))
 
     emit(jobs / "submit_all.sh", qmix_submit_all(tree))
     (jobs / "submit_all.sh").chmod(0o755)
 
     n_points = len(QMIX.points())
-    print(f"Wrote {len(written)} files:")
+    if QMIX.shard_sampled:
+        n_jobs = sum(1 for w in written if w.endswith(".sh")) - 1
+        print(f"Wrote {len(written)} files ({n_jobs} jobs, sampled sharded "
+              f"one adapter per job):")
+    else:
+        print(f"Wrote {len(written)} files:")
     print(f"  {len(list(exp.glob('*.yaml')))} configs in {exp}")
     print(f"  {len(list(jobs.glob('*.sh')))} scripts in {jobs}")
     print(f"\n{n_points} query compositions x {len(QMIX.seeds)} draw seeds = "
@@ -3238,6 +3266,8 @@ def qmix_submit_all(tree: str) -> str:
     # does not say what it costs is one nobody can check before running it.
     behav_h = round(n_sets * 0.75)
     other_h = round(n_sets * (0.12 + 0.05))
+    if QMIX.shard_sampled:
+        return _qmix_pool_submit_all(stages)
     return f"""#!/bin/bash
 # GENERATED BY scripts/gen_simplex3.py --qmix --suite ... -- do not edit by hand.
 #
@@ -3265,6 +3295,54 @@ def qmix_submit_all(tree: str) -> str:
 #
 #     sinfo -o "%P %a %D %t %G"
 #     squeue --states=PD -o "%P %R" | sort | uniq -c
+
+set -euo pipefail
+cd "$(dirname "$0")"
+mkdir -p {output_dir()}/logs
+
+sb() {{ sbatch --parsable "$@"; }}
+
+{stages}
+echo
+echo "Submitted. Watch with: squeue -u $USER -o '%.10i %.14j %.9P %.2t %.10M %R'"
+"""
+
+
+def _qmix_pool_submit_all(stages: str) -> str:
+    """The submit script for a pool tree (qmix_v2): the same stages, its own costs.
+
+    Kept apart from ``qmix_submit_all`` rather than parameterizing its prose,
+    whose figures (450 jobs, ~45 min each, 8-9 h under a 16-GPU cap) are the
+    qmix tree's and must keep regenerating byte-for-byte.
+    """
+    n_models = len(extract_targets())
+    pools = [(arm, QMIX.n_for(arm)) for arm, _ in QMIX.points()]
+    rows = sum(n for _, n in pools)
+    n_jobs = len(pools) * (n_models + len(QMIX_LEVELS) - 1)
+    # The qmix tree's measured per-adapter costs at 100 rows (147 s sampled at
+    # R=16, 18.6 s greedy, 1.9 s functional), scaled by rows.
+    behav_h = rows / 100 * n_models * 147 / 3600
+    greedy_h = rows / 100 * n_models * 18.6 / 3600
+    func_h = rows / 100 * n_models * 1.9 / 3600
+    listing = "\n".join(f"#   {arm.key:<10} {n:>5} rows" for arm, n in pools)
+    return f"""#!/bin/bash
+# GENERATED BY scripts/gen_simplex3.py --qmix --qmix-spec ... -- do not edit by hand.
+#
+# The QMIX_V2 pools: each diluent drawn ONCE, at its 0%-yahoo recipe and seed 0,
+# over the same {n_models} fixed adapters. Every (yahoo %, query count) cell is
+# composed from these and qbig_v2's yahoo pool afterwards, by subsampling; no
+# job here is a probe in its own right.
+{listing}
+#
+# {n_jobs} jobs: per pool, {n_models} sampled shards (one adapter each) + greedy + functional.
+#   - sampled behavioral, R={SPEC.replicates} at T=1.0: ~{behav_h:.0f} GPU-h, l40s only
+#   - greedy: ~{greedy_h:.1f} GPU-h, l40s only; functional: ~{func_h:.1f} GPU-h
+# Sampled and greedy are pinned to l40s so the pools share one architecture --
+# and so one random stream per adapter -- with qbig_v2's yahoo pool.
+#
+# sbatch on this cluster refuses without --comment=accept_cost, and the gate
+# quotes the REQUESTED wall rather than elapsed time. It is added by hand at
+# submit time and is deliberately not baked in here.
 
 set -euo pipefail
 cd "$(dirname "$0")"

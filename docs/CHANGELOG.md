@@ -4,6 +4,34 @@
 
 ## Unreleased
 
+### qmix_v2: query-mixture curves composed from one pool per corpus
+
+**qmix** (query mixture) fixes the sixteen yahoo-simplex adapters and varies the
+yahoo percentage of the probe, diluting it with a corpus the adapters never saw.
+**qmix_v2** rebuilds it from **pools**: each corpus is decoded once, and every
+(arm, yahoo %, query count) cell is composed by subsampling.
+- **Yahoo pool:** qbig_v2's 2000-row uniform draw.
+- **Dolly pool:** a new 2000-row draw.
+- **oasst1cjk pool:** a new 859-row zh/ja/ko draw.
+- **Cost:** about 22 GPU-h on l40s, against roughly 1,100 GPU-h for a 1000-query
+  qmix with separate draws. Every cell also gets a 100-trial spread.
+
+Changes:
+- `QMixArm.query_n`, plus the `QMixSpec` fields `emit_pure`,
+  `suite_overrides` and `shard_sampled`. `QMIX_SPECS["yahoo_v2"]` uses them.
+- `scripts/gen_simplex3.py --qmix-spec` selects the spec. Every existing tree,
+  qmix included, regenerates byte-for-byte.
+- `scripts/build_oasst1_pairs.py` gains `--langs`, `--splits` and `--version`.
+  With the defaults it rebuilds `oasst1_pairs_v1` byte-identically; the new
+  options build `oasst1_pairs_cjk`.
+- `figures/simplex3_qmix_v2_olmo2/subsample_qmix_v2.py`, with
+  `jobs/qmix_v2_subsample.sh`, scores the cells. Each trial's yahoo count is
+  binomial. Before scoring it checks:
+  - each pool against the pipeline;
+  - that yahoo prompts render identically under both prompt formats.
+- Pools submitted 2026-10-29 as jobs 1366681–1366717. They are queued behind
+  the billing cap.
+
 ### qbig: functional recovery per hidden state and per layer combination
 
 `figures/simplex3_qbig_olmo2/layers_qbig.py` scores qbig's functional level (input

@@ -41,6 +41,17 @@ Run once::
 
 Writes ``results/shared_cache/00_sources/oasst1_pairs_v1/``, which
 ``load_dataset`` resolves as a bare directory of parquet.
+
+**The cjk table** (``oasst1_pairs_cjk``, 2026-10-29) is the same pairing rule
+restricted to zh, ja and ko, for **qmix_v2**'s CJK diluent pool -- queries only,
+never a training corpus, which is why it may hold languages (ja 86, ko 5) far
+below the n=500 bar the four v1 vertices were chosen to clear.  It also reads
+the ``validation`` split, which v1 does not: a query pool has no held-out side to
+protect, and the 34 extra pairs take it from 825 to 859 (zh 768, ja 86, ko 5)::
+
+    python scripts/build_oasst1_pairs.py --langs zh ja ko --splits train validation \
+        --version cjk \
+        --out /weka/scratch/jhu/cpriebe1/MO/model-taxonomy/results/shared_cache/00_sources/oasst1_pairs_cjk
 """
 
 from __future__ import annotations
@@ -71,7 +82,7 @@ COLUMNS = ["prompt", "response", "lang", "message_id", "parent_id",
            "message_tree_id", "is_root"]
 
 
-def build(rows_iter) -> list[dict]:
+def build(rows_iter, langs=None) -> list[dict]:
     """The pairing, as a pure function of the source rows.
 
     Two passes rather than one: the parent of an assistant message may appear
@@ -81,13 +92,14 @@ def build(rows_iter) -> list[dict]:
     for row in rows_iter:
         by_id[row["message_id"]] = row
 
+    langs = LANGS if langs is None else tuple(langs)
     out: list[dict] = []
     for row in by_id.values():
         if row["role"] != "assistant" or row["deleted"]:
             continue
         if row["rank"] != 0:
             continue
-        if row["lang"] not in LANGS:
+        if row["lang"] not in langs:
             continue
         parent = by_id.get(row["parent_id"])
         if parent is None or parent["role"] != "prompter" or parent["deleted"]:
@@ -129,20 +141,30 @@ def fingerprint(rows: list[dict]) -> str:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--out", default=str(OUT_DIR),
-                        help="Directory to write the parquet into.")
+    parser.add_argument("--langs", nargs="+", default=list(LANGS),
+                        help="Assistant-message languages to keep (default: the v1 four).")
+    parser.add_argument("--splits", nargs="+", default=[SPLIT],
+                        help="Source splits to pool before pairing (default: train).")
+    parser.add_argument("--version", default=VERSION,
+                        help="Directory suffix: oasst1_pairs_<version>.")
+    parser.add_argument("--out", default=None,
+                        help="Directory to write the parquet into "
+                             "(default: results/shared_cache/00_sources/oasst1_pairs_<version>).")
     parser.add_argument("--dry-run", action="store_true",
                         help="Report the counts and the fingerprint, write nothing.")
     args = parser.parse_args()
 
     from datasets import Dataset, load_dataset
 
-    source = load_dataset(SOURCE_ID, split=SPLIT)
-    rows = build(source)
+    # Pooled before pairing, so a parent and its reply are found whichever split
+    # each sits in (oasst1 splits by conversation tree, so in practice they agree).
+    source = [r for split in args.splits
+              for r in load_dataset(SOURCE_ID, split=split)]
+    rows = build(source, args.langs)
 
     counts = Counter(r["lang"] for r in rows)
-    print(f"{SOURCE_ID} [{SPLIT}]: {len(source)} messages -> {len(rows)} pairs")
-    for lang in LANGS:
+    print(f"{SOURCE_ID} [{'+'.join(args.splits)}]: {len(source)} messages -> {len(rows)} pairs")
+    for lang in args.langs:
         print(f"  {lang}  {counts[lang]}")
     print(f"  message_id fingerprint: {fingerprint(rows)}")
 
@@ -156,7 +178,7 @@ def main() -> None:
     if args.dry_run:
         return
 
-    out = Path(args.out)
+    out = Path(args.out or OUT_DIR.parent / f"oasst1_pairs_{args.version}")
     out.mkdir(parents=True, exist_ok=True)
     table = Dataset.from_dict({c: [r[c] for r in rows] for c in COLUMNS})
     table.to_parquet(str(out / "train-00000-of-00001.parquet"))

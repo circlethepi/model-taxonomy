@@ -54,6 +54,11 @@ _REPO = "/weka/scratch/jhu/cpriebe1/MO/model-taxonomy"
 #: the path.  See that script's docstring.
 OASST1_PAIRS = f"{_REPO}/results/shared_cache/00_sources/oasst1_pairs_v1"
 
+#: The same pairing rule over zh, ja and ko only, pooling oasst1's train and
+#: validation splits: 859 rows.  A query pool for qmix_v2's oasst1cjk arm, never
+#: a training corpus.  ``scripts/build_oasst1_pairs.py --version cjk``.
+OASST1_PAIRS_CJK = f"{_REPO}/results/shared_cache/00_sources/oasst1_pairs_cjk"
+
 
 def _compositions(total: int, parts: int):
     """Every way to write *total* as an ordered sum of *parts* non-negative ints."""

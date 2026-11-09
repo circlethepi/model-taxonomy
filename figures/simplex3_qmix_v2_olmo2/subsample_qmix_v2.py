@@ -50,6 +50,12 @@ simplex.
 **Each pool's full matrices are checked against the standard pipeline** before
 any trial is scored, and the run stops if they disagree beyond round-off.
 
+**A collapsed trial is scored NaN.**  When all sixteen adapters give the same
+representation on a trial's queries (seen with greedy on diluted probes, job
+1473695), Procrustes has nothing to fit; both scores are written as NaN (the
+user's call, 2026-11-03), the row keeps its ``n_queries``, and the log ends with
+a count per perspective, arm, yahoo % and n.
+
 Writes ``qmix_v2_subsample.csv`` beside this file.
 
 Usage::
@@ -74,7 +80,8 @@ import numpy as np  # noqa: E402
 
 import subsample_qbig as qb  # noqa: E402
 import layers_qbig as lq  # noqa: E402
-from subsample_qbig_v2 import functional_reads, score_parts  # noqa: E402
+from subsample_qbig_v2 import functional_reads  # noqa: E402
+from subsample_qbig_v2 import score_parts as _score_parts  # noqa: E402
 from src.analysis.subsample import CosineParts, cosine_parts, reduce_replicates  # noqa: E402
 from src.plots import simplex_suite as suite  # noqa: E402
 
@@ -114,6 +121,26 @@ N_DRAWS = 100
 FIELDS = ["embedder", "level", "perspective", "label", "layers",
           "temperature", "replicates", "arm", "yahoo_pct", "n_queries",
           "n_yahoo", "query_draw", "n_query_draws", "dcor", "disparity"]
+
+
+#: Procrustes' refusal for a trial whose 16 adapters all coincide.
+DEGENERATE = "degenerate configuration: all points coincide"
+#: ``(perspective, arm, yahoo_pct, n_queries)`` -> collapsed trials, so the
+#: run's log says where they fell.
+COLLAPSED: dict[tuple, int] = {}
+
+
+def score_parts(parts, idx, ids, level, key) -> dict:
+    """Score one trial; a collapsed one (all 16 adapters coincide, so
+    Procrustes has nothing to fit) is recorded as NaN on both scores -- the
+    user's call, 2026-11-03 -- and counted under *key*."""
+    try:
+        return _score_parts(parts, idx, ids, level)
+    except ValueError as e:
+        if str(e) != DEGENERATE:
+            raise
+        COLLAPSED[key] = COLLAPSED.get(key, 0) + 1
+        return {"dcor": float("nan"), "disparity": float("nan")}
 
 
 # ── Pools ────────────────────────────────────────────────────────────────────
@@ -269,7 +296,8 @@ def run(args) -> None:
                 layers=" ".join(map(str, layers)) if layers else "",
                 temperature=temp, replicates=r, arm=arm, yahoo_pct=pct,
                 n_queries=n, n_yahoo=k, query_draw=qi, n_query_draws=nq,
-                **score_parts(parts[arm], idx, ids, level)))
+                **score_parts(parts[arm], idx, ids, level,
+                              (persp, arm, pct, n))))
         print(f"  {label}: {len(rows)} rows, {time.time() - t0:.0f}s", flush=True)
 
     out = HERE / args.out
@@ -279,6 +307,10 @@ def run(args) -> None:
         w.writeheader()
         w.writerows(rows)
     print(f"\nwrote {len(rows)} rows to {out} in {time.time() - t0:.0f}s")
+    total = sum(COLLAPSED.values())
+    print(f"\ncollapsed trials (scored NaN): {total}")
+    for (persp, arm, pct, n), c in sorted(COLLAPSED.items()):
+        print(f"  {persp:14s} {arm:10s} yahoo {pct:3d}%  n={n:4d}: {c}")
 
 
 def main() -> None:

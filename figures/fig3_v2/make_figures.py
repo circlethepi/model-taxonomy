@@ -177,18 +177,32 @@ HEIGHT = {"log": 2.1, "linear": 2.4}
 WSPACE_SCALE = 0.65
 #: Legend placement per keyed panel (panels without an entry are keyed by an
 #: inset colorbar, or not at all).
-LEGEND_LOC = {"layers": "upper left", "qmix_dilution": "upper center",
+LEGEND_LOC = {"layers": "upper left", "layers_single": "upper left",
+              "qmix_dilution": "upper center",
               "qmix_behavioral": "upper right", "qmix_functional": "upper right"}
-HANDLE_LENGTH = {"layers": 1.6, "qmix_dilution": 1.0,
+HANDLE_LENGTH = {"layers": 1.6, "layers_single": 1.6, "qmix_dilution": 1.0,
                  "qmix_behavioral": 1.6, "qmix_functional": 1.6}
-COLORBAR_BOX = {"log": [0.07, 0.13, 0.86, 0.05],
+COLORBAR_BOX = {"log": [0.07, 0.18, 0.86, 0.05],
                 "linear": [0.22, 0.84, 0.74, 0.05]}
 
 VARIANTS = {
     "qmix_dilution": ["layers", "qmix_dilution", "replicates", "temperature"],
     "qmix_queries": ["layers", "qmix_behavioral", "qmix_functional",
                      "replicates", "temperature"],
+    "qmix_dolly": ["layers_single", "qmix_dolly_both", "replicates",
+                   "temperature_subset"],
 }
+
+#: qmix_dolly's merged panel: the two-row dilution bar's box per y scale.  On
+#: the log scale the functional lines sit where the bottom box would be, so
+#: the bar moves to the empty upper right.
+STACKED_BAR_BOX = {"log": [0.42, 0.80, 0.53, 0.07],
+                   "linear": [0.22, 0.80, 0.74, 0.07]}
+
+#: qmix_dolly: the dolly arm only, at these yahoo % (dilution 100/99/90/50/0).
+DOLLY_YAHOO_PCTS = [0, 1, 10, 50, 100]
+#: qmix_dolly: the temperatures drawn (no greedy).
+SUBSET_TS = [0.2, 0.4, 0.6, 0.8, 1.0]
 
 
 # ── data ─────────────────────────────────────────────────────────────────────
@@ -306,6 +320,29 @@ def inset_colorbar(ax, colours, labels, title, yscale):
     return cax
 
 
+def inset_stacked_bar(ax, rows, labels, title, box):
+    """A discrete two-row bar inside *ax*: ``rows`` is a list of colour lists
+    (one per row, top first), each row half the bar's thickness; *labels*
+    tick the columns, below the bottom row only."""
+    cax = ax.inset_axes(box)
+    n = len(labels)
+    grid = np.array([[matplotlib.colors.to_rgba(c) for c in row]
+                     for row in rows])
+    cax.imshow(grid, aspect="auto", extent=(-0.5, n - 0.5, len(rows), 0),
+               interpolation="nearest")
+    for y in range(1, len(rows)):
+        cax.axhline(y, color=mq.GREEDY_COLOR, lw=0.5)
+    cax.set_xticks(range(n))
+    cax.set_xticklabels(labels)
+    cax.set_yticks([])
+    cax.grid(False)
+    cax.tick_params(length=2, pad=1)
+    for s in cax.spines.values():
+        s.set_edgecolor(mq.GREEDY_COLOR)
+    cax.set_title(title, pad=2)
+    return cax
+
+
 def colorbar_frame(ax, cax, renderer):
     """A legend's frame behind *cax*, its title and its ticks (v1's)."""
     rc = matplotlib.rcParams
@@ -350,6 +387,58 @@ def panel_layers(ax, data, yscale):
             alpha=LAYER_LINE_ALPHA)
 
 
+def panel_layers_single(ax, data, yscale):
+    """Panel 1 without the group (third) lines: single layers h1/h9/h16,
+    dotted in their third's colour, and all states."""
+    rows = data["subsample"]
+    query_axes(ax, yscale)
+    ax.set_title("Functional layers")
+    if rows is None:
+        pending(ax)
+    else:
+        func = [r for r in rows if r["level"] == "functional"]
+        draw(ax, pick(func, perspective=REFERENCE_PERSPECTIVE),
+             REFERENCE_COLOR, marker=REFERENCE_MARKER, zorder=3,
+             alpha=LAYER_LINE_ALPHA)
+        for persp, kind, depth in LAYER_READS:
+            if kind == "single":
+                draw(ax, pick(func, perspective=persp), THIRD_COLORS[depth],
+                     ls=SINGLE_LS, alpha=LAYER_LINE_ALPHA)
+    for colour, name in zip(THIRD_COLORS, DEPTH_NAMES):
+        ax.plot([], [], linestyle=SINGLE_LS, color=colour, lw=LINEWIDTH,
+                marker="o", ms=MARKER_SIZE, label=name,
+                alpha=LAYER_LINE_ALPHA)
+    ax.plot([], [], "-", color=REFERENCE_COLOR, lw=LINEWIDTH,
+            marker=REFERENCE_MARKER, ms=MARKER_SIZE, label="all",
+            alpha=LAYER_LINE_ALPHA)
+
+
+def panel_qmix_both(ax, data, yscale, arm="dolly",
+                    yahoo_pcts=DOLLY_YAHOO_PCTS):
+    """Sampled behavioral (T=1, R=16) and functional (all states) on one
+    axes, one *arm*; dilution on each level's ramp, keyed by a two-row bar
+    (behavioral on top, functional below)."""
+    rows = data["qmix"]
+    pcts = sorted(yahoo_pcts, reverse=True)            # undiluted first
+    query_axes(ax, yscale)
+    ax.set_title(f"Query mixture\n(T={FIXED_T:g}, R={FIXED_R})")
+    bar_rows = []
+    for level, persp, _name in QMIX_LEVELS:
+        colours = dict(zip(pcts, ramp(DILUTION_RAMPS[level], len(pcts))))
+        bar_rows.append([colours[p] for p in pcts])
+        if rows is None:
+            continue
+        lvl = pick(rows, level=level, perspective=persp)
+        draw(ax, pick(lvl, arm=SHARED_ARM), colours[100])
+        for pct in pcts[1:]:
+            draw(ax, [r for r in pick(lvl, arm=arm)
+                      if int(r["yahoo_pct"]) == pct], colours[pct])
+    if rows is None:
+        pending(ax)
+    inset_stacked_bar(ax, bar_rows, [str(100 - p) for p in pcts],
+                      "Dilution %", STACKED_BAR_BOX[yscale])
+
+
 def panel_qmix_dilution(ax, data, yscale):
     rows = data["qmix"]
     if rows is None:
@@ -378,10 +467,11 @@ def panel_qmix_dilution(ax, data, yscale):
                  f"T={FIXED_T:g}, R={FIXED_R})")
 
 
-def panel_qmix_queries(ax, data, yscale, level):
+def panel_qmix_queries(ax, data, yscale, level, arms=ARMS,
+                       yahoo_pcts=YAHOO_PCTS, tick_labels=DILUTION_TICK_LABELS):
     rows = data["qmix"]
     persp, name = next((p, n) for lv, p, n in QMIX_LEVELS if lv == level)
-    pcts = sorted(YAHOO_PCTS, reverse=True)            # undiluted first
+    pcts = sorted(yahoo_pcts, reverse=True)            # undiluted first
     colours = dict(zip(pcts, ramp(DILUTION_RAMPS[level], len(pcts))))
     query_axes(ax, yscale)
     if rows is None:
@@ -389,13 +479,14 @@ def panel_qmix_queries(ax, data, yscale, level):
     else:
         lvl = pick(rows, level=level, perspective=persp)
         draw(ax, pick(lvl, arm=SHARED_ARM), colours[100])
-        for arm, _l, ls in ARMS:
+        for arm, _l, ls in arms:
             for pct in pcts[1:]:
                 draw(ax, [r for r in pick(lvl, arm=arm)
                           if int(r["yahoo_pct"]) == pct], colours[pct], ls=ls)
-    for arm, label, ls in ARMS:
-        ax.plot([], [], ls, color=KEY_COLOR, lw=LINEWIDTH, label=label)
-    labels = [str(100 - p) if 100 - p in DILUTION_TICK_LABELS else ""
+    if len(arms) > 1:
+        for arm, label, ls in arms:
+            ax.plot([], [], ls, color=KEY_COLOR, lw=LINEWIDTH, label=label)
+    labels = [str(100 - p) if 100 - p in tick_labels else ""
               for p in pcts]
     inset_colorbar(ax, [colours[p] for p in pcts], labels, "Dilution %",
                    yscale)
@@ -440,13 +531,41 @@ def panel_temperature(ax, data, yscale):
     inset_colorbar(ax, colours, labels, "Temperature (T)", yscale)
 
 
+def panel_temperature_subset(ax, data, yscale):
+    """Sampled behavioral at R=16 for ``SUBSET_TS`` only (no greedy)."""
+    rows = data["temp"]
+    query_axes(ax, yscale)
+    ax.set_title(f"Temperature\n(R={FIXED_R})")
+    if rows is None:
+        pending(ax)
+        return
+    cmap = LinearSegmentedColormap.from_list("T", T_RAMP)
+    sampled = sampled_at(rows, replicates=FIXED_R)
+    colours = [cmap(t) for t in SUBSET_TS]
+    for t, colour in zip(SUBSET_TS, colours):
+        draw(ax, [r for r in sampled if float(r["temperature"]) == t], colour)
+    labels = [f"{t:g}" for t in SUBSET_TS]
+    inset_colorbar(ax, colours, labels, "Temperature (T)", yscale)
+
+
+DOLLY_ARMS = [a for a in ARMS if a[0] == "dolly"]
+
 PANELS = {
     "layers": panel_layers,
+    "layers_single": panel_layers_single,
+    "qmix_dolly_both": panel_qmix_both,
     "qmix_dilution": panel_qmix_dilution,
     "qmix_behavioral": lambda ax, d, y: panel_qmix_queries(ax, d, y, "behavioral"),
     "qmix_functional": lambda ax, d, y: panel_qmix_queries(ax, d, y, "functional"),
+    "qmix_behavioral_dolly": lambda ax, d, y: panel_qmix_queries(
+        ax, d, y, "behavioral", DOLLY_ARMS, DOLLY_YAHOO_PCTS,
+        {100 - p for p in DOLLY_YAHOO_PCTS}),
+    "qmix_functional_dolly": lambda ax, d, y: panel_qmix_queries(
+        ax, d, y, "functional", DOLLY_ARMS, DOLLY_YAHOO_PCTS,
+        {100 - p for p in DOLLY_YAHOO_PCTS}),
     "replicates": panel_replicates,
     "temperature": panel_temperature,
+    "temperature_subset": panel_temperature_subset,
 }
 
 

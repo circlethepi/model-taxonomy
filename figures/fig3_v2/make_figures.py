@@ -191,6 +191,8 @@ VARIANTS = {
                      "replicates", "temperature"],
     "qmix_dolly": ["layers_single", "qmix_dolly_both", "replicates",
                    "temperature_subset"],
+    "qmix_oasst1cjk": ["layers_single", "qmix_oasst1cjk_both", "replicates",
+                       "temperature_subset"],
 }
 
 #: qmix_dolly's merged panel: the two-row dilution bar's box per y scale.  On
@@ -198,9 +200,17 @@ VARIANTS = {
 #: the bar moves to the empty upper right.
 STACKED_BAR_BOX = {"log": [0.42, 0.80, 0.53, 0.07],
                    "linear": [0.22, 0.80, 0.74, 0.07]}
+#: qmix_oasst1cjk's log-scale bar: its behavioral lines sit higher at large n
+#: than dolly's and cross the upper-right box, so the bar is thinner and
+#: raised to clear them.
+CJK_STACKED_BAR_BOX = {"log": [0.445, 0.835, 0.53, 0.05],
+                       "linear": STACKED_BAR_BOX["linear"]}
 
 #: qmix_dolly: the dolly arm only, at these yahoo % (dilution 100/99/90/50/0).
 DOLLY_YAHOO_PCTS = [0, 1, 10, 50, 100]
+#: qmix_oasst1cjk: as qmix_dolly, with the oasst1-cjk arm in place of dolly.
+#: Same x axis; the CJK curves stop at its grid's n=500, plus the single-draw
+#: full-pool point at 859.
 #: qmix_dolly: the temperatures drawn (no greedy).
 SUBSET_TS = [0.2, 0.4, 0.6, 0.8, 1.0]
 
@@ -414,7 +424,7 @@ def panel_layers_single(ax, data, yscale):
 
 
 def panel_qmix_both(ax, data, yscale, arm="dolly",
-                    yahoo_pcts=DOLLY_YAHOO_PCTS):
+                    yahoo_pcts=DOLLY_YAHOO_PCTS, bar_box=STACKED_BAR_BOX):
     """Sampled behavioral (T=1, R=16) and functional (all states) on one
     axes, one *arm*; dilution on each level's ramp, keyed by a two-row bar
     (behavioral on top, functional below)."""
@@ -436,7 +446,7 @@ def panel_qmix_both(ax, data, yscale, arm="dolly",
     if rows is None:
         pending(ax)
     inset_stacked_bar(ax, bar_rows, [str(100 - p) for p in pcts],
-                      "Dilution %", STACKED_BAR_BOX[yscale])
+                      "Dilution %", bar_box[yscale])
 
 
 def panel_qmix_dilution(ax, data, yscale):
@@ -554,6 +564,8 @@ PANELS = {
     "layers": panel_layers,
     "layers_single": panel_layers_single,
     "qmix_dolly_both": panel_qmix_both,
+    "qmix_oasst1cjk_both": lambda ax, d, y: panel_qmix_both(
+        ax, d, y, arm="oasst1cjk", bar_box=CJK_STACKED_BAR_BOX),
     "qmix_dilution": panel_qmix_dilution,
     "qmix_behavioral": lambda ax, d, y: panel_qmix_queries(ax, d, y, "behavioral"),
     "qmix_functional": lambda ax, d, y: panel_qmix_queries(ax, d, y, "functional"),
